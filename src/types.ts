@@ -1,0 +1,81 @@
+export type TimeRange = '1h' | '24h' | '7d' | '30d';
+
+export interface DashboardPayload {
+  generatedAt: string;
+  range: TimeRange;
+  stale: boolean;
+  host: {
+    hostname: string | null;
+    os: string | null;
+    architecture: string | null;
+    uptimeSeconds: number | null;
+  };
+  latest: {
+    timestamp: string | null;
+    cpuPercent: number | null;
+    memoryPercent: number | null;
+    memoryUsedBytes: number | null;
+    memoryTotalBytes: number | null;
+    temperatureC: number | null;
+    load1: number | null;
+    load5: number | null;
+    load15: number | null;
+    powerState: string | null;
+    gpuMemoryBytes: number | null;
+    gpuClockHz: number | null;
+    networkRxBytesPerSecond: number | null;
+    networkTxBytesPerSecond: number | null;
+    diskReadBytesPerSecond: number | null;
+    diskWriteBytesPerSecond: number | null;
+  } | null;
+  series: TelemetryPoint[];
+  disks: DiskUsage[];
+  containers: ContainerStatus[];
+  alerts: AlertEvent[];
+  privilegeEvents: PrivilegeEvent[];
+}
+
+export interface TelemetryPoint {
+  timestamp: string;
+  cpuPercent: number | null;
+  memoryPercent: number | null;
+  temperatureC: number | null;
+  load1: number | null;
+  networkRxBytesPerSecond: number | null;
+  networkTxBytesPerSecond: number | null;
+  diskReadBytesPerSecond: number | null;
+  diskWriteBytesPerSecond: number | null;
+}
+
+export interface DiskUsage {
+  mount: string;
+  totalBytes: number | null;
+  usedBytes: number | null;
+  usedPercent: number | null;
+}
+
+export interface ContainerStatus {
+  name: string;
+  owner: string | null;
+  state: string | null;
+  health: string | null;
+  cpuPercent: number | null;
+  memoryBytes: number | null;
+  memoryPercent: number | null;
+}
+
+export interface AlertEvent {
+  timestamp: string;
+  severity: string;
+  kind: string | null;
+  status: string | null;
+  message: string;
+}
+
+export interface PrivilegeEvent {
+  timestamp: string;
+  actor: string | null;
+  target: string | null;
+  action: string;
+  result: string;
+}

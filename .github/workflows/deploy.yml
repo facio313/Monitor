@@ -1,0 +1,88 @@
+name: Build and deploy
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: monitor-production
+  cancel-in-progress: false
+
+env:
+  IMAGE_NAME: ghcr.io/facio313/monitor
+
+jobs:
+  build-and-deploy:
+    name: Test, build ARM64 image, and deploy
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Test host collector
+        run: python3 -m unittest discover -s ops/tests -p 'test_*.py'
+
+      - name: Sign in to GitHub Container Registry
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Build, test, and publish ARM64 image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          platforms: linux/arm64
+          push: true
+          pull: true
+          tags: |
+            ${{ env.IMAGE_NAME }}:${{ github.sha }}
+            ${{ env.IMAGE_NAME }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Request restricted server deployment
+        env:
+          DEPLOY_KEY: ${{ secrets.DEPLOY_KEY }}
+          GHCR_TOKEN: ${{ github.token }}
+          DEPLOY_ACTOR: ${{ github.actor }}
+        run: |
+          set -Eeuo pipefail
+
+          install -d -m 700 "$HOME/.ssh"
+          printf '%s\n' "$DEPLOY_KEY" | tr -d '\r' > "$HOME/.ssh/deploy_key"
+          chmod 600 "$HOME/.ssh/deploy_key"
+          trap 'rm -f "$HOME/.ssh/deploy_key"' EXIT
+
+          printf '%s\n' \
+            '[ssh.bonifacio.work]:22022 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAII91ovdQZMg9NpUyjjFSS0Ra0SEuYuAw4Uv3GTv6J92F' \
+            > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+
+          {
+            printf '%s\n' "$GHCR_TOKEN"
+            printf '%s\n' "$DEPLOY_ACTOR"
+          } | ssh -T \
+            -i "$HOME/.ssh/deploy_key" \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+            -o ConnectTimeout=15 \
+            -o ServerAliveInterval=15 \
+            -o ServerAliveCountMax=3 \
+            -p 22022 \
+            cks@ssh.bonifacio.work \
+            "deploy monitor $GITHUB_SHA"

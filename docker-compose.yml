@@ -1,0 +1,54 @@
+services:
+  monitor:
+    image: ${MONITOR_IMAGE:-ghcr.io/facio313/monitor:latest}
+    build:
+      context: .
+    container_name: monitor
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${MONITOR_PORT:-5181}:8080"
+    environment:
+      NODE_ENV: production
+      PORT: "8080"
+      MONITOR_DATA_DIR: /data
+      MONITOR_PASSWORD_FILE: /run/secrets/monitor_password
+      MONITOR_SESSION_SECRET_FILE: /run/secrets/monitor_session_secret
+      MONITOR_ALLOWED_ORIGINS: ${MONITOR_ALLOWED_ORIGINS:-https://bonifacio.work}
+    volumes:
+      - type: bind
+        source: ${MONITOR_EXPORT_DIR:-./data}
+        target: /data
+        read_only: true
+        bind:
+          create_host_path: false
+    secrets:
+      - monitor_password
+      - monitor_session_secret
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 256m
+    cpus: 0.75
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - >-
+          fetch('http://127.0.0.1:8080/readyz').then((response) => {
+          if (!response.ok) process.exit(1) }).catch(() => process.exit(1))
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+secrets:
+  monitor_password:
+    file: ${MONITOR_PASSWORD_PATH:-./secrets/password}
+  monitor_session_secret:
+    file: ${MONITOR_SESSION_SECRET_PATH:-./secrets/session-secret}
