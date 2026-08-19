@@ -1,4 +1,4 @@
-import { useMemo, useState, type ReactNode } from 'react';
+import { useEffect, useMemo, useRef, useState, type MouseEvent, type ReactNode } from 'react';
 import {
   Area,
   AreaChart,
@@ -12,7 +12,17 @@ import {
   YAxis,
 } from 'recharts';
 import { useDashboard } from '../hooks/useDashboard';
-import type { ContainerStatus, DashboardPayload, TimeRange } from '../types';
+import type {
+  AlertEvent,
+  ContainerStatus,
+  DashboardPayload,
+  MonitorPage,
+  PowerEvent,
+  PowerSummary,
+  PrivilegeEvent,
+  TelemetrySample,
+  TimeRange,
+} from '../types';
 import {
   clampPercent,
   formatBytes,
@@ -35,21 +45,51 @@ const RANGES: Array<{ value: TimeRange; label: string }> = [
   { value: '30d', label: '30D' },
 ];
 
+type StatusTone = 'good' | 'warn' | 'critical' | 'neutral';
+const API_EVENT_CAP = 500;
+
 interface DashboardProps {
+  page: MonitorPage;
+  navigationVersion: number;
+  onNavigate: (page: MonitorPage, hash?: string) => void;
   onLogout: () => Promise<void>;
   onPasswordChanged: () => void;
   onUnauthorized: () => void;
 }
 
-export function Dashboard({ onLogout, onPasswordChanged, onUnauthorized }: DashboardProps) {
+export function Dashboard({ page, navigationVersion, onNavigate, onLogout, onPasswordChanged, onUnauthorized }: DashboardProps) {
   const [range, setRange] = useState<TimeRange>('24h');
   const [loggingOut, setLoggingOut] = useState(false);
   const [passwordDialogOpen, setPasswordDialogOpen] = useState(false);
+  const titleRef = useRef<HTMLHeadingElement>(null);
   const { data, error, initialLoading, refreshing, lastUpdated, refresh } = useDashboard(range, onUnauthorized);
+  const contentReady = data !== null;
+  const anchorContentReady = contentReady && page === 'details' && Boolean(window.location.hash);
 
   async function handleLogout() {
     setLoggingOut(true);
     await onLogout();
+  }
+
+  useEffect(() => {
+    document.title = page === 'details' ? 'Telemetry details · Monitor' : 'Monitor';
+  }, [page]);
+
+  useEffect(() => {
+    const focusFrame = window.requestAnimationFrame(() => {
+      const anchor = page === 'details' ? window.location.hash.slice(1) : '';
+      const target = (anchor ? document.getElementById(anchor) : null) ?? titleRef.current;
+      if (!target) return;
+      target.scrollIntoView({ behavior: 'auto', block: 'start' });
+      if (target instanceof HTMLElement) target.focus({ preventScroll: true });
+    });
+    return () => window.cancelAnimationFrame(focusFrame);
+  }, [anchorContentReady, navigationVersion, page]);
+
+  function handlePageLink(event: MouseEvent<HTMLAnchorElement>, nextPage: MonitorPage, hash = '') {
+    if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+    event.preventDefault();
+    onNavigate(nextPage, hash);
   }
 
   return (
@@ -63,6 +103,20 @@ export function Dashboard({ onLogout, onPasswordChanged, onUnauthorized }: Dashb
           </div>
         </div>
         <div className="header-actions">
+          <nav className="page-nav" aria-label="Monitor pages">
+            <a
+              href="/monitor/"
+              className={page === 'overview' ? 'active' : ''}
+              aria-current={page === 'overview' ? 'page' : undefined}
+              onClick={(event) => handlePageLink(event, 'overview')}
+            >Overview</a>
+            <a
+              href="/monitor/details"
+              className={page === 'details' ? 'active' : ''}
+              aria-current={page === 'details' ? 'page' : undefined}
+              onClick={(event) => handlePageLink(event, 'details')}
+            >Details</a>
+          </nav>
           <span className="secure-label"><span className="status-dot status-dot-good" />Secure session</span>
           <button
             className="icon-button labeled-button"
@@ -91,9 +145,15 @@ export function Dashboard({ onLogout, onPasswordChanged, onUnauthorized }: Dashb
       <main className="dashboard-main" inert={passwordDialogOpen || undefined}>
         <section className="dashboard-heading" aria-labelledby="dashboard-title">
           <div>
-            <span className="eyebrow">System overview</span>
-            <h1 id="dashboard-title">{data ? safeText(data.host.hostname, 'Host') : 'Host telemetry'}</h1>
-            <p className="heading-copy">Current health, performance, and operational activity at a glance.</p>
+            <span className="eyebrow">{page === 'details' ? 'Detailed telemetry' : 'System overview'}</span>
+            <h1 ref={titleRef} tabIndex={-1} id="dashboard-title">
+              {page === 'details' ? 'Telemetry details' : data ? safeText(data.host.hostname, 'Host') : 'Host telemetry'}
+            </h1>
+            <p className="heading-copy">
+              {page === 'details'
+                ? 'Power evidence, full event history, and resource trends for the selected range.'
+                : 'Current health, performance, and operational activity at a glance.'}
+            </p>
           </div>
           <div className="dashboard-controls">
             <div className="range-control" role="group" aria-label="Chart time range">
@@ -136,7 +196,9 @@ export function Dashboard({ onLogout, onPasswordChanged, onUnauthorized }: Dashb
           </div>
         )}
 
-        {initialLoading && !data ? <DashboardSkeleton /> : data ? <DashboardContent data={data} range={range} /> : (
+        {initialLoading && !data ? <DashboardSkeleton /> : data ? (page === 'details'
+          ? <DetailsContent data={data} range={range} onNavigate={onNavigate} />
+          : <OverviewContent data={data} range={range} onNavigate={onNavigate} />) : (
           <EmptyState icon="server" title="No telemetry available" detail="The collector has not returned a dashboard snapshot yet." action={<button className="secondary-button" onClick={() => void refresh()}>Retry</button>} />
         )}
       </main>
@@ -156,7 +218,7 @@ export function Dashboard({ onLogout, onPasswordChanged, onUnauthorized }: Dashb
   );
 }
 
-function DashboardContent({ data, range }: { data: DashboardPayload; range: TimeRange }) {
+function OverviewContent({ data, range, onNavigate }: { data: DashboardPayload; range: TimeRange; onNavigate: DashboardProps['onNavigate'] }) {
   const chartData = useMemo(() => data.series.map((point) => ({ ...point, label: formatTime(point.timestamp, range) })), [data.series, range]);
   const latest = data.latest;
   const temperature = latest?.temperatureC ?? null;
@@ -171,6 +233,8 @@ function DashboardContent({ data, range }: { data: DashboardPayload; range: Time
         <MetricCard icon="temperature" label="Temperature" value={temperature == null ? '—' : `${temperature.toFixed(1)}°C`} detail={temperature == null ? 'Sensor unavailable' : temperature >= 80 ? 'Running hot' : 'Within operating range'} percent={temperature == null ? undefined : temperature} accent="orange" />
         <MetricCard icon="activity" label="System load" value={formatDecimal(latest?.load1)} detail={`${formatDecimal(latest?.load5)} / ${formatDecimal(latest?.load15)} · 5m / 15m`} accent="green" />
       </section>
+
+      <PowerOverview latest={latest} onNavigate={onNavigate} />
 
       <section className="two-column chart-layout" aria-label="Historical telemetry">
         <Panel title="Resource history" subtitle="CPU and memory utilization" icon="activity" badge={range.toUpperCase()}>
@@ -267,21 +331,338 @@ function DashboardContent({ data, range }: { data: DashboardPayload; range: Time
       </Panel>
 
       <section className="two-column activity-layout">
-        <Panel title="Alerts" subtitle="Recent collector and system notices" icon="alert" badge={data.alerts.length ? String(data.alerts.length) : undefined}>
-          {data.alerts.length ? <div className="event-list">{data.alerts.map((alert, index) => {
-            const severity = normalizeTone(alert.severity);
-            return <article className="event-item" key={`${alert.timestamp}-${index}`}><span className={`event-marker event-${severity}`}><Icon name={severity === 'critical' ? 'alert' : severity === 'warn' ? 'info' : 'check'} size={15} /></span><div className="event-body"><div className="event-title"><strong>{safeText(alert.kind, 'System event', 60)}</strong><StatusBadge value={alert.status} /></div><p>{safeText(alert.message, 'No details provided')}</p><time dateTime={alert.timestamp || undefined}>{formatDateTime(alert.timestamp)}</time></div></article>;
-          })}</div> : <InlineEmpty icon="check" text="No recent alerts" positive />}
+        <Panel title="Alerts" subtitle={`Showing the latest ${Math.min(data.alerts.length, 10)} of ${data.alerts.length} notices in this range`} icon="alert" badge={summaryBadge(data.alerts.length)}>
+          <AlertList alerts={data.alerts.slice(0, 10)} />
+          <DetailsLink section="alerts" count={data.alerts.length} label="View all alerts" onNavigate={onNavigate} />
         </Panel>
 
-        <Panel title="Privilege activity" subtitle="Recent elevated operations" icon="shield" badge={data.privilegeEvents.length ? String(data.privilegeEvents.length) : undefined}>
-          {data.privilegeEvents.length ? <div className="event-list">{data.privilegeEvents.map((event, index) => (
-            <article className="event-item" key={`${event.timestamp}-${index}`}><span className={`event-marker event-${normalizeTone(event.result)}`}><Icon name="shield" size={15} /></span><div className="event-body"><div className="event-title"><strong>{safeText(event.action, 'Privileged operation', 70)}</strong><StatusBadge value={event.result} /></div><p><span className="muted">Actor</span> {safeText(event.actor, 'Unknown', 60)} <span className="event-arrow">→</span> <span className="muted">Target</span> {safeText(event.target, 'Unknown', 80)}</p><time dateTime={event.timestamp || undefined}>{formatDateTime(event.timestamp)}</time></div></article>
-          ))}</div> : <InlineEmpty icon="shield" text="No recent privilege activity" positive />}
+        <Panel title="Privilege activity" subtitle={`Showing the latest ${Math.min(data.privilegeEvents.length, 10)} of ${data.privilegeEvents.length} operations in this range`} icon="shield" badge={summaryBadge(data.privilegeEvents.length)}>
+          <PrivilegeList events={data.privilegeEvents.slice(0, 10)} />
+          <DetailsLink section="privilege" count={data.privilegeEvents.length} label="View all privilege activity" onNavigate={onNavigate} />
         </Panel>
       </section>
     </div>
   );
+}
+
+function PowerOverview({ latest, onNavigate }: { latest: TelemetrySample | null; onNavigate: DashboardProps['onNavigate'] }) {
+  const flags = decodeThrottledFlags(latest?.throttledFlags);
+  const hasActiveIssue = flags.active.length > 0;
+  const stateTone = currentPowerStatusTone(latest?.throttledFlags, latest?.powerState);
+  const currentSummary = hasActiveIssue
+    ? `${flags.active.length} active power condition${flags.active.length === 1 ? '' : 's'}`
+    : stateTone === 'warn' || stateTone === 'critical'
+      ? safeText(latest?.powerState, 'Power issue reported', 72)
+    : flags.available && flags.historical.length
+      ? 'Currently normal · earlier this boot'
+      : safeText(latest?.powerState, flags.available ? 'No active throttling flags' : 'Power flags unavailable', 72);
+
+  return (
+    <section className="power-spotlight" aria-labelledby="power-overview-title">
+      <div className="power-spotlight-icon"><Icon name="zap" size={23} /></div>
+      <div className="power-spotlight-reading">
+        <span className="eyebrow">EXT5V supply</span>
+        <strong id="power-overview-title">{formatVoltage(latest?.supplyVoltageVolts)}</strong>
+        <span>{latest?.supplyVoltageVolts == null ? 'Current voltage sample unavailable' : 'Latest external 5V rail sample'}</span>
+      </div>
+      <div className="power-spotlight-state">
+        <span className={`status-badge badge-${stateTone}`}><span />{currentSummary}</span>
+        <p>Kernel/vcgencmd: {safeText(latest?.powerState, 'Unavailable', 80)}</p>
+        <p>{flags.available ? `${formatFlags(latest?.throttledFlags)} · ${flags.historical.length} since-boot historical condition${flags.historical.length === 1 ? '' : 's'}` : 'Throttled flags were not reported.'}</p>
+      </div>
+      <a
+        className="details-link power-details-link"
+        href="/monitor/details#power"
+        onClick={(event) => navigateInApp(event, onNavigate, 'details', '#power')}
+      >Inspect power evidence <Icon name="chevron" size={15} /></a>
+    </section>
+  );
+}
+
+function DetailsContent({ data, range, onNavigate }: { data: DashboardPayload; range: TimeRange; onNavigate: DashboardProps['onNavigate'] }) {
+  const chartData = useMemo(
+    () => data.series.map((point) => ({ ...point, label: formatTime(point.timestamp, range) })),
+    [data.series, range],
+  );
+  const latest = data.latest;
+  const flags = decodeThrottledFlags(latest?.throttledFlags);
+  const powerEvents = data.powerEvents ?? [];
+  const summary = normalizedPowerSummary(data.powerSummary, data.series);
+  const voltageChartData = chartData.filter((point) => Number.isFinite(point.supplyVoltageVolts));
+  const voltageDomain = voltageChartDomain(voltageChartData.map((point) => Number(point.supplyVoltageVolts)));
+  const criticalPowerEvents = powerEvents.filter((event) => normalizeTone(event.severity) === 'critical').length;
+  const warningPowerEvents = powerEvents.filter((event) => normalizeTone(event.severity) === 'warn').length;
+  const currentPowerTone = currentPowerStatusTone(latest?.throttledFlags, latest?.powerState);
+  const currentPowerNormal = flags.available && flags.active.length === 0 && currentPowerTone === 'good';
+  const currentFlagValue = !flags.available
+    ? '—'
+    : currentPowerNormal
+      ? 'Normal'
+      : flags.active.length
+        ? String(flags.active.length)
+        : 'State issue';
+  const currentPowerCopy = !flags.available
+    ? 'No current vcgencmd flag sample is available.'
+    : flags.active.length
+      ? `${flags.active.length} condition${flags.active.length === 1 ? '' : 's'} active now.`
+      : currentPowerTone === 'warn' || currentPowerTone === 'critical'
+        ? `The reported kernel/vcgencmd state is ${safeText(latest?.powerState, 'abnormal', 64)}.`
+      : currentPowerTone === 'neutral'
+        ? 'No active bits are set, but the reported power state is unrecognized.'
+        : flags.historical.length
+          ? 'Currently normal. Historical bits record earlier conditions in this boot only.'
+        : 'Currently normal with no active or historical throttling bits.';
+
+  return (
+    <div className="dashboard-content details-content">
+      <nav className="detail-jump-nav" aria-label="Details sections">
+        <a href="/monitor/details#power" onClick={(event) => navigateInApp(event, onNavigate, 'details', '#power')}>Power</a>
+        <a href="/monitor/details#resources" onClick={(event) => navigateInApp(event, onNavigate, 'details', '#resources')}>Resources</a>
+        <a href="/monitor/details#alerts" onClick={(event) => navigateInApp(event, onNavigate, 'details', '#alerts')}>Alerts</a>
+        <a href="/monitor/details#privilege" onClick={(event) => navigateInApp(event, onNavigate, 'details', '#privilege')}>Privilege</a>
+      </nav>
+
+      <section id="power" tabIndex={-1} className="detail-section" aria-labelledby="power-detail-title">
+        <DetailSectionHeading
+          eyebrow="Power integrity"
+          title="Supply voltage and throttling evidence"
+          id="power-detail-title"
+          detail="Current readings are separated from historical conditions latched since boot."
+        />
+
+        <div className="power-card-grid">
+          <SummaryCard label="Current EXT5V" value={formatVoltage(latest?.supplyVoltageVolts)} detail={latest?.supplyVoltageVolts == null ? 'No current sensor sample' : `Snapshot ${formatDateTime(latest.timestamp)}`} tone="cyan" />
+          <SummaryCard label="Current flags" value={currentFlagValue} detail={currentPowerCopy} tone={!flags.available || currentPowerTone === 'neutral' ? 'violet' : currentPowerTone === 'critical' ? 'red' : currentPowerNormal ? 'green' : 'orange'} />
+          <SummaryCard label="Historical flags" value={flags.available ? String(flags.historical.length) : '—'} detail={flags.historical.length ? 'Latched earlier in this boot; not necessarily active now.' : 'No since-boot historical bits reported.'} tone="violet" />
+          <SummaryCard label="Power events" value={String(powerEvents.length)} detail={`${criticalPowerEvents} critical · ${warningPowerEvents} warning`} tone="orange" />
+        </div>
+
+        <div className="power-state-panel">
+          <div>
+            <span className="power-state-label">Kernel / vcgencmd state</span>
+            <strong>{safeText(latest?.powerState, 'Unavailable', 100)}</strong>
+            <StatusBadge value={currentPowerNormal ? 'Current normal' : latest?.powerState} tone={currentPowerNormal ? 'good' : currentPowerTone} />
+          </div>
+          <div>
+            <span className="power-state-label">Active low bits · {formatFlags(latest?.throttledFlags)}</span>
+            <FlagList values={flags.active} empty={flags.available ? 'No active low-bit conditions.' : 'Current flags unavailable.'} tone="active" />
+          </div>
+          <div>
+            <span className="power-state-label">Historical high bits · since boot</span>
+            <FlagList values={flags.historical} empty={flags.available ? 'No conditions recorded earlier in this boot.' : 'Historical flags unavailable.'} tone="historical" />
+          </div>
+        </div>
+
+        <div className="power-explainer" role="note">
+          <Icon name="info" size={18} />
+          <p><strong>What this voltage means</strong><span>EXT5V is a sampled external 5V supply rail. It is not amperage, USB-C negotiated wattage, or wall-outlet power. Missing values mean this sensor did not provide a sample; they are not zero volts.</span></p>
+        </div>
+
+        <section className="power-summary-grid" aria-label="Full-range power summary">
+          <SummaryStat label="Voltage samples" value={formatCount(summary.voltageSampleCount)} detail={`${formatCount(summary.sampleCount)} total telemetry samples`} />
+          <SummaryStat label="Minimum EXT5V" value={formatVoltage(summary.minSupplyVoltageVolts)} detail="Full selected range" />
+          <SummaryStat label="Average EXT5V" value={formatVoltage(summary.averageSupplyVoltageVolts)} detail="Full selected range" />
+          <SummaryStat label="Maximum EXT5V" value={formatVoltage(summary.maxSupplyVoltageVolts)} detail="Full selected range" />
+          <SummaryStat label="Under-voltage samples" value={formatCount(summary.underVoltageSampleCount)} detail="Full-range anomaly count" />
+          <SummaryStat label="Throttled samples" value={formatCount(summary.throttledSampleCount)} detail="Full-range anomaly count" />
+        </section>
+
+        <Panel title="EXT5V history" subtitle="Downsampled chart · summary cards use the full selected range" icon="zap" badge={range.toUpperCase()}>
+          <ChartFrame empty={!voltageChartData.length} label="EXT5V supply voltage time series" tall>
+            <ResponsiveContainer width="100%" height="100%">
+              <LineChart data={voltageChartData} margin={{ top: 8, right: 12, left: -12, bottom: 0 }}>
+                <CartesianGrid stroke="#21302f" strokeDasharray="4 5" vertical={false} />
+                <XAxis dataKey="label" stroke="#6e807d" tickLine={false} axisLine={false} minTickGap={34} tick={{ fontSize: 11 }} />
+                <YAxis domain={voltageDomain} stroke="#6e807d" tickLine={false} axisLine={false} tick={{ fontSize: 11 }} width={48} tickFormatter={(value) => `${Number(value).toFixed(2)}V`} />
+                <Tooltip content={<VoltageTooltip />} />
+                <Legend iconType="circle" iconSize={7} wrapperStyle={{ fontSize: 12, paddingTop: 12 }} />
+                <Line type="linear" dataKey="supplyVoltageVolts" name="EXT5V" stroke="#48d6cf" strokeWidth={2.4} dot={false} activeDot={{ r: 4 }} connectNulls={false} />
+              </LineChart>
+            </ResponsiveContainer>
+          </ChartFrame>
+        </Panel>
+
+        <Panel title="Power event timeline" subtitle={`${powerEvents.length} newest power, storage, and recovery events in this range (up to ${API_EVENT_CAP})`} icon="alert" badge={exactEventBadge(powerEvents.length)}>
+          <PowerEventList events={powerEvents} />
+        </Panel>
+      </section>
+
+      <section id="resources" tabIndex={-1} className="detail-section" aria-labelledby="resource-detail-title">
+        <DetailSectionHeading eyebrow="Performance" title="Resource telemetry" id="resource-detail-title" detail="Richer charts share the selected range and last-good snapshot." />
+        <section className="metric-grid" aria-label="Current detailed system metrics">
+          <MetricCard icon="cpu" label="CPU usage" value={formatPercent(latest?.cpuPercent, 1)} detail={`Load ${formatDecimal(latest?.load1)} · 1 min`} percent={latest?.cpuPercent} accent="cyan" />
+          <MetricCard icon="memory" label="Memory" value={formatPercent(latest?.memoryPercent, 1)} detail={`${formatBytes(latest?.memoryUsedBytes)} of ${formatBytes(latest?.memoryTotalBytes)}`} percent={latest?.memoryPercent} accent="violet" />
+          <MetricCard icon="temperature" label="Temperature" value={latest?.temperatureC == null ? '—' : `${latest.temperatureC.toFixed(1)}°C`} detail={latest?.temperatureC == null ? 'Sensor unavailable' : 'Current SoC temperature'} percent={latest?.temperatureC} accent="orange" />
+          <MetricCard icon="activity" label="System load" value={formatDecimal(latest?.load1)} detail={`${formatDecimal(latest?.load5)} / ${formatDecimal(latest?.load15)} · 5m / 15m`} accent="green" />
+        </section>
+
+        <section className="two-column chart-layout" aria-label="Detailed resource charts">
+          <Panel title="CPU & memory" subtitle="Utilization across the selected range" icon="activity" badge={range.toUpperCase()}>
+            <ChartFrame empty={!chartData.length} label="Detailed CPU and memory utilization chart" tall>
+              <ResponsiveContainer width="100%" height="100%">
+                <AreaChart data={chartData} margin={{ top: 8, right: 8, left: -20, bottom: 0 }}>
+                  <defs>
+                    <linearGradient id="detailCpuFill" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor="#48d6cf" stopOpacity={0.32} /><stop offset="100%" stopColor="#48d6cf" stopOpacity={0.01} /></linearGradient>
+                    <linearGradient id="detailMemoryFill" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor="#9a8cff" stopOpacity={0.28} /><stop offset="100%" stopColor="#9a8cff" stopOpacity={0.01} /></linearGradient>
+                  </defs>
+                  <CartesianGrid stroke="#21302f" strokeDasharray="4 5" vertical={false} />
+                  <XAxis dataKey="label" stroke="#6e807d" tickLine={false} axisLine={false} minTickGap={34} tick={{ fontSize: 11 }} />
+                  <YAxis domain={[0, 100]} stroke="#6e807d" tickLine={false} axisLine={false} tick={{ fontSize: 11 }} tickFormatter={(value) => `${value}%`} />
+                  <Tooltip content={<PercentTooltip />} />
+                  <Legend iconType="circle" iconSize={7} wrapperStyle={{ fontSize: 12, paddingTop: 12 }} />
+                  <Area type="monotone" dataKey="cpuPercent" name="CPU" stroke="#48d6cf" strokeWidth={2} fill="url(#detailCpuFill)" activeDot={{ r: 4 }} />
+                  <Area type="monotone" dataKey="memoryPercent" name="Memory" stroke="#9a8cff" strokeWidth={2} fill="url(#detailMemoryFill)" activeDot={{ r: 4 }} />
+                </AreaChart>
+              </ResponsiveContainer>
+            </ChartFrame>
+          </Panel>
+
+          <Panel title="Temperature & load" subtitle="SoC thermals with 1, 5, and 15-minute load" icon="temperature" badge={range.toUpperCase()}>
+            <ChartFrame empty={!chartData.length} label="Detailed temperature and load chart" tall>
+              <ResponsiveContainer width="100%" height="100%">
+                <LineChart data={chartData} margin={{ top: 8, right: 4, left: -20, bottom: 0 }}>
+                  <CartesianGrid stroke="#21302f" strokeDasharray="4 5" vertical={false} />
+                  <XAxis dataKey="label" stroke="#6e807d" tickLine={false} axisLine={false} minTickGap={34} tick={{ fontSize: 11 }} />
+                  <YAxis yAxisId="temp" stroke="#6e807d" tickLine={false} axisLine={false} tick={{ fontSize: 11 }} tickFormatter={(value) => `${value}°`} />
+                  <YAxis yAxisId="load" orientation="right" stroke="#6e807d" tickLine={false} axisLine={false} tick={{ fontSize: 11 }} width={34} />
+                  <Tooltip content={<ThermalTooltip />} />
+                  <Legend iconType="circle" iconSize={7} wrapperStyle={{ fontSize: 11, paddingTop: 12 }} />
+                  <Line yAxisId="temp" type="monotone" dataKey="temperatureC" name="Temperature" stroke="#ffad66" strokeWidth={2} dot={false} connectNulls />
+                  <Line yAxisId="load" type="monotone" dataKey="load1" name="Load 1m" stroke="#75dda2" strokeWidth={2} dot={false} />
+                  <Line yAxisId="load" type="monotone" dataKey="load5" name="Load 5m" stroke="#9a8cff" strokeWidth={1.5} dot={false} />
+                  <Line yAxisId="load" type="monotone" dataKey="load15" name="Load 15m" stroke="#48d6cf" strokeWidth={1.5} dot={false} />
+                </LineChart>
+              </ResponsiveContainer>
+            </ChartFrame>
+          </Panel>
+        </section>
+
+        <Panel title="Network & disk I/O" subtitle="Receive, transmit, read, and write throughput" icon="network" badge="BYTES / SEC">
+          <ChartFrame empty={!chartData.length} label="Detailed network and disk throughput chart" tall>
+            <ResponsiveContainer width="100%" height="100%">
+              <LineChart data={chartData} margin={{ top: 8, right: 8, left: 2, bottom: 0 }}>
+                <CartesianGrid stroke="#21302f" strokeDasharray="4 5" vertical={false} />
+                <XAxis dataKey="label" stroke="#6e807d" tickLine={false} axisLine={false} minTickGap={34} tick={{ fontSize: 11 }} />
+                <YAxis stroke="#6e807d" tickLine={false} axisLine={false} tick={{ fontSize: 11 }} width={54} tickFormatter={(value) => compactBytes(Number(value))} />
+                <Tooltip content={<IoTooltip />} />
+                <Legend iconType="circle" iconSize={7} wrapperStyle={{ fontSize: 11, paddingTop: 12 }} />
+                <Line type="monotone" dataKey="networkRxBytesPerSecond" name="Network ↓" stroke="#48d6cf" strokeWidth={2} dot={false} />
+                <Line type="monotone" dataKey="networkTxBytesPerSecond" name="Network ↑" stroke="#9a8cff" strokeWidth={2} dot={false} />
+                <Line type="monotone" dataKey="diskReadBytesPerSecond" name="Disk read" stroke="#75dda2" strokeWidth={1.7} dot={false} />
+                <Line type="monotone" dataKey="diskWriteBytesPerSecond" name="Disk write" stroke="#ffad66" strokeWidth={1.7} dot={false} />
+              </LineChart>
+            </ResponsiveContainer>
+          </ChartFrame>
+        </Panel>
+      </section>
+
+      <section id="alerts" tabIndex={-1} className="detail-section" aria-labelledby="alerts-detail-title">
+        <DetailSectionHeading eyebrow="Operations" title="All recent alerts" id="alerts-detail-title" detail={`${data.alerts.length} newest records in this range (up to ${API_EVENT_CAP}).`} />
+        <Panel title="Collector & system alerts" subtitle="Full list returned for this snapshot" icon="alert" badge={exactEventBadge(data.alerts.length)}>
+          <AlertList alerts={data.alerts} />
+        </Panel>
+      </section>
+
+      <section id="privilege" tabIndex={-1} className="detail-section" aria-labelledby="privilege-detail-title">
+        <DetailSectionHeading eyebrow="Audit" title="All privilege activity" id="privilege-detail-title" detail={`${data.privilegeEvents.length} newest records in this range (up to ${API_EVENT_CAP}).`} />
+        <Panel title="Elevated operations" subtitle="Semantic actions only; raw commands are not exposed" icon="shield" badge={exactEventBadge(data.privilegeEvents.length)}>
+          <PrivilegeList events={data.privilegeEvents} />
+        </Panel>
+      </section>
+    </div>
+  );
+}
+
+function DetailSectionHeading({ eyebrow, title, id, detail }: { eyebrow: string; title: string; id: string; detail: string }) {
+  return <header className="detail-section-heading"><span className="eyebrow">{eyebrow}</span><h2 id={id}>{title}</h2><p>{detail}</p></header>;
+}
+
+function SummaryCard({ label, value, detail, tone }: { label: string; value: string; detail: string; tone: string }) {
+  return <article className={`summary-card summary-${tone}`}><span>{label}</span><strong>{value}</strong><p>{detail}</p></article>;
+}
+
+function SummaryStat({ label, value, detail }: { label: string; value: string; detail: string }) {
+  return <article className="summary-stat"><span>{label}</span><strong>{value}</strong><small>{detail}</small></article>;
+}
+
+function FlagList({ values, empty, tone }: { values: string[]; empty: string; tone: 'active' | 'historical' }) {
+  if (!values.length) return <p className="flag-empty">{empty}</p>;
+  return <ul className={`flag-list flag-${tone}`}>{values.map((value) => <li key={value}>{value}</li>)}</ul>;
+}
+
+function PowerEventList({ events }: { events: PowerEvent[] }) {
+  if (!events.length) return <InlineEmpty icon="check" text="No power or storage integrity events in this snapshot" positive />;
+  return <div className="event-list power-event-list">{events.map((event, index) => {
+    const eventTone = eventStatusTone(event.severity, event.status);
+    return (
+      <article className="event-item power-event-item" key={`${event.timestamp}-${event.kind}-${index}`}>
+        <span className={`event-marker event-${eventTone}`}><Icon name={eventTone === 'critical' ? 'alert' : eventTone === 'warn' ? 'zap' : 'check'} size={15} /></span>
+        <div className="event-body">
+          <div className="event-title"><strong>{safeText(event.kind, 'Power event', 70)}</strong><EventBadges severity={event.severity} status={event.status} /></div>
+          <p>{safeText(event.message, 'No details provided')}</p>
+          <div className="power-event-meta">
+            <time dateTime={event.timestamp || undefined}>{formatDateTime(event.timestamp)}</time>
+            {event.supplyVoltageVolts != null && <span>EXT5V {formatVoltage(event.supplyVoltageVolts)}</span>}
+            {event.throttledFlags != null && <span>Flags {formatFlags(event.throttledFlags)}</span>}
+          </div>
+        </div>
+      </article>
+    );
+  })}</div>;
+}
+
+function AlertList({ alerts }: { alerts: AlertEvent[] }) {
+  if (!alerts.length) return <InlineEmpty icon="check" text="No recent alerts" positive />;
+  return <div className="event-list">{alerts.map((alert, index) => {
+    const eventTone = eventStatusTone(alert.severity, alert.status);
+    return <article className="event-item" key={`${alert.timestamp}-${index}`}><span className={`event-marker event-${eventTone}`}><Icon name={eventTone === 'critical' ? 'alert' : eventTone === 'warn' ? 'info' : 'check'} size={15} /></span><div className="event-body"><div className="event-title"><strong>{safeText(alert.kind, 'System event', 60)}</strong><EventBadges severity={alert.severity} status={alert.status} /></div><p>{safeText(alert.message, 'No details provided')}</p><time dateTime={alert.timestamp || undefined}>{formatDateTime(alert.timestamp)}</time></div></article>;
+  })}</div>;
+}
+
+function EventBadges({ severity, status }: { severity: unknown; status: unknown }) {
+  const severityLabel = safeText(severity, 'Unknown', 32);
+  const statusLabel = safeText(status, '', 32);
+  return (
+    <span className="event-badges">
+      <StatusBadge value={severityLabel} tone={eventSeverityTone(severityLabel)} />
+      {statusLabel && statusLabel.toLowerCase() !== severityLabel.toLowerCase()
+        ? <StatusBadge value={statusLabel} tone={eventStatusTone(severityLabel, statusLabel)} />
+        : null}
+    </span>
+  );
+}
+
+function PrivilegeList({ events }: { events: PrivilegeEvent[] }) {
+  if (!events.length) return <InlineEmpty icon="shield" text="No recent privilege activity" positive />;
+  return <div className="event-list">{events.map((event, index) => (
+    <article className="event-item" key={`${event.timestamp}-${index}`}><span className={`event-marker event-${normalizeTone(event.result)}`}><Icon name="shield" size={15} /></span><div className="event-body"><div className="event-title"><strong>{safeText(event.action, 'Privileged operation', 70)}</strong><StatusBadge value={event.result} /></div><p><span className="muted">Actor</span> {safeText(event.actor, 'Unknown', 60)} <span className="event-arrow">→</span> <span className="muted">Target</span> {safeText(event.target, 'Unknown', 80)}</p><time dateTime={event.timestamp || undefined}>{formatDateTime(event.timestamp)}</time></div></article>
+  ))}</div>;
+}
+
+function DetailsLink({ section, count, label, onNavigate }: { section: string; count: number; label: string; onNavigate: DashboardProps['onNavigate'] }) {
+  return (
+    <div className="panel-link-row">
+      <a href={`/monitor/details#${section}`} onClick={(event) => navigateInApp(event, onNavigate, 'details', `#${section}`)}>
+        {label} <span className="sr-only">({count} total)</span><Icon name="chevron" size={14} />
+      </a>
+    </div>
+  );
+}
+
+function navigateInApp(event: MouseEvent<HTMLAnchorElement>, onNavigate: DashboardProps['onNavigate'], page: MonitorPage, hash = '') {
+  if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+  event.preventDefault();
+  onNavigate(page, hash);
+}
+
+function summaryBadge(count: number): string | undefined {
+  if (!count) return undefined;
+  return count > 10 ? '10+' : String(count);
+}
+
+function exactEventBadge(count: number): string | undefined {
+  if (!count) return undefined;
+  return count >= API_EVENT_CAP ? `${count} MAX` : String(count);
 }
 
 function MetricCard({ icon, label, value, detail, percent, accent }: { icon: IconName; label: string; value: string; detail: string; percent?: number | null; accent: string }) {
@@ -306,10 +687,10 @@ function DetailItem({ label, value }: { label: string; value: string }) {
   return <div><dt>{label}</dt><dd>{value}</dd></div>;
 }
 
-function StatusBadge({ value }: { value: unknown }) {
+function StatusBadge({ value, tone }: { value: unknown; tone?: StatusTone }) {
   const safeValue = safeText(value, 'Unknown', 32);
   const label = safeValue.replace(/[-_]+/g, ' ');
-  return <span className={`status-badge badge-${normalizeTone(safeValue)}`}><span />{label}</span>;
+  return <span className={`status-badge badge-${tone ?? normalizeTone(safeValue)}`}><span />{label}</span>;
 }
 
 function ContainerList({ containers }: { containers: ContainerStatus[] }) {
@@ -380,17 +761,147 @@ function IoTooltip({ active, payload, label }: any) {
   return <div className="chart-tooltip"><strong>{label}</strong>{payload.map((item: any) => <span key={item.dataKey}><i style={{ background: item.color }} />{item.name}<b>{formatRate(Number(item.value))}</b></span>)}</div>;
 }
 
+function VoltageTooltip({ active, payload, label }: any) {
+  if (!active || !payload?.length) return null;
+  return <div className="chart-tooltip"><strong>{label}</strong>{payload.map((item: any) => <span key={item.dataKey}><i style={{ background: item.color }} />{item.name}<b>{formatVoltage(item.value)}</b></span>)}</div>;
+}
+
+export function decodeThrottledFlags(value: number | null | undefined): { available: boolean; active: string[]; historical: string[] } {
+  if (!Number.isSafeInteger(value) || Number(value) < 0 || Number(value) > 0xffff_ffff) {
+    return { available: false, active: [], historical: [] };
+  }
+
+  const flags = Number(value) >>> 0;
+  const activeDefinitions: Array<[number, string]> = [
+    [0x1, 'Under-voltage detected'],
+    [0x2, 'ARM frequency capped'],
+    [0x4, 'Throttling active'],
+    [0x8, 'Soft temperature limit active'],
+  ];
+  const historicalDefinitions: Array<[number, string]> = [
+    [0x1_0000, 'Under-voltage has occurred'],
+    [0x2_0000, 'ARM frequency capping has occurred'],
+    [0x4_0000, 'Throttling has occurred'],
+    [0x8_0000, 'Soft temperature limit has occurred'],
+  ];
+  const active = activeDefinitions.filter(([mask]) => (flags & mask) !== 0).map(([, label]) => label);
+  const historical = historicalDefinitions.filter(([mask]) => (flags & mask) !== 0).map(([, label]) => label);
+  const unknownActive = (flags & 0x0000_fff0) >>> 0;
+  const unknownHistorical = (flags & 0xfff0_0000) >>> 0;
+  if (unknownActive) active.push(`Unknown active bits ${formatFlags(unknownActive)}`);
+  if (unknownHistorical) historical.push(`Unknown historical bits ${formatFlags(unknownHistorical)}`);
+  return { available: true, active, historical };
+}
+
+function normalizedPowerSummary(summary: PowerSummary | null | undefined, series: TelemetrySample[]): PowerSummary {
+  const voltages = series
+    .map((sample) => sample.supplyVoltageVolts)
+    .filter((value): value is number => typeof value === 'number' && Number.isFinite(value) && value >= 0);
+  const fallback: PowerSummary = {
+    sampleCount: series.length,
+    voltageSampleCount: voltages.length,
+    minSupplyVoltageVolts: voltages.length ? Math.min(...voltages) : null,
+    averageSupplyVoltageVolts: voltages.length ? voltages.reduce((total, value) => total + value, 0) / voltages.length : null,
+    maxSupplyVoltageVolts: voltages.length ? Math.max(...voltages) : null,
+    underVoltageSampleCount: series.filter((sample) => validFlags(sample.throttledFlags) !== null && (validFlags(sample.throttledFlags)! & 0x1) !== 0).length,
+    throttledSampleCount: series.filter((sample) => validFlags(sample.throttledFlags) !== null && (validFlags(sample.throttledFlags)! & 0x4) !== 0).length,
+  };
+
+  if (!summary || typeof summary !== 'object') return fallback;
+  return {
+    sampleCount: validCount(summary.sampleCount, fallback.sampleCount),
+    voltageSampleCount: validCount(summary.voltageSampleCount, fallback.voltageSampleCount),
+    minSupplyVoltageVolts: validNullableMeasurement(summary.minSupplyVoltageVolts, fallback.minSupplyVoltageVolts),
+    averageSupplyVoltageVolts: validNullableMeasurement(summary.averageSupplyVoltageVolts, fallback.averageSupplyVoltageVolts),
+    maxSupplyVoltageVolts: validNullableMeasurement(summary.maxSupplyVoltageVolts, fallback.maxSupplyVoltageVolts),
+    underVoltageSampleCount: validCount(summary.underVoltageSampleCount, fallback.underVoltageSampleCount),
+    throttledSampleCount: validCount(summary.throttledSampleCount, fallback.throttledSampleCount),
+  };
+}
+
+function validCount(value: unknown, fallback: number): number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : fallback;
+}
+
+function validNullableMeasurement(value: unknown, fallback: number | null): number | null {
+  if (value === null) return null;
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : fallback;
+}
+
+function validFlags(value: unknown): number | null {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 && value <= 0xffff_ffff
+    ? value >>> 0
+    : null;
+}
+
+function voltageChartDomain(values: number[]): [number, number] {
+  const finiteValues = values.filter((value) => Number.isFinite(value) && value >= 0);
+  if (!finiteValues.length) return [4.5, 5.5];
+  const minimum = Math.min(...finiteValues);
+  const maximum = Math.max(...finiteValues);
+  const padding = Math.max(0.025, (maximum - minimum) * 0.15);
+  return [
+    Math.max(0, Math.floor((minimum - padding) * 100) / 100),
+    Math.ceil((maximum + padding) * 100) / 100,
+  ];
+}
+
+function formatVoltage(value: unknown): string {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? `${value.toFixed(3)} V` : '—';
+}
+
+export function formatFlags(value: unknown): string {
+  const flags = validFlags(value);
+  return flags === null ? 'Unavailable' : `0x${flags.toString(16).padStart(8, '0')}`;
+}
+
+function formatCount(value: unknown): string {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value.toLocaleString() : '—';
+}
+
 function compactBytes(value: number): string {
   const text = formatBytes(value, 0);
   return text.replace(' ', '');
 }
 
-function normalizeTone(value: unknown): 'good' | 'warn' | 'critical' | 'neutral' {
+function normalizeTone(value: unknown): StatusTone {
   const normalized = safeText(value, '').toLowerCase();
   if (/(critical|error|fail|denied|unhealthy|dead|down|exited)/.test(normalized)) return 'critical';
   if (/(warn|pending|degrad|unknown|starting|stale|under.?voltage|throttl|thermal.?limit|frequency.?cap)/.test(normalized)) return 'warn';
-  if (/(ok|success|healthy|running|online|active|resolved|allowed|on|nominal)/.test(normalized)) return 'good';
+  if (/(ok|success|healthy|running|online|active|resolved|allowed|nominal)/.test(normalized) || /\b(?:normal|on)\b/.test(normalized)) return 'good';
   return 'neutral';
+}
+
+export function eventStatusTone(severity: unknown, status: unknown): StatusTone {
+  const normalizedStatus = safeText(status, '').toLowerCase();
+  if (/\b(?:recovered|resolved|cleared|normal|nominal|restored)\b/.test(normalizedStatus)) return 'good';
+  const severityTone = eventSeverityTone(severity);
+  if (severityTone !== 'neutral') return severityTone;
+  if (/\bactive\b/.test(normalizedStatus)) return 'warn';
+  return severityTone;
+}
+
+function eventSeverityTone(severity: unknown): StatusTone {
+  const normalizedSeverity = safeText(severity, '').toLowerCase();
+  if (/(info|notice)/.test(normalizedSeverity)) return 'good';
+  return normalizeTone(normalizedSeverity);
+}
+
+function powerStateTone(value: unknown): StatusTone {
+  const normalized = safeText(value, '').toLowerCase();
+  if (!normalized) return 'neutral';
+  if (/\bactive\b/.test(normalized) && !/(inactive|not active)/.test(normalized)) return 'warn';
+  return normalizeTone(normalized);
+}
+
+export function currentPowerStatusTone(throttledFlags: number | null | undefined, powerState: unknown): StatusTone {
+  const flags = decodeThrottledFlags(throttledFlags);
+  if (!flags.available) return powerStateTone(powerState);
+  const normalizedState = safeText(powerState, '').toLowerCase();
+  const reportedTone = powerStateTone(normalizedState);
+  if (flags.active.length) return reportedTone === 'critical' ? 'critical' : 'warn';
+  if (!normalizedState || /\b(?:normal|nominal)\b/.test(normalizedState) || /\bdegraded[-_ ]history\b/.test(normalizedState)) return 'good';
+  return reportedTone;
 }
 
 function isContainerHealthy(container: ContainerStatus): boolean {

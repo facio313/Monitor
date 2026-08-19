@@ -12,37 +12,72 @@ The default output root is `/var/lib/monitor-export`:
 - `current.json`: atomically replaced snapshot with exactly the public keys
   `generatedAt`, `host`, `latest`, `disks`, and `containers`.
   `latest` includes memory byte totals, all three load averages, current power
-  state, and GPU allocation/clock fields in addition to the rate metrics.
+  state, supply voltage, the complete `get_throttled` flags integer, and GPU
+  allocation/clock fields in addition to the rate metrics. The nullable fields
+  `supplyVoltageVolts` and `throttledFlags` immediately follow `powerState` in
+  both current and history samples.
   Each disk is exactly `mount`, `totalBytes`, `usedBytes`, and `usedPercent`.
 - `history/YYYY-MM-DD.jsonl`: atomically replaced daily sample series. At most
   2,000 valid rows are kept per day, and files older than 30 calendar days are
-  pruned.
+  pruned. On rewrite, valid rows from the immediately preceding sample contract
+  are migrated by adding the two new nullable power fields; foreign fields,
+  invalid timestamps, booleans in numeric fields, and non-finite numbers are
+  not propagated.
 - `alerts.jsonl`: at most 5,000 semantic `SNAPSHOT`, `metrics`, or `RECOVERED`
   events. Raw lines are never copied. On Raspberry Pi-class hosts with
-  `vcgencmd`, current throttle/power transitions are also emitted here.
+  `vcgencmd`, current throttle/power transitions are also emitted here. A
+  transition message includes the validated full flags and, when available,
+  the validated supply-voltage observation; voltage changes alone never create
+  an alert.
+- `power.jsonl`: at most 5,000 fixed-message kernel power/storage events with
+  exactly `timestamp`, `severity`, `kind`, `status`, and `message`. Only kernel
+  `Undervoltage detected!`, `Voltage normalised`, NVMe controller-reset, and
+  NVMe I/O-error patterns are accepted. Raw kernel lines and their variable
+  details are never exported. Repeated events of the same kind and status in
+  one second are collapsed, while an active/recovered pair remains distinct.
 - `privilege.jsonl`: at most 5,000 records containing **only** `timestamp`,
   `actor`, `target`, `action`, and `result`. In particular, command text and
   arguments are never exported. The default source is the already-focused
   `/var/log/privilege-events.log`; `auth.log`/`secure` can be configured as
   fallbacks but are not enabled together by default, avoiding duplicates.
 
-Durable log cursors live under the hidden output `.state` directory so service
-restarts and reboots do not duplicate events. Short-lived host and per-container
-CPU/network/disk delta counters live in
+Durable server-watch, kernel, and privilege-log cursors live under the hidden
+output `.state` directory so service restarts and reboots do not duplicate
+events. A replaced or truncated kernel log is detected by inode/offset and its
+bounded tail is read again; semantic same-second deduplication prevents a
+rotated overlap from duplicating exported events. Short-lived host and
+per-container CPU/network/disk delta counters live in
 `/run/monitor-collector/delta-state.json`; each run atomically replaces that
 mode-`0600` file rather than appending it. Container CPU state is keyed by
 owner and container ID internally, pruned to containers still listed, and
 hard-capped at 600 entries. IDs never enter a public export.
 
 When `vcgencmd` exists, the collector reads throttle/power flags, GPU
-temperature, allocated memory, core clock, and core voltage with a strict
-timeout. GPU temperature is used as the host temperature fallback; memory and
-clock populate the public snapshot; and current throttle transitions become
-semantic alerts. Active low-bit conditions take precedence. When those bits
-are clear but the historical high bits remain set (for example `0x50000`), the
-snapshot reports `powerState: "degraded-history"`; it reports `normal` only
-when neither current nor historical flags are present. This avoids presenting
-one-minute samples as healthy while under-voltage is flapping between samples.
+temperature, allocated memory, core clock, core voltage, and on Raspberry Pi 5
+the external supply rail using `/usr/bin/vcgencmd pmic_read_adc EXT5V_V`, all
+with the same strict command timeout and a 256-byte output limit per command.
+Only a finite `EXT5V_V` value in the protocol sanity range 0–10 V is accepted;
+it is rounded to three decimal places. That broad input bound is not a health
+threshold. A malformed response, unsupported command, timeout, or non-zero
+exit produces `null`, never zero fabricated from failure.
+
+GPU temperature is used as the host temperature fallback; memory, clock,
+supply voltage, and full unsigned 32-bit throttle flags populate the public
+snapshot; and current throttle transitions become semantic alerts. Active
+low-bit conditions take precedence. When those bits are clear but historical
+high bits remain set (for example `0x50000`), the snapshot reports
+`powerState: "degraded-history"`; it reports `normal` only when neither current
+nor historical flags are present. No voltage threshold is used to classify
+power state or emit alerts: kernel events and `vcgencmd get_throttled` remain
+authoritative. The dedicated kernel cursor also captures brief under-voltage
+events that begin and recover between one-minute `vcgencmd` samples.
+
+`MONITOR_KERNEL_LOG` defaults to `/var/log/kern.log`. On the first run and after
+rotation, the collector examines only the newest 8 MiB
+(`MONITOR_KERNEL_MAX_INPUT_BYTES=8388608`) so recent incidents are retained
+without loading an unbounded historical log. The command-line/environment
+value is clamped to at most 16 MiB. The ordinary event/privilege input bound
+remains separately controlled by `MONITOR_MAX_INPUT_BYTES`.
 
 The Docker response is reduced immediately to `name`, `owner`, `state`,
 `health`, `cpuPercent`, `memoryBytes`, and `memoryPercent`. Environment,
@@ -72,9 +107,16 @@ sockets. It grants writes only to `/var/lib/monitor-export` and
 `root:cks` mode `0750` and public files are mode `0640`, allowing the rootless
 `cks` Monitor container to read an explicitly bind-mounted export directory.
 The otherwise-private device namespace exposes only `/dev/vcio` with the
-device-cgroup permission needed by `vcgencmd`. If an LSM (SELinux/AppArmor) independently denies
-socket access, add a narrow local policy for these three paths; do not expose
-the sockets over TCP and do not make them world-readable.
+device-cgroup permission needed by `vcgencmd`; `/var/log` is available read-only
+for the configured semantic inputs. If an LSM (SELinux/AppArmor) independently
+denies socket access, add a narrow local policy for these three paths; do not
+expose the sockets over TCP and do not make them world-readable.
+
+The one-shot cgroup uses `MemoryHigh=160M`, `MemoryMax=192M`, and
+`TasksMax=64`. These limits leave substantial room for the bounded 8 MiB kernel
+tail, parsed telemetry, six concurrent Docker-stat requests, and their `curl`
+children on the 8 GiB host, while containing an unexpectedly large captured
+Docker response instead of exposing the whole host to its memory/task growth.
 
 `/etc/default/monitor-collector` is installed only when it does not already
 exist. Edit it to select different input/output paths, then run:
@@ -84,7 +126,7 @@ sudo systemctl restart monitor-collector.service
 ```
 
 No logrotate rule is needed: the collector atomically enforces row bounds on
-its two event exports and calendar retention on history. Journald owns service
+its three event exports and calendar retention on history. Journald owns service
 logs.
 
 ## Password-hash state operations
@@ -144,6 +186,7 @@ python3 collector.py \
   --mountinfo /tmp/fixture/mountinfo \
   --mount-root /tmp/fixture/root \
   --events-log /tmp/fixture/events.log \
+  --kernel-log /tmp/fixture/kern.log \
   --privilege-logs /tmp/fixture/auth.log \
   --docker-sockets '' \
   --output-dir /tmp/monitor-export \

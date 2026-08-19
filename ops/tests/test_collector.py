@@ -49,7 +49,100 @@ class ParsingTests(unittest.TestCase):
         self.assertEqual(collector.parse_vcgencmd("measure_temp", "temp=48.7'C"), ("temperatureC", 48.7))
         self.assertEqual(collector.parse_vcgencmd("get_mem gpu", "gpu=4M"), ("gpuMemoryBytes", 4 * 1024 ** 2))
         self.assertEqual(collector.parse_vcgencmd("measure_clock core", "frequency(48)=500000000"), ("gpuClockHz", 500_000_000))
+        self.assertEqual(
+            collector.parse_vcgencmd(
+                "pmic_read_adc EXT5V_V",
+                "     EXT5V_V volt(24)=4.86956000V\n",
+            ),
+            ("supplyVoltageVolts", 4.87),
+        )
         self.assertEqual(collector.parse_loadavg("1.25 2.50 3.75 1/100 1"), (1.25, 2.5, 3.75))
+
+    def test_vcgencmd_voltage_parser_rejects_malformed_nonfinite_and_out_of_range(self):
+        command = "pmic_read_adc EXT5V_V"
+        for output in (
+            "EXT5V_V volt(24)=nanV",
+            "EXT5V_V volt(24)=infV",
+            "EXT5V_V volt(24)=-0.1V",
+            "EXT5V_V volt(24)=10.0001V",
+            "EXT5V_V volt(24)=4.9V trailing-data",
+            "HDMI_V volt(23)=4.9V",
+            "not vcgencmd output",
+        ):
+            with self.subTest(output=output):
+                self.assertIsNone(collector.parse_vcgencmd(command, output))
+        self.assertEqual(
+            collector.parse_vcgencmd(command, "EXT5V_V volt(24)=0V"),
+            ("supplyVoltageVolts", 0.0),
+        )
+        self.assertEqual(
+            collector.parse_vcgencmd(command, "EXT5V_V volt(24)=10V"),
+            ("supplyVoltageVolts", 10.0),
+        )
+        self.assertIsNone(collector.supply_voltage_volts(float("nan")))
+        self.assertIsNone(collector.supply_voltage_volts(True))
+        self.assertIsNone(collector.supply_voltage_volts("4.9"))
+        self.assertIsNone(collector.parse_vcgencmd("get_throttled", "junk throttled=0x1"))
+        self.assertIsNone(collector.parse_vcgencmd("get_throttled", "throttled=0x100000000"))
+
+    def test_collect_gpu_bounds_commands_and_ignores_failures(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            executable = Path(temporary) / "vcgencmd"
+            executable.write_text("#!/bin/sh\nexit 0\n")
+            executable.chmod(0o755)
+            calls = []
+
+            def fake_run(arguments, **kwargs):
+                calls.append((arguments, kwargs))
+                invocation = tuple(arguments[1:])
+                if invocation == ("get_throttled",):
+                    return collector.subprocess.CompletedProcess(
+                        arguments, 0, stdout="throttled=0x50000\n", stderr=""
+                    )
+                if invocation == ("pmic_read_adc", "EXT5V_V"):
+                    return collector.subprocess.CompletedProcess(
+                        arguments, 0, stdout="EXT5V_V volt(24)=4.87654000V\n", stderr=""
+                    )
+                if invocation == ("measure_temp",):
+                    raise collector.subprocess.TimeoutExpired(arguments, kwargs["timeout"])
+                return collector.subprocess.CompletedProcess(
+                    arguments, 1, stdout="frequency(48)=999999999\n", stderr=""
+                )
+
+            with mock.patch.object(collector.subprocess, "run", side_effect=fake_run):
+                result = collector.collect_gpu(str(executable), 1.25)
+            self.assertEqual(result, {"throttledFlags": 0x50000, "supplyVoltageVolts": 4.877})
+            self.assertEqual(len(calls), 6)
+            self.assertTrue(all(call[1]["timeout"] == 1.25 for call in calls))
+            self.assertTrue(all(call[1]["capture_output"] and call[1]["text"] for call in calls))
+
+            def failed_pmic(arguments, **_kwargs):
+                return collector.subprocess.CompletedProcess(
+                    arguments, 1, stdout="EXT5V_V volt(24)=4.90000000V\n", stderr=""
+                )
+
+            with mock.patch.object(collector.subprocess, "run", side_effect=failed_pmic):
+                self.assertEqual(collector.collect_gpu(str(executable), 1.25), {})
+
+    def test_existing_history_rows_migrate_to_exact_finite_contract(self):
+        legacy = {field: None for field in collector.LEGACY_SAMPLE_FIELDS}
+        legacy.update({
+            "timestamp": "2026-08-20T03:00:00.999Z",
+            "cpuPercent": float("nan"),
+            "powerState": "normal",
+        })
+        normalized = collector.existing_sample_record(legacy)
+        self.assertEqual(tuple(normalized), collector.SAMPLE_FIELDS)
+        self.assertEqual(normalized["timestamp"], "2026-08-20T03:00:00Z")
+        self.assertIsNone(normalized["cpuPercent"])
+        self.assertIsNone(normalized["supplyVoltageVolts"])
+        self.assertIsNone(normalized["throttledFlags"])
+
+        current = dict(normalized, supplyVoltageVolts=True, throttledFlags=True)
+        current_normalized = collector.existing_sample_record(current)
+        self.assertIsNone(current_normalized["supplyVoltageVolts"])
+        self.assertIsNone(current_normalized["throttledFlags"])
+        self.assertIsNone(collector.existing_sample_record({**legacy, "unexpected": "secret"}))
 
     def test_docker_reduction_has_exact_safe_fields(self):
         raw = {
@@ -276,6 +369,57 @@ class RedactionTests(unittest.TestCase):
             "action": "sudo", "result": "success",
         })
 
+    def test_kernel_power_lines_are_exact_semantic_records(self):
+        fallback = "2026-08-20T04:00:00Z"
+        cases = (
+            (
+                "2026-08-20T03:54:17+00:00 host kernel: hwmon: Undervoltage detected! raw=secret",
+                {
+                    "timestamp": "2026-08-20T03:54:17Z", "severity": "warning",
+                    "kind": "under-voltage", "status": "active",
+                    "message": "Kernel reported an under-voltage condition.",
+                },
+            ),
+            (
+                "2026-08-20T03:54:19+00:00 host kernel: hwmon: Voltage normalised raw=secret",
+                {
+                    "timestamp": "2026-08-20T03:54:19Z", "severity": "info",
+                    "kind": "under-voltage", "status": "recovered",
+                    "message": "Kernel reported voltage recovery.",
+                },
+            ),
+            (
+                "2026-08-20T03:54:30Z host kernel: nvme nvme0: controller is down; will reset: raw=secret",
+                {
+                    "timestamp": "2026-08-20T03:54:30Z", "severity": "critical",
+                    "kind": "nvme-reset", "status": "active",
+                    "message": "Kernel reported an NVMe controller reset.",
+                },
+            ),
+            (
+                "2026-08-20T03:55:00Z host kernel: blk_update_request: I/O error, dev nvme0n1, raw=secret",
+                {
+                    "timestamp": "2026-08-20T03:55:00Z", "severity": "critical",
+                    "kind": "nvme-io", "status": "active",
+                    "message": "Kernel reported an NVMe I/O error.",
+                },
+            ),
+        )
+        for line, expected in cases:
+            with self.subTest(kind=expected["kind"], status=expected["status"]):
+                record = collector.sanitize_kernel_power_line(line, fallback)
+                self.assertEqual(record, expected)
+                self.assertNotIn("secret", json.dumps(record))
+                self.assertEqual(collector.existing_power_record(record), expected)
+
+        self.assertIsNone(collector.sanitize_kernel_power_line(
+            "2026-08-20T03:56:00Z unrelated password=secret", fallback
+        ))
+        valid = cases[0][1]
+        self.assertIsNone(collector.existing_power_record({**valid, "raw": "secret"}))
+        self.assertIsNone(collector.existing_power_record({**valid, "message": "raw secret"}))
+        self.assertIsNone(collector.existing_power_record({**valid, "severity": "critical"}))
+
 
 class FilesystemTests(unittest.TestCase):
     def test_atomic_write_leaves_complete_file_and_no_temp(self):
@@ -321,6 +465,14 @@ class FilesystemTests(unittest.TestCase):
             auth = root / "auth.log"
             events.write_text("2026-08-19T00:00:00Z SNAPSHOT reason=cpu-high secret=drop\nmalformed\n")
             auth.write_text("Aug 19 host sudo: cks : USER=root ; COMMAND=/bin/secret --password=x\n")
+            history_dir = output / "history"
+            history_dir.mkdir(parents=True)
+            legacy_sample = {field: None for field in collector.LEGACY_SAMPLE_FIELDS}
+            legacy_sample.update({
+                "timestamp": "2026-08-19T00:00:00Z",
+                "powerState": "normal",
+            })
+            (history_dir / "2026-08-19.jsonl").write_text(json.dumps(legacy_sample) + "\n")
             container_id = "b" * 64
             docker_sample = [0]
 
@@ -343,11 +495,17 @@ class FilesystemTests(unittest.TestCase):
             config = collector.Config(
                 output_dir=output, runtime_dir=runtime, proc_root=proc, sys_root=sys_root,
                 etc_root=etc, mount_root=mount_root, events_log=events,
-                privilege_logs=[auth], docker_sockets={"cks": Path("/fake.sock")},
+                kernel_log=root / "missing-kern.log", privilege_logs=[auth],
+                docker_sockets={"cks": Path("/fake.sock")},
                 vcgencmd="", max_log_records=10,
             )
             now = dt.datetime(2026, 8, 19, 0, 1, tzinfo=dt.timezone.utc)
-            gpu = {"throttledFlags": 0x50000, "gpuMemoryBytes": 4 * 1024 ** 2, "gpuClockHz": 500_000_000}
+            gpu = {
+                "throttledFlags": 0x50000,
+                "supplyVoltageVolts": 4.86956,
+                "gpuMemoryBytes": 4 * 1024 ** 2,
+                "gpuClockHz": 500_000_000,
+            }
             with mock.patch.object(collector, "collect_gpu", return_value=gpu), \
                  mock.patch.object(collector, "docker_get", side_effect=fake_docker):
                 current = collector.run(config, now)
@@ -359,6 +517,8 @@ class FilesystemTests(unittest.TestCase):
             self.assertEqual(set(current["host"]), {"hostname", "os", "architecture", "uptimeSeconds"})
             self.assertEqual(tuple(current["latest"]), collector.SAMPLE_FIELDS)
             self.assertEqual(current["latest"]["powerState"], "degraded-history")
+            self.assertEqual(current["latest"]["supplyVoltageVolts"], 4.87)
+            self.assertEqual(current["latest"]["throttledFlags"], 0x50000)
             self.assertEqual(current["latest"]["gpuMemoryBytes"], 4 * 1024 ** 2)
             self.assertEqual(current["latest"]["gpuClockHz"], 500_000_000)
             self.assertEqual(set(current["disks"][0]), {"mount", "totalBytes", "usedBytes", "usedPercent"})
@@ -377,7 +537,14 @@ class FilesystemTests(unittest.TestCase):
             privilege = json.loads(privilege_lines[0])
             self.assertEqual(set(privilege), {"timestamp", "actor", "target", "action", "result"})
             self.assertNotIn("secret", json.dumps(privilege))
-            self.assertEqual(len((output / "history" / "2026-08-19.jsonl").read_text().splitlines()), 2)
+            history = [
+                json.loads(line)
+                for line in (output / "history" / "2026-08-19.jsonl").read_text().splitlines()
+            ]
+            self.assertEqual(len(history), 3)
+            self.assertTrue(all(tuple(sample) == collector.SAMPLE_FIELDS for sample in history))
+            self.assertEqual([sample["supplyVoltageVolts"] for sample in history], [None, 4.87, 4.87])
+            self.assertEqual([sample["throttledFlags"] for sample in history], [None, 0x50000, 0x50000])
             self.assertTrue((runtime / "delta-state.json").is_file())
 
     def test_bounded_exports_keep_newest_records(self):
@@ -392,27 +559,134 @@ class FilesystemTests(unittest.TestCase):
             root = Path(temporary)
             config = collector.Config(
                 output_dir=root / "out", runtime_dir=root / "run",
-                events_log=root / "missing-events", privilege_logs=[], docker_sockets={},
+                events_log=root / "missing-events", kernel_log=root / "missing-kern.log",
+                privilege_logs=[], docker_sockets={},
             )
-            collector.export_sanitized_logs(config, "2026-08-19T00:00:00Z", {"throttledFlags": 0x50005})
-            collector.export_sanitized_logs(config, "2026-08-19T00:01:00Z", {"throttledFlags": 0x50005})
-            collector.export_sanitized_logs(config, "2026-08-19T00:02:00Z", {"throttledFlags": 0x50000})
+            collector.export_sanitized_logs(config, "2026-08-19T00:00:00Z", {
+                "throttledFlags": 0x50005, "supplyVoltageVolts": 4.8119,
+            })
+            collector.export_sanitized_logs(config, "2026-08-19T00:01:00Z", {
+                "throttledFlags": 0x50005, "supplyVoltageVolts": 4.1,
+            })
+            collector.export_sanitized_logs(config, "2026-08-19T00:02:00Z", {
+                "throttledFlags": 0x50000, "supplyVoltageVolts": 4.9238,
+            })
+            collector.export_sanitized_logs(config, "2026-08-19T00:03:00Z", {
+                "throttledFlags": 0x50000, "supplyVoltageVolts": 1.0,
+            })
             records = [json.loads(line) for line in (config.output_dir / "alerts.jsonl").read_text().splitlines()]
             self.assertEqual([record["status"] for record in records], ["active", "recovered"])
             self.assertTrue(all(set(record) == {"timestamp", "severity", "kind", "status", "message"} for record in records))
+            self.assertEqual(
+                records[0]["message"],
+                "Current vcgencmd throttle flags are 0x5. Full flags are 0x00050005. "
+                "Supply voltage is 4.812 V.",
+            )
+            self.assertEqual(
+                records[1]["message"],
+                "Current vcgencmd throttle condition recovered. Full flags are 0x00050000. "
+                "Supply voltage is 4.924 V.",
+            )
+
+    def test_kernel_power_tail_rotation_deduplication_and_retention(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            kernel_log = root / "kern.log"
+            old_event = (
+                "2026-08-20T03:00:00Z host kernel: hwmon: Undervoltage detected!\n"
+            )
+            filler = "".join(f"filler-{index:03d} " + "x" * 70 + "\n" for index in range(100))
+            recent_event = (
+                "2026-08-20T03:54:30Z host kernel: nvme nvme0: controller is down; will reset\n"
+            )
+            kernel_log.write_text(old_event + filler + recent_event)
+            config = collector.Config(
+                output_dir=root / "out", runtime_dir=root / "run",
+                events_log=root / "missing-events", kernel_log=kernel_log,
+                kernel_max_input_bytes=512, privilege_logs=[], docker_sockets={},
+                max_log_records=10,
+            )
+
+            collector.export_sanitized_logs(config, "2026-08-20T04:00:00Z")
+            power_path = config.output_dir / "power.jsonl"
+            records = [json.loads(line) for line in power_path.read_text().splitlines()]
+            self.assertEqual([(record["kind"], record["status"]) for record in records], [
+                ("nvme-reset", "active"),
+            ])
+            self.assertEqual(stat.S_IMODE(power_path.stat().st_mode), 0o640)
+
+            with kernel_log.open("a") as handle:
+                handle.write(
+                    "2026-08-20T03:54:31.100Z host kernel: Undervoltage detected! first detail\n"
+                    "2026-08-20T03:54:31.900Z host kernel: Undervoltage detected! duplicate detail\n"
+                    "2026-08-20T03:54:31.950Z host kernel: Voltage normalised detail\n"
+                )
+            collector.export_sanitized_logs(config, "2026-08-20T04:01:00Z")
+            records = [json.loads(line) for line in power_path.read_text().splitlines()]
+            self.assertEqual([(record["kind"], record["status"]) for record in records], [
+                ("nvme-reset", "active"),
+                ("under-voltage", "active"),
+                ("under-voltage", "recovered"),
+            ])
+
+            rotated = root / "kern.log.1"
+            kernel_log.rename(rotated)
+            kernel_log.write_text(
+                "2026-08-20T03:54:31.999Z host kernel: Voltage normalised duplicate after rotation\n"
+                "2026-08-20T03:54:33.100Z host kernel: nvme0n1: I/O Error secret=drop\n"
+                "2026-08-20T03:54:33.900Z host kernel: I/O error, dev nvme0n1 duplicate\n"
+                "2026-08-20T03:54:34Z host kernel: I/O Error, dev sda ignored\n"
+            )
+            collector.export_sanitized_logs(config, "2026-08-20T04:02:00Z")
+            records = [json.loads(line) for line in power_path.read_text().splitlines()]
+            self.assertEqual([(record["kind"], record["status"]) for record in records], [
+                ("nvme-reset", "active"),
+                ("under-voltage", "active"),
+                ("under-voltage", "recovered"),
+                ("nvme-io", "active"),
+            ])
+            cursor_state = json.loads((config.output_dir / ".state" / "log-cursors.json").read_text())
+            self.assertEqual(cursor_state["kernelPower"]["inode"], kernel_log.stat().st_ino)
+            self.assertTrue(all(set(record) == {
+                "timestamp", "severity", "kind", "status", "message",
+            } for record in records))
+            self.assertNotIn("secret", power_path.read_text())
+
+            config.kernel_max_input_bytes = 4096
+            with kernel_log.open("a") as handle:
+                for second in range(10, 22):
+                    handle.write(
+                        f"2026-08-20T03:55:{second:02d}Z host kernel: "
+                        "nvme nvme0: controller is down; will reset\n"
+                    )
+            collector.export_sanitized_logs(config, "2026-08-20T04:03:00Z")
+            records = [json.loads(line) for line in power_path.read_text().splitlines()]
+            self.assertEqual(len(records), 10)
+            self.assertTrue(all(record["kind"] == "nvme-reset" for record in records))
+            self.assertEqual(records[0]["timestamp"], "2026-08-20T03:55:12Z")
+            self.assertEqual(records[-1]["timestamp"], "2026-08-20T03:55:21Z")
 
     def test_default_paths_timeout_and_systemd_access_contract(self):
         with mock.patch.dict(os.environ, {}, clear=True):
             config = collector.config_from_environment([])
         self.assertEqual(config.privilege_logs, [Path("/var/log/privilege-events.log")])
+        self.assertEqual(config.kernel_log, Path("/var/log/kern.log"))
+        self.assertEqual(config.kernel_max_input_bytes, 8_388_608)
         self.assertEqual(config.command_timeout, 2.0)
         ops_root = Path(__file__).resolve().parents[1]
         unit = (ops_root / "systemd" / "monitor-collector.service").read_text()
+        defaults = (ops_root / "monitor-collector.default").read_text()
         installer = (ops_root / "install.sh").read_text()
         self.assertIn("Group=cks", unit)
         self.assertIn("RuntimeDirectoryPreserve=yes", unit)
         self.assertIn("BindPaths=-/dev/vcio", unit)
         self.assertIn("DeviceAllow=/dev/vcio rw", unit)
+        self.assertIn("ReadOnlyPaths=/proc /sys /var/log /run/user", unit)
+        self.assertIn("MemoryHigh=160M", unit)
+        self.assertIn("MemoryMax=192M", unit)
+        self.assertIn("TasksMax=64", unit)
+        self.assertIn("MONITOR_KERNEL_LOG=/var/log/kern.log", defaults)
+        self.assertIn("MONITOR_KERNEL_MAX_INPUT_BYTES=8388608", defaults)
         self.assertIn("-o root -g cks -m 0750 /var/lib/monitor-export", installer)
 
     def test_power_state_is_normal_only_without_active_or_historical_flags(self):
@@ -432,14 +706,21 @@ class FilesystemTests(unittest.TestCase):
                 config = collector.Config(
                     output_dir=root / "out", runtime_dir=root / "run", proc_root=proc,
                     sys_root=root / "sys", etc_root=root / "etc", mount_root=root / "mount",
-                    events_log=root / "events", privilege_logs=[], docker_sockets={}, vcgencmd="",
+                    events_log=root / "events", kernel_log=root / "kern.log",
+                    privilege_logs=[], docker_sockets={}, vcgencmd="",
                 )
                 with mock.patch.object(collector, "collect_gpu", return_value={"throttledFlags": flags}):
-                    return collector.run(config)["latest"]["powerState"]
+                    return collector.run(config)["latest"]
 
-        self.assertEqual(fixture(0), "normal")
-        self.assertEqual(fixture(0x50000), "degraded-history")
-        self.assertEqual(fixture(0x50005), "throttled")
+        normal = fixture(0)
+        self.assertEqual(normal["powerState"], "normal")
+        self.assertEqual(normal["throttledFlags"], 0)
+        self.assertIsNone(normal["supplyVoltageVolts"])
+        self.assertEqual(fixture(0x50000)["powerState"], "degraded-history")
+        self.assertEqual(fixture(0x50005)["powerState"], "throttled")
+        unavailable = fixture(None)
+        self.assertIsNone(unavailable["powerState"])
+        self.assertIsNone(unavailable["throttledFlags"])
 
 
 if __name__ == "__main__":

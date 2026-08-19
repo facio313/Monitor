@@ -15,7 +15,9 @@ const MAX_HISTORY_FILE_BYTES = 8 * 1024 * 1024;
 const MAX_JSONL_LINES = 50_000;
 const MAX_LINE_BYTES = 128 * 1024;
 const MAX_SERIES_POINTS = 360;
-const MAX_EVENTS = 100;
+const MAX_EVENTS = 500;
+const MAX_POWER_CORRELATION_MS = 2 * 60 * 1_000;
+const MAX_UINT32 = 0xffff_ffff;
 
 type JsonRecord = Record<string, unknown>;
 
@@ -58,6 +60,15 @@ function finite(value: unknown, minimum = 0, maximum = Number.MAX_SAFE_INTEGER):
 
 function percent(value: unknown): number | null {
   return finite(value, 0, 100);
+}
+
+function uint32(value: unknown): number | null {
+  return typeof value === 'number'
+    && Number.isInteger(value)
+    && value >= 0
+    && value <= MAX_UINT32
+    ? (value === 0 ? 0 : value)
+    : null;
 }
 
 function cleanText(value: unknown, maximumLength: number): string | null {
@@ -112,6 +123,7 @@ function normalizeSample(value: unknown): TelemetrySample | null {
   const disk = recordAt(value, 'disk') ?? recordAt(value, 'diskIo') ?? recordAt(value, 'io');
   const gpu = recordAt(value, 'gpu');
   const thermal = recordAt(value, 'thermal');
+  const power = recordAt(value, 'power');
   const load = first(cpu, ['loadAverage', 'load']) ?? first(value, ['loadAverage', 'load']);
   const loadValues = Array.isArray(load) ? load : [];
 
@@ -146,9 +158,19 @@ function normalizeSample(value: unknown): TelemetrySample | null {
     load15: finite(loadValues[2] ?? first(cpu, ['load15']) ?? first(value, ['load15'])),
     powerState: cleanText(
       first(value, ['powerState'])
-        ?? first(recordAt(value, 'power'), ['state', 'status'])
+        ?? first(power, ['state', 'status'])
         ?? first(recordAt(value, 'host'), ['powerState']),
       32,
+    ),
+    supplyVoltageVolts: finite(
+      first(value, ['supplyVoltageVolts']) ?? first(power, ['supplyVoltageVolts']),
+      0,
+      10,
+    ),
+    throttledFlags: uint32(
+      first(value, ['throttledFlags'])
+        ?? first(power, ['throttledFlags'])
+        ?? first(gpu, ['throttledFlags']),
     ),
     gpuMemoryBytes: finite(first(gpu, ['memoryBytes', 'memoryUsedBytes', 'usedMemoryBytes']) ?? first(value, ['gpuMemoryBytes'])),
     gpuClockHz: finite(first(gpu, ['clockHz', 'gpuClockHz']) ?? first(value, ['gpuClockHz'])),
@@ -179,6 +201,8 @@ function emptySample(timestamp: string): TelemetrySample {
     load5: null,
     load15: null,
     powerState: null,
+    supplyVoltageVolts: null,
+    throttledFlags: null,
     gpuMemoryBytes: null,
     gpuClockHz: null,
     networkRxBytesPerSecond: null,
@@ -186,6 +210,17 @@ function emptySample(timestamp: string): TelemetrySample {
     diskReadBytesPerSecond: null,
     diskWriteBytesPerSecond: null,
   };
+}
+
+function mergeSamples(history: TelemetrySample, current: TelemetrySample): TelemetrySample {
+  const merged = { ...history };
+  for (const key of Object.keys(current) as Array<keyof TelemetrySample>) {
+    const value = current[key];
+    if (key === 'timestamp' || value !== null) {
+      Object.assign(merged, { [key]: value });
+    }
+  }
+  return merged;
 }
 
 function isInside(root: string, target: string): boolean {
@@ -266,13 +301,61 @@ function dateNames(fromMs: number, toMs: number): string[] {
   return names;
 }
 
-function downsample<T>(values: T[], maximum: number): T[] {
+function evenlySelect(values: number[], maximum: number): number[] {
+  if (maximum <= 0) return [];
   if (values.length <= maximum) return values;
-  const output: T[] = [];
-  for (let index = 0; index < maximum; index += 1) {
-    output.push(values[Math.round((index * (values.length - 1)) / (maximum - 1))]!);
+  if (maximum === 1) return [values[Math.floor((values.length - 1) / 2)]!];
+  return Array.from({ length: maximum }, (_, index) => (
+    values[Math.round((index * (values.length - 1)) / (maximum - 1))]!
+  ));
+}
+
+function downsampleTelemetry(values: TelemetrySample[], maximum: number): TelemetrySample[] {
+  if (values.length <= maximum) return values;
+
+  const required = new Set<number>([0, values.length - 1]);
+  let minimumVoltageIndex: number | null = null;
+  let maximumVoltageIndex: number | null = null;
+  const transitions: number[] = [];
+  for (let index = 0; index < values.length; index += 1) {
+    const sample = values[index]!;
+    if (sample.supplyVoltageVolts !== null) {
+      if (
+        minimumVoltageIndex === null
+        || sample.supplyVoltageVolts < values[minimumVoltageIndex]!.supplyVoltageVolts!
+      ) minimumVoltageIndex = index;
+      if (
+        maximumVoltageIndex === null
+        || sample.supplyVoltageVolts > values[maximumVoltageIndex]!.supplyVoltageVolts!
+      ) maximumVoltageIndex = index;
+    }
+    if (index > 0) {
+      const previous = values[index - 1]!;
+      if (
+        sample.powerState !== previous.powerState
+        || sample.throttledFlags !== previous.throttledFlags
+      ) transitions.push(index);
+    }
   }
-  return output;
+  if (minimumVoltageIndex !== null) required.add(minimumVoltageIndex);
+  if (maximumVoltageIndex !== null) required.add(maximumVoltageIndex);
+
+  const transitionCapacity = Math.max(0, maximum - required.size);
+  for (const index of evenlySelect(transitions, transitionCapacity)) required.add(index);
+
+  const remainingCapacity = maximum - required.size;
+  if (remainingCapacity > 0) {
+    const candidates = Array.from(
+      { length: values.length },
+      (_, index) => index,
+    ).filter((index) => !required.has(index));
+    for (const index of evenlySelect(candidates, remainingCapacity)) required.add(index);
+  }
+
+  return [...required]
+    .sort((left, right) => left - right)
+    .slice(0, maximum)
+    .map((index) => values[index]!);
 }
 
 function normalizeHost(current: JsonRecord | null): DashboardResponse['host'] {
@@ -326,27 +409,171 @@ function normalizeContainers(current: JsonRecord | null): DashboardResponse['con
   });
 }
 
+function normalizeAlert(
+  record: JsonRecord,
+  cutoff: number,
+  nowMs: number,
+): DashboardResponse['alerts'][number] | null {
+  const timestamp = timestampOf(record);
+  const time = timestamp ? new Date(timestamp).getTime() : Number.NaN;
+  if (!timestamp || time < cutoff || time > nowMs + 60_000) return null;
+  const message = safeMessage(first(record, ['message', 'summary', 'title']));
+  if (!message) return null;
+  const rawSeverity = cleanText(first(record, ['severity', 'level']), 16)?.toLowerCase();
+  const severity: DashboardResponse['alerts'][number]['severity'] = rawSeverity === 'critical' || rawSeverity === 'error'
+    ? 'critical'
+    : rawSeverity === 'warning' || rawSeverity === 'warn'
+      ? 'warning'
+      : 'info';
+  return {
+    timestamp,
+    severity,
+    kind: cleanText(first(record, ['kind', 'type', 'category']), 64),
+    status: cleanText(first(record, ['status', 'state']), 32),
+    message,
+  };
+}
+
 function normalizeAlerts(records: JsonRecord[], cutoff: number, nowMs: number): DashboardResponse['alerts'] {
-  return records.flatMap((record) => {
-    const timestamp = timestampOf(record);
-    const time = timestamp ? new Date(timestamp).getTime() : Number.NaN;
-    if (!timestamp || time < cutoff || time > nowMs + 60_000) return [];
-    const message = safeMessage(first(record, ['message', 'summary', 'title']));
-    if (!message) return [];
-    const rawSeverity = cleanText(first(record, ['severity', 'level']), 16)?.toLowerCase();
-    const severity: DashboardResponse['alerts'][number]['severity'] = rawSeverity === 'critical' || rawSeverity === 'error'
-      ? 'critical'
-      : rawSeverity === 'warning' || rawSeverity === 'warn'
-        ? 'warning'
-        : 'info';
-    return [{
-      timestamp,
-      severity,
-      kind: cleanText(first(record, ['kind', 'type', 'category']), 64),
-      status: cleanText(first(record, ['status', 'state']), 32),
-      message,
-    }];
-  }).sort((left, right) => right.timestamp.localeCompare(left.timestamp)).slice(0, MAX_EVENTS);
+  return records
+    .map((record) => normalizeAlert(record, cutoff, nowMs))
+    .filter((alert): alert is DashboardResponse['alerts'][number] => alert !== null)
+    .sort((left, right) => right.timestamp.localeCompare(left.timestamp))
+    .slice(0, MAX_EVENTS);
+}
+
+const POWER_ALERT_PATTERN = /\b(?:power-throttle|under-voltage|undervoltage|vcgencmd|throttl(?:e|ed|ing)|voltage)\b/i;
+
+function alertRecordIsPowerRelated(
+  record: JsonRecord,
+  alert: DashboardResponse['alerts'][number],
+): boolean {
+  const kind = alert.kind?.toLowerCase();
+  if (kind === 'power') return true;
+  if (kind !== 'host') return false;
+  const discriminator = cleanText(first(record, ['alert', 'reason', 'name']), 128);
+  return POWER_ALERT_PATTERN.test(`${discriminator ?? ''} ${alert.message}`);
+}
+
+function nearestSample(
+  samples: TelemetrySample[],
+  eventTime: number,
+): TelemetrySample | null {
+  let low = 0;
+  let high = samples.length;
+  while (low < high) {
+    const middle = Math.floor((low + high) / 2);
+    if (new Date(samples[middle]!.timestamp).getTime() < eventTime) low = middle + 1;
+    else high = middle;
+  }
+
+  let nearest: TelemetrySample | null = null;
+  let nearestDistance = MAX_POWER_CORRELATION_MS + 1;
+  for (const index of [low - 1, low]) {
+    const sample = samples[index];
+    if (!sample) continue;
+    const distance = Math.abs(new Date(sample.timestamp).getTime() - eventTime);
+    if (distance < nearestDistance) {
+      nearest = sample;
+      nearestDistance = distance;
+    }
+  }
+  return nearestDistance <= MAX_POWER_CORRELATION_MS ? nearest : null;
+}
+
+function powerEventDedupeKey(event: DashboardResponse['powerEvents'][number]): string {
+  const sameSecond = event.timestamp.slice(0, 19);
+  return [
+    sameSecond,
+    event.severity,
+    event.status?.toLowerCase() ?? '',
+    event.message.toLowerCase(),
+  ].join('\u0000');
+}
+
+function normalizePowerEvents(
+  dedicatedRecords: JsonRecord[],
+  alertRecords: JsonRecord[],
+  samples: TelemetrySample[],
+  cutoff: number,
+  nowMs: number,
+): DashboardResponse['powerEvents'] {
+  const dedicatedCandidates: DashboardResponse['powerEvents'] = [];
+  const alertCandidates: DashboardResponse['powerEvents'] = [];
+  const append = (
+    target: DashboardResponse['powerEvents'],
+    record: JsonRecord,
+    requirePowerSemantics: boolean,
+  ): void => {
+    const alert = normalizeAlert(record, cutoff, nowMs);
+    if (!alert || requirePowerSemantics && !alertRecordIsPowerRelated(record, alert)) return;
+    const eventTime = new Date(alert.timestamp).getTime();
+    const sample = nearestSample(samples, eventTime);
+    target.push({
+      timestamp: alert.timestamp,
+      severity: alert.severity,
+      kind: alert.kind,
+      status: alert.status,
+      message: alert.message,
+      supplyVoltageVolts: sample?.supplyVoltageVolts ?? null,
+      throttledFlags: sample?.throttledFlags ?? null,
+    });
+  };
+
+  // Dedicated power records win semantic duplicates from the legacy alert feed.
+  for (const record of dedicatedRecords) append(dedicatedCandidates, record, false);
+  for (const record of alertRecords) append(alertCandidates, record, true);
+  dedicatedCandidates.sort((left, right) => right.timestamp.localeCompare(left.timestamp));
+  alertCandidates.sort((left, right) => right.timestamp.localeCompare(left.timestamp));
+
+  const seen = new Set<string>();
+  return [...dedicatedCandidates, ...alertCandidates]
+    .filter((event) => {
+      const key = powerEventDedupeKey(event);
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .sort((left, right) => right.timestamp.localeCompare(left.timestamp))
+    .slice(0, MAX_EVENTS);
+}
+
+function summarizePower(samples: TelemetrySample[]): DashboardResponse['powerSummary'] {
+  let voltageSampleCount = 0;
+  let voltageSum = 0;
+  let minimumVoltage: number | null = null;
+  let maximumVoltage: number | null = null;
+  let underVoltageSampleCount = 0;
+  let throttledSampleCount = 0;
+  for (const sample of samples) {
+    if (sample.supplyVoltageVolts !== null) {
+      voltageSampleCount += 1;
+      voltageSum += sample.supplyVoltageVolts;
+      minimumVoltage = minimumVoltage === null
+        ? sample.supplyVoltageVolts
+        : Math.min(minimumVoltage, sample.supplyVoltageVolts);
+      maximumVoltage = maximumVoltage === null
+        ? sample.supplyVoltageVolts
+        : Math.max(maximumVoltage, sample.supplyVoltageVolts);
+    }
+    if (sample.throttledFlags !== null && (sample.throttledFlags & 0x1) !== 0) {
+      underVoltageSampleCount += 1;
+    }
+    if (sample.throttledFlags !== null && (sample.throttledFlags & 0x4) !== 0) {
+      throttledSampleCount += 1;
+    }
+  }
+  return {
+    sampleCount: samples.length,
+    voltageSampleCount,
+    minSupplyVoltageVolts: minimumVoltage,
+    averageSupplyVoltageVolts: voltageSampleCount
+      ? Math.round((voltageSum / voltageSampleCount) * 1_000) / 1_000
+      : null,
+    maxSupplyVoltageVolts: maximumVoltage,
+    underVoltageSampleCount,
+    throttledSampleCount,
+  };
 }
 
 function privilegeAction(record: JsonRecord): DashboardResponse['privilegeEvents'][number]['action'] {
@@ -409,14 +636,21 @@ export function readDashboard(
   if (
     currentSample
     && new Date(currentSample.timestamp).getTime() >= cutoff
-    && !samples.some((sample) => sample.timestamp === currentSample.timestamp)
-  ) samples.push(currentSample);
+  ) {
+    const matchingHistoryIndex = samples.findIndex((sample) => sample.timestamp === currentSample.timestamp);
+    if (matchingHistoryIndex === -1) {
+      samples.push(currentSample);
+    } else {
+      samples[matchingHistoryIndex] = mergeSamples(samples[matchingHistoryIndex]!, currentSample);
+    }
+  }
   samples.sort((left, right) => left.timestamp.localeCompare(right.timestamp));
 
   const observedLatest = currentSample ?? samples.at(-1) ?? null;
   const latestTime = observedLatest ? new Date(observedLatest.timestamp).getTime() : Number.NaN;
   const latest = observedLatest ?? emptySample(new Date(nowMs).toISOString());
   const alerts = parseJsonLines(root, join(root, 'alerts.jsonl'), MAX_EVENT_FILE_BYTES);
+  const power = parseJsonLines(root, join(root, 'power.jsonl'), MAX_EVENT_FILE_BYTES);
   const privilege = parseJsonLines(root, join(root, 'privilege.jsonl'), MAX_EVENT_FILE_BYTES);
 
   return {
@@ -425,10 +659,12 @@ export function readDashboard(
     stale: !Number.isFinite(latestTime) || nowMs - latestTime > staleAfterMs,
     host: normalizeHost(current),
     latest,
-    series: downsample(samples, MAX_SERIES_POINTS),
+    series: downsampleTelemetry(samples, MAX_SERIES_POINTS),
+    powerSummary: summarizePower(samples),
     disks: normalizeDisks(current),
     containers: normalizeContainers(current),
     alerts: normalizeAlerts(alerts, cutoff, nowMs),
+    powerEvents: normalizePowerEvents(power, alerts, samples, cutoff, nowMs),
     privilegeEvents: normalizePrivilege(privilege, cutoff, nowMs),
   };
 }
@@ -437,5 +673,5 @@ export const dataLimits = {
   maximumSeriesPoints: MAX_SERIES_POINTS,
   maximumEvents: MAX_EVENTS,
   acceptedHistoryFilePattern: /^\d{4}-\d{2}-\d{2}\.jsonl$/,
-  fixedFiles: ['current.json', 'alerts.jsonl', 'privilege.jsonl'].map((path) => basename(path)),
+  fixedFiles: ['current.json', 'alerts.jsonl', 'power.jsonl', 'privilege.jsonl'].map((path) => basename(path)),
 } as const;

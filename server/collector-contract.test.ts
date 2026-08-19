@@ -1,5 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import {
+  chmodSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -9,7 +10,7 @@ import {
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { readDashboard } from './data.js';
+import { dataLimits, readDashboard } from './data.js';
 
 const LATEST_FIELDS = [
   'timestamp',
@@ -22,6 +23,8 @@ const LATEST_FIELDS = [
   'load5',
   'load15',
   'powerState',
+  'supplyVoltageVolts',
+  'throttledFlags',
   'gpuMemoryBytes',
   'gpuClockHz',
   'networkRxBytesPerSecond',
@@ -54,7 +57,9 @@ describe('collector to server contract', () => {
     const outputRoot = join(fixture, 'output');
     const runtimeRoot = join(fixture, 'runtime');
     const eventsLog = join(fixture, 'events.log');
+    const kernelLog = join(fixture, 'kern.log');
     const privilegeLog = join(fixture, 'privilege.log');
+    const vcgencmd = join(fixture, 'vcgencmd');
 
     for (const directory of [
       join(procRoot, 'net'),
@@ -93,6 +98,11 @@ describe('collector to server contract', () => {
       eventsLog,
       'SNAPSHOT reason=cpu-high token=RAW_ALERT_SECRET command=never-export-this\n',
     );
+    writeFileSync(kernelLog, [
+      'kernel: hwmon hwmon4: Undervoltage detected! RAW_KERNEL_SECRET',
+      'kernel: hwmon hwmon4: Voltage normalised RAW_KERNEL_SECRET',
+      '',
+    ].join('\n'));
     writeFileSync(privilegeLog, `${JSON.stringify({
       actor: 'fixture-user',
       target: 'root',
@@ -101,6 +111,16 @@ describe('collector to server contract', () => {
       command: 'cat /root/RAW_COMMAND_SECRET',
       password: 'RAW_PASSWORD_SECRET',
     })}\n`);
+    writeFileSync(vcgencmd, [
+      '#!/bin/sh',
+      'case "$*" in',
+      '  get_throttled) printf "%s\\n" "throttled=0x50000" ;;',
+      '  "pmic_read_adc EXT5V_V") printf "%s\\n" "EXT5V_V volt(24)=4.87654000V" ;;',
+      '  *) exit 1 ;;',
+      'esac',
+      '',
+    ].join('\n'));
+    chmodSync(vcgencmd, 0o755);
 
     execFileSync('python3', [
       resolve('ops/collector.py'),
@@ -111,9 +131,10 @@ describe('collector to server contract', () => {
       '--etc-root', etcRoot,
       '--mount-root', mountRoot,
       '--events-log', eventsLog,
+      '--kernel-log', kernelLog,
       '--privilege-logs', privilegeLog,
       '--docker-sockets', '',
-      '--vcgencmd', '',
+      '--vcgencmd', vcgencmd,
     ], {
       cwd: resolve('.'),
       encoding: 'utf8',
@@ -139,9 +160,42 @@ describe('collector to server contract', () => {
       load1: 1.25,
       load5: 2.5,
       load15: 3.75,
+      powerState: 'degraded-history',
+      supplyVoltageVolts: 4.877,
+      throttledFlags: 0x50000,
     });
     expect(dashboard.series).toHaveLength(1);
     expect(Object.keys(dashboard.series[0]!)).toEqual(LATEST_FIELDS);
+    expect(dashboard.powerSummary).toEqual({
+      sampleCount: 1,
+      voltageSampleCount: 1,
+      minSupplyVoltageVolts: 4.877,
+      averageSupplyVoltageVolts: 4.877,
+      maxSupplyVoltageVolts: 4.877,
+      underVoltageSampleCount: 0,
+      throttledSampleCount: 0,
+    });
+    expect(dashboard.powerEvents).toEqual([
+      {
+        timestamp: new Date(now).toISOString(),
+        severity: 'warning',
+        kind: 'under-voltage',
+        status: 'active',
+        message: 'Kernel reported an under-voltage condition.',
+        supplyVoltageVolts: 4.877,
+        throttledFlags: 0x50000,
+      },
+      {
+        timestamp: new Date(now).toISOString(),
+        severity: 'info',
+        kind: 'under-voltage',
+        status: 'recovered',
+        message: 'Kernel reported voltage recovery.',
+        supplyVoltageVolts: 4.877,
+        throttledFlags: 0x50000,
+      },
+    ]);
+    expect(dataLimits.fixedFiles).toContain('power.jsonl');
 
     expect(dashboard.disks).toHaveLength(1);
     expect(Object.keys(dashboard.disks[0]!)).toEqual([
@@ -172,12 +226,14 @@ describe('collector to server contract', () => {
       readFileSync(join(outputRoot, 'current.json'), 'utf8'),
       readFileSync(join(outputRoot, 'history', `${current.generatedAt.slice(0, 10)}.jsonl`), 'utf8'),
       readFileSync(join(outputRoot, 'alerts.jsonl'), 'utf8'),
+      readFileSync(join(outputRoot, 'power.jsonl'), 'utf8'),
       readFileSync(join(outputRoot, 'privilege.jsonl'), 'utf8'),
       JSON.stringify(dashboard),
     ].join('\n');
     expect(publicExport).not.toContain('RAW_ALERT_SECRET');
     expect(publicExport).not.toContain('RAW_COMMAND_SECRET');
     expect(publicExport).not.toContain('RAW_PASSWORD_SECRET');
+    expect(publicExport).not.toContain('RAW_KERNEL_SECRET');
     expect(publicExport).not.toContain('never-export-this');
   });
 });

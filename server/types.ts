@@ -13,6 +13,8 @@ export interface TelemetrySample {
   load5: number | null;
   load15: number | null;
   powerState: string | null;
+  supplyVoltageVolts: number | null;
+  throttledFlags: number | null;
   gpuMemoryBytes: number | null;
   gpuClockHz: number | null;
   networkRxBytesPerSecond: number | null;
@@ -33,6 +35,15 @@ export interface DashboardResponse {
   };
   latest: TelemetrySample;
   series: TelemetrySample[];
+  powerSummary: {
+    sampleCount: number;
+    voltageSampleCount: number;
+    minSupplyVoltageVolts: number | null;
+    averageSupplyVoltageVolts: number | null;
+    maxSupplyVoltageVolts: number | null;
+    underVoltageSampleCount: number;
+    throttledSampleCount: number;
+  };
   disks: Array<{
     mount: string;
     totalBytes: number | null;
@@ -54,6 +65,15 @@ export interface DashboardResponse {
     kind: string | null;
     status: string | null;
     message: string;
+  }>;
+  powerEvents: Array<{
+    timestamp: string;
+    severity: 'info' | 'warning' | 'critical';
+    kind: string | null;
+    status: string | null;
+    message: string;
+    supplyVoltageVolts: number | null;
+    throttledFlags: number | null;
   }>;
   privilegeEvents: Array<{
     timestamp: string;

@@ -39,6 +39,8 @@ SAMPLE_FIELDS = (
     "load5",
     "load15",
     "powerState",
+    "supplyVoltageVolts",
+    "throttledFlags",
     "gpuMemoryBytes",
     "gpuClockHz",
     "networkRxBytesPerSecond",
@@ -46,6 +48,12 @@ SAMPLE_FIELDS = (
     "diskReadBytesPerSecond",
     "diskWriteBytesPerSecond",
 )
+LEGACY_SAMPLE_FIELDS = tuple(
+    field for field in SAMPLE_FIELDS if field not in {"supplyVoltageVolts", "throttledFlags"}
+)
+MAX_UINT32 = (1 << 32) - 1
+MAX_SUPPLY_VOLTAGE_VOLTS = 10.0
+DEFAULT_KERNEL_MAX_INPUT_BYTES = 8_388_608
 DEFAULT_SOCKETS = {
     "cks": "/run/user/1001/docker.sock",
     "psy": "/run/user/1002/docker.sock",
@@ -71,9 +79,27 @@ def iso_timestamp(value: dt.datetime) -> str:
 def finite_number(value: Any, default: float | None = None) -> float | None:
     try:
         parsed = float(value)
-    except (TypeError, ValueError):
+    except (OverflowError, TypeError, ValueError):
         return default
     return parsed if math.isfinite(parsed) else default
+
+
+def uint32(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if 0 <= value <= MAX_UINT32 else None
+
+
+def supply_voltage_volts(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        parsed = float(value)
+    except OverflowError:
+        return None
+    if not math.isfinite(parsed) or parsed < 0.0 or parsed > MAX_SUPPLY_VOLTAGE_VOLTS:
+        return None
+    return round(parsed, 3)
 
 
 def bounded_text(value: Any, maximum: int = 96) -> str:
@@ -355,8 +381,9 @@ def parse_os_release(text: str) -> str:
 
 def parse_vcgencmd(command: str, output: str) -> tuple[str, Any] | None:
     if command == "get_throttled":
-        match = re.search(r"0x([0-9a-fA-F]+)", output)
-        return ("throttledFlags", int(match.group(1), 16)) if match else None
+        match = re.fullmatch(r"\s*throttled=0x([0-9a-fA-F]{1,8})\s*", output)
+        value = int(match.group(1), 16) if match else None
+        return ("throttledFlags", value) if value is not None else None
     if command == "measure_temp":
         match = re.search(r"=(-?[0-9.]+)", output)
         value = finite_number(match.group(1) if match else None)
@@ -374,6 +401,14 @@ def parse_vcgencmd(command: str, output: str) -> tuple[str, Any] | None:
         match = re.search(r"=([0-9.]+)V", output)
         value = finite_number(match.group(1) if match else None)
         return ("coreVoltageV", value) if value is not None else None
+    if command == "pmic_read_adc EXT5V_V":
+        match = re.fullmatch(
+            r"\s*EXT5V_V\s+volt\(\d+\)=([0-9]+(?:\.[0-9]+)?)V\s*",
+            output,
+        )
+        parsed = finite_number(match.group(1) if match else None)
+        value = supply_voltage_volts(parsed)
+        return ("supplyVoltageVolts", value) if value is not None else None
     return None
 
 
@@ -384,6 +419,7 @@ def collect_gpu(vcgencmd: str, timeout: float) -> dict[str, Any]:
     for invocation in (
         ("get_throttled",), ("measure_temp",), ("get_mem", "gpu"),
         ("measure_clock", "core"), ("measure_volts", "core"),
+        ("pmic_read_adc", "EXT5V_V"),
     ):
         try:
             completed = subprocess.run(
@@ -391,8 +427,10 @@ def collect_gpu(vcgencmd: str, timeout: float) -> dict[str, Any]:
             )
         except (OSError, subprocess.SubprocessError):
             continue
+        if completed.returncode != 0:
+            continue
         parsed = parse_vcgencmd(" ".join(invocation), completed.stdout[:256])
-        if completed.returncode == 0 and parsed:
+        if parsed:
             result[parsed[0]] = parsed[1]
     return result
 
@@ -560,6 +598,24 @@ def collect_containers(
 
 TIMESTAMP_RE = re.compile(r"^(\d{4}-\d\d-\d\d[T ][0-9:.+-]+(?:Z)?)")
 SYSLOG_TIMESTAMP_RE = re.compile(r"^([A-Z][a-z]{2})\s+(\d{1,2})\s+(\d\d:\d\d:\d\d)")
+POWER_EVENT_DETAILS = {
+    ("under-voltage", "active"): (
+        "warning",
+        "Kernel reported an under-voltage condition.",
+    ),
+    ("under-voltage", "recovered"): (
+        "info",
+        "Kernel reported voltage recovery.",
+    ),
+    ("nvme-reset", "active"): (
+        "critical",
+        "Kernel reported an NVMe controller reset.",
+    ),
+    ("nvme-io", "active"): (
+        "critical",
+        "Kernel reported an NVMe I/O error.",
+    ),
+}
 
 
 def event_timestamp(line: str, fallback: str) -> str:
@@ -665,6 +721,100 @@ def existing_alert_record(record: Mapping[str, Any]) -> dict[str, Any] | None:
         "status": bounded_text(record.get("status", "unknown"), 32),
         "message": message,
     }
+
+
+def sanitize_kernel_power_line(line: str, fallback_timestamp: str) -> dict[str, str] | None:
+    event: tuple[str, str] | None = None
+    if "Undervoltage detected!" in line:
+        event = ("under-voltage", "active")
+    elif "Voltage normalised" in line:
+        event = ("under-voltage", "recovered")
+    elif re.search(r"\bnvme\S*.*controller is down; will reset\b", line, re.IGNORECASE):
+        event = ("nvme-reset", "active")
+    elif re.search(r"\bnvme\S*", line, re.IGNORECASE) and (
+        "I/O Error" in line or re.search(r"I/O error,\s*dev\s+nvme", line, re.IGNORECASE)
+    ):
+        event = ("nvme-io", "active")
+    if event is None:
+        return None
+    severity, message = POWER_EVENT_DETAILS[event]
+    return {
+        "timestamp": event_timestamp(line, fallback_timestamp),
+        "severity": severity,
+        "kind": event[0],
+        "status": event[1],
+        "message": message,
+    }
+
+
+def existing_power_record(record: Mapping[str, Any]) -> dict[str, str] | None:
+    required = {"timestamp", "severity", "kind", "status", "message"}
+    if set(record) != required:
+        return None
+    normalized_timestamp = event_timestamp(str(record.get("timestamp", "")), "")
+    if not normalized_timestamp:
+        return None
+    event = (str(record.get("kind", "")), str(record.get("status", "")))
+    details = POWER_EVENT_DETAILS.get(event)
+    if details is None:
+        return None
+    severity, message = details
+    if record.get("severity") != severity or record.get("message") != message:
+        return None
+    return {
+        "timestamp": normalized_timestamp,
+        "severity": severity,
+        "kind": event[0],
+        "status": event[1],
+        "message": message,
+    }
+
+
+def existing_sample_record(record: Mapping[str, Any]) -> dict[str, Any] | None:
+    fields = frozenset(record)
+    if fields not in {frozenset(SAMPLE_FIELDS), frozenset(LEGACY_SAMPLE_FIELDS)}:
+        return None
+    timestamp = event_timestamp(str(record.get("timestamp", "")), "")
+    if not timestamp:
+        return None
+    normalized: dict[str, Any] = {}
+    valid_power_states = {
+        "normal", "degraded-history", "throttled", "thermal-limit",
+        "frequency-capped", "under-voltage",
+    }
+    for field in SAMPLE_FIELDS:
+        value = record.get(field)
+        if field == "timestamp":
+            normalized[field] = timestamp
+        elif field == "powerState":
+            normalized[field] = value if isinstance(value, str) and value in valid_power_states else None
+        elif field == "supplyVoltageVolts":
+            normalized[field] = supply_voltage_volts(value)
+        elif field == "throttledFlags":
+            normalized[field] = uint32(value)
+        elif value is None:
+            normalized[field] = None
+        elif isinstance(value, bool) or not isinstance(value, (int, float)):
+            normalized[field] = None
+        else:
+            normalized[field] = value if finite_number(value) is not None else None
+    return normalized
+
+
+def deduplicate_power_records(records: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+    result: list[Mapping[str, Any]] = []
+    seen: set[tuple[str, Any, Any]] = set()
+    for record in records:
+        # event_timestamp deliberately truncates sub-second kernel timestamps.
+        # Status remains part of the key so a rare active/recovered pair in one
+        # second is not collapsed, while bursty duplicate kernel messages are.
+        timestamp_second = event_timestamp(str(record.get("timestamp", "")), "")
+        key = (timestamp_second, record.get("kind"), record.get("status"))
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(record)
+    return result
 
 
 def existing_privilege_record(record: Mapping[str, Any]) -> dict[str, str] | None:
@@ -806,27 +956,46 @@ def export_sanitized_logs(config: "Config", now_text: str, gpu: Mapping[str, Any
 
     # vcgencmd low bits describe a currently active under-voltage, frequency
     # cap, throttle, or thermal limit. Export transitions, not one alert/minute.
-    flags = gpu.get("throttledFlags") if isinstance(gpu, Mapping) else None
-    if isinstance(flags, int):
+    flags = uint32(gpu.get("throttledFlags")) if isinstance(gpu, Mapping) else None
+    voltage = supply_voltage_volts(gpu.get("supplyVoltageVolts")) if isinstance(gpu, Mapping) else None
+    if flags is not None:
         active_flags = flags & 0xF
-        previous_flags = cursors.get("powerFlags")
+        previous_flags = uint32(cursors.get("powerFlags"))
+        detail = f" Full flags are 0x{flags:08x}."
+        if voltage is not None:
+            detail += f" Supply voltage is {voltage:.3f} V."
         if active_flags and active_flags != previous_flags:
             alert_records.append({
                 "timestamp": now_text,
                 "severity": "warning",
                 "kind": "power",
                 "status": "active",
-                "message": f"Current vcgencmd throttle flags are 0x{active_flags:x}.",
+                "message": f"Current vcgencmd throttle flags are 0x{active_flags:x}." + detail,
             })
-        elif not active_flags and isinstance(previous_flags, int) and previous_flags:
+        elif not active_flags and previous_flags not in {None, 0}:
             alert_records.append({
                 "timestamp": now_text,
                 "severity": "info",
                 "kind": "power",
                 "status": "recovered",
-                "message": "Current vcgencmd throttle condition recovered.",
+                "message": "Current vcgencmd throttle condition recovered." + detail,
             })
         next_cursors["powerFlags"] = active_flags
+
+    power_records = [
+        normalized for record in existing_json_lines(config.output_dir / "power.jsonl", config.max_log_records)
+        if (normalized := existing_power_record(record)) is not None
+    ]
+    kernel_cursor = cursors.get("kernelPower", {})
+    if not isinstance(kernel_cursor, Mapping):
+        kernel_cursor = {}
+    lines, cursor = read_new_lines(config.kernel_log, kernel_cursor, config.kernel_max_input_bytes)
+    for line in lines:
+        sanitized = sanitize_kernel_power_line(line, now_text)
+        if sanitized:
+            power_records.append(sanitized)
+    next_cursors["kernelPower"] = cursor
+    power_records = deduplicate_power_records(power_records)
 
     privilege_records = [
         normalized for record in existing_json_lines(config.output_dir / "privilege.jsonl", config.max_log_records)
@@ -845,6 +1014,7 @@ def export_sanitized_logs(config: "Config", now_text: str, gpu: Mapping[str, Any
     next_cursors["privilege"] = next_privilege
 
     rewrite_json_lines(config.output_dir / "alerts.jsonl", alert_records, config.max_log_records)
+    rewrite_json_lines(config.output_dir / "power.jsonl", power_records, config.max_log_records)
     rewrite_json_lines(config.output_dir / "privilege.jsonl", privilege_records, config.max_log_records)
     atomic_write_json(cursor_path, next_cursors, 0o600)
 
@@ -891,6 +1061,7 @@ class Config:
     mountinfo: Path | None = None
     mount_root: Path | None = None
     events_log: Path = Path("/var/log/server-watch/events.log")
+    kernel_log: Path = Path("/var/log/kern.log")
     privilege_logs: list[Path] = field(default_factory=lambda: [Path("/var/log/privilege-events.log")])
     docker_sockets: dict[str, Path] = field(default_factory=lambda: {key: Path(value) for key, value in DEFAULT_SOCKETS.items()})
     curl: str = "/usr/bin/curl"
@@ -899,6 +1070,7 @@ class Config:
     retention_days: int = 30
     max_log_records: int = 5000
     max_input_bytes: int = 1_048_576
+    kernel_max_input_bytes: int = DEFAULT_KERNEL_MAX_INPUT_BYTES
 
     @property
     def mountinfo_path(self) -> Path:
@@ -916,6 +1088,7 @@ def config_from_environment(arguments: Sequence[str] | None = None) -> Config:
     parser.add_argument("--mountinfo", default=env.get("MONITOR_MOUNTINFO"))
     parser.add_argument("--mount-root", default=env.get("MONITOR_MOUNT_ROOT"))
     parser.add_argument("--events-log", default=env.get("MONITOR_EVENTS_LOG", "/var/log/server-watch/events.log"))
+    parser.add_argument("--kernel-log", default=env.get("MONITOR_KERNEL_LOG", "/var/log/kern.log"))
     parser.add_argument("--privilege-logs", default=env.get("MONITOR_PRIVILEGE_LOGS", "/var/log/privilege-events.log"))
     parser.add_argument("--docker-sockets", default=env.get(
         "MONITOR_DOCKER_SOCKETS", ",".join(f"{owner}={path}" for owner, path in DEFAULT_SOCKETS.items())
@@ -926,19 +1099,25 @@ def config_from_environment(arguments: Sequence[str] | None = None) -> Config:
     parser.add_argument("--retention-days", type=int, default=int(env.get("MONITOR_RETENTION_DAYS", "30")))
     parser.add_argument("--max-log-records", type=int, default=int(env.get("MONITOR_MAX_LOG_RECORDS", "5000")))
     parser.add_argument("--max-input-bytes", type=int, default=int(env.get("MONITOR_MAX_INPUT_BYTES", "1048576")))
+    parser.add_argument(
+        "--kernel-max-input-bytes",
+        type=int,
+        default=int(env.get("MONITOR_KERNEL_MAX_INPUT_BYTES", str(DEFAULT_KERNEL_MAX_INPUT_BYTES))),
+    )
     values = parser.parse_args(arguments)
     return Config(
         output_dir=Path(values.output_dir), runtime_dir=Path(values.runtime_dir),
         proc_root=Path(values.proc_root), sys_root=Path(values.sys_root), etc_root=Path(values.etc_root),
         mountinfo=Path(values.mountinfo) if values.mountinfo else None,
         mount_root=Path(values.mount_root) if values.mount_root else None,
-        events_log=Path(values.events_log),
+        events_log=Path(values.events_log), kernel_log=Path(values.kernel_log),
         privilege_logs=[Path(item) for item in values.privilege_logs.split(":") if item],
         docker_sockets=parse_socket_map(values.docker_sockets), curl=values.curl, vcgencmd=values.vcgencmd,
         command_timeout=max(0.1, min(10.0, values.command_timeout)),
         retention_days=max(1, min(366, values.retention_days)),
         max_log_records=max(10, min(100_000, values.max_log_records)),
         max_input_bytes=max(4096, min(16_777_216, values.max_input_bytes)),
+        kernel_max_input_bytes=max(65_536, min(16_777_216, values.kernel_max_input_bytes)),
     )
 
 
@@ -967,9 +1146,10 @@ def run(config: Config, now: dt.datetime | None = None) -> dict[str, Any]:
             temperature = gpu["temperatureC"]
 
         load1, load5, load15 = parse_loadavg(read_text(config.proc_root / "loadavg", 128))
-        power_flags = gpu.get("throttledFlags")
+        power_flags = uint32(gpu.get("throttledFlags"))
+        supply_voltage = supply_voltage_volts(gpu.get("supplyVoltageVolts"))
         power_state = None
-        if isinstance(power_flags, int):
+        if power_flags is not None:
             active_flags = power_flags & 0xF
             historical_flags = (power_flags >> 16) & 0xF
             power_state = ("degraded-history" if historical_flags else "normal") if active_flags == 0 else (
@@ -989,6 +1169,8 @@ def run(config: Config, now: dt.datetime | None = None) -> dict[str, Any]:
             "load5": load5,
             "load15": load15,
             "powerState": power_state,
+            "supplyVoltageVolts": supply_voltage,
+            "throttledFlags": power_flags,
             "gpuMemoryBytes": gpu.get("gpuMemoryBytes") if isinstance(gpu.get("gpuMemoryBytes"), int) else None,
             "gpuClockHz": gpu.get("gpuClockHz") if isinstance(gpu.get("gpuClockHz"), int) else None,
             "networkRxBytesPerSecond": network_rates[0],
@@ -1014,12 +1196,16 @@ def run(config: Config, now: dt.datetime | None = None) -> dict[str, Any]:
             "disks": collect_filesystems(read_text(config.mountinfo_path), config.mount_root),
             "containers": containers,
         }
-        # The strict public snapshot schema has no GPU object. GPU temperature
-        # contributes to latest.temperatureC and power transitions go to alerts.
+        # The strict public snapshot schema has no GPU object. GPU temperature,
+        # supply voltage, and throttle flags contribute only to the safe latest
+        # sample; power transitions go to the bounded semantic event exports.
         atomic_write_json(config.output_dir / "current.json", current)
         history_dir = config.output_dir / "history"
         history_path = history_dir / f"{now.date().isoformat()}.jsonl"
-        history_records = existing_json_lines(history_path, 1999)
+        history_records = [
+            normalized for record in existing_json_lines(history_path, 1999)
+            if (normalized := existing_sample_record(record)) is not None
+        ]
         history_records.append(latest)
         rewrite_json_lines(history_path, history_records, 2000)
         prune_history(history_dir, now.date(), config.retention_days)

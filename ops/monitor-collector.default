@@ -6,6 +6,7 @@ MONITOR_PROC_ROOT=/proc
 MONITOR_SYS_ROOT=/sys
 MONITOR_ETC_ROOT=/etc
 MONITOR_EVENTS_LOG=/var/log/server-watch/events.log
+MONITOR_KERNEL_LOG=/var/log/kern.log
 MONITOR_PRIVILEGE_LOGS=/var/log/privilege-events.log
 MONITOR_DOCKER_SOCKETS=cks=/run/user/1001/docker.sock,psy=/run/user/1002/docker.sock,wgang=/run/user/1003/docker.sock
 MONITOR_CURL=/usr/bin/curl
@@ -14,6 +15,7 @@ MONITOR_COMMAND_TIMEOUT=2
 MONITOR_RETENTION_DAYS=30
 MONITOR_MAX_LOG_RECORDS=5000
 MONITOR_MAX_INPUT_BYTES=1048576
+MONITOR_KERNEL_MAX_INPUT_BYTES=8388608
 
 # Fixture-only overrides (normally leave unset):
 # MONITOR_MOUNTINFO=/path/to/fixture/mountinfo

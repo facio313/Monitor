@@ -16,8 +16,9 @@ StateDirectory=monitor-export
 StateDirectoryMode=0750
 UMask=0027
 
-# The collector needs aggregate proc/sys telemetry, selected logs, and the three
-# read-only rootless Docker API sockets. It writes only its state/export roots.
+# The collector needs aggregate proc/sys telemetry, selected logs (including
+# the configured kernel log), and the three read-only rootless Docker API
+# sockets. It writes only its state/export roots.
 ProtectSystem=strict
 ProtectHome=read-only
 InaccessiblePaths=/home /root
@@ -39,6 +40,9 @@ RestrictNamespaces=true
 RestrictRealtime=true
 LockPersonality=true
 MemoryDenyWriteExecute=true
+MemoryHigh=160M
+MemoryMax=192M
+TasksMax=64
 CapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH
 ReadOnlyPaths=/proc /sys /var/log /run/user
 ReadWritePaths=/var/lib/monitor-export /run/monitor-collector

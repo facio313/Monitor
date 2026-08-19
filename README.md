@@ -35,10 +35,17 @@ The dashboard provides:
 
 - CPU, memory, temperature, load, network, and disk-I/O summaries and charts;
 - `1h`, `24h`, `7d`, and `30d` ranges, with at most 360 chart points;
-- host, power/GPU, filesystem, and per-owner container status;
+- host, EXT5V supply/power/GPU, filesystem, and per-owner container status;
 - recent semantic alerts and privilege outcomes without commands or arguments;
 - stale-data and refresh-error indicators, one-minute visible-tab refreshes,
   and a responsive table/card layout.
+
+The overview keeps operational scanning compact: it shows the latest EXT5V and
+throttle state plus at most the newest 10 alerts and 10 privilege records from
+the selected range. `/monitor/details` uses the same authenticated API snapshot
+to show the full API-bounded event lists (up to 500 each), the EXT5V history and
+power/storage event timeline, full-range power statistics, and expanded CPU,
+memory, temperature/load, network, and disk-I/O charts.
 
 ## Requirements
 
@@ -307,6 +314,7 @@ Collector variables and defaults are:
 | `MONITOR_RUNTIME_DIR` | `/run/monitor-collector` |
 | `MONITOR_PROC_ROOT`, `MONITOR_SYS_ROOT`, `MONITOR_ETC_ROOT` | `/proc`, `/sys`, `/etc` |
 | `MONITOR_EVENTS_LOG` | `/var/log/server-watch/events.log` |
+| `MONITOR_KERNEL_LOG` | `/var/log/kern.log` |
 | `MONITOR_PRIVILEGE_LOGS` | `/var/log/privilege-events.log` |
 | `MONITOR_DOCKER_SOCKETS` | `cks=/run/user/1001/docker.sock,psy=/run/user/1002/docker.sock,wgang=/run/user/1003/docker.sock` |
 | `MONITOR_CURL` | `/usr/bin/curl` |
@@ -315,6 +323,7 @@ Collector variables and defaults are:
 | `MONITOR_RETENTION_DAYS` | `30` |
 | `MONITOR_MAX_LOG_RECORDS` | `5000` per event export |
 | `MONITOR_MAX_INPUT_BYTES` | `1048576` per input read |
+| `MONITOR_KERNEL_MAX_INPUT_BYTES` | `8388608` per kernel-log read |
 
 `MONITOR_MOUNTINFO` and `MONITOR_MOUNT_ROOT` are normally unset and exist for
 fixture roots. The installed source of truth is
@@ -336,14 +345,34 @@ The default root is `/var/lib/monitor-export`:
 - `history/YYYY-MM-DD.jsonl` contains one reduced telemetry sample per line.
   Each day is capped at 2,000 rows and the default calendar retention is 30
   days.
-- `alerts.jsonl` and `privilege.jsonl` are each capped at 5,000 records.
+- `alerts.jsonl`, `power.jsonl`, and `privilege.jsonl` are each capped at 5,000
+  records. Every `power.jsonl` record has exactly `timestamp`, `severity`,
+  `kind`, `status`, and a fixed semantic `message`; it never contains the raw
+  kernel line.
 - `.state/log-cursors.json` prevents replay after service restarts. Short-lived
   rate counters live in `/run/monitor-collector/delta-state.json`.
 
 `host` contains hostname, OS, architecture, and uptime. A `latest`/history
 sample contains a timestamp plus CPU and memory percentages and byte totals,
-temperature, 1/5/15-minute load, power state, GPU memory/clock, network RX/TX
-rates, and disk read/write rates. Missing sensors are represented as `null`.
+temperature, 1/5/15-minute load, power state, the sampled `supplyVoltageVolts`,
+numeric uint32 `throttledFlags`, GPU memory/clock, network RX/TX rates, and disk
+read/write rates. Missing or invalid sensors are represented as `null`.
+
+Once per collector run, `vcgencmd pmic_read_adc EXT5V_V` supplies the single
+external 5 V rail sample and `vcgencmd get_throttled` supplies the numeric
+current/latched flags. EXT5V is a point-in-time rail voltage—not input current
+in amperes, consumed or available watts, wall-outlet power, or the USB-C
+negotiated power profile. Monitor does not invent a voltage threshold from this
+sample. Kernel under-voltage/recovery reports and `vcgencmd` throttle flags are
+the authoritative condition signals; a missing voltage is unknown, not zero.
+
+The collector reads only its configured bounded portion of `/var/log/kern.log`
+and recognizes a narrow semantic allow-list: the exact Raspberry Pi
+`Undervoltage detected!` and `Voltage normalised` events, an NVMe controller
+down/reset pattern, and NVMe I/O-error patterns. It maps those to fixed
+under-voltage, recovery, NVMe-reset, or NVMe-I/O messages, deduplicates repeated
+same-second event kinds and statuses, and exports no device-specific raw text.
+A missing kernel log is non-fatal and simply yields no new kernel power events.
 
 Each disk is reduced to mount, total/used bytes, and used percentage. Each
 container is reduced to name, owner, state, health, CPU percentage, and memory
@@ -352,9 +381,20 @@ bounded semantic message. Privilege records contain only timestamp, actor,
 target, action, and result—never a command, arguments, environment, container
 ID, image, mount, or raw log line.
 
-The API validates and bounds the files again, rejects malformed/future data,
-returns at most 100 alerts and 100 privilege events, and marks a response stale
-when no recent sample exists. Supported requests are:
+The API validates and bounds the files again, rejects malformed, out-of-range,
+or future data, and marks a response stale when no recent sample exists. It
+returns at most 360 chart samples and 500 each of alerts, power events, and
+privilege events. Chart downsampling preferentially retains the first/last
+sample, voltage extrema, and power-state/flag transitions. `powerSummary` is
+calculated from every valid sample in the selected range before downsampling
+and contains `sampleCount`, `voltageSampleCount`, minimum/average/maximum EXT5V,
+and active under-voltage/throttle sample counts. `powerEvents` contains exactly
+`timestamp`, `severity`, `kind`, `status`, `message`,
+`supplyVoltageVolts`, and `throttledFlags`; dedicated `power.jsonl` events take
+precedence, legacy power alerts are merged with semantic deduplication, and
+only a telemetry sample within two minutes may be attached to an event.
+
+Supported requests are:
 
 ```text
 GET    /healthz
@@ -386,6 +426,9 @@ GET    /monitor/api/dashboard?range=1h|24h|7d|30d
 - API responses are `no-store`; Helmet supplies a restrictive CSP and related
   headers. The data reader refuses symlink escapes, oversized files/lines, and
   non-allow-listed fields, and applies a second redaction pass to messages.
+- Kernel power evidence is reduced to the fixed `power.jsonl` schema before the
+  web container can read it. The container never receives `/var/log/kern.log`
+  or another raw host log.
 
 This is a shared-password operations view. Keep it behind HTTPS, do not expose
 port `5181`, and do not mount additional host paths into the container.
@@ -549,9 +592,21 @@ Diagnostics do not require exposing secret values:
 ```sh
 sudo systemctl status monitor-collector.timer monitor-collector.service
 sudo journalctl -u monitor-collector.service -n 100 --no-pager
+sudo /usr/bin/vcgencmd pmic_read_adc EXT5V_V
+sudo /usr/bin/vcgencmd get_throttled
+sudo systemctl start monitor-collector.service
+sudo -u cks tail -n 20 /var/lib/monitor-export/power.jsonl
 sudo -u cks env XDG_RUNTIME_DIR=/run/user/1001 DOCKER_HOST=unix:///run/user/1001/docker.sock docker logs --tail 100 monitor
 sudo nginx -t
 ```
+
+`pmic_read_adc EXT5V_V` confirms whether this board exposes the sampled rail;
+`get_throttled` reports current low bits and latched historical high bits. An
+unsupported command or missing reading should appear as `null`, not as a
+fabricated zero. Inspect the sanitized `power.jsonl` export rather than copying
+raw kernel-log lines into tickets or chat. If the file is absent, run the
+collector once and check its journal; absence remains normal on hosts without a
+matching kernel event.
 
 Remove the container, then the collector:
 

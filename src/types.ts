@@ -1,4 +1,26 @@
 export type TimeRange = '1h' | '24h' | '7d' | '30d';
+export type MonitorPage = 'overview' | 'details';
+
+export interface TelemetrySample {
+  timestamp: string | null;
+  cpuPercent: number | null;
+  memoryPercent: number | null;
+  memoryUsedBytes: number | null;
+  memoryTotalBytes: number | null;
+  temperatureC: number | null;
+  load1: number | null;
+  load5: number | null;
+  load15: number | null;
+  powerState: string | null;
+  supplyVoltageVolts: number | null;
+  throttledFlags: number | null;
+  gpuMemoryBytes: number | null;
+  gpuClockHz: number | null;
+  networkRxBytesPerSecond: number | null;
+  networkTxBytesPerSecond: number | null;
+  diskReadBytesPerSecond: number | null;
+  diskWriteBytesPerSecond: number | null;
+}
 
 export interface DashboardPayload {
   generatedAt: string;
@@ -10,41 +32,34 @@ export interface DashboardPayload {
     architecture: string | null;
     uptimeSeconds: number | null;
   };
-  latest: {
-    timestamp: string | null;
-    cpuPercent: number | null;
-    memoryPercent: number | null;
-    memoryUsedBytes: number | null;
-    memoryTotalBytes: number | null;
-    temperatureC: number | null;
-    load1: number | null;
-    load5: number | null;
-    load15: number | null;
-    powerState: string | null;
-    gpuMemoryBytes: number | null;
-    gpuClockHz: number | null;
-    networkRxBytesPerSecond: number | null;
-    networkTxBytesPerSecond: number | null;
-    diskReadBytesPerSecond: number | null;
-    diskWriteBytesPerSecond: number | null;
-  } | null;
-  series: TelemetryPoint[];
+  latest: TelemetrySample | null;
+  series: TelemetrySample[];
   disks: DiskUsage[];
   containers: ContainerStatus[];
   alerts: AlertEvent[];
   privilegeEvents: PrivilegeEvent[];
+  powerEvents: PowerEvent[];
+  powerSummary: PowerSummary;
 }
 
-export interface TelemetryPoint {
+export interface PowerEvent {
   timestamp: string;
-  cpuPercent: number | null;
-  memoryPercent: number | null;
-  temperatureC: number | null;
-  load1: number | null;
-  networkRxBytesPerSecond: number | null;
-  networkTxBytesPerSecond: number | null;
-  diskReadBytesPerSecond: number | null;
-  diskWriteBytesPerSecond: number | null;
+  severity: string;
+  kind: string | null;
+  status: string | null;
+  message: string;
+  supplyVoltageVolts: number | null;
+  throttledFlags: number | null;
+}
+
+export interface PowerSummary {
+  sampleCount: number;
+  voltageSampleCount: number;
+  minSupplyVoltageVolts: number | null;
+  averageSupplyVoltageVolts: number | null;
+  maxSupplyVoltageVolts: number | null;
+  underVoltageSampleCount: number;
+  throttledSampleCount: number;
 }
 
 export interface DiskUsage {

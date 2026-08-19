@@ -479,10 +479,22 @@ describe('dashboard ingestion', () => {
       timestamp: '2026-08-19T12:00:00.000Z',
       cpuPercent: null,
       temperatureC: null,
+      supplyVoltageVolts: null,
+      throttledFlags: null,
       diskReadBytesPerSecond: null,
     });
     expect(response.body.series).toEqual([]);
     expect(response.body.alerts).toEqual([]);
+    expect(response.body.powerEvents).toEqual([]);
+    expect(response.body.powerSummary).toEqual({
+      sampleCount: 0,
+      voltageSampleCount: 0,
+      minSupplyVoltageVolts: null,
+      averageSupplyVoltageVolts: null,
+      maxSupplyVoltageVolts: null,
+      underVoltageSampleCount: 0,
+      throttledSampleCount: 0,
+    });
   });
 
   it('whitelists fields, redacts secrets, and never returns raw privilege commands', async () => {
@@ -534,6 +546,8 @@ describe('dashboard ingestion', () => {
       'load5',
       'load15',
       'powerState',
+      'supplyVoltageVolts',
+      'throttledFlags',
       'gpuMemoryBytes',
       'gpuClockHz',
       'networkRxBytesPerSecond',
@@ -548,12 +562,201 @@ describe('dashboard ingestion', () => {
     expect(response.body.privilegeEvents[0].result).toBe('success');
   });
 
-  it('downsamples history to at most 360 points', async () => {
+  it('normalizes power telemetry, summarizes the full range, and correlates sanitized power events', async () => {
     const directory = dataDirectory();
-    const lines = Array.from({ length: 1_000 }, (_, index) => JSON.stringify({
+    const history = [
+      { timestamp: '2026-08-19T11:54:00Z', supplyVoltageVolts: 5.2, throttledFlags: 0 },
+      { timestamp: '2026-08-19T11:55:00Z', supplyVoltageVolts: '5.0', throttledFlags: 1.5 },
+      { timestamp: '2026-08-19T11:56:00Z', supplyVoltageVolts: -0.1, throttledFlags: -1 },
+      { timestamp: '2026-08-19T11:57:30Z', supplyVoltageVolts: 4.7, throttledFlags: 1 },
+      { timestamp: '2026-08-19T11:58:00Z', supplyVoltageVolts: 10, throttledFlags: 0xffff_ffff },
+    ];
+    writeFileSync(
+      join(directory, 'history', '2026-08-19.jsonl'),
+      history.map((sample) => JSON.stringify(sample)).join('\n'),
+    );
+    writeFileSync(join(directory, 'current.json'), JSON.stringify({
+      latest: {
+        timestamp: '2026-08-19T12:00:00Z',
+        supplyVoltageVolts: 5.1,
+        throttledFlags: 4,
+      },
+    }));
+
+    const duplicateMessage = 'Supply voltage warning token=abc123';
+    writeFileSync(join(directory, 'power.jsonl'), [
+      {
+        timestamp: '2026-08-19T11:57:20.100Z', severity: 'warning', kind: 'power', status: 'active',
+        message: duplicateMessage,
+      },
+      {
+        timestamp: '2026-08-19T11:57:20.900Z', severity: 'warning', kind: 'power', status: 'active',
+        message: duplicateMessage,
+      },
+      {
+        timestamp: '2026-08-19T11:51:00Z', severity: 'info', kind: 'nvme', status: 'recovered',
+        message: 'NVMe power condition recovered.',
+      },
+      {
+        timestamp: '2026-08-19T12:02:00Z', severity: 'critical', kind: 'power', status: 'active',
+        message: 'Future power event must be excluded.',
+      },
+      {
+        timestamp: '2026-08-19T10:59:59Z', severity: 'critical', kind: 'power', status: 'active',
+        message: 'Out-of-range power event must be excluded.',
+      },
+    ].map((event) => JSON.stringify(event)).join('\n'));
+    writeFileSync(join(directory, 'alerts.jsonl'), [
+      {
+        timestamp: '2026-08-19T11:57:20.500Z', severity: 'warning', kind: 'host', status: 'active',
+        message: duplicateMessage,
+      },
+      {
+        timestamp: '2026-08-19T11:58:10Z', severity: 'warn', kind: 'HOST', status: 'active',
+        message: 'Host condition POWER-THROTTLE is active.',
+      },
+      {
+        timestamp: '2026-08-19T11:58:20Z', severity: 'warn', kind: 'application', status: 'active',
+        message: 'Application voltage label changed.',
+      },
+      {
+        timestamp: '2026-08-19T11:54:10Z', severity: 'warn', kind: 'host', status: 'active',
+        message: 'A hypervoltagefoo lookalike is not a controlled match.',
+      },
+    ].map((event) => JSON.stringify(event)).join('\n'));
+
+    const app = appFor(directory);
+    const cookie = await loginCookie(app);
+    const response = await request(app)
+      .get('/monitor/api/dashboard?range=1h')
+      .set('Cookie', cookie)
+      .expect(200);
+
+    expect(response.body.latest).toMatchObject({
+      supplyVoltageVolts: 5.1,
+      throttledFlags: 4,
+    });
+    const invalidSample = response.body.series.find((sample: { timestamp: string }) => (
+      sample.timestamp === '2026-08-19T11:55:00.000Z'
+    ));
+    expect(invalidSample).toMatchObject({ supplyVoltageVolts: null, throttledFlags: null });
+    expect(response.body.powerSummary).toEqual({
+      sampleCount: 6,
+      voltageSampleCount: 4,
+      minSupplyVoltageVolts: 4.7,
+      averageSupplyVoltageVolts: 6.25,
+      maxSupplyVoltageVolts: 10,
+      underVoltageSampleCount: 2,
+      throttledSampleCount: 2,
+    });
+
+    expect(response.body.powerEvents).toHaveLength(3);
+    expect(response.body.powerEvents[0]).toEqual({
+      timestamp: '2026-08-19T11:58:10.000Z',
+      severity: 'warning',
+      kind: 'HOST',
+      status: 'active',
+      message: 'Host condition POWER-THROTTLE is active.',
+      supplyVoltageVolts: 10,
+      throttledFlags: 0xffff_ffff,
+    });
+    expect(response.body.powerEvents[1]).toEqual({
+      timestamp: '2026-08-19T11:57:20.900Z',
+      severity: 'warning',
+      kind: 'power',
+      status: 'active',
+      message: 'Supply voltage warning token=[redacted]',
+      supplyVoltageVolts: 4.7,
+      throttledFlags: 1,
+    });
+    expect(response.body.powerEvents[2]).toEqual({
+      timestamp: '2026-08-19T11:51:00.000Z',
+      severity: 'info',
+      kind: 'nvme',
+      status: 'recovered',
+      message: 'NVMe power condition recovered.',
+      supplyVoltageVolts: null,
+      throttledFlags: null,
+    });
+    expect(Object.keys(response.body.powerEvents[0])).toEqual([
+      'timestamp',
+      'severity',
+      'kind',
+      'status',
+      'message',
+      'supplyVoltageVolts',
+      'throttledFlags',
+    ]);
+    expect(JSON.stringify(response.body)).not.toContain('abc123');
+  });
+
+  it('merges a same-timestamp current sample into legacy history before power summaries and correlation', async () => {
+    const directory = dataDirectory();
+    const timestamp = '2026-08-19T11:59:00Z';
+    writeFileSync(join(directory, 'history', '2026-08-19.jsonl'), `${JSON.stringify({
+      timestamp,
+      cpuPercent: 12,
+      powerState: 'normal',
+    })}\n`);
+    writeFileSync(join(directory, 'current.json'), JSON.stringify({
+      latest: {
+        timestamp,
+        powerState: 'under-voltage',
+        supplyVoltageVolts: 4.75,
+        throttledFlags: 1,
+      },
+    }));
+    writeFileSync(join(directory, 'power.jsonl'), `${JSON.stringify({
+      timestamp,
+      severity: 'warning',
+      kind: 'under-voltage',
+      status: 'active',
+      message: 'Kernel reported an under-voltage condition.',
+    })}\n`);
+
+    const app = appFor(directory);
+    const cookie = await loginCookie(app);
+    const response = await request(app)
+      .get('/monitor/api/dashboard?range=1h')
+      .set('Cookie', cookie)
+      .expect(200);
+
+    expect(response.body.latest).toMatchObject({
+      powerState: 'under-voltage',
+      supplyVoltageVolts: 4.75,
+      throttledFlags: 1,
+    });
+    expect(response.body.series).toHaveLength(1);
+    expect(response.body.series[0]).toMatchObject({
+      cpuPercent: 12,
+      powerState: 'under-voltage',
+      supplyVoltageVolts: 4.75,
+      throttledFlags: 1,
+    });
+    expect(response.body.powerSummary).toMatchObject({
+      sampleCount: 1,
+      voltageSampleCount: 1,
+      minSupplyVoltageVolts: 4.75,
+      averageSupplyVoltageVolts: 4.75,
+      maxSupplyVoltageVolts: 4.75,
+      underVoltageSampleCount: 1,
+    });
+    expect(response.body.powerEvents[0]).toMatchObject({
+      supplyVoltageVolts: 4.75,
+      throttledFlags: 1,
+    });
+  });
+
+  it('downsamples history while preserving endpoints, voltage extrema, and power transitions', async () => {
+    const directory = dataDirectory();
+    const samples = Array.from({ length: 1_000 }, (_, index) => ({
       timestamp: new Date(NOW - 3_600_000 + index * 3_000).toISOString(),
       cpu: { percent: index % 101 },
-    })).join('\n');
+      powerState: index === 400 ? 'under-voltage' : 'normal',
+      supplyVoltageVolts: index === 137 ? 4.2 : index === 811 ? 5.8 : 5.1,
+      throttledFlags: index === 400 ? 1 : 0,
+    }));
+    const lines = samples.map((sample) => JSON.stringify(sample)).join('\n');
     writeFileSync(join(directory, 'history', '2026-08-19.jsonl'), lines);
     const app = appFor(directory);
     const cookie = await loginCookie(app);
@@ -562,13 +765,73 @@ describe('dashboard ingestion', () => {
       .set('Cookie', cookie)
       .expect(200);
     expect(response.body.series).toHaveLength(360);
+    const timestamps = new Set(response.body.series.map((sample: { timestamp: string }) => sample.timestamp));
+    for (const index of [0, 137, 400, 401, 811, 999]) {
+      expect(timestamps.has(samples[index]!.timestamp)).toBe(true);
+    }
+    expect(response.body.powerSummary).toEqual({
+      sampleCount: 1_000,
+      voltageSampleCount: 1_000,
+      minSupplyVoltageVolts: 4.2,
+      averageSupplyVoltageVolts: 5.1,
+      maxSupplyVoltageVolts: 5.8,
+      underVoltageSampleCount: 1,
+      throttledSampleCount: 0,
+    });
+  });
+
+  it('caps alerts, power events, and privilege details at 500 newest records', async () => {
+    const directory = dataDirectory();
+    const timestamps = Array.from({ length: 600 }, (_, index) => new Date(NOW - index * 1_000).toISOString());
+    writeFileSync(join(directory, 'alerts.jsonl'), timestamps.map((timestamp, index) => JSON.stringify({
+      timestamp,
+      severity: 'info',
+      kind: 'application',
+      status: 'active',
+      message: `Routine alert ${index}`,
+    })).join('\n'));
+    writeFileSync(join(directory, 'power.jsonl'), timestamps.map((timestamp, index) => JSON.stringify({
+      timestamp,
+      severity: 'warning',
+      kind: 'power',
+      status: 'active',
+      message: `Power event ${index}`,
+    })).join('\n'));
+    writeFileSync(join(directory, 'privilege.jsonl'), timestamps.map((timestamp, index) => JSON.stringify({
+      timestamp,
+      actor: `user-${index}`,
+      target: 'root',
+      action: 'sudo',
+      result: 'success',
+    })).join('\n'));
+
+    const app = appFor(directory);
+    const cookie = await loginCookie(app);
+    const response = await request(app)
+      .get('/monitor/api/dashboard?range=1h')
+      .set('Cookie', cookie)
+      .expect(200);
+    expect(response.body.alerts).toHaveLength(500);
+    expect(response.body.powerEvents).toHaveLength(500);
+    expect(response.body.privilegeEvents).toHaveLength(500);
+    expect(response.body.alerts[0].message).toBe('Routine alert 0');
+    expect(response.body.alerts.at(-1).message).toBe('Routine alert 499');
+    expect(response.body.powerEvents[0].message).toBe('Power event 0');
+    expect(response.body.powerEvents.at(-1).message).toBe('Power event 499');
   });
 
   it('does not follow collector symlinks outside the configured data directory', async () => {
     const directory = dataDirectory();
-    const outside = join(mkdtempSync(join(tmpdir(), 'monitor-outside-')), 'current.json');
+    const outsideDirectory = mkdtempSync(join(tmpdir(), 'monitor-outside-'));
+    const outside = join(outsideDirectory, 'current.json');
     writeFileSync(outside, JSON.stringify({ timestamp: '2026-08-19T12:00:00Z', host: { hostname: 'leaked' } }));
     symlinkSync(outside, join(directory, 'current.json'));
+    const outsidePower = join(outsideDirectory, 'power.jsonl');
+    writeFileSync(outsidePower, `${JSON.stringify({
+      timestamp: '2026-08-19T11:59:00Z', severity: 'critical', kind: 'power', status: 'active',
+      message: 'token=outside-secret must not leak',
+    })}\n`);
+    symlinkSync(outsidePower, join(directory, 'power.jsonl'));
     const app = appFor(directory);
     const cookie = await loginCookie(app);
     const response = await request(app)
@@ -577,6 +840,8 @@ describe('dashboard ingestion', () => {
       .expect(200);
     expect(response.body.host.hostname).toBeNull();
     expect(response.body.latest.cpuPercent).toBeNull();
+    expect(response.body.powerEvents).toEqual([]);
+    expect(JSON.stringify(response.body)).not.toContain('outside-secret');
   });
 
   it('serves the built SPA with no-store caching while APIs remain JSON 404s', async () => {
@@ -597,6 +862,9 @@ describe('dashboard ingestion', () => {
     expect(index.text).toContain('<title>Monitor</title>');
     expect(index.headers['cache-control']).toBe('no-store');
     expect(index.headers['content-security-policy']).toContain("default-src 'self'");
+    const details = await request(app).get('/monitor/details').expect(200);
+    expect(details.text).toContain('<title>Monitor</title>');
+    expect(details.headers['cache-control']).toBe('no-store');
     const asset = await request(app).get('/monitor/assets/app-ABC12345.js').expect(200);
     expect(asset.headers['cache-control']).toContain('immutable');
     await request(app).get('/monitor/api/not-a-route').expect(404).expect('Content-Type', /json/);
