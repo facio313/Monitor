@@ -1,5 +1,4 @@
 import {
-  createHash,
   createHmac,
   randomBytes,
   timingSafeEqual,
@@ -9,39 +8,32 @@ import type { Request, Response } from 'express';
 export const SESSION_COOKIE = 'monitor_session';
 
 interface SessionPayload {
-  v: 1;
+  v: 2;
   iat: number;
   exp: number;
   nonce: string;
+  epoch: string;
 }
 
 export interface VerifiedSession {
   expiresAt: string;
-}
-
-function digest(value: string): Buffer {
-  return createHash('sha256').update(value, 'utf8').digest();
-}
-
-export function passwordMatches(candidate: unknown, expected: string): boolean {
-  const normalized = typeof candidate === 'string' ? candidate : '';
-  return timingSafeEqual(digest(normalized), digest(expected))
-    && typeof candidate === 'string';
+  epoch: string;
 }
 
 function sign(encodedPayload: string, secret: string): string {
   return createHmac('sha256', secret).update(encodedPayload, 'ascii').digest('base64url');
 }
 
-export function issueSession(secret: string, nowMs: number, ttlMs: number): {
+export function issueSession(secret: string, epoch: string, nowMs: number, ttlMs: number): {
   token: string;
   expiresAt: string;
 } {
   const payload: SessionPayload = {
-    v: 1,
+    v: 2,
     iat: Math.floor(nowMs / 1_000),
     exp: Math.floor((nowMs + ttlMs) / 1_000),
     nonce: randomBytes(16).toString('base64url'),
+    epoch,
   };
   const encoded = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
   return {
@@ -65,6 +57,7 @@ function parseCookies(header: string | undefined): Map<string, string> {
 export function verifySession(
   request: Request,
   secret: string,
+  expectedEpoch: string,
   nowMs: number,
 ): VerifiedSession | null {
   const token = parseCookies(request.headers.cookie).get(SESSION_COOKIE);
@@ -84,16 +77,22 @@ export function verifySession(
     const payload = parsed as Partial<SessionPayload>;
     const nowSeconds = Math.floor(nowMs / 1_000);
     if (
-      payload.v !== 1
+      payload.v !== 2
       || !Number.isSafeInteger(payload.iat)
       || !Number.isSafeInteger(payload.exp)
       || typeof payload.nonce !== 'string'
       || payload.nonce.length < 16
+      || typeof payload.epoch !== 'string'
+      || payload.epoch.length !== expectedEpoch.length
+      || !timingSafeEqual(Buffer.from(payload.epoch, 'utf8'), Buffer.from(expectedEpoch, 'utf8'))
       || (payload.iat as number) > nowSeconds + 60
       || (payload.exp as number) <= nowSeconds
       || (payload.exp as number) - (payload.iat as number) > 24 * 60 * 60
     ) return null;
-    return { expiresAt: new Date((payload.exp as number) * 1_000).toISOString() };
+    return {
+      expiresAt: new Date((payload.exp as number) * 1_000).toISOString(),
+      epoch: payload.epoch,
+    };
   } catch {
     return null;
   }

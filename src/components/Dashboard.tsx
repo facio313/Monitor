@@ -26,6 +26,7 @@ import {
   toneForPercent,
 } from '../utils';
 import { Icon, type IconName } from './Icon';
+import { PasswordChangeDialog } from './PasswordChangeDialog';
 
 const RANGES: Array<{ value: TimeRange; label: string }> = [
   { value: '1h', label: '1H' },
@@ -36,12 +37,14 @@ const RANGES: Array<{ value: TimeRange; label: string }> = [
 
 interface DashboardProps {
   onLogout: () => Promise<void>;
+  onPasswordChanged: () => void;
   onUnauthorized: () => void;
 }
 
-export function Dashboard({ onLogout, onUnauthorized }: DashboardProps) {
+export function Dashboard({ onLogout, onPasswordChanged, onUnauthorized }: DashboardProps) {
   const [range, setRange] = useState<TimeRange>('24h');
   const [loggingOut, setLoggingOut] = useState(false);
+  const [passwordDialogOpen, setPasswordDialogOpen] = useState(false);
   const { data, error, initialLoading, refreshing, lastUpdated, refresh } = useDashboard(range, onUnauthorized);
 
   async function handleLogout() {
@@ -51,7 +54,7 @@ export function Dashboard({ onLogout, onUnauthorized }: DashboardProps) {
 
   return (
     <div className="app-shell">
-      <header className="topbar">
+      <header className="topbar" inert={passwordDialogOpen || undefined}>
         <div className="brand">
           <div className="brand-mark"><Icon name="activity" size={20} /></div>
           <div>
@@ -61,6 +64,17 @@ export function Dashboard({ onLogout, onUnauthorized }: DashboardProps) {
         </div>
         <div className="header-actions">
           <span className="secure-label"><span className="status-dot status-dot-good" />Secure session</span>
+          <button
+            className="icon-button labeled-button"
+            onClick={() => setPasswordDialogOpen(true)}
+            type="button"
+            aria-label="Change password"
+            aria-haspopup="dialog"
+            aria-expanded={passwordDialogOpen}
+          >
+            <Icon name="lock" size={16} />
+            <span>Change password</span>
+          </button>
           <button
             className="icon-button labeled-button"
             onClick={handleLogout}
@@ -74,7 +88,7 @@ export function Dashboard({ onLogout, onUnauthorized }: DashboardProps) {
         </div>
       </header>
 
-      <main className="dashboard-main">
+      <main className="dashboard-main" inert={passwordDialogOpen || undefined}>
         <section className="dashboard-heading" aria-labelledby="dashboard-title">
           <div>
             <span className="eyebrow">System overview</span>
@@ -127,10 +141,17 @@ export function Dashboard({ onLogout, onUnauthorized }: DashboardProps) {
         )}
       </main>
 
-      <footer className="app-footer">
+      <footer className="app-footer" inert={passwordDialogOpen || undefined}>
         <span><Icon name="shield" size={14} />Private monitor</span>
         <span>Generated {data ? formatDateTime(data.generatedAt) : '—'}</span>
       </footer>
+
+      <PasswordChangeDialog
+        open={passwordDialogOpen}
+        onClose={() => setPasswordDialogOpen(false)}
+        onPasswordChanged={onPasswordChanged}
+        onUnauthorized={onUnauthorized}
+      />
     </div>
   );
 }

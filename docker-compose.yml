@@ -11,6 +11,7 @@ services:
       NODE_ENV: production
       PORT: "8080"
       MONITOR_DATA_DIR: /data
+      MONITOR_AUTH_STATE_FILE: /var/lib/monitor-auth/password.json
       MONITOR_PASSWORD_FILE: /run/secrets/monitor_password
       MONITOR_SESSION_SECRET_FILE: /run/secrets/monitor_session_secret
       MONITOR_ALLOWED_ORIGINS: ${MONITOR_ALLOWED_ORIGINS:-https://bonifacio.work}
@@ -19,6 +20,12 @@ services:
         source: ${MONITOR_EXPORT_DIR:-./data}
         target: /data
         read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${MONITOR_AUTH_STATE_PATH:-./auth-state}
+        target: /var/lib/monitor-auth
+        read_only: false
         bind:
           create_host_path: false
     secrets:

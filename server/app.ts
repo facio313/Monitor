@@ -6,12 +6,12 @@ import { basename, join, resolve, sep } from 'node:path';
 import {
   clearSessionCookie,
   issueSession,
-  passwordMatches,
   setSessionCookie,
   verifySession,
 } from './auth.js';
 import { loadConfig, type ConfigOverrides } from './config.js';
 import { readDashboard, telemetryIsReady } from './data.js';
+import { PasswordStore, PasswordStoreBusyError } from './password-store.js';
 import { DASHBOARD_RANGES, type DashboardRange } from './types.js';
 
 export interface AppOptions extends ConfigOverrides {
@@ -39,6 +39,7 @@ function mutationIsSameOrigin(request: Request, allowedOrigins: string[]): boole
 
 export function createApp(options: AppOptions = {}) {
   const config = loadConfig(options);
+  const passwordStore = new PasswordStore(config.authStateFile, config.getBootstrapPassword);
   const now = options.now ?? Date.now;
   const publicDirectory = resolve(options.publicDir ?? join(process.cwd(), 'dist', 'public'));
   const indexFile = join(publicDirectory, 'index.html');
@@ -99,22 +100,43 @@ export function createApp(options: AppOptions = {}) {
     },
   });
 
-  app.post('/monitor/api/auth/login', loginLimiter, (request, response) => {
+  const passwordChangeLimiter = rateLimit({
+    windowMs: 15 * 60 * 1_000,
+    limit: 5,
+    standardHeaders: 'draft-8',
+    legacyHeaders: false,
+    skipSuccessfulRequests: true,
+    handler: (_request, response) => {
+      apiError(response, 429, 'RATE_LIMITED', 'Too many password change attempts');
+    },
+  });
+
+  app.post('/monitor/api/auth/login', loginLimiter, async (request, response) => {
     const body: unknown = request.body;
     const suppliedPassword = body && typeof body === 'object'
       ? (body as Record<string, unknown>).password
       : undefined;
-    if (!passwordMatches(suppliedPassword, config.password)) {
+    let sessionEpoch: string | null;
+    try {
+      sessionEpoch = await passwordStore.authenticate(suppliedPassword);
+    } catch (error) {
+      if (error instanceof PasswordStoreBusyError) {
+        apiError(response, 429, 'RATE_LIMITED', 'Too many login attempts');
+        return;
+      }
+      throw error;
+    }
+    if (!sessionEpoch) {
       apiError(response, 401, 'INVALID_CREDENTIALS', 'Invalid credentials');
       return;
     }
-    const session = issueSession(config.sessionSecret, now(), config.sessionTtlMs);
+    const session = issueSession(config.sessionSecret, sessionEpoch, now(), config.sessionTtlMs);
     setSessionCookie(response, session.token, config.sessionTtlMs);
     response.status(200).json({ authenticated: true, expiresAt: session.expiresAt });
   });
 
   app.get('/monitor/api/auth/session', (request, response) => {
-    const session = verifySession(request, config.sessionSecret, now());
+    const session = verifySession(request, config.sessionSecret, passwordStore.sessionEpoch, now());
     if (!session) {
       response.status(200).json({ authenticated: false, expiresAt: null });
       return;
@@ -127,8 +149,42 @@ export function createApp(options: AppOptions = {}) {
     response.status(204).end();
   });
 
+  app.post('/monitor/api/auth/password', (request, response, next) => {
+    const authorizedEpoch = passwordStore.sessionEpoch;
+    const session = verifySession(request, config.sessionSecret, authorizedEpoch, now());
+    if (!session) {
+      apiError(response, 401, 'AUTH_REQUIRED', 'Authentication required');
+      return;
+    }
+    response.locals.monitorAuthorizedEpoch = session.epoch;
+    next();
+  }, passwordChangeLimiter, async (request, response) => {
+    const body: unknown = request.body;
+    const record = body && typeof body === 'object' ? body as Record<string, unknown> : {};
+    let result;
+    try {
+      result = await passwordStore.changePassword(
+        record.currentPassword,
+        record.newPassword,
+        response.locals.monitorAuthorizedEpoch,
+      );
+    } catch (error) {
+      if (error instanceof PasswordStoreBusyError) {
+        apiError(response, 429, 'RATE_LIMITED', 'Too many password change attempts');
+        return;
+      }
+      throw error;
+    }
+    if (result !== 'changed') {
+      apiError(response, 400, 'PASSWORD_CHANGE_REJECTED', 'Password change rejected');
+      return;
+    }
+    clearSessionCookie(response);
+    response.status(204).end();
+  });
+
   app.get('/monitor/api/dashboard', (request, response) => {
-    if (!verifySession(request, config.sessionSecret, now())) {
+    if (!verifySession(request, config.sessionSecret, passwordStore.sessionEpoch, now())) {
       apiError(response, 401, 'AUTH_REQUIRED', 'Authentication required');
       return;
     }

@@ -59,6 +59,14 @@ export function logout(): Promise<void> {
   return apiFetch<void>('/auth/session', { method: 'DELETE' });
 }
 
+export function changePassword(currentPassword: string, newPassword: string): Promise<void> {
+  return apiFetch<void>('/auth/password', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ currentPassword, newPassword }),
+  });
+}
+
 export function getDashboard(range: TimeRange, signal?: AbortSignal): Promise<DashboardPayload> {
   return apiFetch<DashboardPayload>(`/dashboard?range=${encodeURIComponent(range)}`, { signal });
 }

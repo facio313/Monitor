@@ -18,3 +18,6 @@ systemctl daemon-reload
 echo "Collector removed. Data and local configuration were preserved:"
 echo "  /var/lib/monitor-export"
 echo "  /etc/default/monitor-collector"
+echo "Monitor application auth state and its backups were not modified:"
+echo "  /home/cks/.local/state/monitor-auth"
+echo "  /home/cks/backups/monitor-auth"

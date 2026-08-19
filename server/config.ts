@@ -4,7 +4,8 @@ import { resolve } from 'node:path';
 const MAX_SECRET_FILE_BYTES = 64 * 1024;
 
 export interface RuntimeConfig {
-  password: string;
+  getBootstrapPassword: () => string;
+  authStateFile: string;
   sessionSecret: string;
   dataDir: string;
   sessionTtlMs: number;
@@ -14,6 +15,7 @@ export interface RuntimeConfig {
 
 export interface ConfigOverrides {
   password?: string;
+  authStateFile?: string;
   sessionSecret?: string;
   dataDir?: string;
   sessionTtlMs?: number;
@@ -42,18 +44,25 @@ function positiveInteger(value: string | undefined, fallback: number): number {
 }
 
 export function loadConfig(overrides: ConfigOverrides = {}): RuntimeConfig {
-  const password = overrides.password
-    ?? secretFromEnvironment('MONITOR_PASSWORD_FILE', 'MONITOR_PASSWORD');
   const sessionSecret = overrides.sessionSecret
     ?? secretFromEnvironment('MONITOR_SESSION_SECRET_FILE', 'MONITOR_SESSION_SECRET');
 
-  if (!password) throw new Error('Monitor password is not configured');
   if (!sessionSecret || Buffer.byteLength(sessionSecret) < 32) {
     throw new Error('Monitor session secret must contain at least 32 bytes');
   }
 
   return {
-    password,
+    getBootstrapPassword: () => {
+      const password = overrides.password
+        ?? secretFromEnvironment('MONITOR_PASSWORD_FILE', 'MONITOR_PASSWORD');
+      if (!password) throw new Error('Monitor bootstrap password is not configured');
+      return password;
+    },
+    authStateFile: resolve(
+      overrides.authStateFile
+        ?? process.env.MONITOR_AUTH_STATE_FILE
+        ?? '/var/lib/monitor-auth/password.json',
+    ),
     sessionSecret,
     dataDir: resolve(overrides.dataDir ?? process.env.MONITOR_DATA_DIR ?? '/data'),
     sessionTtlMs: Math.max(1_000, Math.min(

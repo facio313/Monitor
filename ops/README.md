@@ -87,6 +87,38 @@ No logrotate rule is needed: the collector atomically enforces row bounds on
 its two event exports and calendar retention on history. Journald owns service
 logs.
 
+## Password-hash state operations
+
+`monitor_auth_state.py` manages the web application's separate persistent auth
+state; it does not run as part of the root collector. The application needs a
+writable directory bind because a single-file bind cannot be replaced with the
+same-directory atomic rename used for password changes. On the Bonifacio host,
+create the exact host directory as root (the existing `.local/state` parent may
+be root-owned), then validate it as the rootless deployment user:
+
+```sh
+cd /home/cks/Monitor
+sudo install -d -o cks -g cks -m 0700 /home/cks/.local/state/monitor-auth
+sudo -u cks python3 ops/monitor_auth_state.py prepare
+sudo -u cks python3 ops/monitor_auth_state.py status
+```
+
+Defaults are `/home/cks/.local/state/monitor-auth` for live state and
+`/home/cks/backups/monitor-auth` for local snapshots. Override them with
+`MONITOR_AUTH_STATE_PATH` and `MONITOR_AUTH_BACKUP_PATH`. Directories must be
+owned by the invoking user with mode `0700`; state and snapshot files must be
+single-link regular files with mode `0600`. Symlinked paths are refused.
+
+The application, not this helper, initializes missing `password.json` from the
+bootstrap password and atomically updates it after a password change. The
+helper's `backup` and offline `restore --confirm-container-stopped` commands
+validate the same version-1 scrypt state shape, copy without displaying hash
+material, fsync temporary files, and atomically rename them. Restore first
+creates a `pre-restore` snapshot of valid current state, restores the selected
+password hash, and generates a fresh session epoch so old cookies cannot become
+valid again. See the repository README for stop/start ordering, session-secret
+rotation, legacy rollback limits, and off-host disaster recovery.
+
 Docker list and per-container stats calls use a 2-second curl timeout. All
 owner list endpoints are read first, then stats use the fast
 `stream=false&one-shot=true` endpoint with at most six bounded worker threads,
@@ -126,6 +158,8 @@ python3 -m unittest discover -s tests -v
 sudo sh ./uninstall.sh
 ```
 
-Uninstall deliberately preserves `/var/lib/monitor-export` and
-`/etc/default/monitor-collector`. Remove those separately only after deciding
-the retained telemetry/configuration is no longer needed.
+Uninstall deliberately preserves `/var/lib/monitor-export`,
+`/etc/default/monitor-collector`, `/home/cks/.local/state/monitor-auth`, and
+`/home/cks/backups/monitor-auth`. Remove those separately only after deciding
+the retained telemetry, authentication recovery, and configuration value is no
+longer needed.

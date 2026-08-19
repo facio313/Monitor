@@ -214,9 +214,31 @@ td strong { color: #cdd8d5; font-family: "SFMono-Regular", Consolas, "Liberation
 .primary-button { width: 100%; height: 44px; margin-top: 13px; display: flex; align-items: center; justify-content: center; gap: 8px; border: 1px solid #3d8e86; border-radius: 9px; color: #061311; background: linear-gradient(180deg, #66e2da, #43c8c0); box-shadow: 0 10px 30px rgb(42 183 172 / 14%); font-size: 11px; font-weight: 700; cursor: pointer; transition: filter .18s, transform .18s; }
 .primary-button:hover { filter: brightness(1.06); }
 .primary-button:active { transform: translateY(1px); }
-.primary-button:disabled { opacity: .55; cursor: not-allowed; }
+.primary-button:disabled, .primary-button[aria-disabled="true"] { opacity: .55; cursor: not-allowed; }
 .login-footnote { margin: 20px 0 0; justify-content: center; gap: 5px; color: var(--faint); font-size: 9px; }
 .spinner { width: 15px; height: 15px; border: 2px solid rgb(4 29 26 / 28%); border-top-color: #0d3b37; border-radius: 50%; animation: spin .75s linear infinite; }
+
+.dialog-backdrop { padding: 24px; display: grid; place-items: center; position: fixed; inset: 0; z-index: 50; background: rgb(2 8 7 / 76%); backdrop-filter: blur(8px); }
+.password-dialog { width: min(460px, 100%); max-height: calc(100vh - 48px); overflow-y: auto; border: 1px solid #29403c; border-radius: 15px; background: #0b1715; box-shadow: 0 28px 90px rgb(0 0 0 / 52%), inset 0 1px rgb(255 255 255 / 3%); }
+.password-dialog-header { padding: 20px 20px 18px; display: grid; grid-template-columns: auto 1fr auto; align-items: start; gap: 12px; border-bottom: 1px solid var(--border-soft); }
+.password-dialog-icon { width: 38px; height: 38px; display: grid; place-items: center; color: #a9e7e1; border: 1px solid #28514c; border-radius: 10px; background: #112724; }
+.password-dialog-header h2 { margin: 1px 0 4px; color: var(--text); font-size: 16px; letter-spacing: -.02em; }
+.password-dialog-header p { margin: 0; color: var(--muted); font-size: 10px; line-height: 1.5; }
+.dialog-close-button { width: 32px; height: 32px; display: grid; place-items: center; border: 0; border-radius: 8px; color: var(--muted); background: transparent; font-size: 24px; line-height: 1; cursor: pointer; }
+.dialog-close-button:hover { color: var(--text); background: var(--surface-high); }
+.dialog-close-button:disabled { opacity: .45; cursor: not-allowed; }
+.password-change-form { padding: 20px; }
+.password-change-error { margin-bottom: 17px; }
+.password-change-error span { min-width: 0; overflow-wrap: anywhere; }
+.form-field + .form-field { margin-top: 16px; }
+.form-field label { margin-bottom: 7px; display: block; color: #a8b6b3; font-size: 10px; font-weight: 600; }
+.password-field.field-invalid { border-color: rgb(255 111 113 / 70%); }
+.password-field.field-invalid:focus-within { border-color: var(--red); box-shadow: 0 0 0 3px rgb(255 111 113 / 8%); }
+.field-hint { margin: 6px 2px 0; color: var(--faint); font-size: 9px; line-height: 1.45; }
+.field-hint-error { color: #e89495; }
+.password-dialog-actions { margin-top: 22px; display: grid; grid-template-columns: minmax(0, .7fr) minmax(0, 1.3fr); gap: 10px; }
+.password-dialog-actions button { width: 100%; height: 42px; margin: 0; display: flex; align-items: center; justify-content: center; gap: 7px; }
+.password-dialog-actions .secondary-button:disabled { opacity: .55; cursor: not-allowed; }
 
 .boot-screen { display: flex; flex-direction: column; gap: 17px; color: var(--muted); font-size: 11px; }
 .boot-screen p { margin: 0; }
@@ -289,6 +311,13 @@ td strong { color: #cdd8d5; font-family: "SFMono-Regular", Consolas, "Liberation
   .io-summary { flex-direction: column; gap: 8px; }
   .hardware-strip { grid-template-columns: 1fr; }
   .app-footer span:last-child { display: none; }
+  .dialog-backdrop { padding: 12px; align-items: end; }
+  .password-dialog { width: 100%; max-height: calc(100vh - 24px); border-radius: 15px 15px 11px 11px; }
+  .password-dialog-header, .password-change-form { padding: 17px; }
+  .password-dialog-icon { display: none; }
+  .password-dialog-header { grid-template-columns: 1fr auto; }
+  .password-dialog-actions { grid-template-columns: 1fr; }
+  .password-dialog-actions .secondary-button { order: 2; }
 }
 
 @media (prefers-reduced-motion: reduce) {

@@ -27,6 +27,11 @@ export default function App() {
     setSession('anonymous');
   }, []);
 
+  const handlePasswordChanged = useCallback(() => {
+    setSessionMessage('Password changed. Sign in with your new password.');
+    setSession('anonymous');
+  }, []);
+
   async function handleLogout() {
     try {
       await logout();
@@ -50,5 +55,5 @@ export default function App() {
     return <LoginScreen sessionMessage={sessionMessage} onAuthenticated={() => { setSessionMessage(null); setSession('authenticated'); }} />;
   }
 
-  return <Dashboard onLogout={handleLogout} onUnauthorized={handleUnauthorized} />;
+  return <Dashboard onLogout={handleLogout} onPasswordChanged={handlePasswordChanged} onUnauthorized={handleUnauthorized} />;
 }
