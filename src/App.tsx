@@ -13,6 +13,7 @@ function pageFromLocation(): MonitorPage {
 
 export default function App() {
   const [session, setSession] = useState<SessionState>('checking');
+  const [authMode, setAuthMode] = useState<'local' | 'sso'>('local');
   const [sessionMessage, setSessionMessage] = useState<string | null>(null);
   const [page, setPage] = useState<MonitorPage>(pageFromLocation);
   const [navigationVersion, setNavigationVersion] = useState(0);
@@ -20,7 +21,14 @@ export default function App() {
   useEffect(() => {
     const controller = new AbortController();
     getSession(controller.signal)
-      .then((authenticated) => setSession(authenticated ? 'authenticated' : 'anonymous'))
+      .then((result) => {
+        setAuthMode(result.mode);
+        if (!result.authenticated && result.mode === 'sso') {
+          window.location.assign(`/sso/?rd=${encodeURIComponent(window.location.href)}`);
+          return;
+        }
+        setSession(result.authenticated ? 'authenticated' : 'anonymous');
+      })
       .catch((error: unknown) => {
         if (error instanceof DOMException && error.name === 'AbortError') return;
         setSessionMessage('Could not verify the current session. You can still try signing in.');
@@ -53,9 +61,13 @@ export default function App() {
   }, []);
 
   const handleUnauthorized = useCallback(() => {
+    if (authMode === 'sso') {
+      window.location.assign(`/sso/?rd=${encodeURIComponent(window.location.href)}`);
+      return;
+    }
     setSessionMessage('Your session expired. Sign in again to continue.');
     setSession('anonymous');
-  }, []);
+  }, [authMode]);
 
   const handlePasswordChanged = useCallback(() => {
     setSessionMessage('Password changed. Sign in with your new password.');
@@ -66,6 +78,10 @@ export default function App() {
     try {
       await logout();
     } finally {
+      if (authMode === 'sso') {
+        window.location.assign(`/sso/logout?rd=${encodeURIComponent(`${window.location.origin}/sso/`)}`);
+        return;
+      }
       setSessionMessage('You have been signed out.');
       setSession('anonymous');
     }
@@ -93,6 +109,7 @@ export default function App() {
       onLogout={handleLogout}
       onPasswordChanged={handlePasswordChanged}
       onUnauthorized={handleUnauthorized}
+      ssoEnabled={authMode === 'sso'}
     />
   );
 }

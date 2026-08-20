@@ -55,9 +55,10 @@ interface DashboardProps {
   onLogout: () => Promise<void>;
   onPasswordChanged: () => void;
   onUnauthorized: () => void;
+  ssoEnabled?: boolean;
 }
 
-export function Dashboard({ page, navigationVersion, onNavigate, onLogout, onPasswordChanged, onUnauthorized }: DashboardProps) {
+export function Dashboard({ page, navigationVersion, onNavigate, onLogout, onPasswordChanged, onUnauthorized, ssoEnabled = false }: DashboardProps) {
   const [range, setRange] = useState<TimeRange>('24h');
   const [loggingOut, setLoggingOut] = useState(false);
   const [passwordDialogOpen, setPasswordDialogOpen] = useState(false);
@@ -118,17 +119,19 @@ export function Dashboard({ page, navigationVersion, onNavigate, onLogout, onPas
             >Details</a>
           </nav>
           <span className="secure-label"><span className="status-dot status-dot-good" />Secure session</span>
-          <button
-            className="icon-button labeled-button"
-            onClick={() => setPasswordDialogOpen(true)}
-            type="button"
-            aria-label="Change password"
-            aria-haspopup="dialog"
-            aria-expanded={passwordDialogOpen}
-          >
-            <Icon name="lock" size={16} />
-            <span>Change password</span>
-          </button>
+          {!ssoEnabled && (
+            <button
+              className="icon-button labeled-button"
+              onClick={() => setPasswordDialogOpen(true)}
+              type="button"
+              aria-label="Change password"
+              aria-haspopup="dialog"
+              aria-expanded={passwordDialogOpen}
+            >
+              <Icon name="lock" size={16} />
+              <span>Change password</span>
+            </button>
+          )}
           <button
             className="icon-button labeled-button"
             onClick={handleLogout}
@@ -208,12 +211,14 @@ export function Dashboard({ page, navigationVersion, onNavigate, onLogout, onPas
         <span>Generated {data ? formatDateTime(data.generatedAt) : '—'}</span>
       </footer>
 
-      <PasswordChangeDialog
-        open={passwordDialogOpen}
-        onClose={() => setPasswordDialogOpen(false)}
-        onPasswordChanged={onPasswordChanged}
-        onUnauthorized={onUnauthorized}
-      />
+      {!ssoEnabled && (
+        <PasswordChangeDialog
+          open={passwordDialogOpen}
+          onClose={() => setPasswordDialogOpen(false)}
+          onPasswordChanged={onPasswordChanged}
+          onUnauthorized={onUnauthorized}
+        />
+      )}
     </div>
   );
 }

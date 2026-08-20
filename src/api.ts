@@ -37,12 +37,20 @@ async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
   return response.json() as Promise<T>;
 }
 
-export async function getSession(signal?: AbortSignal): Promise<boolean> {
+export interface SessionInfo {
+  authenticated: boolean;
+  mode: 'local' | 'sso';
+}
+
+export async function getSession(signal?: AbortSignal): Promise<SessionInfo> {
   try {
-    const session = await apiFetch<{ authenticated?: boolean }>('/auth/session', { signal });
-    return session.authenticated === true;
+    const session = await apiFetch<{ authenticated?: boolean; mode?: string }>('/auth/session', { signal });
+    return {
+      authenticated: session.authenticated === true,
+      mode: session.mode === 'sso' ? 'sso' : 'local',
+    };
   } catch (error) {
-    if (error instanceof ApiError && error.status === 401) return false;
+    if (error instanceof ApiError && error.status === 401) return { authenticated: false, mode: 'local' };
     throw error;
   }
 }

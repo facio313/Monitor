@@ -79,6 +79,12 @@ an existing file.
 
 Do not rerun this block over credentials already in use.
 
+This is the rollback/local-development credential path. Production on
+`bonifacio.work` sets `MONITOR_SSO_ENABLED=true` and accepts identity only from
+the host Nginx Authelia `auth_request` boundary. In that mode the password login
+and password-change endpoints are disabled; the existing state and signing
+secret are retained only for an explicit rollback.
+
 ```sh
 sudo install -d -o cks -g cks -m 0700 /home/cks/.config/monitor
 sudo -u cks sh -c 'umask 077; openssl rand -hex 24 > /home/cks/.config/monitor/password'
@@ -299,6 +305,7 @@ Application variables:
 | `MONITOR_PASSWORD` | unset | Development-only bootstrap fallback when no password file is set |
 | `MONITOR_SESSION_SECRET` | unset | Development-only fallback when no file is set |
 | `MONITOR_ALLOWED_ORIGINS` | empty | Comma-separated permitted mutation origins |
+| `MONITOR_SSO_ENABLED` | `false` | Trust validated `Remote-User` and `Remote-Email` from the loopback-only reverse proxy and disable local credentials |
 | `MONITOR_SESSION_TTL_SECONDS` | `3600` | Signed-session lifetime; capped at 24 hours |
 | `MONITOR_STALE_AFTER_SECONDS` | `300` | Age at which telemetry is marked stale |
 
@@ -423,6 +430,11 @@ GET    /monitor/api/dashboard?range=1h|24h|7d|30d
   `Secure`, `SameSite=Strict` cookies scoped to `/monitor`. Login permits five
   failed attempts per 15 minutes; state-changing API requests enforce origin
   checks.
+- Production SSO requests reach the app only through Nginx on the same host.
+  Nginx removes client-supplied identity headers, obtains them from Authelia,
+  and overwrites `Remote-User`/`Remote-Email`; port `5181` remains loopback-only.
+  Signing out redirects to the central `/sso/logout` endpoint. Local password
+  authentication remains available only when `MONITOR_SSO_ENABLED` is false.
 - API responses are `no-store`; Helmet supplies a restrictive CSP and related
   headers. The data reader refuses symlink escapes, oversized files/lines, and
   non-allow-listed fields, and applies a second redaction pass to messages.
@@ -430,8 +442,9 @@ GET    /monitor/api/dashboard?range=1h|24h|7d|30d
   web container can read it. The container never receives `/var/log/kern.log`
   or another raw host log.
 
-This is a shared-password operations view. Keep it behind HTTPS, do not expose
-port `5181`, and do not mount additional host paths into the container.
+This is a private operations view. Keep it behind the central HTTPS SSO gate,
+do not expose port `5181`, and do not mount additional host paths into the
+container.
 
 ## GitHub Actions deployment
 

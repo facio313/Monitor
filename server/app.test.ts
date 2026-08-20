@@ -77,6 +77,48 @@ describe('authentication', () => {
     await request(app).get('/monitor/api/dashboard?range=1h').expect(401);
   });
 
+  it('uses trusted proxy identity in SSO mode and disables local credentials', async () => {
+    const directory = dataDirectory();
+    const app = createApp({
+      password: 'unused local password',
+      authStateFile: join(directory, 'auth-state.json'),
+      sessionSecret: SECRET,
+      dataDir: directory,
+      now: () => NOW,
+      ssoEnabled: true,
+    });
+
+    await request(app).get('/monitor/api/auth/session').expect(200, {
+      authenticated: false,
+      expiresAt: null,
+      mode: 'sso',
+      user: null,
+    });
+    await request(app)
+      .get('/monitor/api/auth/session')
+      .set('Remote-User', 'portfolio-owner')
+      .set('Remote-Email', 'owner@example.test')
+      .expect(200, {
+        authenticated: true,
+        expiresAt: null,
+        mode: 'sso',
+        user: 'portfolio-owner',
+      });
+    await request(app).post('/monitor/api/auth/login').send({ password: 'unused local password' }).expect(403);
+    await request(app)
+      .post('/monitor/api/auth/password')
+      .set('Remote-User', 'portfolio-owner')
+      .set('Remote-Email', 'owner@example.test')
+      .send({ currentPassword: 'old', newPassword: 'new password value' })
+      .expect(403);
+    await request(app).get('/monitor/api/dashboard?range=1h').expect(401);
+    await request(app)
+      .get('/monitor/api/dashboard?range=1h')
+      .set('Remote-User', 'portfolio-owner')
+      .set('Remote-Email', 'owner@example.test')
+      .expect(200);
+  });
+
   it('rejects bad credentials and issues a hardened session cookie', async () => {
     const app = appFor(dataDirectory());
     await request(app).post('/monitor/api/auth/login').send({ password: 'wrong' }).expect(401);

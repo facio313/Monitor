@@ -15,6 +15,7 @@ services:
       MONITOR_PASSWORD_FILE: /run/secrets/monitor_password
       MONITOR_SESSION_SECRET_FILE: /run/secrets/monitor_session_secret
       MONITOR_ALLOWED_ORIGINS: ${MONITOR_ALLOWED_ORIGINS:-https://bonifacio.work}
+      MONITOR_SSO_ENABLED: ${MONITOR_SSO_ENABLED:-false}
     volumes:
       - type: bind
         source: ${MONITOR_EXPORT_DIR:-./data}

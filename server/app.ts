@@ -23,6 +23,14 @@ function apiError(response: Response, status: number, code: string, message: str
   response.status(status).json({ error: message, code });
 }
 
+function trustedSsoUser(request: Request): string | null {
+  const user = request.get('remote-user');
+  const email = request.get('remote-email');
+  if (!user || !email) return null;
+  const safeHeader = (value: string) => value.length <= 254 && !/[\u0000-\u001f\u007f]/u.test(value);
+  return safeHeader(user) && safeHeader(email) ? user : null;
+}
+
 function mutationIsSameOrigin(request: Request, allowedOrigins: string[]): boolean {
   const fetchSite = request.get('sec-fetch-site');
   if (fetchSite === 'cross-site') return false;
@@ -112,6 +120,10 @@ export function createApp(options: AppOptions = {}) {
   });
 
   app.post('/monitor/api/auth/login', loginLimiter, async (request, response) => {
+    if (config.ssoEnabled) {
+      apiError(response, 403, 'SSO_REQUIRED', 'Sign in through the portfolio single sign-on portal');
+      return;
+    }
     const body: unknown = request.body;
     const suppliedPassword = body && typeof body === 'object'
       ? (body as Record<string, unknown>).password
@@ -136,6 +148,16 @@ export function createApp(options: AppOptions = {}) {
   });
 
   app.get('/monitor/api/auth/session', (request, response) => {
+    if (config.ssoEnabled) {
+      const user = trustedSsoUser(request);
+      response.status(200).json({
+        authenticated: user !== null,
+        expiresAt: null,
+        mode: 'sso',
+        user,
+      });
+      return;
+    }
     const session = verifySession(request, config.sessionSecret, passwordStore.sessionEpoch, now());
     if (!session) {
       response.status(200).json({ authenticated: false, expiresAt: null });
@@ -150,6 +172,10 @@ export function createApp(options: AppOptions = {}) {
   });
 
   app.post('/monitor/api/auth/password', (request, response, next) => {
+    if (config.ssoEnabled) {
+      apiError(response, 403, 'SSO_MANAGED', 'Password changes are managed by the portfolio single sign-on service');
+      return;
+    }
     const authorizedEpoch = passwordStore.sessionEpoch;
     const session = verifySession(request, config.sessionSecret, authorizedEpoch, now());
     if (!session) {
@@ -184,7 +210,10 @@ export function createApp(options: AppOptions = {}) {
   });
 
   app.get('/monitor/api/dashboard', (request, response) => {
-    if (!verifySession(request, config.sessionSecret, passwordStore.sessionEpoch, now())) {
+    const authorized = config.ssoEnabled
+      ? trustedSsoUser(request) !== null
+      : verifySession(request, config.sessionSecret, passwordStore.sessionEpoch, now()) !== null;
+    if (!authorized) {
       apiError(response, 401, 'AUTH_REQUIRED', 'Authentication required');
       return;
     }

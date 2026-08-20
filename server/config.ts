@@ -11,6 +11,7 @@ export interface RuntimeConfig {
   sessionTtlMs: number;
   staleAfterMs: number;
   allowedOrigins: string[];
+  ssoEnabled: boolean;
 }
 
 export interface ConfigOverrides {
@@ -21,6 +22,11 @@ export interface ConfigOverrides {
   sessionTtlMs?: number;
   staleAfterMs?: number;
   allowedOrigins?: string[];
+  ssoEnabled?: boolean;
+}
+
+function enabled(value: string | undefined): boolean {
+  return value?.trim().toLowerCase() === 'true';
 }
 
 function secretFromEnvironment(fileName: string, valueName: string): string | undefined {
@@ -77,5 +83,6 @@ export function loadConfig(overrides: ConfigOverrides = {}): RuntimeConfig {
         .split(',')
         .map((origin) => origin.trim())
         .filter(Boolean),
+    ssoEnabled: overrides.ssoEnabled ?? enabled(process.env.MONITOR_SSO_ENABLED),
   };
 }
