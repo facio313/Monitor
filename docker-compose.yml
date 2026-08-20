@@ -14,6 +14,7 @@ services:
       MONITOR_AUTH_STATE_FILE: /var/lib/monitor-auth/password.json
       MONITOR_PASSWORD_FILE: /run/secrets/monitor_password
       MONITOR_SESSION_SECRET_FILE: /run/secrets/monitor_session_secret
+      MONITOR_EDGE_SECRET_FILE: /run/secrets/monitor_edge_secret
       MONITOR_ALLOWED_ORIGINS: ${MONITOR_ALLOWED_ORIGINS:-https://bonifacio.work}
       MONITOR_SSO_ENABLED: ${MONITOR_SSO_ENABLED:-false}
     volumes:
@@ -32,6 +33,7 @@ services:
     secrets:
       - monitor_password
       - monitor_session_secret
+      - monitor_edge_secret
     read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=16m
@@ -60,3 +62,5 @@ secrets:
     file: ${MONITOR_PASSWORD_PATH:-./secrets/password}
   monitor_session_secret:
     file: ${MONITOR_SESSION_SECRET_PATH:-./secrets/session-secret}
+  monitor_edge_secret:
+    file: ${MONITOR_EDGE_SECRET_PATH:-./secrets/edge-secret}

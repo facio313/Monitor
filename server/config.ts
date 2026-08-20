@@ -1,4 +1,11 @@
-import { readFileSync, statSync } from 'node:fs';
+import {
+  closeSync,
+  constants as fileConstants,
+  fstatSync,
+  lstatSync,
+  openSync,
+  readFileSync,
+} from 'node:fs';
 import { resolve } from 'node:path';
 
 const MAX_SECRET_FILE_BYTES = 64 * 1024;
@@ -12,6 +19,7 @@ export interface RuntimeConfig {
   staleAfterMs: number;
   allowedOrigins: string[];
   ssoEnabled: boolean;
+  edgeSecret: string | null;
 }
 
 export interface ConfigOverrides {
@@ -23,6 +31,7 @@ export interface ConfigOverrides {
   staleAfterMs?: number;
   allowedOrigins?: string[];
   ssoEnabled?: boolean;
+  edgeSecret?: string;
 }
 
 function enabled(value: string | undefined): boolean {
@@ -32,11 +41,26 @@ function enabled(value: string | undefined): boolean {
 function secretFromEnvironment(fileName: string, valueName: string): string | undefined {
   const file = process.env[fileName];
   if (file) {
-    const stat = statSync(file);
-    if (!stat.isFile() || stat.size > MAX_SECRET_FILE_BYTES) {
-      throw new Error(`${fileName} must reference a small regular file`);
+    const before = lstatSync(file);
+    if (
+      !before.isFile()
+      || before.isSymbolicLink()
+      || before.size > MAX_SECRET_FILE_BYTES
+      || (before.mode & 0o077) !== 0
+    ) {
+      throw new Error(`${fileName} must reference a private small regular file`);
     }
-    const value = readFileSync(file, 'utf8').replace(/[\r\n]+$/, '');
+    const descriptor = openSync(file, fileConstants.O_RDONLY | fileConstants.O_NOFOLLOW);
+    let value: string;
+    try {
+      const opened = fstatSync(descriptor);
+      if (before.dev !== opened.dev || before.ino !== opened.ino || opened.size > MAX_SECRET_FILE_BYTES) {
+        throw new Error(`${fileName} changed while it was opened`);
+      }
+      value = readFileSync(descriptor, 'utf8').replace(/[\r\n]+$/, '');
+    } finally {
+      closeSync(descriptor);
+    }
     if (!value) throw new Error(`${fileName} is empty`);
     return value;
   }
@@ -55,6 +79,13 @@ export function loadConfig(overrides: ConfigOverrides = {}): RuntimeConfig {
 
   if (!sessionSecret || Buffer.byteLength(sessionSecret) < 32) {
     throw new Error('Monitor session secret must contain at least 32 bytes');
+  }
+
+  const ssoEnabled = overrides.ssoEnabled ?? enabled(process.env.MONITOR_SSO_ENABLED);
+  const edgeSecret = overrides.edgeSecret
+    ?? secretFromEnvironment('MONITOR_EDGE_SECRET_FILE', 'MONITOR_EDGE_SECRET');
+  if (ssoEnabled && (!edgeSecret || Buffer.byteLength(edgeSecret) < 32)) {
+    throw new Error('Monitor edge secret must contain at least 32 bytes when SSO is enabled');
   }
 
   return {
@@ -83,6 +114,7 @@ export function loadConfig(overrides: ConfigOverrides = {}): RuntimeConfig {
         .split(',')
         .map((origin) => origin.trim())
         .filter(Boolean),
-    ssoEnabled: overrides.ssoEnabled ?? enabled(process.env.MONITOR_SSO_ENABLED),
+    ssoEnabled,
+    edgeSecret: edgeSecret ?? null,
   };
 }

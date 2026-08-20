@@ -3,8 +3,8 @@
 Monitor is the private host-status dashboard served at
 `https://bonifacio.work/monitor/`. It combines one-minute host telemetry,
 rootless Docker status, storage information, sanitized alerts, and sanitized
-privilege activity in a responsive React dashboard protected by a shared
-password.
+privilege activity in a responsive React dashboard protected by the central
+Bonifacio SSO boundary.
 
 ## Architecture
 
@@ -89,7 +89,8 @@ secret are retained only for an explicit rollback.
 sudo install -d -o cks -g cks -m 0700 /home/cks/.config/monitor
 sudo -u cks sh -c 'umask 077; openssl rand -hex 24 > /home/cks/.config/monitor/password'
 sudo -u cks sh -c 'umask 077; openssl rand -hex 32 > /home/cks/.config/monitor/session-secret'
-sudo chmod 0600 /home/cks/.config/monitor/password /home/cks/.config/monitor/session-secret
+sudo -u cks sh -c 'umask 077; openssl rand -hex 32 > /home/cks/.config/monitor/edge-secret'
+sudo chmod 0600 /home/cks/.config/monitor/password /home/cks/.config/monitor/session-secret /home/cks/.config/monitor/edge-secret
 sudo install -d -o cks -g cks -m 0700 /home/cks/.local/state/monitor-auth
 sudo -u cks python3 ops/monitor_auth_state.py prepare
 sudo -u cks python3 ops/monitor_auth_state.py status
@@ -110,7 +111,11 @@ state file always wins and is never replaced from the bootstrap secret.
 The host-specific production definition is
 `/etc/portfolio-deploy/monitor.compose.yml`. It binds the application to
 `127.0.0.1:5181`, mounts `/var/lib/monitor-export` read-only, and requires an
-explicit image tag. Before deploying a password-state-aware image, its Monitor
+explicit image tag. Production also mounts the dedicated edge secret at
+`/run/secrets/monitor_edge_secret`; host Nginx overwrites
+`X-Portfolio-Edge-Secret` with the same value after Authelia authorization.
+This prevents another loopback process from forging only the public
+`Remote-*` headers. Before deploying a password-state-aware image, its Monitor
 service must also contain the following dedicated writable bind. Do not reuse
 the telemetry directory or either secret path:
 
@@ -211,12 +216,14 @@ location = /monitor {
 }
 
 location ^~ /monitor/ {
+    include /etc/nginx/snippets/bonifacio-sso-authrequest.conf;
+    include /etc/nginx/snippets/monitor-edge-secret.conf;
     proxy_pass         http://127.0.0.1:5181;
     proxy_http_version 1.1;
     proxy_set_header   Host                $host;
     proxy_set_header   X-Real-IP           $remote_addr;
     proxy_set_header   X-Forwarded-For     $proxy_add_x_forwarded_for;
-    proxy_set_header   X-Forwarded-Proto   $http_x_forwarded_proto;
+    proxy_set_header   X-Forwarded-Proto   https;
     proxy_set_header   X-Forwarded-Prefix  /monitor;
     proxy_intercept_errors on;
     error_page 502 503 504 =503 /_portfolio_unavailable.html;
@@ -245,6 +252,7 @@ MONITOR_AUTH_STATE_PATH="$PWD/auth-state" python3 ops/monitor_auth_state.py prep
 umask 077
 openssl rand -hex 24 > secrets/password
 openssl rand -hex 32 > secrets/session-secret
+openssl rand -hex 32 > secrets/edge-secret
 python3 ops/collector.py \
   --docker-sockets '' \
   --events-log /dev/null \
@@ -286,6 +294,7 @@ MONITOR_EXPORT_DIR="$PWD/data" \
 MONITOR_AUTH_STATE_PATH="$PWD/auth-state" \
 MONITOR_PASSWORD_PATH="$PWD/secrets/password" \
 MONITOR_SESSION_SECRET_PATH="$PWD/secrets/session-secret" \
+MONITOR_EDGE_SECRET_PATH="$PWD/secrets/edge-secret" \
 MONITOR_ALLOWED_ORIGINS=http://localhost:5181 \
 docker compose up --detach --build
 ```
@@ -302,8 +311,10 @@ Application variables:
 | `MONITOR_AUTH_STATE_FILE` | `/var/lib/monitor-auth/password.json` | Writable, persistent password-hash/session-epoch state file |
 | `MONITOR_PASSWORD_FILE` | unset | Preferred bootstrap password file; used only when auth state is absent |
 | `MONITOR_SESSION_SECRET_FILE` | unset | Preferred HMAC secret file; at least 32 bytes |
+| `MONITOR_EDGE_SECRET_FILE` | unset | SSO-only edge-to-origin shared secret file; at least 32 bytes and distinct from the session secret |
 | `MONITOR_PASSWORD` | unset | Development-only bootstrap fallback when no password file is set |
 | `MONITOR_SESSION_SECRET` | unset | Development-only fallback when no file is set |
+| `MONITOR_EDGE_SECRET` | unset | Development-only edge-secret fallback; prefer the file in production |
 | `MONITOR_ALLOWED_ORIGINS` | empty | Comma-separated permitted mutation origins |
 | `MONITOR_SSO_ENABLED` | `false` | Trust validated `Remote-User` and `Remote-Email` from the loopback-only reverse proxy and disable local credentials |
 | `MONITOR_SESSION_TTL_SECONDS` | `3600` | Signed-session lifetime; capped at 24 hours |
@@ -311,7 +322,8 @@ Application variables:
 
 The repository Compose file additionally accepts `MONITOR_IMAGE`,
 `MONITOR_PORT`, `MONITOR_EXPORT_DIR`, `MONITOR_AUTH_STATE_PATH`,
-`MONITOR_PASSWORD_PATH`, and `MONITOR_SESSION_SECRET_PATH`.
+`MONITOR_PASSWORD_PATH`, `MONITOR_SESSION_SECRET_PATH`, and
+`MONITOR_EDGE_SECRET_PATH`.
 
 Collector variables and defaults are:
 
@@ -432,7 +444,9 @@ GET    /monitor/api/dashboard?range=1h|24h|7d|30d
   checks.
 - Production SSO requests reach the app only through Nginx on the same host.
   Nginx removes client-supplied identity headers, obtains them from Authelia,
-  and overwrites `Remote-User`/`Remote-Email`; port `5181` remains loopback-only.
+  overwrites `Remote-User`/`Remote-Email`, and overwrites a dedicated secret
+  header which the application compares in constant time; port `5181` remains
+  loopback-only. Identity headers without the matching secret fail closed.
   Signing out redirects to the central `/sso/logout` endpoint. Local password
   authentication remains available only when `MONITOR_SSO_ENABLED` is false.
 - API responses are `no-store`; Helmet supplies a restrictive CSP and related

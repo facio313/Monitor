@@ -21,7 +21,10 @@ jobs:
   build-and-deploy:
     name: Test, build ARM64 image, and deploy
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 30
+    # The restricted host may spend up to 20 minutes waiting for the shared
+    # fleet deploy lock. Leave enough time for image publication, cutover, and
+    # rollback verification without interrupting the host mid-deployment.
+    timeout-minutes: 60
 
     steps:
       - name: Check out source
@@ -29,6 +32,9 @@ jobs:
 
       - name: Test host collector
         run: python3 -m unittest discover -s ops/tests -p 'test_*.py'
+
+      - name: Validate production Compose configuration
+        run: docker compose config --quiet
 
       - name: Sign in to GitHub Container Registry
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3

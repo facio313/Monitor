@@ -1,6 +1,7 @@
 import express, { type NextFunction, type Request, type Response } from 'express';
 import rateLimit from 'express-rate-limit';
 import helmet from 'helmet';
+import { timingSafeEqual } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { basename, join, resolve, sep } from 'node:path';
 import {
@@ -23,9 +24,17 @@ function apiError(response: Response, status: number, code: string, message: str
   response.status(status).json({ error: message, code });
 }
 
-function trustedSsoUser(request: Request): string | null {
+function safeEqual(left: string, right: string): boolean {
+  const leftBuffer = Buffer.from(left, 'utf8');
+  const rightBuffer = Buffer.from(right, 'utf8');
+  return leftBuffer.length === rightBuffer.length && timingSafeEqual(leftBuffer, rightBuffer);
+}
+
+function trustedSsoUser(request: Request, edgeSecret: string | null): string | null {
   const user = request.get('remote-user');
   const email = request.get('remote-email');
+  const suppliedEdgeSecret = request.get('x-portfolio-edge-secret');
+  if (!edgeSecret || !suppliedEdgeSecret || !safeEqual(suppliedEdgeSecret, edgeSecret)) return null;
   if (!user || !email) return null;
   const safeHeader = (value: string) => value.length <= 254 && !/[\u0000-\u001f\u007f]/u.test(value);
   return safeHeader(user) && safeHeader(email) ? user : null;
@@ -149,7 +158,7 @@ export function createApp(options: AppOptions = {}) {
 
   app.get('/monitor/api/auth/session', (request, response) => {
     if (config.ssoEnabled) {
-      const user = trustedSsoUser(request);
+      const user = trustedSsoUser(request, config.edgeSecret);
       response.status(200).json({
         authenticated: user !== null,
         expiresAt: null,
@@ -211,7 +220,7 @@ export function createApp(options: AppOptions = {}) {
 
   app.get('/monitor/api/dashboard', (request, response) => {
     const authorized = config.ssoEnabled
-      ? trustedSsoUser(request) !== null
+      ? trustedSsoUser(request, config.edgeSecret) !== null
       : verifySession(request, config.sessionSecret, passwordStore.sessionEpoch, now()) !== null;
     if (!authorized) {
       apiError(response, 401, 'AUTH_REQUIRED', 'Authentication required');

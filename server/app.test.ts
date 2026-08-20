@@ -18,6 +18,7 @@ import { PasswordStore, PasswordStoreBusyError } from './password-store.js';
 
 const NOW = Date.parse('2026-08-19T12:00:00.000Z');
 const SECRET = 'test-session-secret-is-at-least-32-bytes-long';
+const EDGE_SECRET = 'test-edge-secret-is-at-least-32-bytes-long';
 
 function dataDirectory(): string {
   const directory = mkdtempSync(join(tmpdir(), 'monitor-test-'));
@@ -46,22 +47,63 @@ async function loginCookie(app: ReturnType<typeof createApp>): Promise<string> {
 }
 
 describe('authentication', () => {
-  it('loads password and session secret files ahead of environment values', () => {
+  it('loads password, session, and SSO edge secret files ahead of environment values', () => {
     const directory = mkdtempSync(join(tmpdir(), 'monitor-secrets-'));
     const passwordFile = join(directory, 'password');
     const sessionFile = join(directory, 'session');
+    const edgeFile = join(directory, 'edge');
     writeFileSync(passwordFile, 'password-from-file\n');
     writeFileSync(sessionFile, `${SECRET}\n`);
+    writeFileSync(edgeFile, `${EDGE_SECRET}\n`);
+    for (const path of [passwordFile, sessionFile, edgeFile]) chmodSync(path, 0o600);
     vi.stubEnv('MONITOR_PASSWORD_FILE', passwordFile);
     vi.stubEnv('MONITOR_PASSWORD', 'password-from-environment');
     vi.stubEnv('MONITOR_SESSION_SECRET_FILE', sessionFile);
     vi.stubEnv('MONITOR_SESSION_SECRET', 'environment-session-secret-is-long-enough');
+    vi.stubEnv('MONITOR_SSO_ENABLED', 'true');
+    vi.stubEnv('MONITOR_EDGE_SECRET_FILE', edgeFile);
+    vi.stubEnv('MONITOR_EDGE_SECRET', 'environment-edge-secret-is-long-enough');
     try {
       const config = loadConfig();
       expect(config.getBootstrapPassword()).toBe('password-from-file');
       expect(config.sessionSecret).toBe(SECRET);
+      expect(config.edgeSecret).toBe(EDGE_SECRET);
     } finally {
       vi.unstubAllEnvs();
+    }
+  });
+
+  it('fails closed when SSO is enabled without a strong edge secret', () => {
+    expect(() => loadConfig({ sessionSecret: SECRET, ssoEnabled: true })).toThrow(
+      'Monitor edge secret must contain at least 32 bytes',
+    );
+    expect(() => loadConfig({ sessionSecret: SECRET, ssoEnabled: true, edgeSecret: 'short' })).toThrow(
+      'Monitor edge secret must contain at least 32 bytes',
+    );
+  });
+
+  it('rejects broad or symlinked SSO edge secret files', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'monitor-edge-secret-'));
+    const realFile = join(directory, 'real');
+    const linkFile = join(directory, 'link');
+    writeFileSync(realFile, `${EDGE_SECRET}\n`);
+    chmodSync(realFile, 0o644);
+    vi.stubEnv('MONITOR_SSO_ENABLED', 'true');
+    vi.stubEnv('MONITOR_EDGE_SECRET_FILE', realFile);
+    try {
+      expect(() => loadConfig({ sessionSecret: SECRET })).toThrow(
+        'must reference a private small regular file',
+      );
+      chmodSync(realFile, 0o600);
+      symlinkSync(realFile, linkFile);
+      vi.stubEnv('MONITOR_EDGE_SECRET_FILE', linkFile);
+      expect(() => loadConfig({ sessionSecret: SECRET })).toThrow(
+        'must reference a private small regular file',
+      );
+    } finally {
+      vi.unstubAllEnvs();
+      unlinkSync(linkFile);
+      unlinkSync(realFile);
     }
   });
 
@@ -86,6 +128,7 @@ describe('authentication', () => {
       dataDir: directory,
       now: () => NOW,
       ssoEnabled: true,
+      edgeSecret: EDGE_SECRET,
     });
 
     await request(app).get('/monitor/api/auth/session').expect(200, {
@@ -98,6 +141,7 @@ describe('authentication', () => {
       .get('/monitor/api/auth/session')
       .set('Remote-User', 'portfolio-owner')
       .set('Remote-Email', 'owner@example.test')
+      .set('X-Portfolio-Edge-Secret', EDGE_SECRET)
       .expect(200, {
         authenticated: true,
         expiresAt: null,
@@ -109,6 +153,7 @@ describe('authentication', () => {
       .post('/monitor/api/auth/password')
       .set('Remote-User', 'portfolio-owner')
       .set('Remote-Email', 'owner@example.test')
+      .set('X-Portfolio-Edge-Secret', EDGE_SECRET)
       .send({ currentPassword: 'old', newPassword: 'new password value' })
       .expect(403);
     await request(app).get('/monitor/api/dashboard?range=1h').expect(401);
@@ -116,7 +161,20 @@ describe('authentication', () => {
       .get('/monitor/api/dashboard?range=1h')
       .set('Remote-User', 'portfolio-owner')
       .set('Remote-Email', 'owner@example.test')
+      .set('X-Portfolio-Edge-Secret', EDGE_SECRET)
       .expect(200);
+
+    await request(app)
+      .get('/monitor/api/auth/session')
+      .set('Remote-User', 'portfolio-owner')
+      .set('Remote-Email', 'owner@example.test')
+      .set('X-Portfolio-Edge-Secret', 'forged-secret-that-is-long-enough-to-look-real')
+      .expect(200, {
+        authenticated: false,
+        expiresAt: null,
+        mode: 'sso',
+        user: null,
+      });
   });
 
   it('rejects bad credentials and issues a hardened session cookie', async () => {
