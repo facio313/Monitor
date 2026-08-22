@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-script_directory=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+script_directory=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 resolver=$script_directory/portfolio-auth-mode.sh
 
 assert_mode() {
@@ -27,7 +27,11 @@ if PORTFOLIO_BRANCH=main PORTFOLIO_AUTH_MODE=local "$resolver" check 2>/dev/null
   exit 1
 fi
 
-PORTFOLIO_BRANCH=topic PORTFOLIO_AUTH_MODE=local "$resolver" exec -- \
-  sh -c '[ "$PORTFOLIO_BRANCH" = topic ] && [ "$PORTFOLIO_AUTH_MODE" = local ]'
+topic_contract=$(PORTFOLIO_BRANCH=topic PORTFOLIO_AUTH_MODE=local "$resolver" contract)
+[ "$topic_contract" = "$(printf 'topic\nlocal')" ]
+
+topic_environment=$(PORTFOLIO_BRANCH=topic PORTFOLIO_AUTH_MODE=local "$resolver" exec -- env)
+printf '%s\n' "$topic_environment" | grep -Fqx 'PORTFOLIO_BRANCH=topic'
+printf '%s\n' "$topic_environment" | grep -Fqx 'PORTFOLIO_AUTH_MODE=local'
 
 printf '%s\n' 'portfolio auth mode contract: ok'
