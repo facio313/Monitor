@@ -322,6 +322,42 @@ def restore(
     return previous_backup, state_file
 
 
+def retire(state_dir: Path, backup_dir: Path, uid: int) -> Path | None:
+    """Deactivate the local credential record after an owner-only snapshot.
+
+    This is intentionally idempotent. The caller must stop Monitor first so a
+    local-mode process cannot keep the retired password/session epoch in memory.
+    """
+
+    if not _validate_directory(state_dir, uid, allow_missing=True):
+        return None
+    state_file = state_dir / STATE_FILENAME
+    if not state_file.exists() and not state_file.is_symlink():
+        return None
+    descriptor, before = _open_regular_file(state_file, uid)
+    os.close(descriptor)
+    snapshot = backup(state_dir, backup_dir, uid, prefix="retired-sso")
+    after = state_file.lstat()
+    if (
+        after.st_dev != before.st_dev
+        or after.st_ino != before.st_ino
+        or after.st_size != before.st_size
+        or after.st_mtime_ns != before.st_mtime_ns
+    ):
+        raise StateError(f"state file changed while it was retired: {state_file}")
+    state_file.unlink()
+    try:
+        _fsync_directory(state_dir)
+    except OSError:
+        # The unlink has already committed. Do not imply that the active state
+        # still exists when only crash durability could not be confirmed.
+        print(
+            "warning: auth-state was retired but directory durability sync failed",
+            file=sys.stderr,
+        )
+    return snapshot
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Manage Monitor password-hash state without displaying its contents."
@@ -350,6 +386,20 @@ def _parser() -> argparse.ArgumentParser:
         "--confirm-container-stopped",
         action="store_true",
         help="confirm that Monitor is stopped so it cannot race or cache the restored state",
+    )
+    retire_parser = subparsers.add_parser(
+        "retire",
+        help="back up and deactivate local password state before an SSO-only deployment",
+    )
+    retire_parser.add_argument(
+        "--confirm-container-stopped",
+        action="store_true",
+        help="confirm that Monitor is stopped so it cannot cache the retired state",
+    )
+    retire_parser.add_argument(
+        "--confirm-sso-mode",
+        action="store_true",
+        help="confirm that the replacement deployment uses central SSO",
     )
     return parser
 
@@ -384,6 +434,20 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"previous auth-state backup created: {previous}")
             print(f"auth-state password hash restored with a fresh session epoch: {restored}")
             print("restart Monitor before accepting authentication requests")
+        elif arguments.command == "retire":
+            if not arguments.confirm_container_stopped or not arguments.confirm_sso_mode:
+                parser.error(
+                    "retire requires --confirm-container-stopped and --confirm-sso-mode"
+                )
+            snapshot = retire(
+                arguments.state_dir,
+                arguments.backup_dir,
+                uid,
+            )
+            if snapshot is None:
+                print("auth-state already retired: no active local credential record")
+            else:
+                print(f"auth-state retired; owner-only recovery snapshot: {snapshot}")
     except StateError as error:
         print(f"auth-state operation refused: {error}", file=sys.stderr)
         return 1

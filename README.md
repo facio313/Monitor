@@ -44,12 +44,20 @@ runtime branch/mode overrides must match the branch and mode used to build the
 image.
 
 In `sso` mode Monitor still requires the edge secret and accepts `Remote-*`
-identity only when the Nginx-injected secret matches. Local login and password
-changes stay disabled. In `local` mode the existing password screen, scrypt
-state, and signed Monitor cookie remain active; local mode is not an
-unauthenticated SSO bypass. `MONITOR_SSO_ENABLED` is now only a compatibility
-check: if an older deployment still supplies it, it must agree with the
-canonical mode.
+identity only when the Nginx-injected secret matches. `Remote-Groups` must be
+one whitespace-free, exact hierarchy-closed prefix: `user`, `user,developer`,
+or `user,developer,admin`; missing, empty, whitespace-padded, duplicate,
+unknown, or reordered groups fail closed. A valid `user` can inspect only its SSO session identity; both the
+dashboard and metadata-only legacy auth inventory require `developer` or
+`admin`, matching the outer `/monitor` ACL in a second application-level
+boundary. Roles are recalculated from the trusted headers on every request and
+are never stored in a Monitor cookie.
+Local login and password changes stay disabled, and the SSO session check
+expires any legacy Monitor cookie presented by that browser. In `local` mode
+the existing password screen, scrypt state, and signed Monitor cookie remain
+active; local mode is not an unauthenticated SSO bypass. `MONITOR_SSO_ENABLED`
+is now only a compatibility check: if an older deployment still supplies it,
+it must agree with the canonical mode.
 
 The dashboard provides:
 
@@ -108,7 +116,11 @@ sudo chmod 0600 /home/cks/.config/monitor/edge-secret
 
 Do not mount `MONITOR_PASSWORD_FILE`, `MONITOR_SESSION_SECRET_FILE`, or
 `MONITOR_AUTH_STATE_FILE` in a `main`/ `dev` deployment. SSO mode does not
-read them and does not instantiate the local password store.
+read credential contents and does not instantiate the local password store.
+`GET /monitor/api/operations/auth-inventory` is developer-gated and reports
+only aggregate file/cookie counts. If an old local state file remains, stop the
+container and run the explicit owner-only `retire` procedure described below;
+do not expose hash contents or remove a running local-mode store.
 
 ### 3. Build and start the rootless container
 
@@ -383,6 +395,7 @@ GET    /monitor/api/auth/session
 DELETE /monitor/api/auth/session
 POST   /monitor/api/auth/password
 GET    /monitor/api/dashboard?range=1h|24h|7d|30d
+GET    /monitor/api/operations/auth-inventory  # developer/admin, aggregate only
 ```
 
 ## Security boundaries
@@ -404,9 +417,10 @@ GET    /monitor/api/dashboard?range=1h|24h|7d|30d
   checks.
 - Production SSO requests reach the app only through Nginx on the same host.
   Nginx removes client-supplied identity headers, obtains them from Authelia,
-  overwrites `Remote-User`/`Remote-Email`, and overwrites a dedicated secret
-  header which the application compares in constant time; port `5181` remains
-  loopback-only. Identity headers without the matching secret fail closed.
+  overwrites `Remote-User`/`Remote-Email`/`Remote-Groups`, and overwrites a
+  dedicated secret header which the application compares in constant time;
+  port `5181` remains loopback-only. Identity headers without the matching
+  secret and canonical hierarchy-closed groups fail closed.
   Signing out redirects to the central `/sso/logout` endpoint. Local password
   authentication remains available only when the canonical authentication mode
   is `local`.

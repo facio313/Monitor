@@ -1,18 +1,24 @@
 import express, { type NextFunction, type Request, type Response } from 'express';
 import rateLimit from 'express-rate-limit';
 import helmet from 'helmet';
-import { timingSafeEqual } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { basename, join, resolve, sep } from 'node:path';
 import {
   clearSessionCookie,
   issueSession,
+  requestHasSessionCookie,
   setSessionCookie,
   verifySession,
 } from './auth.js';
 import { loadConfig, type ConfigOverrides } from './config.js';
 import { readDashboard, telemetryIsReady } from './data.js';
+import { inventoryLegacyAuth } from './legacy-auth.js';
 import { PasswordStore, PasswordStoreBusyError } from './password-store.js';
+import {
+  permissionsForRole,
+  ssoRoleAtLeast,
+  trustedSsoIdentity,
+} from './sso.js';
 import { DASHBOARD_RANGES, type DashboardRange } from './types.js';
 
 export interface AppOptions extends ConfigOverrides {
@@ -22,22 +28,6 @@ export interface AppOptions extends ConfigOverrides {
 
 function apiError(response: Response, status: number, code: string, message: string): void {
   response.status(status).json({ error: message, code });
-}
-
-function safeEqual(left: string, right: string): boolean {
-  const leftBuffer = Buffer.from(left, 'utf8');
-  const rightBuffer = Buffer.from(right, 'utf8');
-  return leftBuffer.length === rightBuffer.length && timingSafeEqual(leftBuffer, rightBuffer);
-}
-
-function trustedSsoUser(request: Request, edgeSecret: string | null): string | null {
-  const user = request.get('remote-user');
-  const email = request.get('remote-email');
-  const suppliedEdgeSecret = request.get('x-portfolio-edge-secret');
-  if (!edgeSecret || !suppliedEdgeSecret || !safeEqual(suppliedEdgeSecret, edgeSecret)) return null;
-  if (!user || !email) return null;
-  const safeHeader = (value: string) => value.length <= 254 && !/[\u0000-\u001f\u007f]/u.test(value);
-  return safeHeader(user) && safeHeader(email) ? user : null;
 }
 
 function mutationIsSameOrigin(request: Request, allowedOrigins: string[]): boolean {
@@ -162,12 +152,16 @@ export function createApp(options: AppOptions = {}) {
 
   app.get('/monitor/api/auth/session', (request, response) => {
     if (config.ssoEnabled) {
-      const user = trustedSsoUser(request, config.edgeSecret);
+      const identity = trustedSsoIdentity(request, config.edgeSecret);
+      if (requestHasSessionCookie(request)) clearSessionCookie(response);
       response.status(200).json({
-        authenticated: user !== null,
+        authenticated: identity !== null,
         expiresAt: null,
         mode: 'sso',
-        user,
+        user: identity?.subject ?? null,
+        groups: identity?.groups ?? [],
+        role: identity?.role ?? null,
+        permissions: identity ? permissionsForRole(identity.role) : [],
       });
       return;
     }
@@ -228,17 +222,27 @@ export function createApp(options: AppOptions = {}) {
   });
 
   app.get('/monitor/api/dashboard', (request, response) => {
-    const authorized = config.ssoEnabled
-      ? trustedSsoUser(request, config.edgeSecret) !== null
-      : verifySession(
+    if (config.ssoEnabled) {
+      const identity = trustedSsoIdentity(request, config.edgeSecret);
+      if (!identity) {
+        apiError(response, 401, 'AUTH_REQUIRED', 'Authentication required');
+        return;
+      }
+      if (!ssoRoleAtLeast(identity, 'developer')) {
+        apiError(response, 403, 'ROLE_REQUIRED', 'Developer role required');
+        return;
+      }
+    } else {
+      const session = verifySession(
         request,
         localAuth!.sessionSecret,
         localAuth!.passwordStore.sessionEpoch,
         now(),
-      ) !== null;
-    if (!authorized) {
-      apiError(response, 401, 'AUTH_REQUIRED', 'Authentication required');
-      return;
+      );
+      if (!session) {
+        apiError(response, 401, 'AUTH_REQUIRED', 'Authentication required');
+        return;
+      }
     }
     const requestedRange = request.query.range;
     if (typeof requestedRange !== 'string' || !DASHBOARD_RANGES.includes(requestedRange as DashboardRange)) {
@@ -251,6 +255,23 @@ export function createApp(options: AppOptions = {}) {
       now(),
       config.staleAfterMs,
     ));
+  });
+
+  app.get('/monitor/api/operations/auth-inventory', (request, response) => {
+    if (!config.ssoEnabled) {
+      apiError(response, 404, 'NOT_FOUND', 'Not found');
+      return;
+    }
+    const identity = trustedSsoIdentity(request, config.edgeSecret);
+    if (!identity) {
+      apiError(response, 401, 'AUTH_REQUIRED', 'Authentication required');
+      return;
+    }
+    if (!ssoRoleAtLeast(identity, 'developer')) {
+      apiError(response, 403, 'ROLE_REQUIRED', 'Developer role required');
+      return;
+    }
+    response.status(200).json(inventoryLegacyAuth(request, config.legacyAuthStateFile));
   });
 
   app.use('/monitor/api', (_request, response) => {

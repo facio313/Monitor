@@ -227,6 +227,53 @@ class MonitorAuthStateTests(unittest.TestCase):
 
         self.assertFalse(nested_backup.exists())
 
+    def test_retire_is_recoverable_and_idempotent(self) -> None:
+        state_file = self.write_state()
+        original = state_file.read_bytes()
+
+        snapshot = auth_state.retire(
+            self.state_dir,
+            self.backup_dir,
+            self.uid,
+        )
+
+        self.assertIsNotNone(snapshot)
+        assert snapshot is not None
+        self.assertEqual(snapshot.read_bytes(), original)
+        self.assertFalse(state_file.exists())
+        self.assertIsNone(
+            auth_state.retire(self.state_dir, self.backup_dir, self.uid)
+        )
+        self.assertEqual(
+            auth_state.status(self.state_dir, self.uid),
+            "directory=ready state=awaiting-initialization",
+        )
+
+    def test_retire_reports_post_unlink_directory_sync_failure_as_warning(self) -> None:
+        state_file = self.write_state()
+        original_sync = auth_state._fsync_directory
+        calls = 0
+
+        def fail_final_sync(path: Path) -> None:
+            nonlocal calls
+            calls += 1
+            if path == self.state_dir and not state_file.exists():
+                raise OSError("injected post-unlink sync failure")
+            original_sync(path)
+
+        with mock.patch.object(auth_state, "_fsync_directory", side_effect=fail_final_sync):
+            with mock.patch("sys.stderr") as stderr:
+                snapshot = auth_state.retire(
+                    self.state_dir,
+                    self.backup_dir,
+                    self.uid,
+                )
+
+        self.assertGreater(calls, 0)
+        self.assertIsNotNone(snapshot)
+        self.assertFalse(state_file.exists())
+        self.assertTrue(stderr.write.called)
+
 
 if __name__ == "__main__":
     unittest.main()

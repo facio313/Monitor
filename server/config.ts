@@ -16,6 +16,7 @@ interface CommonRuntimeConfig {
   dataDir: string;
   staleAfterMs: number;
   allowedOrigins: string[];
+  legacyAuthStateFile: string;
 }
 
 export interface SsoRuntimeConfig extends CommonRuntimeConfig {
@@ -132,6 +133,11 @@ export function loadConfig(overrides: ConfigOverrides = {}): RuntimeConfig {
         .split(',')
         .map((origin) => origin.trim())
         .filter(Boolean),
+    legacyAuthStateFile: resolve(
+      overrides.authStateFile
+        ?? process.env.MONITOR_AUTH_STATE_FILE
+        ?? '/var/lib/monitor-auth/password.json',
+    ),
   };
 
   if (ssoEnabled) {
@@ -159,11 +165,7 @@ export function loadConfig(overrides: ConfigOverrides = {}): RuntimeConfig {
       if (!password) throw new Error('Monitor bootstrap password is not configured');
       return password;
     },
-    authStateFile: resolve(
-      overrides.authStateFile
-        ?? process.env.MONITOR_AUTH_STATE_FILE
-        ?? '/var/lib/monitor-auth/password.json',
-    ),
+    authStateFile: common.legacyAuthStateFile,
     sessionSecret,
     sessionTtlMs: Math.max(1_000, Math.min(
       overrides.sessionTtlMs

@@ -54,6 +54,10 @@ function parseCookies(header: string | undefined): Map<string, string> {
   return cookies;
 }
 
+export function requestHasSessionCookie(request: Request): boolean {
+  return parseCookies(request.headers.cookie).has(SESSION_COOKIE);
+}
+
 export function verifySession(
   request: Request,
   secret: string,

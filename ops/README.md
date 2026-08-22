@@ -161,6 +161,22 @@ password hash, and generates a fresh session epoch so old cookies cannot become
 valid again. See the repository README for stop/start ordering, session-secret
 rotation, legacy rollback limits, and off-host disaster recovery.
 
+Before replacing a local deployment with central SSO, stop the container and
+retire the active record explicitly:
+
+```sh
+sudo -u cks python3 ops/monitor_auth_state.py retire \
+  --confirm-container-stopped --confirm-sso-mode
+```
+
+`retire` validates the same owner/mode/link/schema boundary, creates an
+owner-only `retired-sso-*` recovery snapshot outside the mounted state
+directory, rechecks the source identity, removes only the active
+`password.json`, and fsyncs the directory. Repeating it with no active record
+is a no-op. Production SSO must not mount the active state or its recovery
+snapshots; restoring one is a deliberate return to local mode and creates a
+fresh session epoch.
+
 Docker list and per-container stats calls use a 2-second curl timeout. All
 owner list endpoints are read first, then stats use the fast
 `stream=false&one-shot=true` endpoint with at most six bounded worker threads,

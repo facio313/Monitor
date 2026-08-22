@@ -16,10 +16,20 @@ import { describe, expect, it, vi } from 'vitest';
 import { createApp } from './app.js';
 import { loadConfig } from './config.js';
 import { PasswordStore, PasswordStoreBusyError } from './password-store.js';
+import { parseSsoGroups } from './sso.js';
 
 const NOW = Date.parse('2026-08-19T12:00:00.000Z');
 const SECRET = 'test-session-secret-is-at-least-32-bytes-long';
 const EDGE_SECRET = 'test-edge-secret-is-at-least-32-bytes-long';
+
+function ssoHeaders(groups = 'user', edgeSecret = EDGE_SECRET): Record<string, string> {
+  return {
+    'Remote-User': 'portfolio-owner',
+    'Remote-Email': 'owner@example.test',
+    'Remote-Groups': groups,
+    'X-Portfolio-Edge-Secret': edgeSecret,
+  };
+}
 
 function dataDirectory(): string {
   const directory = mkdtempSync(join(tmpdir(), 'monitor-test-'));
@@ -187,46 +197,124 @@ describe('authentication', () => {
       expiresAt: null,
       mode: 'sso',
       user: null,
+      groups: [],
+      role: null,
+      permissions: [],
     });
     await request(app)
       .get('/monitor/api/auth/session')
-      .set('Remote-User', 'portfolio-owner')
-      .set('Remote-Email', 'owner@example.test')
-      .set('X-Portfolio-Edge-Secret', EDGE_SECRET)
+      .set(ssoHeaders())
       .expect(200, {
         authenticated: true,
         expiresAt: null,
         mode: 'sso',
         user: 'portfolio-owner',
+        groups: ['user'],
+        role: 'user',
+        permissions: [],
       });
     await request(app).post('/monitor/api/auth/login').send({ password: 'unused local password' }).expect(403);
     await request(app)
       .post('/monitor/api/auth/password')
-      .set('Remote-User', 'portfolio-owner')
-      .set('Remote-Email', 'owner@example.test')
-      .set('X-Portfolio-Edge-Secret', EDGE_SECRET)
+      .set(ssoHeaders())
       .send({ currentPassword: 'old', newPassword: 'new password value' })
       .expect(403);
     await request(app).get('/monitor/api/dashboard?range=1h').expect(401);
     await request(app)
       .get('/monitor/api/dashboard?range=1h')
-      .set('Remote-User', 'portfolio-owner')
-      .set('Remote-Email', 'owner@example.test')
-      .set('X-Portfolio-Edge-Secret', EDGE_SECRET)
+      .set(ssoHeaders())
+      .expect(403, { error: 'Developer role required', code: 'ROLE_REQUIRED' });
+    await request(app)
+      .get('/monitor/api/dashboard?range=1h')
+      .set(ssoHeaders('user,developer'))
       .expect(200);
 
     await request(app)
       .get('/monitor/api/auth/session')
-      .set('Remote-User', 'portfolio-owner')
-      .set('Remote-Email', 'owner@example.test')
-      .set('X-Portfolio-Edge-Secret', 'forged-secret-that-is-long-enough-to-look-real')
+      .set(ssoHeaders('user', 'forged-secret-that-is-long-enough-to-look-real'))
       .expect(200, {
         authenticated: false,
         expiresAt: null,
         mode: 'sso',
         user: null,
+        groups: [],
+        role: null,
+        permissions: [],
       });
     expect(existsSync(absentState)).toBe(false);
+  });
+
+  it('fails closed on non-canonical SSO groups and gates aggregate auth inventory', async () => {
+    const directory = dataDirectory();
+    const authStateFile = join(directory, 'legacy-auth-state.json');
+    writeFileSync(authStateFile, '{"legacy":"credential-record"}\n', { mode: 0o600 });
+    const app = createApp({
+      authStateFile,
+      dataDir: directory,
+      now: () => NOW,
+      ssoEnabled: true,
+      edgeSecret: EDGE_SECRET,
+    });
+
+    for (const groups of [
+      '',
+      'developer',
+      'admin',
+      'user,admin',
+      'developer,user',
+      'user,user',
+      'user,unknown',
+      'user,',
+      'user, developer',
+    ]) {
+      await request(app)
+        .get('/monitor/api/dashboard?range=1h')
+        .set(ssoHeaders(groups))
+        .expect(401);
+    }
+
+    await request(app)
+      .get('/monitor/api/operations/auth-inventory')
+      .set(ssoHeaders())
+      .expect(403, { error: 'Developer role required', code: 'ROLE_REQUIRED' });
+    const developer = await request(app)
+      .get('/monitor/api/operations/auth-inventory')
+      .set('Cookie', 'monitor_session=legacy-local-cookie')
+      .set(ssoHeaders('user,developer'))
+      .expect(200);
+    expect(developer.body).toEqual({
+      localPasswordRecords: 1,
+      unsafeLocalAuthArtifacts: 0,
+      legacySessionCookies: 1,
+    });
+    await request(app)
+      .get('/monitor/api/operations/auth-inventory')
+      .set(ssoHeaders('user,developer,admin'))
+      .expect(200, {
+        localPasswordRecords: 1,
+        unsafeLocalAuthArtifacts: 0,
+        legacySessionCookies: 0,
+      });
+
+    const session = await request(app)
+      .get('/monitor/api/auth/session')
+      .set('Cookie', 'monitor_session=legacy-local-cookie')
+      .set(ssoHeaders('user,developer,admin'))
+      .expect(200);
+    expect(session.body).toMatchObject({
+      authenticated: true,
+      groups: ['user', 'developer', 'admin'],
+      role: 'admin',
+      permissions: ['dashboard:read', 'auth-inventory:read'],
+    });
+    expect(String(session.headers['set-cookie'])).toContain('monitor_session=;');
+    expect(existsSync(authStateFile)).toBe(true);
+  });
+
+  it('rejects whitespace before HTTP header normalization', () => {
+    for (const groups of [' user', 'user ', 'user, developer', 'user,developer ']) {
+      expect(parseSsoGroups(groups)).toBeNull();
+    }
   });
 
   it('rejects bad credentials and issues a hardened session cookie', async () => {
