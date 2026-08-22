@@ -3,6 +3,9 @@ services:
     image: ${MONITOR_IMAGE:-ghcr.io/facio313/monitor:latest}
     build:
       context: .
+      args:
+        PORTFOLIO_BRANCH: ${PORTFOLIO_BRANCH:?run Compose through npm run compose}
+        PORTFOLIO_AUTH_MODE: ${PORTFOLIO_AUTH_MODE:?run Compose through npm run compose}
     container_name: monitor
     restart: unless-stopped
     ports:
@@ -11,12 +14,7 @@ services:
       NODE_ENV: production
       PORT: "8080"
       MONITOR_DATA_DIR: /data
-      MONITOR_AUTH_STATE_FILE: /var/lib/monitor-auth/password.json
-      MONITOR_PASSWORD_FILE: /run/secrets/monitor_password
-      MONITOR_SESSION_SECRET_FILE: /run/secrets/monitor_session_secret
-      MONITOR_EDGE_SECRET_FILE: /run/secrets/monitor_edge_secret
       MONITOR_ALLOWED_ORIGINS: ${MONITOR_ALLOWED_ORIGINS:-https://bonifacio.work}
-      MONITOR_SSO_ENABLED: ${MONITOR_SSO_ENABLED:-false}
     volumes:
       - type: bind
         source: ${MONITOR_EXPORT_DIR:-./data}
@@ -24,16 +22,6 @@ services:
         read_only: true
         bind:
           create_host_path: false
-      - type: bind
-        source: ${MONITOR_AUTH_STATE_PATH:-./auth-state}
-        target: /var/lib/monitor-auth
-        read_only: false
-        bind:
-          create_host_path: false
-    secrets:
-      - monitor_password
-      - monitor_session_secret
-      - monitor_edge_secret
     read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=16m
@@ -56,11 +44,3 @@ services:
       timeout: 5s
       retries: 5
       start_period: 15s
-
-secrets:
-  monitor_password:
-    file: ${MONITOR_PASSWORD_PATH:-./secrets/password}
-  monitor_session_secret:
-    file: ${MONITOR_SESSION_SECRET_PATH:-./secrets/session-secret}
-  monitor_edge_secret:
-    file: ${MONITOR_EDGE_SECRET_PATH:-./secrets/edge-secret}

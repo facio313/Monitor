@@ -1,0 +1,22 @@
+services:
+  monitor:
+    environment:
+      MONITOR_AUTH_STATE_FILE: /var/lib/monitor-auth/password.json
+      MONITOR_PASSWORD_FILE: /run/secrets/monitor_password
+      MONITOR_SESSION_SECRET_FILE: /run/secrets/monitor_session_secret
+    volumes:
+      - type: bind
+        source: ${MONITOR_AUTH_STATE_PATH:-./auth-state}
+        target: /var/lib/monitor-auth
+        read_only: false
+        bind:
+          create_host_path: false
+    secrets:
+      - monitor_password
+      - monitor_session_secret
+
+secrets:
+  monitor_password:
+    file: ${MONITOR_PASSWORD_PATH:-./secrets/password}
+  monitor_session_secret:
+    file: ${MONITOR_SESSION_SECRET_PATH:-./secrets/session-secret}

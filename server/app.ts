@@ -56,7 +56,11 @@ function mutationIsSameOrigin(request: Request, allowedOrigins: string[]): boole
 
 export function createApp(options: AppOptions = {}) {
   const config = loadConfig(options);
-  const passwordStore = new PasswordStore(config.authStateFile, config.getBootstrapPassword);
+  const localAuth = config.ssoEnabled ? null : {
+    passwordStore: new PasswordStore(config.authStateFile, config.getBootstrapPassword),
+    sessionSecret: config.sessionSecret,
+    sessionTtlMs: config.sessionTtlMs,
+  };
   const now = options.now ?? Date.now;
   const publicDirectory = resolve(options.publicDir ?? join(process.cwd(), 'dist', 'public'));
   const indexFile = join(publicDirectory, 'index.html');
@@ -139,7 +143,7 @@ export function createApp(options: AppOptions = {}) {
       : undefined;
     let sessionEpoch: string | null;
     try {
-      sessionEpoch = await passwordStore.authenticate(suppliedPassword);
+      sessionEpoch = await localAuth!.passwordStore.authenticate(suppliedPassword);
     } catch (error) {
       if (error instanceof PasswordStoreBusyError) {
         apiError(response, 429, 'RATE_LIMITED', 'Too many login attempts');
@@ -151,8 +155,8 @@ export function createApp(options: AppOptions = {}) {
       apiError(response, 401, 'INVALID_CREDENTIALS', 'Invalid credentials');
       return;
     }
-    const session = issueSession(config.sessionSecret, sessionEpoch, now(), config.sessionTtlMs);
-    setSessionCookie(response, session.token, config.sessionTtlMs);
+    const session = issueSession(localAuth!.sessionSecret, sessionEpoch, now(), localAuth!.sessionTtlMs);
+    setSessionCookie(response, session.token, localAuth!.sessionTtlMs);
     response.status(200).json({ authenticated: true, expiresAt: session.expiresAt });
   });
 
@@ -167,7 +171,12 @@ export function createApp(options: AppOptions = {}) {
       });
       return;
     }
-    const session = verifySession(request, config.sessionSecret, passwordStore.sessionEpoch, now());
+    const session = verifySession(
+      request,
+      localAuth!.sessionSecret,
+      localAuth!.passwordStore.sessionEpoch,
+      now(),
+    );
     if (!session) {
       response.status(200).json({ authenticated: false, expiresAt: null });
       return;
@@ -185,8 +194,8 @@ export function createApp(options: AppOptions = {}) {
       apiError(response, 403, 'SSO_MANAGED', 'Password changes are managed by the portfolio single sign-on service');
       return;
     }
-    const authorizedEpoch = passwordStore.sessionEpoch;
-    const session = verifySession(request, config.sessionSecret, authorizedEpoch, now());
+    const authorizedEpoch = localAuth!.passwordStore.sessionEpoch;
+    const session = verifySession(request, localAuth!.sessionSecret, authorizedEpoch, now());
     if (!session) {
       apiError(response, 401, 'AUTH_REQUIRED', 'Authentication required');
       return;
@@ -198,7 +207,7 @@ export function createApp(options: AppOptions = {}) {
     const record = body && typeof body === 'object' ? body as Record<string, unknown> : {};
     let result;
     try {
-      result = await passwordStore.changePassword(
+      result = await localAuth!.passwordStore.changePassword(
         record.currentPassword,
         record.newPassword,
         response.locals.monitorAuthorizedEpoch,
@@ -221,7 +230,12 @@ export function createApp(options: AppOptions = {}) {
   app.get('/monitor/api/dashboard', (request, response) => {
     const authorized = config.ssoEnabled
       ? trustedSsoUser(request, config.edgeSecret) !== null
-      : verifySession(request, config.sessionSecret, passwordStore.sessionEpoch, now()) !== null;
+      : verifySession(
+        request,
+        localAuth!.sessionSecret,
+        localAuth!.passwordStore.sessionEpoch,
+        now(),
+      ) !== null;
     if (!authorized) {
       apiError(response, 401, 'AUTH_REQUIRED', 'Authentication required');
       return;

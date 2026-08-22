@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - dev
   workflow_dispatch:
 
 permissions:
@@ -11,15 +12,16 @@ permissions:
   packages: write
 
 concurrency:
-  group: monitor-production
+  group: monitor-${{ github.ref_name }}
   cancel-in-progress: false
 
 env:
   IMAGE_NAME: ghcr.io/facio313/monitor
+  PORTFOLIO_BRANCH: ${{ github.ref_name }}
 
 jobs:
   build-and-deploy:
-    name: Test, build ARM64 image, and deploy
+    name: Test and build ARM64 image; deploy main
     runs-on: ubuntu-24.04-arm
     # The restricted host may spend up to 20 minutes waiting for the shared
     # fleet deploy lock. Leave enough time for image publication, cutover, and
@@ -30,11 +32,36 @@ jobs:
       - name: Check out source
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - name: Test host collector
-        run: python3 -m unittest discover -s ops/tests -p 'test_*.py'
+      - name: Resolve branch authentication contract
+        id: auth
+        run: |
+          set -eu
+          ./scripts/test-portfolio-auth-mode.sh
+          mode=$(./scripts/portfolio-auth-mode.sh print)
+          {
+            printf 'branch=%s\n' "$PORTFOLIO_BRANCH"
+            printf 'mode=%s\n' "$mode"
+            printf 'tags<<EOF\n'
+            printf '%s:%s\n' "$IMAGE_NAME" "$GITHUB_SHA"
+            if [ "$GITHUB_REF_NAME" = main ]; then
+              printf '%s:latest\n' "$IMAGE_NAME"
+            fi
+            printf 'EOF\n'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Validate branch authentication contract and host collector
+        run: |
+          python3 -m unittest discover -s ops/tests -p 'test_*.py'
 
       - name: Validate production Compose configuration
-        run: docker compose config --quiet
+        env:
+          PORTFOLIO_BRANCH: ${{ steps.auth.outputs.branch }}
+          PORTFOLIO_AUTH_MODE: ${{ steps.auth.outputs.mode }}
+        run: |
+          npm run compose -- config --quiet
+          PORTFOLIO_BRANCH=ci/local \
+            PORTFOLIO_AUTH_MODE=local \
+            npm run compose -- config --quiet
 
       - name: Sign in to GitHub Container Registry
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
@@ -53,13 +80,15 @@ jobs:
           platforms: linux/arm64
           push: true
           pull: true
-          tags: |
-            ${{ env.IMAGE_NAME }}:${{ github.sha }}
-            ${{ env.IMAGE_NAME }}:latest
+          tags: ${{ steps.auth.outputs.tags }}
+          build-args: |
+            PORTFOLIO_BRANCH=${{ steps.auth.outputs.branch }}
+            PORTFOLIO_AUTH_MODE=${{ steps.auth.outputs.mode }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
       - name: Request restricted server deployment
+        if: github.ref_name == 'main'
         env:
           DEPLOY_KEY: ${{ secrets.DEPLOY_KEY }}
           GHCR_TOKEN: ${{ github.token }}

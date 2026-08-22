@@ -1,0 +1,10 @@
+services:
+  monitor:
+    environment:
+      MONITOR_EDGE_SECRET_FILE: /run/secrets/monitor_edge_secret
+    secrets:
+      - monitor_edge_secret
+
+secrets:
+  monitor_edge_secret:
+    file: ${MONITOR_EDGE_SECRET_PATH:-./secrets/edge-secret}

@@ -18,18 +18,38 @@ host proc/sys + selected logs + named rootless Docker sockets
             /var/lib/monitor-export (bounded JSON/JSONL)
                               | read-only bind mount
                               v
-browser -> TLS/Nginx /monitor/ -> rootless Docker -> Express API + React UI
-                                                        |
-                                      dedicated writable hash-state bind
-                                                        |
-                              /home/cks/.local/state/monitor-auth (0700)
+browser -> TLS/Nginx + central SSO -> Express API + React UI
 ```
 
-The privilege boundary is intentional: only the short-lived collector can
-read protected host inputs. The web container receives neither Docker sockets
-nor raw logs; it can read only the collector's reduced export. Its only durable
-writable mount is a separate owner-only directory containing the password hash
-and session epoch; telemetry and the session-signing secret remain separate.
+The privilege boundary is intentional: only the short-lived collector can read
+protected host inputs. The web container receives neither Docker sockets nor
+raw logs; it can read only the collector's reduced export. In production SSO
+mode the application has no password database, session database, auth-state
+directory, or other writable user store. It consumes only the identity asserted
+by the central SSO edge, protected by a dedicated read-only edge secret.
+
+Local mode is deliberately different: it creates a disposable, application-
+specific password hash and signed cookie under the worktree so the application
+can be developed without the SSO stack. That state is a local development aid,
+not a second production identity system.
+
+## Branch authentication contract
+
+`scripts/portfolio-auth-mode.sh` is the only branch-to-authentication resolver.
+It uses `PORTFOLIO_BRANCH`, then `GITHUB_REF_NAME`, then the current Git branch.
+`main` and `dev` resolve to `sso`; every other branch resolves to `local`. If an
+explicit `PORTFOLIO_AUTH_MODE` disagrees, startup, build, or Compose validation
+fails closed. Container images additionally carry a read-only build contract;
+runtime branch/mode overrides must match the branch and mode used to build the
+image.
+
+In `sso` mode Monitor still requires the edge secret and accepts `Remote-*`
+identity only when the Nginx-injected secret matches. Local login and password
+changes stay disabled. In `local` mode the existing password screen, scrypt
+state, and signed Monitor cookie remain active; local mode is not an
+unauthenticated SSO bypass. `MONITOR_SSO_ENABLED` is now only a compatibility
+check: if an older deployment still supplies it, it must agree with the
+canonical mode.
 
 The dashboard provides:
 
@@ -75,71 +95,39 @@ The timer runs the one-shot collector approximately once per minute. Local
 overrides belong in `/etc/default/monitor-collector`; the installer preserves
 an existing file.
 
-### 2. Create credentials and the auth-state directory once
+### 2. Create the production edge credential
 
-Do not rerun this block over credentials already in use.
-
-This is the rollback/local-development credential path. Production on
-`bonifacio.work` sets `MONITOR_SSO_ENABLED=true` and accepts identity only from
-the host Nginx Authelia `auth_request` boundary. In that mode the password login
-and password-change endpoints are disabled; the existing state and signing
-secret are retained only for an explicit rollback.
+Production needs only the shared edge-to-origin credential. It must be distinct
+from every SSO or application secret and readable only by `cks`:
 
 ```sh
 sudo install -d -o cks -g cks -m 0700 /home/cks/.config/monitor
-sudo -u cks sh -c 'umask 077; openssl rand -hex 24 > /home/cks/.config/monitor/password'
-sudo -u cks sh -c 'umask 077; openssl rand -hex 32 > /home/cks/.config/monitor/session-secret'
 sudo -u cks sh -c 'umask 077; openssl rand -hex 32 > /home/cks/.config/monitor/edge-secret'
-sudo chmod 0600 /home/cks/.config/monitor/password /home/cks/.config/monitor/session-secret /home/cks/.config/monitor/edge-secret
-sudo install -d -o cks -g cks -m 0700 /home/cks/.local/state/monitor-auth
-sudo -u cks python3 ops/monitor_auth_state.py prepare
-sudo -u cks python3 ops/monitor_auth_state.py status
+sudo chmod 0600 /home/cks/.config/monitor/edge-secret
 ```
 
-During first migration, the production Compose definition reads the plaintext
-bootstrap and signing files through Docker secrets; secret values are not
-placed in the image, Compose file, process arguments, or environment. The
-helper creates
-`/home/cks/.local/state/monitor-auth` as `cks` mode `0700` but deliberately does
-not create `password.json`. On the first application start, the application
-derives a scrypt password hash from the bootstrap password and atomically
-creates the mode-`0600` state file with a new session epoch. An existing valid
-state file always wins and is never replaced from the bootstrap secret.
+Do not mount `MONITOR_PASSWORD_FILE`, `MONITOR_SESSION_SECRET_FILE`, or
+`MONITOR_AUTH_STATE_FILE` in a `main`/ `dev` deployment. SSO mode does not
+read them and does not instantiate the local password store.
 
-### 3. Bootstrap the rootless container
+### 3. Build and start the rootless container
 
 The host-specific production definition is
 `/etc/portfolio-deploy/monitor.compose.yml`. It binds the application to
-`127.0.0.1:5181`, mounts `/var/lib/monitor-export` read-only, and requires an
-explicit image tag. Production also mounts the dedicated edge secret at
-`/run/secrets/monitor_edge_secret`; host Nginx overwrites
-`X-Portfolio-Edge-Secret` with the same value after Authelia authorization.
-This prevents another loopback process from forging only the public
-`Remote-*` headers. Before deploying a password-state-aware image, its Monitor
-service must also contain the following dedicated writable bind. Do not reuse
-the telemetry directory or either secret path:
-
-```yaml
-environment:
-  MONITOR_AUTH_STATE_FILE: /var/lib/monitor-auth/password.json
-volumes:
-  - type: bind
-    source: /home/cks/.local/state/monitor-auth
-    target: /var/lib/monitor-auth
-    read_only: false
-    bind:
-      create_host_path: false
-```
-
-The repository Compose definition already contains the equivalent parameterized
-mount. The host-specific `/etc` definition must be updated separately by an
-operator; this repository does not modify live host configuration.
+`127.0.0.1:5181`, mounts `/var/lib/monitor-export` read-only, mounts only the
+edge secret at `/run/secrets/monitor_edge_secret`, and requires an explicit
+image tag. There must be no writable auth-state mount or local password/session
+secret in this definition.
 
 ```sh
 sudo -u cks env \
   XDG_RUNTIME_DIR=/run/user/1001 \
   DOCKER_HOST=unix:///run/user/1001/docker.sock \
-  docker build --tag portfolio-local/monitor:bootstrap /home/cks/Monitor
+  docker build \
+    --build-arg PORTFOLIO_BRANCH=main \
+    --build-arg PORTFOLIO_AUTH_MODE=sso \
+    --tag portfolio-local/monitor:bootstrap \
+    /home/cks/Monitor
 
 sudo -u cks env \
   XDG_RUNTIME_DIR=/run/user/1001 \
@@ -150,60 +138,11 @@ sudo -u cks env \
     up --detach --no-deps --pull never monitor
 
 curl --fail --silent --show-error http://127.0.0.1:5181/readyz
-sudo -u cks python3 /home/cks/Monitor/ops/monitor_auth_state.py status
-sudo -u cks python3 /home/cks/Monitor/ops/monitor_auth_state.py backup
 ```
 
-The Docker build runs the API test suite before producing the image. The final
-two commands verify first-time atomic initialization and create the first local
-owner-only auth-state snapshot.
-
-After that snapshot succeeds, complete the second migration stage: remove
-`MONITOR_PASSWORD_FILE` and the `monitor_password` service secret from
-`/etc/portfolio-deploy/monitor.compose.yml` (and remove its top-level secret
-definition if nothing else uses it). Keep the host bootstrap file mode `0600`
-for offline recovery, but do not leave it mounted in the running container.
-Retain `MONITOR_SESSION_SECRET_FILE` and `monitor_session_secret`.
-
-Force-recreate the same deployed image so Docker applies the reduced secret
-set, verify readiness, then make this password-state-aware image the immediate
-local rollback baseline:
-
-```sh
-monitor_current_image=$(sudo -u cks env \
-  XDG_RUNTIME_DIR=/run/user/1001 \
-  DOCKER_HOST=unix:///run/user/1001/docker.sock \
-  docker container inspect --format '{{.Config.Image}}' monitor)
-
-sudo -u cks env \
-  XDG_RUNTIME_DIR=/run/user/1001 \
-  DOCKER_HOST=unix:///run/user/1001/docker.sock \
-  MONITOR_IMAGE="$monitor_current_image" \
-  docker compose --project-name monitor \
-    --file /etc/portfolio-deploy/monitor.compose.yml \
-    up --detach --force-recreate --no-deps --pull never monitor
-
-curl --fail --silent --show-error http://127.0.0.1:5181/readyz
-
-monitor_feature_image_id=$(sudo -u cks env \
-  XDG_RUNTIME_DIR=/run/user/1001 \
-  DOCKER_HOST=unix:///run/user/1001/docker.sock \
-  docker container inspect --format '{{.Image}}' monitor)
-sudo -u cks env \
-  XDG_RUNTIME_DIR=/run/user/1001 \
-  DOCKER_HOST=unix:///run/user/1001/docker.sock \
-  docker image tag "$monitor_feature_image_id" portfolio-local/monitor:rollback
-unset monitor_current_image monitor_feature_image_id
-```
-
-State-aware startup reads the bootstrap secret lazily only when
-`password.json` is absent. Consequently, normal post-migration restarts need no
-bootstrap mount, while deletion/corruption without an explicit recovery setup
-fails closed. A pre-feature image also fails closed after this second stage
-because its required password configuration is absent. The repository's generic
-Compose file intentionally keeps the password secret for fresh development and
-first-run bootstrap; do not copy that service secret back into an already
-migrated production definition except during deliberate offline recovery.
+The image contains a read-only build-authentication contract. Server startup
+compares it with the runtime branch and mode, so changing environment variables
+cannot turn a `main`/ `dev` SSO image into a local-password image.
 
 ### 4. Publish `/monitor/` through Nginx
 
@@ -243,7 +182,23 @@ loopback-only.
 
 ## Local development
 
-Create disposable local data and secrets without copying production values:
+Use a branch other than `main` or `dev`. The shortest direct path creates a
+private disposable password, session secret, and auth-state directory beneath
+`.runtime/monitor-dev`; the password value is never printed and remains only in
+the mode-`0600` file named by the startup message:
+
+```sh
+npm ci
+npm run dev
+```
+
+This helper does not inspect host container sockets or synthesize telemetry.
+Point `MONITOR_DATA_DIR` at a prepared collector export when dashboard data is
+needed; the login UI and API can still start with the private disposable local
+authentication state.
+
+For an explicit reusable local setup, create disposable local data and secrets
+without copying production values:
 
 ```sh
 cd /home/cks/Monitor
@@ -252,7 +207,6 @@ MONITOR_AUTH_STATE_PATH="$PWD/auth-state" python3 ops/monitor_auth_state.py prep
 umask 077
 openssl rand -hex 24 > secrets/password
 openssl rand -hex 32 > secrets/session-secret
-openssl rand -hex 32 > secrets/edge-secret
 python3 ops/collector.py \
   --docker-sockets '' \
   --events-log /dev/null \
@@ -283,7 +237,10 @@ Useful checks:
 npm test
 npm run test:collector
 npm run build
-docker build --tag monitor:local .
+docker build \
+  --build-arg PORTFOLIO_BRANCH=feature/local-monitor \
+  --build-arg PORTFOLIO_AUTH_MODE=local \
+  --tag monitor:local .
 ```
 
 To exercise the repository Compose definition with the disposable files:
@@ -294,9 +251,8 @@ MONITOR_EXPORT_DIR="$PWD/data" \
 MONITOR_AUTH_STATE_PATH="$PWD/auth-state" \
 MONITOR_PASSWORD_PATH="$PWD/secrets/password" \
 MONITOR_SESSION_SECRET_PATH="$PWD/secrets/session-secret" \
-MONITOR_EDGE_SECRET_PATH="$PWD/secrets/edge-secret" \
 MONITOR_ALLOWED_ORIGINS=http://localhost:5181 \
-docker compose up --detach --build
+npm run compose -- up --detach --build
 ```
 
 ## Configuration
@@ -305,25 +261,29 @@ Application variables:
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
+| `PORTFOLIO_BRANCH` | current Git branch outside packaged builds | Canonical branch identity; CI and Docker builds must set it explicitly |
+| `PORTFOLIO_AUTH_MODE` | derived from the canonical branch | Must be `sso` for `main`/`dev` and `local` for every other branch |
 | `HOST` | `0.0.0.0` | Express listen address |
 | `PORT` | `8080` | Express listen port |
 | `MONITOR_DATA_DIR` | `/data` | Sanitized collector export root |
-| `MONITOR_AUTH_STATE_FILE` | `/var/lib/monitor-auth/password.json` | Writable, persistent password-hash/session-epoch state file |
-| `MONITOR_PASSWORD_FILE` | unset | Preferred bootstrap password file; used only when auth state is absent |
-| `MONITOR_SESSION_SECRET_FILE` | unset | Preferred HMAC secret file; at least 32 bytes |
+| `MONITOR_AUTH_STATE_FILE` | `/var/lib/monitor-auth/password.json` | Local-only disposable password-hash/session-epoch state file |
+| `MONITOR_PASSWORD_FILE` | unset | Local-only bootstrap password file; used only when auth state is absent |
+| `MONITOR_SESSION_SECRET_FILE` | unset | Local-only cookie HMAC secret file; at least 32 bytes |
 | `MONITOR_EDGE_SECRET_FILE` | unset | SSO-only edge-to-origin shared secret file; at least 32 bytes and distinct from the session secret |
-| `MONITOR_PASSWORD` | unset | Development-only bootstrap fallback when no password file is set |
-| `MONITOR_SESSION_SECRET` | unset | Development-only fallback when no file is set |
-| `MONITOR_EDGE_SECRET` | unset | Development-only edge-secret fallback; prefer the file in production |
+| `MONITOR_PASSWORD` | unset | Local-only bootstrap fallback when no password file is set |
+| `MONITOR_SESSION_SECRET` | unset | Local-only fallback when no file is set |
+| `MONITOR_EDGE_SECRET` | unset | Edge-secret fallback; use the private file in production |
 | `MONITOR_ALLOWED_ORIGINS` | empty | Comma-separated permitted mutation origins |
-| `MONITOR_SSO_ENABLED` | `false` | Trust validated `Remote-User` and `Remote-Email` from the loopback-only reverse proxy and disable local credentials |
+| `MONITOR_SSO_ENABLED` | unset | Deprecated compatibility assertion; when present it must agree with `PORTFOLIO_AUTH_MODE` |
 | `MONITOR_SESSION_TTL_SECONDS` | `3600` | Signed-session lifetime; capped at 24 hours |
 | `MONITOR_STALE_AFTER_SECONDS` | `300` | Age at which telemetry is marked stale |
 
-The repository Compose file additionally accepts `MONITOR_IMAGE`,
-`MONITOR_PORT`, `MONITOR_EXPORT_DIR`, `MONITOR_AUTH_STATE_PATH`,
-`MONITOR_PASSWORD_PATH`, `MONITOR_SESSION_SECRET_PATH`, and
-`MONITOR_EDGE_SECRET_PATH`.
+The repository Compose launcher automatically selects `docker-compose.sso.yml` or
+`docker-compose.local.yml` from the canonical mode. Common options are
+`MONITOR_IMAGE`, `MONITOR_PORT`, and `MONITOR_EXPORT_DIR`. SSO mode additionally
+accepts `MONITOR_EDGE_SECRET_PATH`; local mode accepts
+`MONITOR_AUTH_STATE_PATH`, `MONITOR_PASSWORD_PATH`, and
+`MONITOR_SESSION_SECRET_PATH`.
 
 Collector variables and defaults are:
 
@@ -434,11 +394,11 @@ GET    /monitor/api/dashboard?range=1h|24h|7d|30d
   immediately allow-listed; the web container has no socket mount.
 - Export files are bounded, atomically replaced, and readable by the `cks`
   deployment boundary without becoming world-readable.
-- The rootless container has a read-only filesystem/data mount, no Linux
-  capabilities, `no-new-privileges`, a small tmpfs, and CPU, memory, PID, and
-  log-size limits. Its sole persistent writable mount is the owner-only auth
-  state directory; auth backups are never mounted into the container.
-- Sessions are HMAC-signed, one-hour by default, and stored in `HttpOnly`,
+- The production rootless container has a read-only filesystem and telemetry
+  mount, no writable user/auth store, no Linux capabilities,
+  `no-new-privileges`, a small tmpfs, and CPU, memory, PID, and log-size limits.
+  Only the local Compose overlay adds a disposable writable auth-state mount.
+- Local-mode sessions are HMAC-signed, one-hour by default, and stored in `HttpOnly`,
   `Secure`, `SameSite=Strict` cookies scoped to `/monitor`. Login permits five
   failed attempts per 15 minutes; state-changing API requests enforce origin
   checks.
@@ -448,7 +408,8 @@ GET    /monitor/api/dashboard?range=1h|24h|7d|30d
   header which the application compares in constant time; port `5181` remains
   loopback-only. Identity headers without the matching secret fail closed.
   Signing out redirects to the central `/sso/logout` endpoint. Local password
-  authentication remains available only when `MONITOR_SSO_ENABLED` is false.
+  authentication remains available only when the canonical authentication mode
+  is `local`.
 - API responses are `no-store`; Helmet supplies a restrictive CSP and related
   headers. The data reader refuses symlink escapes, oversized files/lines, and
   non-allow-listed fields, and applies a second redaction pass to messages.
@@ -462,13 +423,14 @@ container.
 
 ## GitHub Actions deployment
 
-`.github/workflows/deploy.yml` runs on every `main` push and by manual
-dispatch. It:
+`.github/workflows/deploy.yml` runs on `main` and `dev` pushes and by manual
+dispatch. It builds and tests both SSO branches, but only `main` publishes
+`:latest` and requests a deployment. It:
 
 1. runs the Python collector tests;
 2. builds and tests the ARM64 image;
-3. publishes `ghcr.io/facio313/monitor:<commit-sha>` and `:latest`;
-4. connects with the repository `DEPLOY_KEY` secret and requests only
+3. publishes the immutable SHA tag (and `:latest` only for `main`);
+4. on `main` only, connects with the repository `DEPLOY_KEY` secret and requests only
    `deploy monitor <40-character-sha>`.
 
 The server-side forced-command dispatcher validates that command, logs in to
@@ -483,115 +445,19 @@ The only long-lived repository secret required by the workflow is
 `DEPLOY_KEY`; the corresponding public key must remain restricted to the
 server dispatcher.
 
-## Password state, backup, recovery, and rotation
+## Local-only password state
 
-The writable auth state never contains the active password in plaintext. The
-host file at `/home/cks/.config/monitor/password` remains a plaintext
-bootstrap/recovery credential and initially matches the password used to create
-the hash. Replacing it has no effect while a valid `password.json` exists, and
-it no longer matches the active password after a dashboard password change.
-There is no supported way to retrieve a changed password.
+Password state, session signing, password changes, backups, and recovery exist
+only for branches outside `main` and `dev`. The default helper keeps this
+disposable state beneath `.runtime/monitor-dev`, which is ignored by Git.
+The repository's `docker-compose.local.yml` likewise adds the password and
+session secrets plus the writable auth-state mount only when the canonical mode
+is `local`.
 
-An authenticated operator changes the active password from the dashboard's
-**Change password** control. The current password is required, the replacement
-must contain at least 16 characters and at most 256 UTF-8 bytes, and a successful
-change atomically writes a fresh scrypt hash and session epoch. Every existing
-session is invalidated, including the caller's session.
-
-The hash state is still sensitive because it permits offline guessing. Never
-print it, attach it to an issue, place it in Git, or copy it into telemetry. The
-operations helper reports only path/status metadata and refuses symlinks,
-additional hard links, non-regular files, wrong owners, or group/other-readable
-state. Run it as `cks`, not root:
-
-```sh
-cd /home/cks/Monitor
-sudo -u cks python3 ops/monitor_auth_state.py status
-sudo -u cks python3 ops/monitor_auth_state.py backup
-```
-
-Backups are atomically created under `/home/cks/backups/monitor-auth` with
-directory mode `0700` and file mode `0600`. Create the first state snapshot
-immediately after successful initialization, then after important password
-changes and before auth-related upgrades. Backups are not mounted into the
-container. This local snapshot helper is not a substitute for encrypted
-off-host disaster-recovery backups; before the first migration, protect the
-bootstrap credential and session-signing secret, and afterward protect those
-plus the auth state with equivalent access control.
-
-Before using an off-host snapshot, copy it into the backup directory as owner
-`cks` with mode `0600`; the helper refuses a differently owned or more broadly
-readable restore source.
-
-Restore only while Monitor is stopped, so the in-memory state cannot race with
-or mask the restored file. The helper automatically preserves the replaced
-state as a new `pre-restore` backup, restores only the selected password hash,
-and generates a fresh random session epoch. It never displays either hash, and
-cookies issued under the snapshot's old epoch cannot become valid again:
-
-```sh
-sudo -u cks env \
-  XDG_RUNTIME_DIR=/run/user/1001 \
-  DOCKER_HOST=unix:///run/user/1001/docker.sock \
-  docker stop monitor
-
-sudo -u cks python3 /home/cks/Monitor/ops/monitor_auth_state.py \
-  restore --confirm-container-stopped \
-  /home/cks/backups/monitor-auth/password-YYYYMMDDTHHMMSSZ-XXXXXXXX.json
-
-sudo -u cks env \
-  XDG_RUNTIME_DIR=/run/user/1001 \
-  DOCKER_HOST=unix:///run/user/1001/docker.sock \
-  docker start monitor
-curl --fail --silent --show-error http://127.0.0.1:5181/readyz
-```
-
-A restore makes the snapshot's password active. Change it immediately after
-login if that password may be known to an attacker. A normal restore otherwise
-needs only the stop/restore/start sequence above. If
-the independent session-signing secret may also have leaked, rotate its host
-file and force-recreate the container. Atomic replacement of a host secret file
-does not update the inode already mounted by Docker into an existing container:
-
-```sh
-monitor_current_image=$(sudo -u cks env \
-  XDG_RUNTIME_DIR=/run/user/1001 \
-  DOCKER_HOST=unix:///run/user/1001/docker.sock \
-  docker container inspect --format '{{.Config.Image}}' monitor)
-
-sudo -u cks sh -c 'umask 077; openssl rand -hex 32 > /home/cks/.config/monitor/session-secret.next && mv /home/cks/.config/monitor/session-secret.next /home/cks/.config/monitor/session-secret'
-
-sudo -u cks env \
-  XDG_RUNTIME_DIR=/run/user/1001 \
-  DOCKER_HOST=unix:///run/user/1001/docker.sock \
-  MONITOR_IMAGE="$monitor_current_image" \
-  docker compose --project-name monitor \
-    --file /etc/portfolio-deploy/monitor.compose.yml \
-    up --detach --force-recreate --no-deps --pull never monitor
-unset monitor_current_image
-```
-
-If no usable hash-state backup exists, the last-resort recovery path is to stop
-Monitor, preserve the existing `password.json` outside the mounted state
-directory with mode `0600`, and atomically replace the offline bootstrap password
-file. Temporarily restore the `MONITOR_PASSWORD_FILE`/`monitor_password` entries
-to the production Compose definition and force-recreate the current
-password-state-aware image with `password.json` absent. A plain `docker start`
-cannot add the removed secret and must not be used. The new container will
-initialize a fresh hash and session epoch from the replacement bootstrap value.
-After verifying login, create a state snapshot, remove the bootstrap mount
-again, and force-recreate once more. Do not delete or move the only state copy
-until a protected backup exists.
-
-The external bind survives normal container recreation, deployments, and
-rollbacks to any password-state-aware image. During the first-stage deployment,
-the old rollback image can still use the mounted bootstrap credential; do not
-change the password before initialization, readiness, and backup succeed. Once
-the second stage removes that mount, a pre-feature image cannot silently revert
-the password and instead fails to start. Keep the offline bootstrap credential
-protected, take a pre-deploy state backup whenever state already exists, and
-retag the verified password-state-aware image as the rollback baseline using the
-procedure above.
+Local password state stores a scrypt hash and session epoch, never plaintext.
+It is not an application user database and must not be copied into production.
+Delete the disposable local directory to reset local access; never reuse the
+central SSO password, edge secret, or production data as local credentials.
 
 ## Rollback, diagnostics, and uninstall
 
@@ -648,7 +514,7 @@ sudo sh /home/cks/Monitor/ops/uninstall.sh
 ```
 
 The uninstall script deliberately preserves `/var/lib/monitor-export` and
-`/etc/default/monitor-collector`. It also leaves credentials, auth state and
-auth-state backups, the production Compose file, deployment dispatcher entry,
-Nginx route, and container images in place. Remove those explicit paths only
-after deciding their data and rollback value are no longer needed.
+`/etc/default/monitor-collector`. It also leaves the edge credential, production Compose file, deployment
+dispatcher entry, Nginx route, and container images in place. Local disposable
+auth state beneath the worktree is separate and can be removed when no longer
+needed.

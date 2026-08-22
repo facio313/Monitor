@@ -1,5 +1,6 @@
 import {
   chmodSync,
+  existsSync,
   mkdirSync,
   readFileSync,
   statSync,
@@ -33,6 +34,7 @@ function appFor(directory: string) {
     sessionSecret: SECRET,
     dataDir: directory,
     now: () => NOW,
+    ssoEnabled: false,
   });
 }
 
@@ -47,27 +49,51 @@ async function loginCookie(app: ReturnType<typeof createApp>): Promise<string> {
 }
 
 describe('authentication', () => {
-  it('loads password, session, and SSO edge secret files ahead of environment values', () => {
+  it('loads local password and session files ahead of environment values', () => {
     const directory = mkdtempSync(join(tmpdir(), 'monitor-secrets-'));
     const passwordFile = join(directory, 'password');
     const sessionFile = join(directory, 'session');
-    const edgeFile = join(directory, 'edge');
     writeFileSync(passwordFile, 'password-from-file\n');
     writeFileSync(sessionFile, `${SECRET}\n`);
-    writeFileSync(edgeFile, `${EDGE_SECRET}\n`);
-    for (const path of [passwordFile, sessionFile, edgeFile]) chmodSync(path, 0o600);
+    for (const path of [passwordFile, sessionFile]) chmodSync(path, 0o600);
     vi.stubEnv('MONITOR_PASSWORD_FILE', passwordFile);
     vi.stubEnv('MONITOR_PASSWORD', 'password-from-environment');
     vi.stubEnv('MONITOR_SESSION_SECRET_FILE', sessionFile);
     vi.stubEnv('MONITOR_SESSION_SECRET', 'environment-session-secret-is-long-enough');
+    vi.stubEnv('PORTFOLIO_BRANCH', 'feature/local-monitor');
+    vi.stubEnv('PORTFOLIO_AUTH_MODE', 'local');
+    try {
+      const config = loadConfig();
+      expect(config.ssoEnabled).toBe(false);
+      if (config.ssoEnabled) throw new Error('expected local configuration');
+      expect(config.getBootstrapPassword()).toBe('password-from-file');
+      expect(config.sessionSecret).toBe(SECRET);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it('loads only the edge credential in SSO mode and ignores all local auth storage', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'monitor-sso-secrets-'));
+    const edgeFile = join(directory, 'edge');
+    const absentState = join(directory, 'auth', 'password.json');
+    writeFileSync(edgeFile, `${EDGE_SECRET}\n`);
+    chmodSync(edgeFile, 0o600);
+    vi.stubEnv('PORTFOLIO_BRANCH', 'main');
+    vi.stubEnv('PORTFOLIO_AUTH_MODE', 'sso');
     vi.stubEnv('MONITOR_SSO_ENABLED', 'true');
     vi.stubEnv('MONITOR_EDGE_SECRET_FILE', edgeFile);
     vi.stubEnv('MONITOR_EDGE_SECRET', 'environment-edge-secret-is-long-enough');
+    vi.stubEnv('MONITOR_PASSWORD_FILE', join(directory, 'missing-password'));
+    vi.stubEnv('MONITOR_SESSION_SECRET_FILE', join(directory, 'missing-session'));
+    vi.stubEnv('MONITOR_AUTH_STATE_FILE', absentState);
     try {
       const config = loadConfig();
-      expect(config.getBootstrapPassword()).toBe('password-from-file');
-      expect(config.sessionSecret).toBe(SECRET);
+      expect(config.ssoEnabled).toBe(true);
       expect(config.edgeSecret).toBe(EDGE_SECRET);
+      expect('sessionSecret' in config).toBe(false);
+      expect('authStateFile' in config).toBe(false);
+      expect(existsSync(absentState)).toBe(false);
     } finally {
       vi.unstubAllEnvs();
     }
@@ -82,12 +108,39 @@ describe('authentication', () => {
     );
   });
 
+  it('derives authentication only from a matching branch contract', () => {
+    vi.stubEnv('PORTFOLIO_BRANCH', 'feature/local-dashboard');
+    vi.stubEnv('PORTFOLIO_AUTH_MODE', 'local');
+    try {
+      expect(loadConfig({ sessionSecret: SECRET }).ssoEnabled).toBe(false);
+
+      vi.stubEnv('PORTFOLIO_BRANCH', 'dev');
+      vi.stubEnv('PORTFOLIO_AUTH_MODE', 'sso');
+      expect(loadConfig({ sessionSecret: SECRET, edgeSecret: EDGE_SECRET }).ssoEnabled).toBe(true);
+
+      vi.stubEnv('PORTFOLIO_AUTH_MODE', 'local');
+      expect(() => loadConfig({ sessionSecret: SECRET })).toThrow(
+        'Portfolio branch dev requires sso authentication',
+      );
+
+      vi.stubEnv('PORTFOLIO_AUTH_MODE', 'sso');
+      vi.stubEnv('MONITOR_SSO_ENABLED', 'false');
+      expect(() => loadConfig({ sessionSecret: SECRET, edgeSecret: EDGE_SECRET })).toThrow(
+        'MONITOR_SSO_ENABLED conflicts with PORTFOLIO_AUTH_MODE',
+      );
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
   it('rejects broad or symlinked SSO edge secret files', () => {
     const directory = mkdtempSync(join(tmpdir(), 'monitor-edge-secret-'));
     const realFile = join(directory, 'real');
     const linkFile = join(directory, 'link');
     writeFileSync(realFile, `${EDGE_SECRET}\n`);
     chmodSync(realFile, 0o644);
+    vi.stubEnv('PORTFOLIO_BRANCH', 'main');
+    vi.stubEnv('PORTFOLIO_AUTH_MODE', 'sso');
     vi.stubEnv('MONITOR_SSO_ENABLED', 'true');
     vi.stubEnv('MONITOR_EDGE_SECRET_FILE', realFile);
     try {
@@ -121,10 +174,8 @@ describe('authentication', () => {
 
   it('uses trusted proxy identity in SSO mode and disables local credentials', async () => {
     const directory = dataDirectory();
+    const absentState = join(directory, 'auth-state.json');
     const app = createApp({
-      password: 'unused local password',
-      authStateFile: join(directory, 'auth-state.json'),
-      sessionSecret: SECRET,
       dataDir: directory,
       now: () => NOW,
       ssoEnabled: true,
@@ -175,6 +226,7 @@ describe('authentication', () => {
         mode: 'sso',
         user: null,
       });
+    expect(existsSync(absentState)).toBe(false);
   });
 
   it('rejects bad credentials and issues a hardened session cookie', async () => {
@@ -312,6 +364,7 @@ describe('authentication', () => {
         sessionSecret: SECRET,
         dataDir: directory,
         now: () => NOW,
+        ssoEnabled: false,
       });
       await request(restartedApp)
         .post('/monitor/api/auth/login')
@@ -332,6 +385,7 @@ describe('authentication', () => {
         sessionSecret: SECRET,
         dataDir: directory,
         now: () => NOW,
+        ssoEnabled: false,
       })).toThrow(/bootstrap password is not configured/);
     } finally {
       vi.unstubAllEnvs();
@@ -559,6 +613,7 @@ describe('authentication', () => {
       sessionSecret: SECRET,
       dataDir: realParent,
       now: () => NOW,
+      ssoEnabled: false,
     })).toThrow(/real directory/);
   });
 });
@@ -957,6 +1012,7 @@ describe('dashboard ingestion', () => {
       dataDir: directory,
       publicDir: publicDirectory,
       now: () => NOW,
+      ssoEnabled: false,
     });
     const index = await request(app).get('/monitor/').expect(200);
     expect(index.text).toContain('<title>Monitor</title>');
