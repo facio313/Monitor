@@ -741,6 +741,33 @@ describe('dashboard ingestion', () => {
     });
   });
 
+  it('preserves every reviewed Multtara component label', async () => {
+    const directory = dataDirectory();
+    const names = [
+      'multtara-backend',
+      'multtara-collector',
+      'multtara-database',
+      'multtara-frontend',
+    ];
+    writeFileSync(join(directory, 'current.json'), JSON.stringify({
+      containers: names.map((name) => ({
+        name,
+        owner: 'cks',
+        state: 'running',
+        health: 'healthy',
+      })),
+    }));
+    const app = appFor(directory);
+    const cookie = await loginCookie(app);
+
+    const response = await request(app)
+      .get('/monitor/api/dashboard?range=1h')
+      .set('Cookie', cookie)
+      .expect(200);
+
+    expect(response.body.containers.map((container: { name: string }) => container.name)).toEqual(names);
+  });
+
   it('whitelists fields, redacts secrets, and never returns raw privilege commands', async () => {
     const directory = dataDirectory();
     writeFileSync(join(directory, 'current.json'), JSON.stringify({

@@ -19,6 +19,10 @@ describe('container presentation', () => {
     { name: 'feelmyrythm-frontend', owner: 'cks', state: 'running', health: 'healthy', cpuPercent: 3.4, memoryBytes: 30_000, memoryPercent: 3 },
     { name: 'feelmyrythm-backend', owner: 'cks', state: 'running', health: 'unhealthy', cpuPercent: 4.5, memoryBytes: 40_000, memoryPercent: 4 },
     { name: 'feelmyrythm-redis', owner: 'cks', state: 'running', health: 'healthy', cpuPercent: 5.6, memoryBytes: 50_000, memoryPercent: 5 },
+    { name: 'multtara-backend', owner: 'cks', state: 'running', health: 'healthy', cpuPercent: 5.7, memoryBytes: 51_000, memoryPercent: 5.1 },
+    { name: 'multtara-collector', owner: 'cks', state: 'running', health: 'healthy', cpuPercent: 5.8, memoryBytes: 52_000, memoryPercent: 5.2 },
+    { name: 'multtara-database', owner: 'cks', state: 'running', health: 'healthy', cpuPercent: 5.9, memoryBytes: 53_000, memoryPercent: 5.3 },
+    { name: 'multtara-frontend', owner: 'cks', state: 'running', health: 'healthy', cpuPercent: 6, memoryBytes: 54_000, memoryPercent: 5.4 },
     { name: 'pilgrimage-frontend', owner: 'cks', state: 'running', health: 'healthy', cpuPercent: 6.7, memoryBytes: 60_000, memoryPercent: 6 },
     { name: 'pilgrimage-backend', owner: 'cks', state: 'running', health: 'healthy', cpuPercent: 7.8, memoryBytes: 70_000, memoryPercent: 7 },
     { name: 'pilgrimage-redis', owner: 'cks', state: 'exited', health: 'none', cpuPercent: null, memoryBytes: null, memoryPercent: null },
@@ -26,7 +30,7 @@ describe('container presentation', () => {
   ];
 
   it('separates running entries from stopped or other entries and retains the total', () => {
-    expect(containerSummaryLabel(containers)).toBe('7 running · 2 stopped/other · 9 tracked total · 1 unhealthy');
+    expect(containerSummaryLabel(containers)).toBe('11 running · 2 stopped/other · 13 tracked total · 1 unhealthy');
   });
 
   it('renders each final backend service name without legacy or removed names', () => {
@@ -38,6 +42,10 @@ describe('container presentation', () => {
     expect(markup).toContain('>feelmyrythm-frontend</strong>');
     expect(markup).toContain('>feelmyrythm-backend</strong>');
     expect(markup).toContain('>feelmyrythm-redis</strong>');
+    expect(markup).toContain('>multtara-backend</strong>');
+    expect(markup).toContain('>multtara-collector</strong>');
+    expect(markup).toContain('>multtara-database</strong>');
+    expect(markup).toContain('>multtara-frontend</strong>');
     expect(markup).toContain('>pilgrimage-frontend</strong>');
     expect(markup).toContain('>pilgrimage-backend</strong>');
     expect(markup).toContain('>pilgrimage-redis</strong>');

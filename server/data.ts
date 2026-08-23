@@ -64,6 +64,7 @@ const FIXED_CONTAINER_SERVICE_NAMES = [
   'feelmyrythm-redis',
   'multtara-backend',
   'multtara-collector',
+  'multtara-database',
   'multtara-frontend',
   'pilgrimage-frontend',
   'pilgrimage-backend',

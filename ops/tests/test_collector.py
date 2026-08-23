@@ -290,9 +290,10 @@ class ParsingTests(unittest.TestCase):
             ("dukkeobi", "dukkeobi"): "dukkeobi",
             ("react", "react"): "react",
             ("vue", "vue"): "vue",
-            ("multtara", "backend"): "multtara-backend",
-            ("multtara", "collector"): "multtara-collector",
-            ("multtara", "frontend"): "multtara-frontend",
+            ("pongdang-multtara", "backend"): "multtara-backend",
+            ("pongdang-multtara", "collector"): "multtara-collector",
+            ("pongdang-multtara", "db"): "multtara-database",
+            ("pongdang-multtara", "frontend"): "multtara-frontend",
         }
         self.assertEqual(collector.ALLOWED_COMPOSE_SERVICES, expected_pairs)
         self.assertNotIn(("pilgrimage", "pilgrimageDB"), collector.ALLOWED_COMPOSE_SERVICES)
