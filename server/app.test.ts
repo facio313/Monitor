@@ -729,6 +729,7 @@ describe('dashboard ingestion', () => {
     expect(response.body.series).toEqual([]);
     expect(response.body.alerts).toEqual([]);
     expect(response.body.powerEvents).toEqual([]);
+    expect(response.body.incidents).toEqual([]);
     expect(response.body.powerSummary).toEqual({
       sampleCount: 0,
       voltageSampleCount: 0,
@@ -755,7 +756,13 @@ describe('dashboard ingestion', () => {
         diskReadBytesPerSecond: 12,
       },
       disks: [{ mount: '/', usedBytes: 1, totalBytes: 2, command: 'df -h' }],
-      containers: [{ name: 'web', owner: 'svc', state: 'running', health: 'healthy', command: 'private command' }],
+      containers: [
+        {
+          name: 'web', owner: 'cks', state: 'running', health: 'healthy',
+          cpuPercent: 250, command: 'private command',
+        },
+        { name: 'foreign-container-secret', owner: 'other', state: 'running', health: 'healthy' },
+      ],
     }));
     writeFileSync(join(directory, 'alerts.jsonl'), `${JSON.stringify({
       timestamp: '2026-08-19T11:58:00Z', severity: 'warn', message: 'token=abc123 is exposed', command: 'raw',
@@ -773,6 +780,7 @@ describe('dashboard ingestion', () => {
     const serialized = JSON.stringify(response.body);
     expect(serialized).not.toContain('do-not-return');
     expect(serialized).not.toContain('private command');
+    expect(serialized).not.toContain('foreign-container-secret');
     expect(serialized).not.toContain('/etc/shadow');
     expect(serialized).not.toContain('abc123');
     expect(response.body.host.hostname).toBe('host name');
@@ -799,10 +807,203 @@ describe('dashboard ingestion', () => {
       'diskWriteBytesPerSecond',
     ]);
     expect(response.body.disks[0].usedPercent).toBe(50);
-    expect(response.body.containers[0]).toMatchObject({ owner: 'svc', state: 'running', health: 'healthy' });
+    expect(response.body.containers).toHaveLength(1);
+    expect(response.body.containers[0]).toMatchObject({
+      name: 'cks-workload', owner: 'cks', state: 'running', health: 'healthy', cpuPercent: 250,
+    });
     expect(response.body.alerts[0]).toMatchObject({ kind: null, status: null });
     expect(response.body.privilegeEvents[0].action).toBe('sudo');
     expect(response.body.privilegeEvents[0].result).toBe('success');
+  });
+
+  it('strictly reconstructs bounded incident snapshots and drops malformed or out-of-range records', async () => {
+    const directory = dataDirectory();
+    const validIncident = {
+      id: 'incident-20260819T115500Z',
+      startedAt: '2026-08-19T11:55:00Z',
+      observedAt: '2026-08-19T11:59:00Z',
+      endedAt: null,
+      phase: 'active',
+      reasons: ['cpu', 'disk-io'],
+      reasonSecret: 'secret-token',
+      metrics: {
+        timestamp: '2026-08-19T00:00:00Z',
+        cpuPercent: 97.5,
+        memoryPercent: 61,
+        memoryUsedBytes: 610,
+        memoryTotalBytes: 1_000,
+        temperatureC: 76.5,
+        load1: 4.5,
+        load5: 2.5,
+        load15: 1.5,
+        powerState: 'normal',
+        supplyVoltageVolts: 5.04,
+        throttledFlags: 0,
+        gpuMemoryBytes: 4_194_304,
+        gpuClockHz: 910_000_000,
+        networkRxBytesPerSecond: 12_345,
+        networkTxBytesPerSecond: 6_789,
+        diskReadBytesPerSecond: 987_654,
+        diskWriteBytesPerSecond: 456_789,
+        cpu: { percent: 1 },
+        secret: 'raw-metrics-secret',
+      },
+      pressure: {
+        cpu: { someAvg10: 12.5, fullAvg10: null, secret: 'raw-pressure-secret' },
+        memory: { someAvg10: 1.5, fullAvg10: 0.25 },
+        io: { someAvg10: 8.75, fullAvg10: 3.5 },
+      },
+      processes: [
+        {
+          name: 'node', instances: 3, cpuPercent: 70.5, memoryBytes: 500_000_000,
+          command: 'raw-process-secret --token abc',
+        },
+        {
+          name: 'api-token-reader', instances: 1, cpuPercent: 10, memoryBytes: 1,
+          pid: 1234, argv: ['raw-process-argv-secret'],
+        },
+        { name: 'task\nrunner♥', instances: 1, cpuPercent: null, memoryBytes: 2 },
+      ],
+      containers: [
+        {
+          name: 'web', owner: 'cks', state: 'running', health: 'healthy', cpuPercent: 250,
+          memoryBytes: 123_456, memoryPercent: 12.5, command: 'raw-container-secret',
+        },
+        {
+          name: 'out-of-scope-container-secret', owner: 'other', state: 'running', health: 'healthy',
+          cpuPercent: 50, memoryBytes: 1, memoryPercent: 1,
+        },
+      ],
+      traffic: [
+        {
+          app: 'monitor', requestCount: 20, status2xx: 17, status3xx: 1, status4xx: 1,
+          status5xx: 1, slowCount: 2, avgResponseMs: 25.5, maxResponseMs: 250,
+          rawClient: 'raw-traffic-secret',
+        },
+        {
+          app: 'react', requestCount: 1, status2xx: 2, status3xx: 0, status4xx: 0,
+          status5xx: 0, slowCount: 0, avgResponseMs: 1, maxResponseMs: 1,
+        },
+        {
+          app: 'out-of-scope-app-secret', requestCount: 1, status2xx: 1, status3xx: 0, status4xx: 0,
+          status5xx: 0, slowCount: 0, avgResponseMs: 1, maxResponseMs: 1,
+        },
+      ],
+      peaks: { cpuPercent: 99, memoryPercent: 65, temperatureC: 78, load1: 5.5, secret: 'peak-secret' },
+      durationSeconds: null,
+      command: 'raw-incident-secret',
+    };
+    writeFileSync(join(directory, 'incidents.jsonl'), [
+      '{malformed',
+      JSON.stringify(validIncident),
+      JSON.stringify({ ...validIncident, id: 'incident-20260819T115503Z', phase: 'paused' }),
+      JSON.stringify({
+        ...validIncident,
+        id: 'incident-20260819T120200Z',
+        observedAt: '2026-08-19T12:02:00Z',
+      }),
+      JSON.stringify({
+        ...validIncident,
+        id: 'incident-20260819T105959Z',
+        observedAt: '2026-08-19T10:59:59Z',
+      }),
+      JSON.stringify({
+        ...validIncident,
+        id: 'incident-20260819T115504Z',
+        startedAt: '2026-08-19T11:59:30Z',
+      }),
+      JSON.stringify({
+        ...validIncident,
+        id: 'incident-20260819T115505Z',
+        phase: 'recovered',
+      }),
+      JSON.stringify({
+        ...validIncident,
+        id: 'incident-20260819T115501Z',
+        reasons: ['cpu', 'not-allowed'],
+      }),
+      JSON.stringify({
+        ...validIncident,
+        id: 'incident-20260819T115502Z',
+        reasons: ['cpu', 'cpu'],
+      }),
+    ].join('\n'));
+
+    const app = appFor(directory);
+    const cookie = await loginCookie(app);
+    const response = await request(app)
+      .get('/monitor/api/dashboard?range=1h')
+      .set('Cookie', cookie)
+      .expect(200);
+
+    expect(response.body.incidents).toHaveLength(1);
+    expect(response.body.incidents[0]).toEqual({
+      id: 'incident-20260819T115500Z',
+      startedAt: '2026-08-19T11:55:00.000Z',
+      observedAt: '2026-08-19T11:59:00.000Z',
+      endedAt: null,
+      phase: 'active',
+      reasons: ['cpu', 'disk-io'],
+      metrics: {
+        timestamp: '2026-08-19T11:59:00.000Z',
+        cpuPercent: 97.5,
+        memoryPercent: 61,
+        memoryUsedBytes: 610,
+        memoryTotalBytes: 1_000,
+        temperatureC: 76.5,
+        load1: 4.5,
+        load5: 2.5,
+        load15: 1.5,
+        powerState: 'normal',
+        supplyVoltageVolts: 5.04,
+        throttledFlags: 0,
+        gpuMemoryBytes: 4_194_304,
+        gpuClockHz: 910_000_000,
+        networkRxBytesPerSecond: 12_345,
+        networkTxBytesPerSecond: 6_789,
+        diskReadBytesPerSecond: 987_654,
+        diskWriteBytesPerSecond: 456_789,
+      },
+      pressure: {
+        cpu: { someAvg10: 12.5, fullAvg10: null },
+        memory: { someAvg10: 1.5, fullAvg10: 0.25 },
+        io: { someAvg10: 8.75, fullAvg10: 3.5 },
+      },
+      processes: [
+        { name: 'node', instances: 3, cpuPercent: 70.5, memoryBytes: 500_000_000 },
+        { name: 'redacted', instances: 1, cpuPercent: 10, memoryBytes: 1 },
+        { name: 'other', instances: 1, cpuPercent: null, memoryBytes: 2 },
+      ],
+      containers: [
+        {
+          name: 'cks-workload', owner: 'cks', state: 'running', health: 'healthy', cpuPercent: 250,
+          memoryBytes: 123_456, memoryPercent: 12.5,
+        },
+      ],
+      traffic: [{
+        app: 'monitor', requestCount: 20, status2xx: 17, status3xx: 1, status4xx: 1,
+        status5xx: 1, slowCount: 2, avgResponseMs: 25.5, maxResponseMs: 250,
+      }],
+      peaks: { cpuPercent: 99, memoryPercent: 65, temperatureC: 78, load1: 5.5 },
+      durationSeconds: null,
+    });
+    const serialized = JSON.stringify(response.body.incidents);
+    for (const secret of [
+      'secret-token',
+      'raw-metrics-secret',
+      'raw-pressure-secret',
+      'raw-process-secret',
+      'api-token-reader',
+      'raw-process-argv-secret',
+      'raw-container-secret',
+      'out-of-scope-container-secret',
+      'secret-owner',
+      'secret-state',
+      'raw-traffic-secret',
+      'out-of-scope-app-secret',
+      'peak-secret',
+      'raw-incident-secret',
+    ]) expect(serialized).not.toContain(secret);
   });
 
   it('normalizes power telemetry, summarizes the full range, and correlates sanitized power events', async () => {
@@ -1023,7 +1224,7 @@ describe('dashboard ingestion', () => {
     });
   });
 
-  it('caps alerts, power events, and privilege details at 500 newest records', async () => {
+  it('caps alerts, power events, privilege details, and incidents at 500 newest records', async () => {
     const directory = dataDirectory();
     const timestamps = Array.from({ length: 600 }, (_, index) => new Date(NOW - index * 1_000).toISOString());
     writeFileSync(join(directory, 'alerts.jsonl'), timestamps.map((timestamp, index) => JSON.stringify({
@@ -1047,6 +1248,25 @@ describe('dashboard ingestion', () => {
       action: 'sudo',
       result: 'success',
     })).join('\n'));
+    writeFileSync(join(directory, 'incidents.jsonl'), timestamps.map((observedAt, index) => JSON.stringify({
+      id: `incident-${observedAt.replace(/[-:]/g, '').replace('.000', '')}`,
+      startedAt: new Date(Date.parse(observedAt) - 60_000).toISOString(),
+      observedAt,
+      endedAt: null,
+      phase: 'active',
+      reasons: ['cpu'],
+      metrics: {},
+      pressure: {
+        cpu: { someAvg10: null, fullAvg10: null },
+        memory: { someAvg10: null, fullAvg10: null },
+        io: { someAvg10: null, fullAvg10: null },
+      },
+      processes: [],
+      containers: [],
+      traffic: [],
+      peaks: null,
+      durationSeconds: null,
+    })).join('\n'));
 
     const app = appFor(directory);
     const cookie = await loginCookie(app);
@@ -1057,10 +1277,25 @@ describe('dashboard ingestion', () => {
     expect(response.body.alerts).toHaveLength(500);
     expect(response.body.powerEvents).toHaveLength(500);
     expect(response.body.privilegeEvents).toHaveLength(500);
+    expect(response.body.incidents).toHaveLength(500);
     expect(response.body.alerts[0].message).toBe('Routine alert 0');
     expect(response.body.alerts.at(-1).message).toBe('Routine alert 499');
     expect(response.body.powerEvents[0].message).toBe('Power event 0');
     expect(response.body.powerEvents.at(-1).message).toBe('Power event 499');
+    expect(response.body.incidents[0].id).toBe('incident-20260819T120000Z');
+    expect(response.body.incidents.at(-1).id).toBe('incident-20260819T115141Z');
+  });
+
+  it('rejects an oversized incident export without affecting the dashboard', async () => {
+    const directory = dataDirectory();
+    writeFileSync(join(directory, 'incidents.jsonl'), 'x'.repeat(16 * 1024 * 1024 + 1));
+    const app = appFor(directory);
+    const cookie = await loginCookie(app);
+    const response = await request(app)
+      .get('/monitor/api/dashboard?range=1h')
+      .set('Cookie', cookie)
+      .expect(200);
+    expect(response.body.incidents).toEqual([]);
   });
 
   it('does not follow collector symlinks outside the configured data directory', async () => {
@@ -1075,6 +1310,28 @@ describe('dashboard ingestion', () => {
       message: 'token=outside-secret must not leak',
     })}\n`);
     symlinkSync(outsidePower, join(directory, 'power.jsonl'));
+    const outsideIncidents = join(outsideDirectory, 'incidents.jsonl');
+    writeFileSync(outsideIncidents, `${JSON.stringify({
+      id: 'incident-20260819T115800Z',
+      startedAt: '2026-08-19T11:58:00Z',
+      observedAt: '2026-08-19T11:59:00Z',
+      endedAt: null,
+      phase: 'active',
+      reasons: ['cpu'],
+      metrics: {},
+      pressure: {
+        cpu: { someAvg10: null, fullAvg10: null },
+        memory: { someAvg10: null, fullAvg10: null },
+        io: { someAvg10: null, fullAvg10: null },
+      },
+      processes: [],
+      containers: [],
+      traffic: [],
+      peaks: null,
+      durationSeconds: null,
+      secret: 'outside-incident-secret',
+    })}\n`);
+    symlinkSync(outsideIncidents, join(directory, 'incidents.jsonl'));
     const app = appFor(directory);
     const cookie = await loginCookie(app);
     const response = await request(app)
@@ -1084,7 +1341,9 @@ describe('dashboard ingestion', () => {
     expect(response.body.host.hostname).toBeNull();
     expect(response.body.latest.cpuPercent).toBeNull();
     expect(response.body.powerEvents).toEqual([]);
+    expect(response.body.incidents).toEqual([]);
     expect(JSON.stringify(response.body)).not.toContain('outside-secret');
+    expect(JSON.stringify(response.body)).not.toContain('outside-incident-secret');
   });
 
   it('serves the built SPA with no-store caching while APIs remain JSON 404s', async () => {

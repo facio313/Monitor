@@ -7,17 +7,57 @@ import {
   realpathSync,
 } from 'node:fs';
 import { basename, join, relative, resolve, sep } from 'node:path';
-import type { DashboardRange, DashboardResponse, TelemetrySample } from './types.js';
+import type {
+  DashboardRange,
+  DashboardResponse,
+  IncidentReason,
+  TelemetrySample,
+} from './types.js';
 
 const MAX_CURRENT_BYTES = 1024 * 1024;
 const MAX_EVENT_FILE_BYTES = 4 * 1024 * 1024;
+const MAX_INCIDENT_FILE_BYTES = 16 * 1024 * 1024;
 const MAX_HISTORY_FILE_BYTES = 8 * 1024 * 1024;
 const MAX_JSONL_LINES = 50_000;
 const MAX_LINE_BYTES = 128 * 1024;
 const MAX_SERIES_POINTS = 360;
 const MAX_EVENTS = 500;
+const MAX_INCIDENTS = 500;
+const MAX_INCIDENT_REASONS = 16;
+const MAX_INCIDENT_PROCESSES = 32;
+const MAX_INCIDENT_CONTAINERS = 256;
+const MAX_INCIDENT_TRAFFIC = 64;
 const MAX_POWER_CORRELATION_MS = 2 * 60 * 1_000;
 const MAX_UINT32 = 0xffff_ffff;
+const MAX_INCIDENT_DURATION_SECONDS = 366 * 24 * 60 * 60;
+const MAX_RESPONSE_TIME_MS = 300_000;
+const MAX_INCIDENT_COUNT = 1_000_000_000;
+const MAX_CONTAINER_CPU_PERCENT = 1024;
+const INCIDENT_REASON_ORDER: IncidentReason[] = [
+  'cpu',
+  'memory',
+  'temperature',
+  'power-throttle',
+  'load',
+  'disk-io',
+  'traffic',
+];
+const INCIDENT_REASONS = new Set<IncidentReason>(INCIDENT_REASON_ORDER);
+const INCIDENT_TRAFFIC_APPS = new Set([
+  'monitor',
+  'feelmyrythm',
+  'multtara',
+  'pilgrimage',
+  'ddit-finalproject',
+  'dukkeobi',
+  'react',
+  'vue',
+]);
+const SAFE_CONTAINER_NAMES = new Set([...INCIDENT_TRAFFIC_APPS, 'cks-workload']);
+const SAFE_CONTAINER_STATES = new Set([
+  'created', 'running', 'paused', 'restarting', 'removing', 'exited', 'dead', 'unknown',
+]);
+const SAFE_CONTAINER_HEALTH = new Set(['healthy', 'unhealthy', 'starting', 'none', 'unknown']);
 
 type JsonRecord = Record<string, unknown>;
 
@@ -62,6 +102,15 @@ function percent(value: unknown): number | null {
   return finite(value, 0, 100);
 }
 
+function containerCpuPercent(value: unknown): number | null {
+  return finite(value, 0, MAX_CONTAINER_CPU_PERCENT);
+}
+
+function integer(value: unknown, minimum = 0, maximum = Number.MAX_SAFE_INTEGER): number | null {
+  const number = finite(value, minimum, maximum);
+  return number !== null && Number.isInteger(number) ? number : null;
+}
+
 function uint32(value: unknown): number | null {
   return typeof value === 'number'
     && Number.isInteger(value)
@@ -84,6 +133,53 @@ function cleanText(value: unknown, maximumLength: number): string | null {
 function cleanIdentity(value: unknown): string | null {
   const cleaned = cleanText(value, 64);
   return cleaned && /^[a-z0-9_.@-]+$/i.test(cleaned) ? cleaned : null;
+}
+
+function incidentToken(value: unknown, maximumLength: number): string | null {
+  if (typeof value !== 'string' || value.length < 1 || value.length > maximumLength) return null;
+  return /^[A-Za-z0-9][A-Za-z0-9_.:-]*$/.test(value) ? value : null;
+}
+
+function incidentId(value: unknown): string | null {
+  return typeof value === 'string' && /^incident-\d{8}T\d{6}Z$/.test(value) ? value : null;
+}
+
+function safeProcessName(value: unknown): string {
+  if (typeof value !== 'string') return 'unknown';
+  const name = value
+    .trim()
+    .replace(/[^A-Za-z0-9_.:@/+ -]/g, '_')
+    .slice(0, 64)
+    .toLowerCase();
+  if (!name) return 'unknown';
+  if (/password|passwd|secret|token|api.?key/i.test(name)) return 'redacted';
+  if (/^node(?:js)?$/.test(name)) return 'node';
+  if (/^(?:python(?:2|3)?(?:\.[0-9]+)?|pypy3?|gunicorn|uvicorn)$/.test(name)) return 'python';
+  if (['nginx', 'caddy', 'apache2', 'httpd'].includes(name)) return 'web-server';
+  if (['postgres', 'postmaster', 'mysqld', 'mariadbd', 'redis-server'].includes(name)) return 'database';
+  if (['dockerd', 'containerd', 'containerd-shim', 'rootlesskit', 'rootlesskit-docker-proxy'].includes(name)) {
+    return 'container-runtime';
+  }
+  if (['systemd', 'systemd-journal', 'systemd-logind', 'dbus-daemon', 'sshd', 'cron', 'crond'].includes(name)) {
+    return 'system-service';
+  }
+  if (/^(?:kworker\/|ksoftirqd\/|migration\/|rcu[_o]|watchdog\/)/.test(name)) return 'kernel-worker';
+  return 'other';
+}
+
+function safeContainerName(value: unknown): string {
+  const name = cleanText(value, 128)?.toLowerCase();
+  return name && SAFE_CONTAINER_NAMES.has(name) ? name : 'cks-workload';
+}
+
+function safeContainerState(value: unknown): string | null {
+  const state = cleanText(value, 32)?.toLowerCase() ?? 'unknown';
+  return SAFE_CONTAINER_STATES.has(state) ? state : 'unknown';
+}
+
+function safeContainerHealth(value: unknown): string | null {
+  const health = cleanText(value, 32)?.toLowerCase() ?? 'unknown';
+  return SAFE_CONTAINER_HEALTH.has(health) ? health : 'unknown';
 }
 
 function safeMessage(value: unknown): string | null {
@@ -390,23 +486,26 @@ function normalizeDisks(current: JsonRecord | null): DashboardResponse['disks'] 
   });
 }
 
-function normalizeContainers(current: JsonRecord | null): DashboardResponse['containers'] {
-  const input = current ? first(current, ['containers']) : undefined;
+function normalizeContainerList(input: unknown, maximum = 256): DashboardResponse['containers'] {
   if (!Array.isArray(input)) return [];
-  return input.slice(0, 256).flatMap((value) => {
+  return input.slice(0, maximum).flatMap((value) => {
     if (!isRecord(value)) return [];
-    const name = cleanText(first(value, ['name']), 128);
-    if (!name) return [];
+    if (own(value, 'owner') !== 'cks') return [];
+    const name = safeContainerName(first(value, ['name']));
     return [{
       name,
-      owner: cleanText(first(value, ['owner', 'user']), 64),
-      state: cleanText(first(value, ['state', 'status']), 64),
-      health: cleanText(first(value, ['health', 'healthStatus']), 64),
-      cpuPercent: percent(first(value, ['cpuPercent', 'cpu'])),
+      owner: 'cks',
+      state: safeContainerState(first(value, ['state', 'status'])),
+      health: safeContainerHealth(first(value, ['health', 'healthStatus'])),
+      cpuPercent: containerCpuPercent(first(value, ['cpuPercent', 'cpu'])),
       memoryBytes: finite(first(value, ['memoryBytes', 'memoryUsageBytes'])),
       memoryPercent: percent(first(value, ['memoryPercent'])),
     }];
   });
+}
+
+function normalizeContainers(current: JsonRecord | null): DashboardResponse['containers'] {
+  return normalizeContainerList(current ? first(current, ['containers']) : undefined);
 }
 
 function normalizeAlert(
@@ -606,6 +705,234 @@ function normalizePrivilege(records: JsonRecord[], cutoff: number, nowMs: number
   }).sort((left, right) => right.timestamp.localeCompare(left.timestamp)).slice(0, MAX_EVENTS);
 }
 
+function normalizePressureWindow(value: unknown): DashboardResponse['incidents'][number]['pressure']['cpu'] | null {
+  if (!isRecord(value)) return null;
+  return {
+    someAvg10: percent(own(value, 'someAvg10')),
+    fullAvg10: percent(own(value, 'fullAvg10')),
+  };
+}
+
+function normalizeIncidentProcesses(value: unknown): DashboardResponse['incidents'][number]['processes'] | null {
+  if (!Array.isArray(value)) return null;
+  return value.slice(0, MAX_INCIDENT_PROCESSES).flatMap((candidate) => {
+    if (!isRecord(candidate)) return [];
+    const name = safeProcessName(own(candidate, 'name'));
+    const instances = integer(own(candidate, 'instances'), 1, 1_000_000);
+    if (instances === null) return [];
+    return [{
+      name,
+      instances,
+      cpuPercent: percent(own(candidate, 'cpuPercent')),
+      memoryBytes: integer(own(candidate, 'memoryBytes')),
+    }];
+  });
+}
+
+function normalizeIncidentMetrics(
+  value: JsonRecord,
+  observedAt: string,
+): TelemetrySample | null {
+  const memoryUsedBytes = finite(own(value, 'memoryUsedBytes'));
+  const memoryTotalBytes = finite(own(value, 'memoryTotalBytes'));
+  if (
+    memoryUsedBytes !== null
+    && memoryTotalBytes !== null
+    && memoryUsedBytes > memoryTotalBytes
+  ) return null;
+  return {
+    timestamp: observedAt,
+    cpuPercent: percent(own(value, 'cpuPercent')),
+    memoryPercent: percent(own(value, 'memoryPercent')),
+    memoryUsedBytes,
+    memoryTotalBytes,
+    temperatureC: finite(own(value, 'temperatureC'), -100, 250),
+    load1: finite(own(value, 'load1')),
+    load5: finite(own(value, 'load5')),
+    load15: finite(own(value, 'load15')),
+    powerState: cleanText(own(value, 'powerState'), 32),
+    supplyVoltageVolts: finite(own(value, 'supplyVoltageVolts'), 0, 10),
+    throttledFlags: uint32(own(value, 'throttledFlags')),
+    gpuMemoryBytes: finite(own(value, 'gpuMemoryBytes')),
+    gpuClockHz: finite(own(value, 'gpuClockHz')),
+    networkRxBytesPerSecond: finite(own(value, 'networkRxBytesPerSecond')),
+    networkTxBytesPerSecond: finite(own(value, 'networkTxBytesPerSecond')),
+    diskReadBytesPerSecond: finite(own(value, 'diskReadBytesPerSecond')),
+    diskWriteBytesPerSecond: finite(own(value, 'diskWriteBytesPerSecond')),
+  };
+}
+
+function normalizeIncidentContainers(value: unknown): DashboardResponse['incidents'][number]['containers'] | null {
+  if (!Array.isArray(value)) return null;
+  return value.slice(0, MAX_INCIDENT_CONTAINERS).flatMap((candidate) => {
+    if (!isRecord(candidate)) return [];
+    if (own(candidate, 'owner') !== 'cks') return [];
+    const name = safeContainerName(own(candidate, 'name'));
+    return [{
+      name,
+      owner: 'cks',
+      state: safeContainerState(own(candidate, 'state')),
+      health: safeContainerHealth(own(candidate, 'health')),
+      cpuPercent: containerCpuPercent(own(candidate, 'cpuPercent')),
+      memoryBytes: finite(own(candidate, 'memoryBytes')),
+      memoryPercent: percent(own(candidate, 'memoryPercent')),
+    }];
+  });
+}
+
+function normalizeIncidentTraffic(value: unknown): DashboardResponse['incidents'][number]['traffic'] | null {
+  if (!Array.isArray(value)) return null;
+  return value.slice(0, MAX_INCIDENT_TRAFFIC).flatMap((candidate) => {
+    if (!isRecord(candidate)) return [];
+    const app = incidentToken(own(candidate, 'app'), 64);
+    const requestCount = integer(own(candidate, 'requestCount'), 0, MAX_INCIDENT_COUNT);
+    const status2xx = integer(own(candidate, 'status2xx'), 0, MAX_INCIDENT_COUNT);
+    const status3xx = integer(own(candidate, 'status3xx'), 0, MAX_INCIDENT_COUNT);
+    const status4xx = integer(own(candidate, 'status4xx'), 0, MAX_INCIDENT_COUNT);
+    const status5xx = integer(own(candidate, 'status5xx'), 0, MAX_INCIDENT_COUNT);
+    const slowCount = integer(own(candidate, 'slowCount'), 0, MAX_INCIDENT_COUNT);
+    if (
+      !app
+      || !INCIDENT_TRAFFIC_APPS.has(app)
+      || requestCount === null
+      || status2xx === null
+      || status3xx === null
+      || status4xx === null
+      || status5xx === null
+      || slowCount === null
+      || slowCount > requestCount
+      || status2xx + status3xx + status4xx + status5xx > requestCount
+    ) return [];
+    const avgResponseMs = finite(own(candidate, 'avgResponseMs'), 0, MAX_RESPONSE_TIME_MS);
+    const maxResponseMs = finite(own(candidate, 'maxResponseMs'), 0, MAX_RESPONSE_TIME_MS);
+    if (avgResponseMs !== null && maxResponseMs !== null && avgResponseMs > maxResponseMs) return [];
+    return [{
+      app,
+      requestCount,
+      status2xx,
+      status3xx,
+      status4xx,
+      status5xx,
+      slowCount,
+      avgResponseMs,
+      maxResponseMs,
+    }];
+  });
+}
+
+function normalizeIncident(
+  record: JsonRecord,
+  cutoff: number,
+  nowMs: number,
+): DashboardResponse['incidents'][number] | null {
+  const id = incidentId(own(record, 'id'));
+  const startedAt = typeof own(record, 'startedAt') === 'string'
+    ? isoTimestamp(own(record, 'startedAt'))
+    : null;
+  const observedAt = typeof own(record, 'observedAt') === 'string'
+    ? isoTimestamp(own(record, 'observedAt'))
+    : null;
+  const rawEndedAt = own(record, 'endedAt');
+  const endedAt = rawEndedAt === null || rawEndedAt === undefined
+    ? null
+    : typeof rawEndedAt === 'string'
+      ? isoTimestamp(rawEndedAt)
+      : null;
+  if (!id || !startedAt || !observedAt || rawEndedAt !== null && rawEndedAt !== undefined && !endedAt) return null;
+
+  const startedMs = new Date(startedAt).getTime();
+  const observedMs = new Date(observedAt).getTime();
+  const endedMs = endedAt ? new Date(endedAt).getTime() : null;
+  if (
+    startedMs > observedMs
+    || observedMs < cutoff
+    || observedMs > nowMs + 60_000
+    || endedMs !== null && (endedMs < startedMs || endedMs > observedMs)
+  ) return null;
+
+  const phase = own(record, 'phase');
+  if (phase !== 'active' && phase !== 'follow-up' && phase !== 'recovered') return null;
+  if (phase === 'recovered' ? endedAt === null || endedMs !== observedMs : endedAt !== null) return null;
+
+  const rawReasons = own(record, 'reasons');
+  if (!Array.isArray(rawReasons)) return null;
+  if (rawReasons.length === 0 || rawReasons.length > MAX_INCIDENT_REASONS) return null;
+  const reasonSet = new Set<IncidentReason>();
+  for (const reason of rawReasons) {
+    if (typeof reason !== 'string' || !INCIDENT_REASONS.has(reason as IncidentReason)) return null;
+    if (reasonSet.has(reason as IncidentReason)) return null;
+    reasonSet.add(reason as IncidentReason);
+  }
+  const reasons = INCIDENT_REASON_ORDER.filter((reason) => reasonSet.has(reason));
+
+  const rawMetrics = own(record, 'metrics');
+  const rawPressure = own(record, 'pressure');
+  const rawProcesses = own(record, 'processes');
+  const rawContainers = own(record, 'containers');
+  const rawTraffic = own(record, 'traffic');
+  if (!isRecord(rawMetrics) || !isRecord(rawPressure) || !Array.isArray(rawContainers)) return null;
+  const metrics = normalizeIncidentMetrics(rawMetrics, observedAt);
+  const cpuPressure = normalizePressureWindow(own(rawPressure, 'cpu'));
+  const memoryPressure = normalizePressureWindow(own(rawPressure, 'memory'));
+  const ioPressure = normalizePressureWindow(own(rawPressure, 'io'));
+  const processes = normalizeIncidentProcesses(rawProcesses);
+  const containers = normalizeIncidentContainers(rawContainers);
+  const traffic = normalizeIncidentTraffic(rawTraffic);
+  if (!metrics || !cpuPressure || !memoryPressure || !ioPressure || !processes || !containers || !traffic) return null;
+
+  const rawPeaks = own(record, 'peaks');
+  const peaks = rawPeaks === null || rawPeaks === undefined
+    ? null
+    : isRecord(rawPeaks)
+      ? {
+          cpuPercent: percent(own(rawPeaks, 'cpuPercent')),
+          memoryPercent: percent(own(rawPeaks, 'memoryPercent')),
+          temperatureC: finite(own(rawPeaks, 'temperatureC'), -100, 250),
+          load1: finite(own(rawPeaks, 'load1')),
+        }
+      : null;
+  if (rawPeaks !== null && rawPeaks !== undefined && !isRecord(rawPeaks)) return null;
+
+  const rawDurationSeconds = own(record, 'durationSeconds');
+  const durationSeconds = rawDurationSeconds === null || rawDurationSeconds === undefined
+    ? null
+    : integer(rawDurationSeconds, 0, MAX_INCIDENT_DURATION_SECONDS);
+  if (rawDurationSeconds !== null && rawDurationSeconds !== undefined && durationSeconds === null) return null;
+  if (phase === 'recovered' ? durationSeconds === null : durationSeconds !== null) return null;
+
+  return {
+    id,
+    startedAt,
+    observedAt,
+    endedAt,
+    phase,
+    reasons,
+    metrics,
+    pressure: {
+      cpu: cpuPressure,
+      memory: memoryPressure,
+      io: ioPressure,
+    },
+    processes,
+    containers,
+    traffic,
+    peaks,
+    durationSeconds,
+  };
+}
+
+function normalizeIncidents(
+  records: JsonRecord[],
+  cutoff: number,
+  nowMs: number,
+): DashboardResponse['incidents'] {
+  return records
+    .map((record) => normalizeIncident(record, cutoff, nowMs))
+    .filter((incident): incident is DashboardResponse['incidents'][number] => incident !== null)
+    .sort((left, right) => right.observedAt.localeCompare(left.observedAt))
+    .slice(0, MAX_INCIDENTS);
+}
+
 export function readDashboard(
   dataDirectory: string,
   range: DashboardRange,
@@ -652,6 +979,7 @@ export function readDashboard(
   const alerts = parseJsonLines(root, join(root, 'alerts.jsonl'), MAX_EVENT_FILE_BYTES);
   const power = parseJsonLines(root, join(root, 'power.jsonl'), MAX_EVENT_FILE_BYTES);
   const privilege = parseJsonLines(root, join(root, 'privilege.jsonl'), MAX_EVENT_FILE_BYTES);
+  const incidents = parseJsonLines(root, join(root, 'incidents.jsonl'), MAX_INCIDENT_FILE_BYTES);
 
   return {
     generatedAt: new Date(nowMs).toISOString(),
@@ -666,12 +994,15 @@ export function readDashboard(
     alerts: normalizeAlerts(alerts, cutoff, nowMs),
     powerEvents: normalizePowerEvents(power, alerts, samples, cutoff, nowMs),
     privilegeEvents: normalizePrivilege(privilege, cutoff, nowMs),
+    incidents: normalizeIncidents(incidents, cutoff, nowMs),
   };
 }
 
 export const dataLimits = {
   maximumSeriesPoints: MAX_SERIES_POINTS,
   maximumEvents: MAX_EVENTS,
+  maximumIncidents: MAX_INCIDENTS,
+  maximumIncidentFileBytes: MAX_INCIDENT_FILE_BYTES,
   acceptedHistoryFilePattern: /^\d{4}-\d{2}-\d{2}\.jsonl$/,
-  fixedFiles: ['current.json', 'alerts.jsonl', 'power.jsonl', 'privilege.jsonl'].map((path) => basename(path)),
+  fixedFiles: ['current.json', 'alerts.jsonl', 'power.jsonl', 'privilege.jsonl', 'incidents.jsonl'].map((path) => basename(path)),
 } as const;

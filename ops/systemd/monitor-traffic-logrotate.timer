@@ -1,0 +1,11 @@
+[Unit]
+Description=Check Monitor request-log rotation every minute
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=60s
+AccuracySec=5s
+Unit=monitor-traffic-logrotate.service
+
+[Install]
+WantedBy=timers.target

@@ -9,21 +9,24 @@ Bonifacio SSO boundary.
 ## Architecture
 
 ```text
-host proc/sys + selected logs + named rootless Docker sockets
-                              |
-                    systemd timer (root)
-                              |
-                 sanitizing Python collector
-                              |
-            /var/lib/monitor-export (bounded JSON/JSONL)
-                              | read-only bind mount
-                              v
+cks rootless Docker socket -> short-lived cks exporter -> reduced /run snapshot
+                                                        |
+host proc/sys + selected logs + privacy request counts -+
+                                                        |
+                                              root systemd collector
+                                                        |
+                                /var/lib/monitor-export (bounded JSON/JSONL)
+                                                        | read-only bind mount
+                                                        v
 browser -> TLS/Nginx + central SSO -> Express API + React UI
 ```
 
-The privilege boundary is intentional: only the short-lived collector can read
-protected host inputs. The web container receives neither Docker sockets nor
-raw logs; it can read only the collector's reduced export. In production SSO
+The privilege boundary is intentional: the root collector reads protected host
+inputs but its mount namespace contains no Docker socket. A separate one-shot
+helper runs as the same unprivileged `cks` account that already owns the sole
+rootless daemon and writes only a strictly validated, fixed-schema snapshot.
+The web container receives neither Docker sockets nor raw logs; it can read
+only the collector's reduced export. In production SSO
 mode the application has no password database, session database, auth-state
 directory, or other writable user store. It consumes only the identity asserted
 by the central SSO edge, protected by a dedicated read-only edge secret.
@@ -63,17 +66,20 @@ The dashboard provides:
 
 - CPU, memory, temperature, load, network, and disk-I/O summaries and charts;
 - `1h`, `24h`, `7d`, and `30d` ranges, with at most 360 chart points;
-- host, EXT5V supply/power/GPU, filesystem, and per-owner container status;
+- host, EXT5V supply/power/GPU, filesystem, and allow-listed `cks` container status;
+- bounded peak-incident evidence with PSI, fixed executable classes,
+  fixed-label `cks` workloads, and per-capture app request counts (not visitors);
 - recent semantic alerts and privilege outcomes without commands or arguments;
 - stale-data and refresh-error indicators, one-minute visible-tab refreshes,
   and a responsive table/card layout.
 
 The overview keeps operational scanning compact: it shows the latest EXT5V and
-throttle state plus at most the newest 10 alerts and 10 privilege records from
-the selected range. `/monitor/details` uses the same authenticated API snapshot
-to show the full API-bounded event lists (up to 500 each), the EXT5V history and
-power/storage event timeline, full-range power statistics, and expanded CPU,
-memory, temperature/load, network, and disk-I/O charts.
+throttle state, the latest three incident captures, and at most the newest 10
+alerts and 10 privilege records from the selected range. `/monitor/details`
+uses the same authenticated API snapshot to show the full API-bounded event and
+incident lists (up to 500 each), the EXT5V history and power/storage event
+timeline, full-range power statistics, and expanded CPU, memory,
+temperature/load, network, and disk-I/O charts.
 
 ## Requirements
 
@@ -94,7 +100,7 @@ terminal.
 ```sh
 cd /home/cks/Monitor
 sudo sh ops/install.sh
-sudo systemctl status monitor-collector.timer monitor-collector.service
+sudo systemctl status monitor-collector.timer monitor-container-exporter.service monitor-collector.service
 sudo journalctl -u monitor-collector.service -n 50 --no-pager
 sudo python3 -m json.tool /var/lib/monitor-export/current.json >/dev/null
 ```
@@ -191,6 +197,44 @@ curl --fail --silent --show-error https://bonifacio.work/monitor/ >/dev/null
 
 Only the Nginx/TLS endpoint should be exposed publicly. Port `5181` remains
 loopback-only.
+
+Install the separate privacy-preserving request counter after the site is
+working:
+
+```sh
+cd /home/cks/Monitor
+sudo sh ops/install-traffic-logging.sh
+sudo systemctl restart monitor-collector.service
+sudo systemctl status monitor-traffic-logrotate.timer monitor-traffic-retention.timer
+```
+
+The installed HTTP-level map has a fixed allowlist and writes one
+identifier-free observation for each matching request: timestamp, fixed app
+label, status code, and request duration. It does not persist IP, SSO subject,
+method, URI/path/query, referrer, user agent, or cookies. Unknown paths are not
+logged. A dedicated timer checks the supplied logrotate rule every minute;
+`maxsize 5M` means rotate on the next check after the active file crosses that
+size, not a synchronous 5 MiB cap. Under-size non-empty files rotate daily and
+at most two numbered, uncompressed archives are retained so a delayed collector
+can finish reading an old inode. Before each rename, logrotate durably creates
+the root-only marker
+`/var/lib/monitor-traffic-logrotate/reopen-required`. A successful Nginx log
+reopen durably removes it; a failed reopen leaves it in place, fails the unit,
+and is retried before any later rotation. The one-shot uses a bounded
+`Restart=on-failure` loop with a two-second delay, while the minute timer remains
+the long-term retry path. Nginx is never signaled on marker-free timer checks.
+An independent retention timer removes
+exact-name, regular, single-link rotations older than 48 hours. Rotation,
+retention, installation, and removal share one maintenance lock. The retention
+path remains installed after traffic logging is removed; only a marker created
+after a successful Nginx reload permits it to expire the final inactive log.
+That marker must itself age for 48 hours, giving graceful Nginx workers time to
+release the old descriptor before deletion.
+
+The collector reduces those observations to per-app request and response-time
+summaries for one capture interval and attaches them only to bounded peak
+incidents. Dashboard request counts therefore show requests in that capture,
+not people or unique visitors.
 
 ## Local development
 
@@ -307,12 +351,26 @@ Collector variables and defaults are:
 | `MONITOR_EVENTS_LOG` | `/var/log/server-watch/events.log` |
 | `MONITOR_KERNEL_LOG` | `/var/log/kern.log` |
 | `MONITOR_PRIVILEGE_LOGS` | `/var/log/privilege-events.log` |
-| `MONITOR_DOCKER_SOCKETS` | `cks=/run/user/1001/docker.sock,psy=/run/user/1002/docker.sock,wgang=/run/user/1003/docker.sock` |
+| `MONITOR_TRAFFIC_LOG` | `/var/log/nginx/monitor-traffic.jsonl` |
+| `MONITOR_CONTAINER_INPUT` | `/run/monitor-container-exporter/containers.json` in production |
+| `MONITOR_DOCKER_SOCKETS` | empty in production; direct socket mode is fixture/development-only and rejects non-`cks` owners |
+| `MONITOR_PROCESS_UIDS` | `0,1001` (root and `cks`; other UIDs are rejected) |
 | `MONITOR_CURL` | `/usr/bin/curl` |
 | `MONITOR_VCGENCMD` | `/usr/bin/vcgencmd` |
 | `MONITOR_COMMAND_TIMEOUT` | `2` seconds per command |
 | `MONITOR_RETENTION_DAYS` | `30` |
 | `MONITOR_MAX_LOG_RECORDS` | `5000` per event export |
+| `MONITOR_INCIDENT_RETENTION_DAYS` | `30` |
+| `MONITOR_MAX_INCIDENT_RECORDS` | `1000` |
+| `MONITOR_INCIDENT_FOLLOW_UP_SAMPLES` | `5` |
+| `MONITOR_CPU_WARN_PERCENT`, `MONITOR_CPU_RECOVER_PERCENT` | `85`, `75` |
+| `MONITOR_CPU_WARN_SAMPLES` | `1` one-minute sample |
+| `MONITOR_MEMORY_AVAILABLE_WARN_PERCENT`, `MONITOR_MEMORY_AVAILABLE_RECOVER_PERCENT` | `20`, `25` |
+| `MONITOR_TEMPERATURE_WARN_C`, `MONITOR_TEMPERATURE_RECOVER_C` | `75`, `72` |
+| `MONITOR_LOAD_WARN`, `MONITOR_LOAD_RECOVER` | `4`, `2` |
+| `MONITOR_DISK_IO_WARN_BYTES_PER_SECOND`, `MONITOR_DISK_IO_RECOVER_BYTES_PER_SECOND` | `104857600`, `52428800` |
+| `MONITOR_TRAFFIC_REQUEST_WARN`, `MONITOR_TRAFFIC_REQUEST_RECOVER` | `300`, `200` per collector interval |
+| `MONITOR_TRAFFIC_SLOW_SECONDS` | `1` |
 | `MONITOR_MAX_INPUT_BYTES` | `1048576` per input read |
 | `MONITOR_KERNEL_MAX_INPUT_BYTES` | `8388608` per kernel-log read |
 
@@ -321,7 +379,13 @@ fixture roots. The installed source of truth is
 `/etc/default/monitor-collector`, seeded from
 `ops/monitor-collector.default`. Colon-separate additional privilege log
 fallbacks only when necessary; enabling overlapping sources can duplicate
-events. Restart the one-shot service after a change:
+events. `ops/install.sh` transactionally replaces this file with the reviewed
+production baseline on upgrade, so obsolete socket or user entries cannot
+survive; a failed install restores the previous file. The shipped production unit additionally disables direct Docker
+collection and pins the exact reduced container input, process UID set, and
+traffic-log path on its command line, so a later-edited environment file
+cannot widen those collection boundaries.
+Restart the one-shot service after a change:
 
 ```sh
 sudo systemctl restart monitor-collector.service
@@ -340,8 +404,27 @@ The default root is `/var/lib/monitor-export`:
   records. Every `power.jsonl` record has exactly `timestamp`, `severity`,
   `kind`, `status`, and a fixed semantic `message`; it never contains the raw
   kernel line.
-- `.state/log-cursors.json` prevents replay after service restarts. Short-lived
-  rate counters live in `/run/monitor-collector/delta-state.json`.
+- `incidents.jsonl` is capped at 1,000 records, 16 MiB, and 30 days. A record is
+  written only on incident entry, during at most five one-minute follow-ups,
+  when another threshold joins the same window, and on recovery.
+- `.state/log-cursors.json` stores durable source positions. New fixed-schema
+  alert, power, and privilege rows plus next cursors and per-output base/final
+  digests first enter the bounded mode-`0600`
+  `.state/pending-sanitized-log-commit.json`; replay uses the digests to finish
+  each output exactly once before advancing the cursor. Identical public rows
+  from distinct alert or privilege source events remain distinct.
+  `.state/incident-lifecycle.json` keeps only the active incident ID, reasons,
+  hysteresis/follow-up state, and peaks so recovery survives a reboot. Incident
+  record, lifecycle, and request cursor changes similarly first enter
+  `.state/pending-incident-commit.json`. Startup replays both journals before
+  new source reads and removes each only after every destination is fsynced.
+  An unsafe pending journal is preserved unchanged and collection fails closed
+  instead of deleting or replacing it.
+  Short-lived host-rate and hashed process counters live in mode-`0600`
+  `/run/monitor-collector/delta-state.json`; the request source uses a separate
+  mode-`0600` durable cursor. Container IDs and CPU baselines stay only in the
+  `cks` exporter's private runtime file and are never mounted into the root
+  collector.
 
 `host` contains hostname, OS, architecture, and uptime. A `latest`/history
 sample contains a timestamp plus CPU and memory percentages and byte totals,
@@ -366,16 +449,22 @@ same-second event kinds and statuses, and exports no device-specific raw text.
 A missing kernel log is non-fatal and simply yields no new kernel power events.
 
 Each disk is reduced to mount, total/used bytes, and used percentage. Each
-container is reduced to name, owner, state, health, CPU percentage, and memory
-bytes/percentage. Alerts contain only timestamp, severity, kind, status, and a
-bounded semantic message. Privilege records contain only timestamp, actor,
-target, action, and result—never a command, arguments, environment, container
-ID, image, mount, or raw log line.
+`cks` workload is reduced to a fixed allow-listed app label (or
+`cks-workload`), owner, state, health, CPU percentage, and memory
+bytes/percentage. Incident process evidence is grouped into fixed executable
+classes such as `node`, `python`, `web-server`, or `other` and contains only
+instance count, CPU percentage, and memory bytes. Request evidence contains
+only a fixed app label, total/status-class/
+slow counts, and average/maximum response time. Alerts contain only timestamp,
+severity, kind, status, and a bounded semantic message. Privilege records
+contain only timestamp, actor, target, action, and result—never PID, UID,
+command, arguments, environment, client identifier, URI, container ID, image,
+mount, or a raw log line.
 
 The API validates and bounds the files again, rejects malformed, out-of-range,
 or future data, and marks a response stale when no recent sample exists. It
-returns at most 360 chart samples and 500 each of alerts, power events, and
-privilege events. Chart downsampling preferentially retains the first/last
+returns at most 360 chart samples and 500 each of incidents, alerts, power
+events, and privilege events. Chart downsampling preferentially retains the first/last
 sample, voltage extrema, and power-state/flag transitions. `powerSummary` is
 calculated from every valid sample in the selected range before downsampling
 and contains `sampleCount`, `voltageSampleCount`, minimum/average/maximum EXT5V,
@@ -403,10 +492,20 @@ GET    /monitor/api/operations/auth-inventory  # developer/admin, aggregate only
 - The root collector is a hardened, one-shot systemd unit with a restricted
   capability set, read-only host paths, and writes limited to its export and
   runtime directories.
-- Only explicitly configured Unix sockets are queried. Docker responses are
-  immediately allow-listed; the web container has no socket mount.
+- The root collector has no Docker socket. A short-lived helper running as
+  `cks` sees only that account's rootless socket, maps mutable names to fixed
+  labels, and atomically writes a mode-`0640` snapshot. The root service sees
+  only that exact snapshot file and revalidates its owner, mode, age, size, and
+  nested schema. The web container also has no socket mount.
 - Export files are bounded, atomically replaced, and readable by the `cks`
   deployment boundary without becoming world-readable.
+- Hashed process identifiers exist only in the mode-`0600` runtime delta file
+  and are never exported. Incident evidence contains fixed executable classes
+  only. The bounded Nginx input has no client or request identifier;
+  its rotation and independent 48-hour retention checks run every minute, and
+  both collector and API independently enforce the fixed app allowlist. A
+  root-only, fsync-backed pending-reopen marker prevents a failed Nginx reopen
+  from being forgotten merely because logrotate already advanced its state.
 - The production rootless container has a read-only filesystem and telemetry
   mount, no writable user/auth store, no Linux capabilities,
   `no-new-privileges`, a small tmpfs, and CPU, memory, PID, and log-size limits.
@@ -429,7 +528,7 @@ GET    /monitor/api/operations/auth-inventory  # developer/admin, aggregate only
   non-allow-listed fields, and applies a second redaction pass to messages.
 - Kernel power evidence is reduced to the fixed `power.jsonl` schema before the
   web container can read it. The container never receives `/var/log/kern.log`
-  or another raw host log.
+  or another raw host log, including the Nginx aggregate source.
 
 This is a private operations view. Keep it behind the central HTTPS SSO gate,
 do not expose port `5181`, and do not mount additional host paths into the
@@ -515,7 +614,7 @@ raw kernel-log lines into tickets or chat. If the file is absent, run the
 collector once and check its journal; absence remains normal on hosts without a
 matching kernel event.
 
-Remove the container, then the collector:
+Remove the container and active privacy request logging, then the collector:
 
 ```sh
 sudo -u cks env \
@@ -524,10 +623,17 @@ sudo -u cks env \
   MONITOR_IMAGE=unused \
   docker compose --project-name monitor \
     --file /etc/portfolio-deploy/monitor.compose.yml down
+sudo sh /home/cks/Monitor/ops/uninstall-traffic-logging.sh
 sudo sh /home/cks/Monitor/ops/uninstall.sh
 ```
 
-The uninstall script deliberately preserves `/var/lib/monitor-export` and
+The traffic uninstaller leaves its independent retention service and timer in
+place so exact-name logs expire even though Nginx no longer writes them. It
+marks the active file retired only after Nginx has successfully reloaded without
+the logging configuration, then waits 48 hours before that final file becomes
+eligible. The collector uninstaller
+deliberately preserves
+`/var/lib/monitor-export` and
 `/etc/default/monitor-collector`. It also leaves the edge credential, production Compose file, deployment
 dispatcher entry, Nginx route, and container images in place. Local disposable
 auth state beneath the worktree is separate and can be removed when no longer

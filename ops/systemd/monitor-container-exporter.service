@@ -1,0 +1,51 @@
+[Unit]
+Description=Reduced cks container telemetry for Monitor
+Documentation=file:/usr/local/share/doc/monitor-collector/README.md
+After=local-fs.target
+
+[Service]
+Type=oneshot
+User=cks
+Group=cks
+ExecStart=/usr/bin/python3 /usr/local/lib/monitor-collector/container_exporter.py --socket=/run/user/1001/docker.sock --output=/run/monitor-container-exporter/containers.json --state=/run/monitor-container-exporter/cpu-state.json
+RuntimeDirectory=monitor-container-exporter
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
+UMask=0027
+
+# The short-lived helper runs as the owner of the one rootless daemon. It can
+# see that socket only while reducing the response to the fixed public schema.
+ProtectSystem=strict
+# ProtectHome also masks /run/user on this systemd release. The explicit
+# inaccessible home paths plus the empty /run view retain the intended boundary
+# while allowing only the exact socket bind below.
+InaccessiblePaths=/home /root
+TemporaryFileSystem=/run:ro
+BindPaths=/run/monitor-container-exporter
+BindReadOnlyPaths=/run/user/1001/docker.sock
+PrivateTmp=true
+PrivateDevices=true
+NoNewPrivileges=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+MemoryHigh=128M
+MemoryMax=160M
+TasksMax=48
+CapabilityBoundingSet=
+ReadWritePaths=/run/monitor-container-exporter
+
+TimeoutStartSec=35s
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7

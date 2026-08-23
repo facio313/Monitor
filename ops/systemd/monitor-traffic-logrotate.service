@@ -1,0 +1,47 @@
+[Unit]
+Description=Rotate Monitor privacy request observations
+Documentation=file:/usr/local/share/doc/monitor-collector/README.md
+ConditionPathExists=/etc/monitor-traffic/logrotate.conf
+StartLimitIntervalSec=60s
+StartLimitBurst=5
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0077
+StateDirectory=monitor-traffic-logrotate
+StateDirectoryMode=0700
+RuntimeDirectory=monitor-traffic-maintenance
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+ExecStartPre=/usr/bin/flock --exclusive --timeout 20 /run/monitor-traffic-maintenance/maintenance.lock /usr/local/lib/monitor-traffic/reopen-log.sh retry
+ExecStart=/usr/bin/flock --exclusive --timeout 20 /run/monitor-traffic-maintenance/maintenance.lock /usr/sbin/logrotate --state /var/lib/monitor-traffic-logrotate/status /etc/monitor-traffic/logrotate.conf
+Restart=on-failure
+RestartSec=2s
+
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+NoNewPrivileges=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+ReadWritePaths=-/var/log/nginx /var/lib/monitor-traffic-logrotate /run/monitor-traffic-maintenance
+TimeoutStartSec=55s
+MemoryMax=64M
+TasksMax=32
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7

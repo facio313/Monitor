@@ -1,5 +1,8 @@
+import { createElement } from 'react';
+import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it } from 'vitest';
-import { currentPowerStatusTone, decodeThrottledFlags, eventStatusTone, formatFlags } from './Dashboard';
+import type { PeakIncident } from '../types';
+import { currentPowerStatusTone, decodeThrottledFlags, eventStatusTone, formatFlags, IncidentTimeline } from './Dashboard';
 
 describe('power presentation helpers', () => {
   it('keeps the full uint32 flag range unsigned', () => {
@@ -31,5 +34,90 @@ describe('power presentation helpers', () => {
     expect(currentPowerStatusTone(0, 'thermal-limit')).toBe('warn');
     expect(currentPowerStatusTone(0, 'frequency-capped')).toBe('warn');
     expect(currentPowerStatusTone(0, 'critical')).toBe('critical');
+  });
+});
+
+describe('incident timeline', () => {
+  const incident: PeakIncident = {
+    id: 'peak-20260822-183602',
+    startedAt: '2026-08-22T09:34:58Z',
+    observedAt: '2026-08-22T09:36:02Z',
+    endedAt: '2026-08-22T09:40:21Z',
+    phase: 'recovered',
+    reasons: ['cpu', 'disk-io'],
+    durationSeconds: 323,
+    metrics: {
+      timestamp: '2026-08-22T09:36:02Z',
+      cpuPercent: 91.2,
+      memoryPercent: 75.4,
+      memoryUsedBytes: 4_294_967_296,
+      memoryTotalBytes: 8_589_934_592,
+      temperatureC: 79.5,
+      load1: 7.4,
+      load5: 4.2,
+      load15: 2.1,
+      powerState: 'normal',
+      supplyVoltageVolts: 5.03,
+      throttledFlags: 0,
+      gpuMemoryBytes: null,
+      gpuClockHz: null,
+      networkRxBytesPerSecond: 12_000,
+      networkTxBytesPerSecond: 8_000,
+      diskReadBytesPerSecond: 15_000_000,
+      diskWriteBytesPerSecond: 3_000_000,
+    },
+    peaks: {
+      cpuPercent: 96.4,
+      memoryPercent: 78.2,
+      temperatureC: 81.3,
+      load1: 11.66,
+    },
+    pressure: {
+      cpu: { someAvg10: 3.14, fullAvg10: 0 },
+      memory: { someAvg10: 0.25, fullAvg10: 0.04 },
+      io: { someAvg10: 12.5, fullAvg10: 7.25 },
+    },
+    processes: [{ name: 'node', instances: 2, cpuPercent: 84.3, memoryBytes: 1_073_741_824 }],
+    containers: [{ name: 'allowed-api', owner: 'portfolio', state: 'running', health: 'healthy', cpuPercent: 71.4, memoryBytes: 536_870_912, memoryPercent: 6.25 }],
+    traffic: [{ app: 'Bonifacio', requestCount: 42, status2xx: 36, status3xx: 1, status4xx: 3, status5xx: 2, slowCount: 4, avgResponseMs: 120, maxResponseMs: 1_450 }],
+  };
+
+  it('renders correlated peaks and sanitized evidence groups', () => {
+    const markup = renderToStaticMarkup(createElement(IncidentTimeline, { incidents: [incident] }));
+
+    expect(markup).toContain('High CPU usage');
+    expect(markup).toContain('High disk I/O');
+    expect(markup).toContain('96.4%');
+    expect(markup).toContain('78.2%');
+    expect(markup).toContain('81.3°C');
+    expect(markup).toContain('node');
+    expect(markup).toContain('2 instances');
+    expect(markup).toContain('Fixed executable classes · no argv or IDs');
+    expect(markup).toContain('allowed-api');
+    expect(markup).toContain('42 requests this capture');
+    expect(markup).toContain('5xx 2');
+    expect(markup).toContain('120 ms average');
+    expect(markup).toContain('42 requests in this capture interval · not visitors');
+    expect(markup).toContain('This capture interval only · request counts, not visitors or client identifiers');
+  });
+
+  it('describes an unresolved historical snapshot as open at that capture', () => {
+    const unresolved: PeakIncident = {
+      ...incident,
+      endedAt: null,
+      phase: 'follow-up',
+      durationSeconds: undefined,
+    };
+    const markup = renderToStaticMarkup(createElement(IncidentTimeline, { incidents: [unresolved] }));
+
+    expect(markup).toContain('Open at this capture');
+    expect(markup).not.toContain('Capture window still open');
+  });
+
+  it('renders a positive empty state when no incident was captured', () => {
+    const markup = renderToStaticMarkup(createElement(IncidentTimeline, { incidents: [] }));
+
+    expect(markup).toContain('No peak incidents captured in this range');
+    expect(markup).toContain('inline-empty positive');
   });
 });

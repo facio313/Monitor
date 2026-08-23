@@ -135,6 +135,8 @@ describe('collector to server contract', () => {
       '--privilege-logs', privilegeLog,
       '--docker-sockets', '',
       '--vcgencmd', vcgencmd,
+      '--temperature-warn-c', '40',
+      '--temperature-recover-c', '35',
     ], {
       cwd: resolve('.'),
       encoding: 'utf8',
@@ -143,9 +145,28 @@ describe('collector to server contract', () => {
       timeout: 10_000,
     });
 
-    const current = JSON.parse(readFileSync(join(outputRoot, 'current.json'), 'utf8')) as {
+    const currentPath = join(outputRoot, 'current.json');
+    const incidentPath = join(outputRoot, 'incidents.jsonl');
+    const current = JSON.parse(readFileSync(currentPath, 'utf8')) as {
       generatedAt: string;
+      containers: unknown[];
     };
+    const multiCoreContainer = {
+      name: 'monitor',
+      owner: 'cks',
+      state: 'running',
+      health: 'healthy',
+      cpuPercent: 250,
+      memoryBytes: 262_144,
+      memoryPercent: 12.5,
+    };
+    current.containers = [multiCoreContainer];
+    writeFileSync(currentPath, `${JSON.stringify(current)}\n`);
+    const incident = JSON.parse(readFileSync(incidentPath, 'utf8').trim()) as {
+      containers: unknown[];
+    };
+    incident.containers = [multiCoreContainer];
+    writeFileSync(incidentPath, `${JSON.stringify(incident)}\n`);
     const now = Date.parse(current.generatedAt);
     expect(Number.isFinite(now)).toBe(true);
 
@@ -166,6 +187,7 @@ describe('collector to server contract', () => {
     });
     expect(dashboard.series).toHaveLength(1);
     expect(Object.keys(dashboard.series[0]!)).toEqual(LATEST_FIELDS);
+    expect(dashboard.containers).toEqual([multiCoreContainer]);
     expect(dashboard.powerSummary).toEqual({
       sampleCount: 1,
       voltageSampleCount: 1,
@@ -196,6 +218,49 @@ describe('collector to server contract', () => {
       },
     ]);
     expect(dataLimits.fixedFiles).toContain('power.jsonl');
+    expect(dataLimits.fixedFiles).toContain('incidents.jsonl');
+
+    expect(dashboard.incidents).toHaveLength(1);
+    expect(dashboard.incidents[0]).toMatchObject({
+      phase: 'active',
+      reasons: ['temperature'],
+      endedAt: null,
+      durationSeconds: null,
+      metrics: {
+        timestamp: new Date(now).toISOString(),
+        temperatureC: 45.5,
+      },
+      pressure: {
+        cpu: { someAvg10: null, fullAvg10: null },
+        memory: { someAvg10: null, fullAvg10: null },
+        io: { someAvg10: null, fullAvg10: null },
+      },
+      processes: [],
+      containers: [multiCoreContainer],
+      traffic: [],
+      peaks: {
+        cpuPercent: null,
+        memoryPercent: 75,
+        temperatureC: 45.5,
+        load1: 1.25,
+      },
+    });
+    expect(dashboard.incidents[0]!.id).toMatch(/^incident-\d{8}T\d{6}Z$/);
+    expect(Object.keys(dashboard.incidents[0]!)).toEqual([
+      'id',
+      'startedAt',
+      'observedAt',
+      'endedAt',
+      'phase',
+      'reasons',
+      'metrics',
+      'pressure',
+      'processes',
+      'containers',
+      'traffic',
+      'peaks',
+      'durationSeconds',
+    ]);
 
     expect(dashboard.disks).toHaveLength(1);
     expect(Object.keys(dashboard.disks[0]!)).toEqual([
@@ -228,6 +293,7 @@ describe('collector to server contract', () => {
       readFileSync(join(outputRoot, 'alerts.jsonl'), 'utf8'),
       readFileSync(join(outputRoot, 'power.jsonl'), 'utf8'),
       readFileSync(join(outputRoot, 'privilege.jsonl'), 'utf8'),
+      readFileSync(join(outputRoot, 'incidents.jsonl'), 'utf8'),
       JSON.stringify(dashboard),
     ].join('\n');
     expect(publicExport).not.toContain('RAW_ALERT_SECRET');

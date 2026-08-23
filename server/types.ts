@@ -23,6 +23,68 @@ export interface TelemetrySample {
   diskWriteBytesPerSecond: number | null;
 }
 
+export interface IncidentPressureWindow {
+  someAvg10: number | null;
+  fullAvg10: number | null;
+}
+
+export type IncidentReason =
+  | 'cpu'
+  | 'memory'
+  | 'temperature'
+  | 'load'
+  | 'disk-io'
+  | 'power-throttle'
+  | 'traffic';
+
+export interface DashboardIncident {
+  id: string;
+  startedAt: string;
+  observedAt: string;
+  endedAt: string | null;
+  phase: 'active' | 'follow-up' | 'recovered';
+  reasons: IncidentReason[];
+  metrics: TelemetrySample;
+  pressure: {
+    cpu: IncidentPressureWindow;
+    memory: IncidentPressureWindow;
+    io: IncidentPressureWindow;
+  };
+  processes: Array<{
+    name: string;
+    instances: number;
+    cpuPercent: number | null;
+    memoryBytes: number | null;
+  }>;
+  containers: Array<{
+    name: string;
+    owner: string | null;
+    state: string | null;
+    health: string | null;
+    cpuPercent: number | null;
+    memoryBytes: number | null;
+    memoryPercent: number | null;
+  }>;
+  traffic: Array<{
+    app: string;
+    requestCount: number;
+    status2xx: number;
+    status3xx: number;
+    status4xx: number;
+    status5xx: number;
+    slowCount: number;
+    avgResponseMs: number | null;
+    maxResponseMs: number | null;
+  }>;
+  peaks: {
+    cpuPercent: number | null;
+    memoryPercent: number | null;
+    temperatureC: number | null;
+    load1: number | null;
+  } | null;
+  durationSeconds: number | null;
+}
+
 export interface DashboardResponse {
   generatedAt: string;
   range: DashboardRange;
@@ -82,4 +144,5 @@ export interface DashboardResponse {
     action: 'sudo' | 'su' | 'authentication' | 'policy' | 'unknown';
     result: 'success' | 'failure' | 'unknown';
   }>;
+  incidents: DashboardIncident[];
 }

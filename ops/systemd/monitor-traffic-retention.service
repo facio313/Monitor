@@ -1,0 +1,40 @@
+[Unit]
+Description=Prune expired Monitor privacy request observations
+Documentation=file:/usr/local/share/doc/monitor-collector/README.md
+ConditionPathExists=/usr/local/lib/monitor-traffic/prune-logs.sh
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0077
+RuntimeDirectory=monitor-traffic-maintenance
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+ExecStart=/usr/bin/flock --exclusive --timeout 20 /run/monitor-traffic-maintenance/maintenance.lock /bin/sh /usr/local/lib/monitor-traffic/prune-logs.sh
+
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+NoNewPrivileges=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+ReadWritePaths=-/var/log/nginx /run/monitor-traffic-maintenance
+TimeoutStartSec=35s
+MemoryMax=32M
+TasksMax=8
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7

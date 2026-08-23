@@ -1,0 +1,17 @@
+/var/log/nginx/monitor-traffic.jsonl {
+    daily
+    maxsize 5M
+    rotate 2
+    maxage 2
+    missingok
+    notifempty
+    nocompress
+    create 0640 www-data adm
+    sharedscripts
+    prerotate
+        /usr/local/lib/monitor-traffic/reopen-log.sh mark
+    endscript
+    postrotate
+        /usr/local/lib/monitor-traffic/reopen-log.sh retry
+    endscript
+}

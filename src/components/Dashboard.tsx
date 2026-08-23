@@ -17,6 +17,7 @@ import type {
   ContainerStatus,
   DashboardPayload,
   MonitorPage,
+  PeakIncident,
   PowerEvent,
   PowerSummary,
   PrivilegeEvent,
@@ -226,6 +227,7 @@ export function Dashboard({ page, navigationVersion, onNavigate, onLogout, onPas
 function OverviewContent({ data, range, onNavigate }: { data: DashboardPayload; range: TimeRange; onNavigate: DashboardProps['onNavigate'] }) {
   const chartData = useMemo(() => data.series.map((point) => ({ ...point, label: formatTime(point.timestamp, range) })), [data.series, range]);
   const latest = data.latest;
+  const incidents = data.incidents ?? [];
   const temperature = latest?.temperatureC ?? null;
   const maxDisk = data.disks.reduce((highest, disk) => Math.max(highest, disk.usedPercent ?? 0), 0);
   const unhealthyContainers = data.containers.filter((container) => !isContainerHealthy(container)).length;
@@ -240,6 +242,16 @@ function OverviewContent({ data, range, onNavigate }: { data: DashboardPayload; 
       </section>
 
       <PowerOverview latest={latest} onNavigate={onNavigate} />
+
+      <Panel
+        title="Recent peak incidents"
+        subtitle={`Showing the latest ${Math.min(incidents.length, 3)} of ${incidents.length} incident captures`}
+        icon="activity"
+        badge={summaryBadge(incidents.length)}
+      >
+        <IncidentTimeline incidents={incidents.slice(0, 3)} compact />
+        {incidents.length > 0 && <DetailsLink section="incidents" count={incidents.length} label="Inspect incident evidence" onNavigate={onNavigate} />}
+      </Panel>
 
       <section className="two-column chart-layout" aria-label="Historical telemetry">
         <Panel title="Resource history" subtitle="CPU and memory utilization" icon="activity" badge={range.toUpperCase()}>
@@ -390,6 +402,7 @@ function DetailsContent({ data, range, onNavigate }: { data: DashboardPayload; r
     [data.series, range],
   );
   const latest = data.latest;
+  const incidents = data.incidents ?? [];
   const flags = decodeThrottledFlags(latest?.throttledFlags);
   const powerEvents = data.powerEvents ?? [];
   const summary = normalizedPowerSummary(data.powerSummary, data.series);
@@ -423,6 +436,7 @@ function DetailsContent({ data, range, onNavigate }: { data: DashboardPayload; r
       <nav className="detail-jump-nav" aria-label="Details sections">
         <a href="/monitor/details#power" onClick={(event) => navigateInApp(event, onNavigate, 'details', '#power')}>Power</a>
         <a href="/monitor/details#resources" onClick={(event) => navigateInApp(event, onNavigate, 'details', '#resources')}>Resources</a>
+        <a href="/monitor/details#incidents" onClick={(event) => navigateInApp(event, onNavigate, 'details', '#incidents')}>Incidents</a>
         <a href="/monitor/details#alerts" onClick={(event) => navigateInApp(event, onNavigate, 'details', '#alerts')}>Alerts</a>
         <a href="/monitor/details#privilege" onClick={(event) => navigateInApp(event, onNavigate, 'details', '#privilege')}>Privilege</a>
       </nav>
@@ -561,6 +575,23 @@ function DetailsContent({ data, range, onNavigate }: { data: DashboardPayload; r
         </Panel>
       </section>
 
+      <section id="incidents" tabIndex={-1} className="detail-section" aria-labelledby="incidents-detail-title">
+        <DetailSectionHeading
+          eyebrow="Correlation"
+          title="Peak incident timeline"
+          id="incidents-detail-title"
+          detail="Threshold windows combine resource peaks with safe process names, cks-owned workloads, pressure, and per-capture request counts—not visitors."
+        />
+        <Panel
+          title="Captured incident evidence"
+          subtitle={`${incidents.length} incident capture${incidents.length === 1 ? '' : 's'} in this range`}
+          icon="activity"
+          badge={exactEventBadge(incidents.length)}
+        >
+          <IncidentTimeline incidents={incidents} />
+        </Panel>
+      </section>
+
       <section id="alerts" tabIndex={-1} className="detail-section" aria-labelledby="alerts-detail-title">
         <DetailSectionHeading eyebrow="Operations" title="All recent alerts" id="alerts-detail-title" detail={`${data.alerts.length} newest records in this range (up to ${API_EVENT_CAP}).`} />
         <Panel title="Collector & system alerts" subtitle="Full list returned for this snapshot" icon="alert" badge={exactEventBadge(data.alerts.length)}>
@@ -593,6 +624,143 @@ function SummaryStat({ label, value, detail }: { label: string; value: string; d
 function FlagList({ values, empty, tone }: { values: string[]; empty: string; tone: 'active' | 'historical' }) {
   if (!values.length) return <p className="flag-empty">{empty}</p>;
   return <ul className={`flag-list flag-${tone}`}>{values.map((value) => <li key={value}>{value}</li>)}</ul>;
+}
+
+export function IncidentTimeline({ incidents, compact = false }: { incidents: PeakIncident[]; compact?: boolean }) {
+  if (!incidents.length) {
+    return <InlineEmpty icon="check" text="No peak incidents captured in this range" positive />;
+  }
+
+  return (
+    <div className={`incident-timeline${compact ? ' incident-timeline-compact' : ''}`}>
+      {incidents.map((incident, index) => {
+        const reasons = Array.isArray(incident.reasons)
+          ? incident.reasons.map((reason) => incidentReasonLabel(reason)).filter(Boolean)
+          : [];
+        const processes = Array.isArray(incident.processes) ? incident.processes : [];
+        const containers = Array.isArray(incident.containers) ? incident.containers : [];
+        const traffic = Array.isArray(incident.traffic) ? incident.traffic : [];
+        const tone = incidentPhaseTone(incident.phase);
+        const titleId = `incident-title-${index}`;
+        const metrics = incident.metrics;
+        const cpuPeak = incident.peaks?.cpuPercent ?? metrics?.cpuPercent;
+        const memoryPeak = incident.peaks?.memoryPercent ?? metrics?.memoryPercent;
+        const temperaturePeak = incident.peaks?.temperatureC ?? metrics?.temperatureC;
+        const loadPeak = incident.peaks?.load1 ?? metrics?.load1;
+        const requestCount = traffic.reduce((total, item) => total + validCount(item.requestCount, 0), 0);
+        const errorCount = traffic.reduce((total, item) => total + validCount(item.status5xx, 0), 0);
+        const slowCount = traffic.reduce((total, item) => total + validCount(item.slowCount, 0), 0);
+
+        return (
+          <article className={`incident-card incident-${tone}`} key={`${incident.id}-${index}`} aria-labelledby={titleId}>
+            <header className="incident-header">
+              <div className="incident-heading">
+                <div className="incident-time-row">
+                  <time dateTime={incident.startedAt || undefined}>{formatDateTime(incident.startedAt)}</time>
+                  <span>{formatIncidentDuration(incident)}</span>
+                  <span className="incident-id">ID {safeText(incident.id, 'Unavailable', 48)}</span>
+                </div>
+                <h3 id={titleId}>{reasons[0] || 'Resource threshold exceeded'}</h3>
+              </div>
+              <StatusBadge value={incident.phase} tone={tone} />
+            </header>
+
+            <div className="incident-window">
+              <span>Observed {formatDateTime(incident.observedAt)}</span>
+              <span>{incident.endedAt ? `Ended ${formatDateTime(incident.endedAt)}` : 'Open at this capture'}</span>
+            </div>
+
+            <div className="incident-reasons" aria-label="Incident causes">
+              {(reasons.length ? reasons : ['Cause not classified']).map((reason, reasonIndex) => (
+                <span key={`${reason}-${reasonIndex}`}>{reason}</span>
+              ))}
+            </div>
+
+            <dl className="incident-metrics" aria-label="Peak resource metrics">
+              <IncidentMetric label="CPU peak" value={formatPercent(cpuPeak, 1)} tone={toneForPercent(cpuPeak)} />
+              <IncidentMetric label="Memory peak" value={formatPercent(memoryPeak, 1)} tone={toneForPercent(memoryPeak)} />
+              <IncidentMetric label="Temperature peak" value={formatTemperature(temperaturePeak)} tone={temperatureTone(temperaturePeak)} />
+              <IncidentMetric label="Load 1m peak" value={formatDecimal(loadPeak)} tone={loadTone(loadPeak)} />
+            </dl>
+
+            <div className="incident-evidence-summary" aria-label="Captured evidence summary">
+              <span><Icon name="cpu" size={14} />{formatCount(processes.length)} process name{processes.length === 1 ? '' : 's'}</span>
+              <span><Icon name="server" size={14} />{formatCount(containers.length)} cks workload{containers.length === 1 ? '' : 's'}</span>
+              <span><Icon name="network" size={14} />{formatCount(requestCount)} request{requestCount === 1 ? '' : 's'} in this capture interval · not visitors</span>
+              {errorCount > 0 && <span className="tone-critical"><Icon name="alert" size={14} />{formatCount(errorCount)} server error{errorCount === 1 ? '' : 's'}</span>}
+              {slowCount > 0 && <span className="tone-warn"><Icon name="clock" size={14} />{formatCount(slowCount)} slow</span>}
+            </div>
+
+            {!compact && (
+              <div className="incident-detail-grid">
+                <section className="incident-evidence-block" aria-label="Pressure stall information">
+                  <IncidentEvidenceHeading icon="activity" title="Pressure" detail="PSI avg10 · some / full" />
+                  <div className="incident-pressure-grid">
+                    <IncidentPressure label="CPU" some={incident.pressure?.cpu?.someAvg10} full={incident.pressure?.cpu?.fullAvg10} />
+                    <IncidentPressure label="Memory" some={incident.pressure?.memory?.someAvg10} full={incident.pressure?.memory?.fullAvg10} />
+                    <IncidentPressure label="I/O" some={incident.pressure?.io?.someAvg10} full={incident.pressure?.io?.fullAvg10} />
+                  </div>
+                </section>
+
+                <section className="incident-evidence-block" aria-label="Safe process aggregates">
+                  <IncidentEvidenceHeading icon="cpu" title="Processes" detail="Fixed executable classes · no argv or IDs" />
+                  {processes.length ? <ul className="incident-entity-list">{processes.map((process, processIndex) => (
+                    <li key={`${process.name}-${processIndex}`}>
+                      <div><strong>{safeText(process.name, 'Unnamed process', 72)}</strong><span>{formatCount(process.instances)} instance{process.instances === 1 ? '' : 's'}</span></div>
+                      <span>CPU {formatPercent(process.cpuPercent, 1)} · {formatBytes(process.memoryBytes)}</span>
+                    </li>
+                  ))}</ul> : <IncidentEvidenceEmpty text="No process attribution captured" />}
+                </section>
+
+                <section className="incident-evidence-block" aria-label="cks app workloads">
+                  <IncidentEvidenceHeading icon="server" title="App workloads" detail="cks-owned containers only" />
+                  {containers.length ? <ul className="incident-entity-list">{containers.map((container, containerIndex) => (
+                    <li key={`${container.name}-${containerIndex}`}>
+                      <div><strong>{safeText(container.name, 'Unnamed workload', 72)}</strong><span>{safeText(container.owner, 'App workload', 48)}</span></div>
+                      <span className="incident-container-stats"><StatusBadge value={container.health || container.state} /> CPU {formatPercent(container.cpuPercent, 1)} · {formatBytes(container.memoryBytes)}</span>
+                    </li>
+                  ))}</ul> : <IncidentEvidenceEmpty text="No cks workload attribution captured" />}
+                </section>
+
+                <section className="incident-evidence-block incident-traffic-block" aria-label="Privacy-preserving request aggregates">
+                  <IncidentEvidenceHeading icon="network" title="Request traffic" detail="This capture interval only · request counts, not visitors or client identifiers" />
+                  {traffic.length ? <div className="incident-traffic-list">{traffic.map((item, trafficIndex) => (
+                    <article key={`${item.app}-${trafficIndex}`}>
+                      <div className="incident-traffic-heading"><strong>{safeText(item.app, 'Unknown app', 72)}</strong><span>{formatCount(item.requestCount)} requests this capture</span></div>
+                      <div className="incident-status-counts">
+                        <span className="tone-good">2xx {formatCount(item.status2xx)}</span>
+                        <span>3xx {formatCount(item.status3xx)}</span>
+                        <span className="tone-warn">4xx {formatCount(item.status4xx)}</span>
+                        <span className="tone-critical">5xx {formatCount(item.status5xx)}</span>
+                        <span>{formatCount(item.slowCount)} slow</span>
+                      </div>
+                      <p>Response {formatMilliseconds(item.avgResponseMs)} average · {formatMilliseconds(item.maxResponseMs)} max</p>
+                    </article>
+                  ))}</div> : <IncidentEvidenceEmpty text="No request aggregate captured for this interval" />}
+                </section>
+              </div>
+            )}
+          </article>
+        );
+      })}
+    </div>
+  );
+}
+
+function IncidentMetric({ label, value, tone }: { label: string; value: string; tone: StatusTone }) {
+  return <div><dt>{label}</dt><dd className={`tone-${tone}`}>{value}</dd></div>;
+}
+
+function IncidentPressure({ label, some, full }: { label: string; some: number | null | undefined; full: number | null | undefined }) {
+  return <div><strong>{label}</strong><span>Some {formatPercent(some, 2)}</span><span>Full {formatPercent(full, 2)}</span></div>;
+}
+
+function IncidentEvidenceHeading({ icon, title, detail }: { icon: IconName; title: string; detail: string }) {
+  return <header className="incident-evidence-heading"><span><Icon name={icon} size={15} /></span><div><h4>{title}</h4><p>{detail}</p></div></header>;
+}
+
+function IncidentEvidenceEmpty({ text }: { text: string }) {
+  return <p className="incident-evidence-empty">{text}</p>;
 }
 
 function PowerEventList({ events }: { events: PowerEvent[] }) {
@@ -862,6 +1030,67 @@ export function formatFlags(value: unknown): string {
 
 function formatCount(value: unknown): string {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value.toLocaleString() : '—';
+}
+
+function incidentReasonLabel(value: unknown): string {
+  const normalized = safeText(value, '', 72).toLowerCase();
+  const labels: Record<string, string> = {
+    cpu: 'High CPU usage',
+    memory: 'High memory usage',
+    temperature: 'High temperature',
+    load: 'High system load',
+    'disk-io': 'High disk I/O',
+    'power-throttle': 'Power throttling',
+    traffic: 'High request traffic',
+  };
+  return labels[normalized] ?? normalized.replace(/[-_]+/g, ' ');
+}
+
+function incidentPhaseTone(value: unknown): StatusTone {
+  if (value === 'active') return 'critical';
+  if (value === 'follow-up') return 'warn';
+  if (value === 'recovered') return 'good';
+  return 'neutral';
+}
+
+function formatIncidentDuration(incident: PeakIncident): string {
+  let seconds = typeof incident.durationSeconds === 'number' && Number.isFinite(incident.durationSeconds)
+    ? Math.max(0, incident.durationSeconds)
+    : Number.NaN;
+  if (!Number.isFinite(seconds)) {
+    const start = new Date(incident.startedAt).getTime();
+    const end = new Date(incident.endedAt ?? incident.observedAt).getTime();
+    seconds = Number.isFinite(start) && Number.isFinite(end) ? Math.max(0, (end - start) / 1_000) : Number.NaN;
+  }
+  if (!Number.isFinite(seconds)) return 'Duration unavailable';
+  if (seconds < 60) return `${Math.round(seconds)}s window`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ${Math.round(seconds % 60)}s window`;
+  const hours = Math.floor(minutes / 60);
+  return `${hours}h ${minutes % 60}m window`;
+}
+
+function formatTemperature(value: number | null | undefined): string {
+  return typeof value === 'number' && Number.isFinite(value) ? `${value.toFixed(1)}°C` : '—';
+}
+
+function temperatureTone(value: number | null | undefined): StatusTone {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return 'neutral';
+  if (value >= 85) return 'critical';
+  if (value >= 75) return 'warn';
+  return 'good';
+}
+
+function loadTone(value: number | null | undefined): StatusTone {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return 'neutral';
+  if (value >= 8) return 'critical';
+  if (value >= 4) return 'warn';
+  return 'good';
+}
+
+function formatMilliseconds(value: number | null | undefined): string {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) return '—';
+  return value >= 1_000 ? `${(value / 1_000).toFixed(2)} s` : `${Math.round(value)} ms`;
 }
 
 function compactBytes(value: number): string {

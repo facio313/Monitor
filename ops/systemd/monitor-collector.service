@@ -1,14 +1,15 @@
 [Unit]
-Description=Read-only host telemetry collector for Monitor
+Description=Host telemetry collector for Monitor
 Documentation=file:/usr/local/share/doc/monitor-collector/README.md
-After=local-fs.target
+Requires=monitor-container-exporter.service
+After=local-fs.target monitor-container-exporter.service
 
 [Service]
 Type=oneshot
 User=root
 Group=cks
 EnvironmentFile=-/etc/default/monitor-collector
-ExecStart=/usr/bin/python3 /usr/local/lib/monitor-collector/collector.py
+ExecStart=/usr/bin/python3 /usr/local/lib/monitor-collector/collector.py --docker-sockets= --container-input=/run/monitor-container-exporter/containers.json --process-uids=0,1001 --traffic-log=/var/log/nginx/monitor-traffic.jsonl
 RuntimeDirectory=monitor-collector
 RuntimeDirectoryMode=0750
 RuntimeDirectoryPreserve=yes
@@ -17,11 +18,14 @@ StateDirectoryMode=0750
 UMask=0027
 
 # The collector needs aggregate proc/sys telemetry, selected logs (including
-# the configured kernel log), and the three read-only rootless Docker API
-# sockets. It writes only its state/export roots.
+# the configured kernel and privacy-preserving traffic logs), and the reduced
+# cks-owned container snapshot. The Docker socket is outside this namespace.
 ProtectSystem=strict
 ProtectHome=read-only
 InaccessiblePaths=/home /root
+TemporaryFileSystem=/run:ro
+BindPaths=/run/monitor-collector
+BindReadOnlyPaths=/run/monitor-container-exporter/containers.json
 PrivateTmp=true
 PrivateDevices=true
 BindPaths=-/dev/vcio
@@ -44,7 +48,7 @@ MemoryHigh=160M
 MemoryMax=192M
 TasksMax=64
 CapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH
-ReadOnlyPaths=/proc /sys /var/log /run/user
+ReadOnlyPaths=/proc /sys /var/log
 ReadWritePaths=/var/lib/monitor-export /run/monitor-collector
 
 TimeoutStartSec=45s
