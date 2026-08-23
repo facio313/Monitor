@@ -4,6 +4,7 @@ import { describe, expect, it } from 'vitest';
 import type { ContainerStatus, PeakIncident } from '../types';
 import {
   ContainerList,
+  containerNameParts,
   containerSummaryLabel,
   currentPowerStatusTone,
   decodeThrottledFlags,
@@ -53,20 +54,46 @@ describe('container presentation', () => {
       'monitor',
       'ddit-finalproject',
       'dukkeobi',
-      'feelmyrythm-backend',
       'feelmyrythm-frontend',
+      'feelmyrythm-backend',
       'feelmyrythm-redis',
-      'multtara-backend',
-      'multtara-collector',
-      'multtara-database',
       'multtara-frontend',
-      'pilgrimage-backend',
+      'multtara-backend',
+      'multtara-database',
+      'multtara-collector',
       'pilgrimage-frontend',
+      'pilgrimage-backend',
       'pilgrimage-redis',
       'react',
       'vue',
     ]);
     expect(containers.map((container) => container.name)).toEqual(originalNames);
+  });
+
+  it('orders application components by role and parses only exact known suffixes', () => {
+    const componentNames = ['sample-collector', 'sample-redis', 'sample-database', 'sample-backend', 'sample-frontend'];
+    const componentContainers = componentNames.map((name) => ({
+      name,
+      owner: 'cks',
+      state: 'running',
+      health: 'healthy',
+      cpuPercent: 0,
+      memoryBytes: 0,
+      memoryPercent: 0,
+    }));
+
+    expect(sortContainers(componentContainers).map(({ name }) => name)).toEqual([
+      'sample-frontend',
+      'sample-backend',
+      'sample-database',
+      'sample-redis',
+      'sample-collector',
+    ]);
+    expect(containerNameParts('team-blue-frontend')).toEqual({ application: 'team-blue', component: 'frontend' });
+    expect(containerNameParts('sample-db')).toEqual({ application: 'sample', component: 'db' });
+    expect(containerNameParts(`${'long-app-'.repeat(10)}frontend`).component).toBe('frontend');
+    expect(containerNameParts('cks-database')).toEqual({ application: 'cks-database', component: null });
+    expect(containerNameParts('redis-backup')).toEqual({ application: 'redis-backup', component: null });
   });
 
   it('sorts every displayed column in both directions and leaves missing values last', () => {
@@ -100,17 +127,24 @@ describe('container presentation', () => {
     expect(markup).toContain('>bonifacio</strong>');
     expect(markup).toContain('>sso</strong>');
     expect(markup).toContain('>sso-redis</strong>');
-    expect(markup).toContain('>feelmyrythm-frontend</strong>');
-    expect(markup).toContain('>feelmyrythm-backend</strong>');
-    expect(markup).toContain('>feelmyrythm-redis</strong>');
-    expect(markup).toContain('>multtara-backend</strong>');
-    expect(markup).toContain('>multtara-collector</strong>');
-    expect(markup).toContain('>multtara-database</strong>');
-    expect(markup).toContain('>multtara-frontend</strong>');
-    expect(markup).toContain('>pilgrimage-frontend</strong>');
-    expect(markup).toContain('>pilgrimage-backend</strong>');
-    expect(markup).toContain('>pilgrimage-redis</strong>');
+    expect(markup).toContain('feelmyrythm-frontend');
+    expect(markup).toContain('feelmyrythm-backend');
+    expect(markup).toContain('feelmyrythm-redis');
+    expect(markup).toContain('multtara-backend');
+    expect(markup).toContain('multtara-collector');
+    expect(markup).toContain('multtara-database');
+    expect(markup).toContain('multtara-frontend');
+    expect(markup).toContain('pilgrimage-frontend');
+    expect(markup).toContain('pilgrimage-backend');
+    expect(markup).toContain('pilgrimage-redis');
     expect(markup).toContain('>cks-database</strong>');
+    expect(markup).toContain('class="container-name-hierarchy"');
+    expect(markup).toContain('class="container-name-component"');
+    expect(markup).toContain('<strong>multtara</strong><span class="container-name-component">frontend</span>');
+    expect(markup).toContain('<span class="sr-only">multtara-frontend</span>');
+    expect(markup).toContain('aria-label="Container sorting controls"');
+    expect(markup).toContain('aria-label="Sort containers by"');
+    expect(markup).toContain('<option value="default" selected="">App groups</option>');
     expect(markup.match(/class="container-sort-button"/g)).toHaveLength(5);
     expect(markup).toContain('aria-sort="other"');
     expect(markup).toContain('aria-label="Sort by Container ascending"');

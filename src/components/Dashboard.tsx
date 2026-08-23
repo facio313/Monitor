@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type MouseEvent, type ReactNode } from 'react';
+import { useEffect, useMemo, useRef, useState, type ChangeEvent, type MouseEvent, type ReactNode } from 'react';
 import {
   Area,
   AreaChart,
@@ -59,6 +59,27 @@ export interface ContainerSort {
 
 const DEFAULT_CONTAINER_SORT: ContainerSort = { key: null, direction: 'ascending' };
 const CONTAINER_SORT_COLLATOR = new Intl.Collator('en', { numeric: true, sensitivity: 'base' });
+const CONTAINER_SORT_OPTIONS: Array<{ key: ContainerSortKey; label: string }> = [
+  { key: 'name', label: 'Container' },
+  { key: 'owner', label: 'Owner' },
+  { key: 'status', label: 'Status' },
+  { key: 'cpu', label: 'CPU' },
+  { key: 'memory', label: 'Memory' },
+];
+const FIXED_CONTAINER_NAMES = new Set(['bonifacio', 'sso', 'sso-redis', 'cks-database', 'monitor']);
+const CONTAINER_COMPONENT_ORDER: Readonly<Record<string, number>> = {
+  frontend: 0,
+  backend: 1,
+  db: 2,
+  database: 2,
+  redis: 3,
+  collector: 4,
+};
+
+export interface ContainerNameParts {
+  application: string;
+  component: string | null;
+}
 
 interface DashboardProps {
   page: MonitorPage;
@@ -884,6 +905,13 @@ export function ContainerList({ containers }: { containers: ContainerStatus[] })
     setSort((current) => nextContainerSort(current, key));
   }
 
+  function handleMobileSortChange(event: ChangeEvent<HTMLSelectElement>) {
+    const key = event.currentTarget.value;
+    setSort(key === 'default'
+      ? DEFAULT_CONTAINER_SORT
+      : { key: key as ContainerSortKey, direction: 'ascending' });
+  }
+
   return (
     <>
       <div className="table-wrap">
@@ -897,7 +925,7 @@ export function ContainerList({ containers }: { containers: ContainerStatus[] })
           </tr></thead>
           <tbody>{sortedContainers.map((container) => (
             <tr key={container.name}>
-              <td><strong>{safeText(container.name, 'Unnamed', 70)}</strong></td>
+              <td><ContainerName name={container.name} /></td>
               <td>{safeText(container.owner, '—', 50)}</td>
               <td>
                 <div className="status-stack">
@@ -913,10 +941,27 @@ export function ContainerList({ containers }: { containers: ContainerStatus[] })
           ))}</tbody>
         </table>
       </div>
+      <div className="container-mobile-sort" role="group" aria-label="Container sorting controls">
+        <label>
+          <span>Sort by</span>
+          <select value={sort.key ?? 'default'} onChange={handleMobileSortChange} aria-label="Sort containers by">
+            <option value="default">App groups</option>
+            {CONTAINER_SORT_OPTIONS.map((option) => <option value={option.key} key={option.key}>{option.label}</option>)}
+          </select>
+        </label>
+        <button
+          type="button"
+          disabled={sort.key === null}
+          onClick={() => sort.key !== null && handleSort(sort.key)}
+          aria-label={sort.key === null ? 'Default app grouping active' : `Sort ${sort.direction === 'ascending' ? 'descending' : 'ascending'}`}
+        >
+          {sort.key === null ? 'Grouped' : sort.direction === 'ascending' ? 'Ascending ↑' : 'Descending ↓'}
+        </button>
+      </div>
       <div className="container-cards">{sortedContainers.map((container) => (
         <article className="container-card" key={`${container.name}-mobile`}>
           <div className="container-card-head">
-            <div><strong>{safeText(container.name, 'Unnamed', 70)}</strong><span>{safeText(container.owner, 'No owner', 50)}</span></div>
+            <div><ContainerName name={container.name} /><span>{safeText(container.owner, 'No owner', 50)}</span></div>
             <StatusBadge value={container.health || container.state} />
           </div>
           <dl>
@@ -927,6 +972,23 @@ export function ContainerList({ containers }: { containers: ContainerStatus[] })
         </article>
       ))}</div>
     </>
+  );
+}
+
+function ContainerName({ name }: { name: string }) {
+  const displayName = safeText(name, 'Unnamed', 70);
+  const accessibleName = safeText(name, 'Unnamed', 140);
+  const parts = containerNameParts(name);
+  if (parts.component === null) return <strong title={accessibleName === displayName ? undefined : accessibleName}>{displayName}</strong>;
+
+  return (
+    <span className="container-name-hierarchy" title={accessibleName}>
+      <span className="container-name-visual" aria-hidden="true">
+        <strong>{safeText(parts.application, 'Unnamed', 56)}</strong>
+        <span className="container-name-component">{safeText(parts.component, 'component', 24)}</span>
+      </span>
+      <span className="sr-only">{accessibleName}</span>
+    </span>
   );
 }
 
@@ -989,8 +1051,21 @@ export function sortContainers(
 }
 
 function compareDefaultContainerOrder(left: ContainerStatus, right: ContainerStatus): number {
-  const rankDifference = defaultContainerRank(left.name) - defaultContainerRank(right.name);
+  const leftRank = defaultContainerRank(left.name);
+  const rightRank = defaultContainerRank(right.name);
+  const rankDifference = leftRank - rightRank;
   if (rankDifference !== 0) return rankDifference;
+
+  if (leftRank === 4) {
+    const leftParts = containerNameParts(left.name);
+    const rightParts = containerNameParts(right.name);
+    const byApplication = compareText(leftParts.application, rightParts.application, 'ascending');
+    if (byApplication !== 0) return byApplication;
+
+    const componentDifference = containerComponentRank(leftParts.component) - containerComponentRank(rightParts.component);
+    if (componentDifference !== 0) return componentDifference;
+  }
+
   return compareText(left.name, right.name, 'ascending');
 }
 
@@ -1001,6 +1076,34 @@ function defaultContainerRank(name: string): number {
   if (normalized === 'cks-database') return 2;
   if (normalized === 'monitor') return 3;
   return 4;
+}
+
+export function containerNameParts(name: string): ContainerNameParts {
+  const fullName = name.trim();
+  const normalized = fullName.toLowerCase();
+  if (!fullName || FIXED_CONTAINER_NAMES.has(normalized)) {
+    return { application: fullName, component: null };
+  }
+
+  const separatorIndex = normalized.lastIndexOf('-');
+  if (separatorIndex <= 0 || separatorIndex === normalized.length - 1) {
+    return { application: fullName, component: null };
+  }
+
+  const component = normalized.slice(separatorIndex + 1);
+  if (!Object.prototype.hasOwnProperty.call(CONTAINER_COMPONENT_ORDER, component)) {
+    return { application: fullName, component: null };
+  }
+
+  return {
+    application: fullName.slice(0, separatorIndex),
+    component: fullName.slice(separatorIndex + 1),
+  };
+}
+
+function containerComponentRank(component: string | null): number {
+  if (component === null) return -1;
+  return CONTAINER_COMPONENT_ORDER[component.toLowerCase()] ?? Number.MAX_SAFE_INTEGER;
 }
 
 function compareContainerColumn(
