@@ -999,7 +999,8 @@ function defaultContainerRank(name: string): number {
   if (normalized === 'bonifacio' || normalized.startsWith('bonifacio-')) return 0;
   if (normalized === 'sso' || normalized.startsWith('sso-')) return 1;
   if (normalized === 'cks-database') return 2;
-  return 3;
+  if (normalized === 'monitor') return 3;
+  return 4;
 }
 
 function compareContainerColumn(
