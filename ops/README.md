@@ -116,10 +116,14 @@ remains separately controlled by `MONITOR_MAX_INPUT_BYTES`.
 
 The unprivileged Docker helper reduces each workload immediately to `name`,
 `owner`, `state`, `health`, `cpuPercent`, `memoryBytes`, and `memoryPercent`.
-`name` is a fixed allow-listed app label derived from exact Compose labels, or
-the generic `cks-workload`; raw container names never persist. Environment,
-mounts, images, commands, IDs, and socket paths are not written or logged. The
-root collector accepts the snapshot only when it is a fresh, single-link,
+Each Docker list request is filtered to one explicitly reviewed Compose
+project. A result is admitted only when its returned project/service labels
+match one exact pair in the fixed map, and it receives that pair's distinct
+public name. Unknown pairs are dropped before any stats request. New exports
+never use the old app-level labels or generic `cks-workload` label; both remain
+accepted only so retained snapshots and incident history can be read safely. Raw container names,
+environment, mounts, images, commands, IDs, and socket paths never persist.
+The root collector accepts the snapshot only when it is a fresh, single-link,
 `cks:cks` mode-`0640` regular file under the exact production bind and every
 nested value satisfies the fixed schema.
 
@@ -264,16 +268,19 @@ is a no-op. Production SSO must not mount the active state or its recovery
 snapshots; restoring one is a deliberate return to local mode and creates a
 fresh session epoch.
 
-Docker list and per-container stats calls use a 2-second curl timeout. The sole
-`cks` list endpoint is read first, then stats use the fast
-`stream=false&one-shot=true` endpoint with at most six bounded worker threads,
-a 20-second global deadline, and a 30-container cap. Because one-shot Docker
-stats contain no usable `precpu_stats`, CPU percent is calculated from the
-protected previous-run counters described above; the first observation is
-`null`. Memory is available immediately from the one-shot response. If the
-deadline is reached, every listed container remains present but unavailable
-stats fields are `null`, never misleading zeroes. The helper has a 35-second
-outer timeout and the dependent root collector has 45 seconds.
+Docker list and per-container stats calls use a 2-second curl timeout. The
+helper issues only project-filtered list requests for the fixed project map and
+fails without replacing its previous snapshot if any of those queries is
+unavailable or malformed. Admitted running workloads then use the fast
+`stream=false&one-shot=true` stats endpoint with at most six bounded worker
+threads, a 20-second global deadline, and a 30-container stats cap. Because
+one-shot Docker stats contain no usable `precpu_stats`, CPU percent is
+calculated from the protected previous-run counters described above; the first
+observation is `null`. Memory is available immediately from the one-shot
+response. If the stats deadline is reached, every admitted container remains
+present but unavailable stats fields are `null`, never misleading zeroes. The
+helper has a 35-second outer timeout and the dependent root collector has 45
+seconds.
 
 ## Fixture run and tests
 

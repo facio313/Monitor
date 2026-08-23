@@ -54,11 +54,27 @@ class ContainerExporterTests(unittest.TestCase):
             root.mkdir()
             output = root / "containers.json"
             output.write_text('{"previous":true}\n', encoding="utf-8")
+            state = root / "cpu-state.json"
+            state.write_text('{"containers":{"cks:old":{"cpuTotal":1}}}\n', encoding="utf-8")
+            calls = 0
+
+            def partial_failure(_socket, path, _curl, _timeout):
+                nonlocal calls
+                calls += 1
+                return [] if calls < 2 else None
+
             with mock.patch.object(container_exporter.os, "geteuid", return_value=1001), \
-                 mock.patch.object(container_exporter.collector, "docker_get", return_value=None):
+                 mock.patch.object(
+                     container_exporter.collector, "docker_get", side_effect=partial_failure
+                 ):
                 with self.assertRaisesRegex(RuntimeError, "source unavailable"):
                     container_exporter.run(self.arguments(root))
+            self.assertEqual(calls, 2)
             self.assertEqual(output.read_text(encoding="utf-8"), '{"previous":true}\n')
+            self.assertEqual(
+                state.read_text(encoding="utf-8"),
+                '{"containers":{"cks:old":{"cpuTotal":1}}}\n',
+            )
 
     def test_rejects_privilege_or_foreign_owner(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

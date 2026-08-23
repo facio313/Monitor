@@ -26,6 +26,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -84,7 +85,35 @@ MAX_PENDING_SANITIZED_LOG_COMMIT_BYTES = 8 * 1024 * 1024
 MAX_SANITIZED_LOG_RECORD_BYTES = 4096
 MAX_CONTAINER_INPUT_BYTES = 1 * 1024 * 1024
 MAX_CONTAINER_INPUT_AGE_SECONDS = 180
-SAFE_CONTAINER_NAMES = ALLOWED_TRAFFIC_APPS | frozenset({"cks-workload"})
+ALLOWED_COMPOSE_SERVICES = {
+    ("bonifacio", "bonifacio"): "bonifacio-web",
+    ("bonifacio", "bonifacioSso"): "bonifacio-sso",
+    ("bonifacio", "bonifacioSsoAdmin"): "bonifacio-sso-admin",
+    ("bonifacio", "bonifacioSsoRedis"): "bonifacio-sso-redis",
+    ("cks-database", "cksDB"): "cks-database",
+    ("monitor", "monitor"): "monitor",
+    ("feelmyrythm", "fmrWeb"): "feelmyrythm-web",
+    ("feelmyrythm", "fmrServer"): "feelmyrythm-server",
+    ("feelmyrythm", "fmrRedis"): "feelmyrythm-redis",
+    ("pilgrimage", "pilgrimageFrontend"): "pilgrimage-frontend",
+    ("pilgrimage", "pilgrimageBackend"): "pilgrimage-backend",
+    ("pilgrimage", "pilgrimageRedis"): "pilgrimage-redis",
+    ("ddit-finalproject", "dditFinalProject"): "ddit-finalproject",
+    ("dukkeobi", "dukkeobi"): "dukkeobi",
+    ("react", "react"): "react",
+    ("vue", "vue"): "vue",
+    ("multtara", "backend"): "multtara-backend",
+    ("multtara", "collector"): "multtara-collector",
+    ("multtara", "frontend"): "multtara-frontend",
+}
+ALLOWED_COMPOSE_PROJECTS = tuple(sorted({
+    project for project, _service in ALLOWED_COMPOSE_SERVICES
+}))
+CURRENT_CONTAINER_NAMES = frozenset(ALLOWED_COMPOSE_SERVICES.values())
+# Previous exporters emitted the app-level traffic labels or ``cks-workload``.
+# Keep both readable for retained snapshots/incidents, but never assign them to
+# a new Docker observation.
+SAFE_CONTAINER_NAMES = CURRENT_CONTAINER_NAMES | ALLOWED_TRAFFIC_APPS | frozenset({"cks-workload"})
 _monotonic = time.monotonic
 VIRTUAL_FILESYSTEMS = {
     "autofs", "bpf", "cgroup", "cgroup2", "configfs", "debugfs", "devpts",
@@ -858,26 +887,38 @@ def docker_cpu_percent(current: Mapping[str, Any] | None, previous: Any) -> floa
     return round(min(MAX_CONTAINER_CPU_PERCENT, max(0.0, cpu_delta / system_delta * online * 100.0)), 2)
 
 
-def safe_container_name(raw: Mapping[str, Any]) -> str:
-    """Map mutable Docker metadata to one of the fixed public app labels."""
-    labels = raw.get("Labels") if isinstance(raw.get("Labels"), Mapping) else {}
-    candidates = (
-        labels.get("com.bonifacio.app"),
-        labels.get("com.docker.compose.service"),
-        labels.get("com.docker.compose.project"),
+def compose_project_list_path(project: str) -> str:
+    """Build a Docker list request restricted to one reviewed Compose project."""
+    if project not in ALLOWED_COMPOSE_PROJECTS:
+        raise ValueError("Docker project is outside the allowlist")
+    filters = json.dumps(
+        {"label": [f"com.docker.compose.project={project}"]},
+        separators=(",", ":"),
     )
-    for candidate in candidates:
-        if not isinstance(candidate, str):
-            continue
-        normalized = candidate.strip().lower().replace("_", "-")
-        if normalized in ALLOWED_TRAFFIC_APPS:
-            return normalized
-    return "cks-workload"
+    return "/v1.41/containers/json?" + urllib.parse.urlencode({"all": "1", "filters": filters})
+
+
+def safe_container_name(raw: Mapping[str, Any], expected_project: str | None = None) -> str | None:
+    """Map one exact Compose project/service pair to a fixed public label."""
+    labels = raw.get("Labels") if isinstance(raw.get("Labels"), Mapping) else {}
+    project = labels.get("com.docker.compose.project")
+    service = labels.get("com.docker.compose.service")
+    if not isinstance(project, str) or not isinstance(service, str):
+        return None
+    if expected_project is not None and project != expected_project:
+        return None
+    return ALLOWED_COMPOSE_SERVICES.get((project, service))
 
 
 def container_from_api(
-    raw: Mapping[str, Any], owner: str, stats: Mapping[str, Any] | None, previous_cpu: Any = None
+    raw: Mapping[str, Any], owner: str, stats: Mapping[str, Any] | None,
+    previous_cpu: Any = None, public_name: str | None = None,
 ) -> dict[str, Any]:
+    name = safe_container_name(raw)
+    if name is None:
+        raise ValueError("container is outside the Compose service allowlist")
+    if public_name is not None and public_name != name:
+        raise ValueError("container Compose labels changed after admission")
     state = bounded_text(raw.get("State", "unknown"), 24).lower()
     status = str(raw.get("Status", ""))
     health_match = re.search(r"\((healthy|unhealthy|starting)\)", status, re.IGNORECASE)
@@ -898,7 +939,7 @@ def container_from_api(
         )
         cpu_percent = docker_cpu_percent(docker_cpu_state(stats), previous_cpu)
     return {
-        "name": safe_container_name(raw),
+        "name": name,
         "owner": "cks" if owner == "cks" else "unknown",
         "state": state,
         "health": health,
@@ -914,20 +955,38 @@ def collect_containers(
     sockets = {"cks": sockets["cks"]} if isinstance(sockets.get("cks"), Path) else {}
     containers: list[dict[str, Any]] = []
     deadline = _monotonic() + 20.0
-    entries: list[tuple[str, Path, Mapping[str, Any]]] = []
-    # Fetch the sole allow-listed cks daemon before the bounded stats fan-out.
+    entries: list[tuple[str, Path, Mapping[str, Any], str]] = []
+    seen_container_ids: set[str] = set()
+    # Every list request is constrained to one reviewed Compose project. An
+    # unavailable query fails the whole export so callers retain the last
+    # complete reduced snapshot instead of publishing a partial count.
     for owner, socket_path in sockets.items():
-        raw_list = docker_get(socket_path, "/v1.41/containers/json?all=1", curl, timeout)
-        if not isinstance(raw_list, list):
-            continue
-        for raw in raw_list[:200]:
-            if isinstance(raw, dict):
-                entries.append((owner, socket_path, raw))
+        for project in ALLOWED_COMPOSE_PROJECTS:
+            raw_list = docker_get(socket_path, compose_project_list_path(project), curl, timeout)
+            if not isinstance(raw_list, list):
+                raise RuntimeError("cks container telemetry source unavailable")
+            if len(raw_list) > 200:
+                raise RuntimeError("cks container telemetry project response exceeded its limit")
+            for raw in raw_list:
+                if not isinstance(raw, dict):
+                    raise RuntimeError("cks container telemetry project response is malformed")
+                public_name = safe_container_name(raw, project)
+                if public_name is None:
+                    continue
+                container_id = str(raw.get("Id", ""))
+                if not re.fullmatch(r"[a-fA-F0-9]{12,64}", container_id):
+                    raise RuntimeError("cks container telemetry workload has an invalid ID")
+                if container_id in seen_container_ids:
+                    raise RuntimeError("cks container telemetry workload was listed more than once")
+                seen_container_ids.add(container_id)
+                entries.append((owner, socket_path, raw, public_name))
+                if len(entries) > 200:
+                    raise RuntimeError("cks container telemetry workload count exceeded its limit")
 
     previous_state = previous_cpu if isinstance(previous_cpu, Mapping) else {}
     listed_keys: list[str] = []
     stats_candidates: list[tuple[int, Path, str, str]] = []
-    for index, (owner, socket_path, raw) in enumerate(entries):
+    for index, (owner, socket_path, raw, _public_name) in enumerate(entries):
         container_id = str(raw.get("Id", ""))
         state_key = f"{owner}:{container_id}"
         if re.fullmatch(r"[A-Za-z0-9_.-]{1,32}:[a-fA-F0-9]{12,64}", state_key):
@@ -983,13 +1042,14 @@ def collect_containers(
                 pass
 
     retained_keys = set(listed_keys[:600])
-    for index, (owner, _socket_path, raw) in enumerate(entries):
+    for index, (owner, _socket_path, raw, public_name) in enumerate(entries):
         stats = stats_by_index.get(index)
         container_id = str(raw.get("Id", ""))
         state_key = f"{owner}:{container_id}"
         current_cpu = docker_cpu_state(stats) if isinstance(stats, Mapping) else None
         containers.append(container_from_api(
-            raw, owner, stats if isinstance(stats, dict) else None, previous_state.get(state_key)
+            raw, owner, stats if isinstance(stats, dict) else None,
+            previous_state.get(state_key), public_name,
         ))
         if current_cpu is not None and state_key in retained_keys:
             next_cpu_state[state_key] = current_cpu

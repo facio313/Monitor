@@ -230,7 +230,6 @@ function OverviewContent({ data, range, onNavigate }: { data: DashboardPayload; 
   const incidents = data.incidents ?? [];
   const temperature = latest?.temperatureC ?? null;
   const maxDisk = data.disks.reduce((highest, disk) => Math.max(highest, disk.usedPercent ?? 0), 0);
-  const unhealthyContainers = data.containers.filter((container) => !isContainerHealthy(container)).length;
 
   return (
     <div className="dashboard-content">
@@ -343,8 +342,8 @@ function OverviewContent({ data, range, onNavigate }: { data: DashboardPayload; 
         ))}</div> : <InlineEmpty icon="drive" text="No mounted disks reported" />}
       </Panel>
 
-      <Panel title="Containers" subtitle={`${data.containers.length} workload${data.containers.length === 1 ? '' : 's'} · ${unhealthyContainers ? `${unhealthyContainers} need attention` : 'all nominal'}`} icon="server">
-        {data.containers.length ? <ContainerList containers={data.containers} /> : <InlineEmpty icon="server" text="No containers reported" />}
+      <Panel title="Tracked containers" subtitle={containerSummaryLabel(data.containers)} icon="server">
+        {data.containers.length ? <ContainerList containers={data.containers} /> : <InlineEmpty icon="server" text="No tracked containers reported" />}
       </Panel>
 
       <section className="two-column activity-layout">
@@ -866,7 +865,7 @@ function StatusBadge({ value, tone }: { value: unknown; tone?: StatusTone }) {
   return <span className={`status-badge badge-${tone ?? normalizeTone(safeValue)}`}><span />{label}</span>;
 }
 
-function ContainerList({ containers }: { containers: ContainerStatus[] }) {
+export function ContainerList({ containers }: { containers: ContainerStatus[] }) {
   return (
     <>
       <div className="table-wrap">
@@ -1138,8 +1137,11 @@ export function currentPowerStatusTone(throttledFlags: number | null | undefined
   return reportedTone;
 }
 
-function isContainerHealthy(container: ContainerStatus): boolean {
-  return normalizeTone(container.health || container.state) === 'good';
+export function containerSummaryLabel(containers: ContainerStatus[]): string {
+  const running = containers.filter((container) => safeText(container.state, '').toLowerCase() === 'running').length;
+  const stoppedOrOther = containers.length - running;
+  const unhealthy = containers.filter((container) => safeText(container.health, '').toLowerCase() === 'unhealthy').length;
+  return `${running} running · ${stoppedOrOther} stopped/other · ${containers.length} tracked total${unhealthy ? ` · ${unhealthy} unhealthy` : ''}`;
 }
 
 function formatDecimal(value: number | null | undefined): string {

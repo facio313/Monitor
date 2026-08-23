@@ -761,6 +761,14 @@ describe('dashboard ingestion', () => {
           name: 'web', owner: 'cks', state: 'running', health: 'healthy',
           cpuPercent: 250, command: 'private command',
         },
+        {
+          name: 'feelmyrythm-web', owner: 'cks', state: 'running', health: 'healthy',
+          cpuPercent: 12.5,
+        },
+        {
+          name: 'pilgrimage', owner: 'cks', state: 'exited', health: 'none',
+          cpuPercent: null,
+        },
         { name: 'foreign-container-secret', owner: 'other', state: 'running', health: 'healthy' },
       ],
     }));
@@ -807,9 +815,15 @@ describe('dashboard ingestion', () => {
       'diskWriteBytesPerSecond',
     ]);
     expect(response.body.disks[0].usedPercent).toBe(50);
-    expect(response.body.containers).toHaveLength(1);
+    expect(response.body.containers).toHaveLength(3);
     expect(response.body.containers[0]).toMatchObject({
       name: 'cks-workload', owner: 'cks', state: 'running', health: 'healthy', cpuPercent: 250,
+    });
+    expect(response.body.containers[1]).toMatchObject({
+      name: 'feelmyrythm-web', owner: 'cks', state: 'running', health: 'healthy', cpuPercent: 12.5,
+    });
+    expect(response.body.containers[2]).toMatchObject({
+      name: 'pilgrimage', owner: 'cks', state: 'exited', health: 'none', cpuPercent: null,
     });
     expect(response.body.alerts[0]).toMatchObject({ kind: null, status: null });
     expect(response.body.privilegeEvents[0].action).toBe('sudo');

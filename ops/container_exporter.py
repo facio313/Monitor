@@ -53,25 +53,10 @@ def run(arguments: Sequence[str] | None = None) -> None:
     with lock_path.open("w", encoding="utf-8") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
 
-        # Distinguish an available daemon with zero workloads from an API or
-        # socket failure.  On failure, leave the previous reduced snapshot in
-        # place and fail the dependency so the root collector cannot publish a
-        # misleading empty workload list.
-        probe = collector.docker_get(
-            socket_path,
-            "/v1.41/containers/json?all=1",
-            values.curl,
-            values.timeout,
-        )
-        if not isinstance(probe, list):
-            raise RuntimeError("cks container telemetry source unavailable")
-
         prior = collector.load_json(state_path)
         containers, next_cpu_state = collector.collect_containers(
             {"cks": socket_path}, values.curl, values.timeout, prior.get("containers")
         )
-        if probe and not containers:
-            raise RuntimeError("cks container telemetry collection incomplete")
         if any(value.get("owner") != "cks" for value in containers):
             raise ValueError("unexpected container owner")
 

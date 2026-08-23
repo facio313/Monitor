@@ -53,7 +53,35 @@ const INCIDENT_TRAFFIC_APPS = new Set([
   'react',
   'vue',
 ]);
-const SAFE_CONTAINER_NAMES = new Set([...INCIDENT_TRAFFIC_APPS, 'cks-workload']);
+const FIXED_CONTAINER_SERVICE_NAMES = [
+  'bonifacio-web',
+  'bonifacio-sso',
+  'bonifacio-sso-admin',
+  'bonifacio-sso-redis',
+  'cks-database',
+  'monitor',
+  'feelmyrythm-web',
+  'feelmyrythm-server',
+  'feelmyrythm-redis',
+  'multtara-backend',
+  'multtara-collector',
+  'multtara-frontend',
+  'pilgrimage-frontend',
+  'pilgrimage-backend',
+  'pilgrimage-redis',
+  'ddit-finalproject',
+  'dukkeobi',
+  'react',
+  'vue',
+] as const;
+// Older collectors emitted app-level traffic labels or `cks-workload`. Keep
+// those values readable in bounded history while accepting the new distinct
+// service labels; the exporter no longer emits the ambiguous legacy values.
+const SAFE_CONTAINER_NAMES = new Set([
+  ...INCIDENT_TRAFFIC_APPS,
+  ...FIXED_CONTAINER_SERVICE_NAMES,
+  'cks-workload',
+]);
 const SAFE_CONTAINER_STATES = new Set([
   'created', 'running', 'paused', 'restarting', 'removing', 'exited', 'dead', 'unknown',
 ]);

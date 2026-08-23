@@ -8,10 +8,29 @@ import threading
 import time as wall_time
 import unittest
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import collector  # noqa: E402
+
+
+def docker_list_project(path: str) -> str | None:
+    if not path.startswith("/v1.41/containers/json?"):
+        return None
+    query = parse_qs(urlsplit(path).query, strict_parsing=True)
+    if query.get("all") != ["1"] or len(query.get("filters", [])) != 1:
+        return None
+    filters = json.loads(query["filters"][0])
+    labels = filters.get("label") if isinstance(filters, dict) else None
+    if not isinstance(labels, list) or len(labels) != 1:
+        return None
+    prefix = "com.docker.compose.project="
+    return (
+        labels[0][len(prefix):]
+        if isinstance(labels[0], str) and labels[0].startswith(prefix)
+        else None
+    )
 
 
 def incident_metrics(timestamp="2026-08-23T00:00:00Z", **changes):
@@ -197,7 +216,10 @@ class ParsingTests(unittest.TestCase):
         raw = {
             "Id": "a" * 64,
             "Names": ["/web"],
-            "Labels": {"com.docker.compose.service": "monitor"},
+            "Labels": {
+                "com.docker.compose.project": "monitor",
+                "com.docker.compose.service": "monitor",
+            },
             "State": "running",
             "Status": "Up 2 hours (healthy)",
             "Image": "private/image",
@@ -248,9 +270,106 @@ class ParsingTests(unittest.TestCase):
         unavailable = collector.container_from_api(raw, "cks", None)
         self.assertIsNone(unavailable["cpuPercent"])
         self.assertIsNone(unavailable["memoryBytes"])
-        unnamed = collector.container_from_api({**raw, "Names": [], "Labels": {}}, "cks", None)
-        self.assertEqual(unnamed["name"], "cks-workload")
-        self.assertNotIn(raw["Id"][:12], json.dumps(unnamed))
+        with self.assertRaisesRegex(ValueError, "outside the Compose service allowlist"):
+            collector.container_from_api({**raw, "Names": [], "Labels": {}}, "cks", None)
+
+    def test_compose_pairs_have_distinct_fixed_names_and_filtered_list_paths(self):
+        expected_pairs = {
+            ("bonifacio", "bonifacio"): "bonifacio-web",
+            ("bonifacio", "bonifacioSso"): "bonifacio-sso",
+            ("bonifacio", "bonifacioSsoAdmin"): "bonifacio-sso-admin",
+            ("bonifacio", "bonifacioSsoRedis"): "bonifacio-sso-redis",
+            ("cks-database", "cksDB"): "cks-database",
+            ("monitor", "monitor"): "monitor",
+            ("feelmyrythm", "fmrWeb"): "feelmyrythm-web",
+            ("feelmyrythm", "fmrServer"): "feelmyrythm-server",
+            ("feelmyrythm", "fmrRedis"): "feelmyrythm-redis",
+            ("pilgrimage", "pilgrimageFrontend"): "pilgrimage-frontend",
+            ("pilgrimage", "pilgrimageBackend"): "pilgrimage-backend",
+            ("pilgrimage", "pilgrimageRedis"): "pilgrimage-redis",
+            ("ddit-finalproject", "dditFinalProject"): "ddit-finalproject",
+            ("dukkeobi", "dukkeobi"): "dukkeobi",
+            ("react", "react"): "react",
+            ("vue", "vue"): "vue",
+            ("multtara", "backend"): "multtara-backend",
+            ("multtara", "collector"): "multtara-collector",
+            ("multtara", "frontend"): "multtara-frontend",
+        }
+        self.assertEqual(collector.ALLOWED_COMPOSE_SERVICES, expected_pairs)
+        self.assertNotIn(("pilgrimage", "pilgrimageDB"), collector.ALLOWED_COMPOSE_SERVICES)
+        self.assertEqual(
+            len(set(collector.ALLOWED_COMPOSE_SERVICES.values())),
+            len(collector.ALLOWED_COMPOSE_SERVICES),
+        )
+        paths = []
+        stats_paths = []
+        ids_by_pair = {
+            pair: f"{index + 1:064x}"
+            for index, pair in enumerate(collector.ALLOWED_COMPOSE_SERVICES)
+        }
+
+        def fake_get(_socket, path, _curl, _timeout):
+            project = docker_list_project(path)
+            if project is None:
+                stats_paths.append(path)
+                return {}
+            self.assertIn(project, collector.ALLOWED_COMPOSE_PROJECTS)
+            paths.append(path)
+            records = []
+            for pair, container_id in ids_by_pair.items():
+                if pair[0] != project:
+                    continue
+                records.append({
+                    "Id": container_id,
+                    "Labels": {
+                        "com.docker.compose.project": pair[0],
+                        "com.docker.compose.service": pair[1],
+                    },
+                    "State": "exited",
+                })
+            if project == "monitor":
+                records.extend([
+                    {
+                        "Id": "e" * 64,
+                        "Labels": {
+                            "com.docker.compose.project": "monitor",
+                            "com.docker.compose.service": "unreviewed",
+                        },
+                        "State": "running",
+                    },
+                    {
+                        "Id": "f" * 64,
+                        "Labels": {
+                            "com.docker.compose.project": "different-project",
+                            "com.docker.compose.service": "monitor",
+                        },
+                        "State": "running",
+                    },
+                ])
+            return records
+
+        with mock.patch.object(collector, "docker_get", side_effect=fake_get):
+            containers, cpu_state = collector.collect_containers(
+                {"cks": Path("/cks.sock")}, "/curl", 2
+            )
+
+        self.assertEqual(len(paths), len(collector.ALLOWED_COMPOSE_PROJECTS))
+        encoded_filter = "filters=%7B%22label%22%3A%5B%22com.docker.compose.project%3D"
+        self.assertTrue(all(encoded_filter in path for path in paths))
+        self.assertNotIn("/v1.41/containers/json?all=1", paths)
+        self.assertEqual(
+            {docker_list_project(path) for path in paths},
+            set(collector.ALLOWED_COMPOSE_PROJECTS),
+        )
+        self.assertEqual(
+            {item["name"] for item in containers},
+            set(collector.ALLOWED_COMPOSE_SERVICES.values()),
+        )
+        self.assertEqual(len(containers), len(collector.ALLOWED_COMPOSE_SERVICES))
+        self.assertNotIn("cks-workload", {item["name"] for item in containers})
+        self.assertEqual(cpu_state, {})
+        self.assertEqual(stats_paths, [])
+        self.assertTrue(all(item["state"] == "exited" for item in containers))
 
     def test_reduced_container_input_requires_fresh_cks_owned_fixed_schema(self):
         now = dt.datetime(2026, 8, 23, 3, 0, tzinfo=dt.timezone.utc)
@@ -287,6 +406,24 @@ class ParsingTests(unittest.TestCase):
             with mock.patch.object(Path, "lstat", owned_by_cks), \
                  mock.patch.object(collector.os, "fstat", opened_by_cks):
                 self.assertEqual(collector.load_container_snapshot(path, now), document["containers"])
+                legacy_document = {
+                    **document,
+                    "containers": [{**document["containers"][0], "name": "cks-workload"}],
+                }
+                path.write_text(json.dumps(legacy_document), encoding="utf-8")
+                self.assertEqual(
+                    collector.load_container_snapshot(path, now),
+                    legacy_document["containers"],
+                )
+                legacy_document = {
+                    **document,
+                    "containers": [{**document["containers"][0], "name": "feelmyrythm"}],
+                }
+                path.write_text(json.dumps(legacy_document), encoding="utf-8")
+                self.assertEqual(
+                    collector.load_container_snapshot(path, now),
+                    legacy_document["containers"],
+                )
                 path.write_text(json.dumps({
                     **document,
                     "containers": [{**document["containers"][0], "name": "alice@example.test"}],
@@ -303,6 +440,10 @@ class ParsingTests(unittest.TestCase):
     def test_docker_stats_use_six_bounded_workers_and_redact_metadata(self):
         cks_raw = [{
             "Id": f"{value:064x}", "Names": [f"/cks-{value}"], "State": "running",
+            "Labels": {
+                "com.docker.compose.project": "monitor",
+                "com.docker.compose.service": "monitor",
+            },
             "Image": "private/secret-image", "Command": "run --token=secret", "Env": ["TOKEN=secret"],
         } for value in range(12)]
         secondary_raw = [{
@@ -364,7 +505,13 @@ class ParsingTests(unittest.TestCase):
         self.assertNotIn(cks_raw[0]["Id"], serialized)
 
     def test_docker_deadline_keeps_all_lists_and_skips_stats(self):
-        raw = [{"Id": f"{value:064x}", "Names": [f"/c{value}"], "State": "running"} for value in range(2)]
+        raw = [{
+            "Id": f"{value:064x}", "Names": [f"/c{value}"], "State": "running",
+            "Labels": {
+                "com.docker.compose.project": "monitor",
+                "com.docker.compose.service": "monitor",
+            },
+        } for value in range(2)]
         calls = []
 
         def fake_get(_socket, path, _curl, _timeout):
@@ -377,7 +524,10 @@ class ParsingTests(unittest.TestCase):
                 {"cks": Path("/cks.sock"), "secondary": Path("/secondary.sock")}, "/curl", 2
             )
         self.assertEqual(len(result), 2)
-        self.assertEqual(len([path for path in calls if "containers/json" in path]), 1)
+        self.assertEqual(
+            len([path for path in calls if "containers/json" in path]),
+            len(collector.ALLOWED_COMPOSE_PROJECTS),
+        )
         self.assertEqual(len([path for path in calls if "/stats?" in path]), 0)
         self.assertTrue(all(item["cpuPercent"] is None for item in result))
         self.assertEqual(cpu_state, {})
@@ -389,6 +539,10 @@ class ParsingTests(unittest.TestCase):
                 "Id": f"{owner_index * 200 + value:064x}",
                 "Names": [f"/{owner}-{value}"],
                 "State": "running",
+                "Labels": {
+                    "com.docker.compose.project": "monitor",
+                    "com.docker.compose.service": "monitor",
+                },
             } for value in range(200)]
             for owner_index, owner in enumerate(sockets)
         }
@@ -1564,6 +1718,10 @@ class FilesystemTests(unittest.TestCase):
                 if "containers/json" in path:
                     return [{
                         "Id": container_id, "Names": ["/fixture"], "State": "running",
+                        "Labels": {
+                            "com.docker.compose.project": "monitor",
+                            "com.docker.compose.service": "monitor",
+                        },
                         "Image": "private/secret", "Command": "run --token=secret",
                     }]
                 return {

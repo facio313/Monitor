@@ -1,8 +1,38 @@
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it } from 'vitest';
-import type { PeakIncident } from '../types';
-import { currentPowerStatusTone, decodeThrottledFlags, eventStatusTone, formatFlags, IncidentTimeline } from './Dashboard';
+import type { ContainerStatus, PeakIncident } from '../types';
+import {
+  ContainerList,
+  containerSummaryLabel,
+  currentPowerStatusTone,
+  decodeThrottledFlags,
+  eventStatusTone,
+  formatFlags,
+  IncidentTimeline,
+} from './Dashboard';
+
+describe('container presentation', () => {
+  const containers: ContainerStatus[] = [
+    { name: 'feelmyrythm-web', owner: 'cks', state: 'running', health: 'healthy', cpuPercent: 1.2, memoryBytes: 10_000, memoryPercent: 1 },
+    { name: 'feelmyrythm-server', owner: 'cks', state: 'running', health: 'unhealthy', cpuPercent: 2.3, memoryBytes: 20_000, memoryPercent: 2 },
+    { name: 'pilgrimage-redis', owner: 'cks', state: 'exited', health: 'none', cpuPercent: null, memoryBytes: null, memoryPercent: null },
+    { name: 'bonifacio-web', owner: 'cks', state: 'paused', health: 'unknown', cpuPercent: null, memoryBytes: null, memoryPercent: null },
+  ];
+
+  it('separates running entries from stopped or other entries and retains the total', () => {
+    expect(containerSummaryLabel(containers)).toBe('2 running · 2 stopped/other · 4 tracked total · 1 unhealthy');
+  });
+
+  it('renders each fixed service label supplied by the backend without collapsing it', () => {
+    const markup = renderToStaticMarkup(createElement(ContainerList, { containers }));
+
+    expect(markup).toContain('feelmyrythm-web');
+    expect(markup).toContain('feelmyrythm-server');
+    expect(markup).toContain('pilgrimage-redis');
+    expect(markup).toContain('bonifacio-web');
+  });
+});
 
 describe('power presentation helpers', () => {
   it('keeps the full uint32 flag range unsigned', () => {

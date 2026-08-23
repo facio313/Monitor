@@ -448,9 +448,12 @@ under-voltage, recovery, NVMe-reset, or NVMe-I/O messages, deduplicates repeated
 same-second event kinds and statuses, and exports no device-specific raw text.
 A missing kernel log is non-fatal and simply yields no new kernel power events.
 
-Each disk is reduced to mount, total/used bytes, and used percentage. Each
-`cks` workload is reduced to a fixed allow-listed app label (or
-`cks-workload`), owner, state, health, CPU percentage, and memory
+Each disk is reduced to mount, total/used bytes, and used percentage. Docker
+list requests are restricted to explicitly reviewed Compose projects, and
+only exact reviewed project/service pairs become fixed, distinct workload
+labels. Previous app-level labels and the generic `cks-workload` value remain
+readable in retained history but are never emitted for a new observation. Each admitted workload is
+reduced to that label, owner, state, health, CPU percentage, and memory
 bytes/percentage. Incident process evidence is grouped into fixed executable
 classes such as `node`, `python`, `web-server`, or `other` and contains only
 instance count, CPU percentage, and memory bytes. Request evidence contains
