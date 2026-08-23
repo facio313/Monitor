@@ -278,6 +278,8 @@ class ParsingTests(unittest.TestCase):
             ("bonifacio", "bonifacio"): "bonifacio",
             ("bonifacio", "bonifacioSso"): "sso",
             ("bonifacio", "bonifacioSsoRedis"): "sso-redis",
+            ("blog", "blogWeb"): "blog-frontend",
+            ("blog", "blogServer"): "blog-backend",
             ("cks-database", "cksDB"): "cks-database",
             ("monitor", "monitor"): "monitor",
             ("feelmyrythm", "fmrWeb"): "feelmyrythm-frontend",
@@ -685,6 +687,8 @@ class IncidentTests(unittest.TestCase):
                  "requestTime": 0.1, "remoteAddr": "must-not-export"},
                 {"timestamp": "2026-08-23T00:04:31Z", "app": "monitor", "status": 503,
                  "requestTime": 1.5},
+                {"timestamp": "2026-08-23T00:04:31Z", "app": "blog", "status": 200,
+                 "requestTime": 0.4},
                 {"timestamp": "2026-08-23T00:04:32Z", "app": "react", "status": 302,
                  "requestTime": 0.2},
                 {"timestamp": "2026-08-23T00:04:33Z", "app": "unknown-safe-token", "status": 200,
@@ -710,6 +714,10 @@ class IncidentTests(unittest.TestCase):
             result, cursor, available = collector.collect_traffic(config, now)
             self.assertTrue(available)
             self.assertEqual(result, [{
+                "app": "blog", "requestCount": 1, "status2xx": 1, "status3xx": 0,
+                "status4xx": 0, "status5xx": 0, "slowCount": 0,
+                "avgResponseMs": 400.0, "maxResponseMs": 400.0,
+            }, {
                 "app": "monitor", "requestCount": 2, "status2xx": 1, "status3xx": 0,
                 "status4xx": 0, "status5xx": 1, "slowCount": 1,
                 "avgResponseMs": 800.0, "maxResponseMs": 1500.0,

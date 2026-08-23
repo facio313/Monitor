@@ -741,9 +741,11 @@ describe('dashboard ingestion', () => {
     });
   });
 
-  it('preserves retained Multtara component labels at the API boundary', async () => {
+  it('preserves current Blog and retained Multtara component labels at the API boundary', async () => {
     const directory = dataDirectory();
     const names = [
+      'blog-frontend',
+      'blog-backend',
       'multtara-backend',
       'multtara-collector',
       'multtara-database',
@@ -922,6 +924,10 @@ describe('dashboard ingestion', () => {
           rawClient: 'raw-traffic-secret',
         },
         {
+          app: 'blog', requestCount: 4, status2xx: 4, status3xx: 0, status4xx: 0,
+          status5xx: 0, slowCount: 0, avgResponseMs: 12.5, maxResponseMs: 20,
+        },
+        {
           app: 'react', requestCount: 1, status2xx: 2, status3xx: 0, status4xx: 0,
           status5xx: 0, slowCount: 0, avgResponseMs: 1, maxResponseMs: 1,
         },
@@ -1021,10 +1027,16 @@ describe('dashboard ingestion', () => {
           memoryBytes: 123_456, memoryPercent: 12.5,
         },
       ],
-      traffic: [{
-        app: 'monitor', requestCount: 20, status2xx: 17, status3xx: 1, status4xx: 1,
-        status5xx: 1, slowCount: 2, avgResponseMs: 25.5, maxResponseMs: 250,
-      }],
+      traffic: [
+        {
+          app: 'monitor', requestCount: 20, status2xx: 17, status3xx: 1, status4xx: 1,
+          status5xx: 1, slowCount: 2, avgResponseMs: 25.5, maxResponseMs: 250,
+        },
+        {
+          app: 'blog', requestCount: 4, status2xx: 4, status3xx: 0, status4xx: 0,
+          status5xx: 0, slowCount: 0, avgResponseMs: 12.5, maxResponseMs: 20,
+        },
+      ],
       peaks: { cpuPercent: 99, memoryPercent: 65, temperatureC: 78, load1: 5.5 },
       durationSeconds: null,
     });

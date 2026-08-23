@@ -72,7 +72,7 @@ MAX_CONTAINER_CPU_PERCENT = 1024.0
 ALLOWED_PROCESS_UIDS = frozenset({0, 1001})
 MAX_TRAFFIC_APPS = 16
 ALLOWED_TRAFFIC_APPS = frozenset({
-    "monitor", "feelmyrythm", "multtara", "pilgrimage",
+    "monitor", "blog", "feelmyrythm", "multtara", "pilgrimage",
     "ddit-finalproject", "dukkeobi", "react", "vue",
 })
 MAX_TRAFFIC_REQUEST_SECONDS = 300.0
@@ -89,6 +89,8 @@ ALLOWED_COMPOSE_SERVICES = {
     ("bonifacio", "bonifacio"): "bonifacio",
     ("bonifacio", "bonifacioSso"): "sso",
     ("bonifacio", "bonifacioSsoRedis"): "sso-redis",
+    ("blog", "blogWeb"): "blog-frontend",
+    ("blog", "blogServer"): "blog-backend",
     ("cks-database", "cksDB"): "cks-database",
     ("monitor", "monitor"): "monitor",
     ("feelmyrythm", "fmrWeb"): "feelmyrythm-frontend",

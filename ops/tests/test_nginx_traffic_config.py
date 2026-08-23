@@ -30,6 +30,7 @@ class NginxTrafficConfigTests(unittest.TestCase):
             labels,
             [
                 "monitor",
+                "blog",
                 "feelmyrythm",
                 "multtara",
                 "pilgrimage",
@@ -39,6 +40,7 @@ class NginxTrafficConfigTests(unittest.TestCase):
                 "vue",
             ],
         )
+        self.assertIn(r"~^portfolio:/blog(?:/|$)               blog;", content)
 
     def test_persistent_log_has_no_request_or_user_identifiers(self) -> None:
         content = NGINX_CONFIG.read_text(encoding="utf-8")

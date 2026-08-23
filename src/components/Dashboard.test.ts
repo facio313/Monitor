@@ -19,6 +19,8 @@ describe('container presentation', () => {
   const containers: ContainerStatus[] = [
     { name: 'sso', owner: 'cks', state: 'running', health: 'healthy', cpuPercent: 1.2, memoryBytes: 10_000, memoryPercent: 1 },
     { name: 'sso-redis', owner: 'cks', state: 'running', health: 'healthy', cpuPercent: 2.3, memoryBytes: 20_000, memoryPercent: 2 },
+    { name: 'blog-backend', owner: 'cks', state: 'running', health: 'healthy', cpuPercent: 2.4, memoryBytes: 21_000, memoryPercent: 2.1 },
+    { name: 'blog-frontend', owner: 'cks', state: 'running', health: 'healthy', cpuPercent: 2.5, memoryBytes: 22_000, memoryPercent: 2.2 },
     { name: 'feelmyrythm-frontend', owner: 'cks', state: 'running', health: 'healthy', cpuPercent: 3.4, memoryBytes: 30_000, memoryPercent: 3 },
     { name: 'feelmyrythm-backend', owner: 'cks', state: 'running', health: 'unhealthy', cpuPercent: 4.5, memoryBytes: 40_000, memoryPercent: 4 },
     { name: 'feelmyrythm-redis', owner: 'cks', state: 'running', health: 'healthy', cpuPercent: 5.6, memoryBytes: 50_000, memoryPercent: 5 },
@@ -39,7 +41,7 @@ describe('container presentation', () => {
   ];
 
   it('separates running entries from stopped or other entries and retains the total', () => {
-    expect(containerSummaryLabel(containers)).toBe('17 running · 2 stopped/other · 19 tracked total · 1 unhealthy');
+    expect(containerSummaryLabel(containers)).toBe('19 running · 2 stopped/other · 21 tracked total · 1 unhealthy');
   });
 
   it('uses the requested grouped default order before sorting the remaining names', () => {
@@ -52,6 +54,8 @@ describe('container presentation', () => {
       'sso-redis',
       'cks-database',
       'monitor',
+      'blog-frontend',
+      'blog-backend',
       'ddit-finalproject',
       'dukkeobi',
       'feelmyrythm-frontend',
@@ -127,6 +131,8 @@ describe('container presentation', () => {
     expect(markup).toContain('>bonifacio</strong>');
     expect(markup).toContain('>sso</strong>');
     expect(markup).toContain('>sso-redis</strong>');
+    expect(markup).toContain('blog-frontend');
+    expect(markup).toContain('blog-backend');
     expect(markup).toContain('feelmyrythm-frontend');
     expect(markup).toContain('feelmyrythm-backend');
     expect(markup).toContain('feelmyrythm-redis');
@@ -141,6 +147,7 @@ describe('container presentation', () => {
     expect(markup).toContain('class="container-name-hierarchy"');
     expect(markup).toContain('class="container-name-component"');
     expect(markup).toContain('<strong>multtara</strong><span class="container-name-component">frontend</span>');
+    expect(markup).toContain('<strong>blog</strong><span class="container-name-component">frontend</span>');
     expect(markup).toContain('<span class="sr-only">multtara-frontend</span>');
     expect(markup).toContain('aria-label="Container sorting controls"');
     expect(markup).toContain('aria-label="Sort containers by"');

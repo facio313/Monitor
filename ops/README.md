@@ -123,6 +123,8 @@ public name. Unknown pairs are dropped before any stats request. New exports
 never use the old app-level labels or generic `cks-workload` label; both remain
 accepted only so retained snapshots and incident history can be read safely. Raw container names,
 environment, mounts, images, commands, IDs, and socket paths never persist.
+The reviewed Blog pairs are exported as `blog-frontend` for `blog/blogWeb` and
+`blog-backend` for `blog/blogServer`; no mutable Docker name reaches Monitor.
 The retired `pongdang-multtara/db` pair is handled the same way: a live Docker
 observation is dropped before stats collection, while its fixed
 `multtara-database` label remains valid only when reading retained snapshots or
@@ -150,7 +152,10 @@ The optional Nginx input is deliberately not a conventional access log.
 `nginx/monitor-traffic.conf` maps only explicitly allow-listed portfolio paths
 to fixed app labels and writes one identifier-free observation per matching
 request with exactly timestamp, label, status, and request duration. All
-unspecified paths are dropped. `monitor-traffic-logrotate.timer` checks
+unspecified paths are dropped. The `/blog` and `/blog/` boundary maps only to
+the fixed `blog` label, so Blog request counts and latency can be correlated
+with host peaks without retaining a path or visitor identifier.
+`monitor-traffic-logrotate.timer` checks
 `logrotate/monitor-traffic` every minute. Its `maxsize 5M` condition is evaluated
 at a timer run, so it initiates rotation after the active file crosses that size
 rather than imposing a synchronous 5 MiB cap. Under-size non-empty files rotate

@@ -212,7 +212,9 @@ The installed HTTP-level map has a fixed allowlist and writes one
 identifier-free observation for each matching request: timestamp, fixed app
 label, status code, and request duration. It does not persist IP, SSO subject,
 method, URI/path/query, referrer, user agent, or cookies. Unknown paths are not
-logged. A dedicated timer checks the supplied logrotate rule every minute;
+logged. `/blog` and `/blog/` are reduced to the fixed `blog` label before the
+record is written, enabling Blog request/latency correlation without recording
+which visitor or Blog path produced it. A dedicated timer checks the supplied logrotate rule every minute;
 `maxsize 5M` means rotate on the next check after the active file crosses that
 size, not a synchronous 5 MiB cap. Under-size non-empty files rotate daily and
 at most two numbered, uncompressed archives are retained so a delayed collector
@@ -454,7 +456,10 @@ only exact reviewed project/service pairs become fixed, distinct workload
 labels. Previous app-level labels and the generic `cks-workload` value remain
 readable in retained history but are never emitted for a new observation. Each admitted workload is
 reduced to that label, owner, state, health, CPU percentage, and memory
-bytes/percentage. Incident process evidence is grouped into fixed executable
+bytes/percentage. The Blog Compose services `blogWeb` and `blogServer` are
+published only as `blog-frontend` and `blog-backend`; the default dashboard
+order keeps them together, frontend before backend, among the alphabetically
+ordered non-core apps. Incident process evidence is grouped into fixed executable
 classes such as `node`, `python`, `web-server`, or `other` and contains only
 instance count, CPU percentage, and memory bytes. Request evidence contains
 only a fixed app label, total/status-class/

@@ -45,6 +45,7 @@ const INCIDENT_REASON_ORDER: IncidentReason[] = [
 const INCIDENT_REASONS = new Set<IncidentReason>(INCIDENT_REASON_ORDER);
 const INCIDENT_TRAFFIC_APPS = new Set([
   'monitor',
+  'blog',
   'feelmyrythm',
   'multtara',
   'pilgrimage',
@@ -57,6 +58,8 @@ const FIXED_CONTAINER_SERVICE_NAMES = [
   'bonifacio',
   'sso',
   'sso-redis',
+  'blog-frontend',
+  'blog-backend',
   'cks-database',
   'monitor',
   'feelmyrythm-frontend',
