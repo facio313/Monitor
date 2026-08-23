@@ -275,14 +275,13 @@ class ParsingTests(unittest.TestCase):
 
     def test_compose_pairs_have_distinct_fixed_names_and_filtered_list_paths(self):
         expected_pairs = {
-            ("bonifacio", "bonifacio"): "bonifacio-web",
-            ("bonifacio", "bonifacioSso"): "bonifacio-sso",
-            ("bonifacio", "bonifacioSsoAdmin"): "bonifacio-sso-admin",
-            ("bonifacio", "bonifacioSsoRedis"): "bonifacio-sso-redis",
+            ("bonifacio", "bonifacio"): "bonifacio",
+            ("bonifacio", "bonifacioSso"): "sso",
+            ("bonifacio", "bonifacioSsoRedis"): "sso-redis",
             ("cks-database", "cksDB"): "cks-database",
             ("monitor", "monitor"): "monitor",
-            ("feelmyrythm", "fmrWeb"): "feelmyrythm-web",
-            ("feelmyrythm", "fmrServer"): "feelmyrythm-server",
+            ("feelmyrythm", "fmrWeb"): "feelmyrythm-frontend",
+            ("feelmyrythm", "fmrServer"): "feelmyrythm-backend",
             ("feelmyrythm", "fmrRedis"): "feelmyrythm-redis",
             ("pilgrimage", "pilgrimageFrontend"): "pilgrimage-frontend",
             ("pilgrimage", "pilgrimageBackend"): "pilgrimage-backend",
@@ -300,6 +299,14 @@ class ParsingTests(unittest.TestCase):
         self.assertEqual(
             len(set(collector.ALLOWED_COMPOSE_SERVICES.values())),
             len(collector.ALLOWED_COMPOSE_SERVICES),
+        )
+        self.assertTrue(
+            collector.LEGACY_CONTAINER_SERVICE_NAMES.isdisjoint(
+                collector.CURRENT_CONTAINER_NAMES
+            )
+        )
+        self.assertTrue(
+            collector.LEGACY_CONTAINER_SERVICE_NAMES <= collector.SAFE_CONTAINER_NAMES
         )
         paths = []
         stats_paths = []
@@ -406,24 +413,19 @@ class ParsingTests(unittest.TestCase):
             with mock.patch.object(Path, "lstat", owned_by_cks), \
                  mock.patch.object(collector.os, "fstat", opened_by_cks):
                 self.assertEqual(collector.load_container_snapshot(path, now), document["containers"])
-                legacy_document = {
-                    **document,
-                    "containers": [{**document["containers"][0], "name": "cks-workload"}],
-                }
-                path.write_text(json.dumps(legacy_document), encoding="utf-8")
-                self.assertEqual(
-                    collector.load_container_snapshot(path, now),
-                    legacy_document["containers"],
-                )
-                legacy_document = {
-                    **document,
-                    "containers": [{**document["containers"][0], "name": "feelmyrythm"}],
-                }
-                path.write_text(json.dumps(legacy_document), encoding="utf-8")
-                self.assertEqual(
-                    collector.load_container_snapshot(path, now),
-                    legacy_document["containers"],
-                )
+                for legacy_name in sorted(collector.LEGACY_CONTAINER_NAMES):
+                    legacy_document = {
+                        **document,
+                        "containers": [{
+                            **document["containers"][0],
+                            "name": legacy_name,
+                        }],
+                    }
+                    path.write_text(json.dumps(legacy_document), encoding="utf-8")
+                    self.assertEqual(
+                        collector.load_container_snapshot(path, now),
+                        legacy_document["containers"],
+                    )
                 path.write_text(json.dumps({
                     **document,
                     "containers": [{**document["containers"][0], "name": "alice@example.test"}],

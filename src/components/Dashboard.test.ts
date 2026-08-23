@@ -14,23 +14,35 @@ import {
 
 describe('container presentation', () => {
   const containers: ContainerStatus[] = [
-    { name: 'feelmyrythm-web', owner: 'cks', state: 'running', health: 'healthy', cpuPercent: 1.2, memoryBytes: 10_000, memoryPercent: 1 },
-    { name: 'feelmyrythm-server', owner: 'cks', state: 'running', health: 'unhealthy', cpuPercent: 2.3, memoryBytes: 20_000, memoryPercent: 2 },
+    { name: 'sso', owner: 'cks', state: 'running', health: 'healthy', cpuPercent: 1.2, memoryBytes: 10_000, memoryPercent: 1 },
+    { name: 'sso-redis', owner: 'cks', state: 'running', health: 'healthy', cpuPercent: 2.3, memoryBytes: 20_000, memoryPercent: 2 },
+    { name: 'feelmyrythm-frontend', owner: 'cks', state: 'running', health: 'healthy', cpuPercent: 3.4, memoryBytes: 30_000, memoryPercent: 3 },
+    { name: 'feelmyrythm-backend', owner: 'cks', state: 'running', health: 'unhealthy', cpuPercent: 4.5, memoryBytes: 40_000, memoryPercent: 4 },
+    { name: 'feelmyrythm-redis', owner: 'cks', state: 'running', health: 'healthy', cpuPercent: 5.6, memoryBytes: 50_000, memoryPercent: 5 },
+    { name: 'pilgrimage-frontend', owner: 'cks', state: 'running', health: 'healthy', cpuPercent: 6.7, memoryBytes: 60_000, memoryPercent: 6 },
+    { name: 'pilgrimage-backend', owner: 'cks', state: 'running', health: 'healthy', cpuPercent: 7.8, memoryBytes: 70_000, memoryPercent: 7 },
     { name: 'pilgrimage-redis', owner: 'cks', state: 'exited', health: 'none', cpuPercent: null, memoryBytes: null, memoryPercent: null },
-    { name: 'bonifacio-web', owner: 'cks', state: 'paused', health: 'unknown', cpuPercent: null, memoryBytes: null, memoryPercent: null },
+    { name: 'bonifacio', owner: 'cks', state: 'paused', health: 'unknown', cpuPercent: null, memoryBytes: null, memoryPercent: null },
   ];
 
   it('separates running entries from stopped or other entries and retains the total', () => {
-    expect(containerSummaryLabel(containers)).toBe('2 running · 2 stopped/other · 4 tracked total · 1 unhealthy');
+    expect(containerSummaryLabel(containers)).toBe('7 running · 2 stopped/other · 9 tracked total · 1 unhealthy');
   });
 
-  it('renders each fixed service label supplied by the backend without collapsing it', () => {
+  it('renders each final backend service name without legacy or removed names', () => {
     const markup = renderToStaticMarkup(createElement(ContainerList, { containers }));
 
-    expect(markup).toContain('feelmyrythm-web');
-    expect(markup).toContain('feelmyrythm-server');
-    expect(markup).toContain('pilgrimage-redis');
-    expect(markup).toContain('bonifacio-web');
+    expect(markup).toContain('>bonifacio</strong>');
+    expect(markup).toContain('>sso</strong>');
+    expect(markup).toContain('>sso-redis</strong>');
+    expect(markup).toContain('>feelmyrythm-frontend</strong>');
+    expect(markup).toContain('>feelmyrythm-backend</strong>');
+    expect(markup).toContain('>feelmyrythm-redis</strong>');
+    expect(markup).toContain('>pilgrimage-frontend</strong>');
+    expect(markup).toContain('>pilgrimage-backend</strong>');
+    expect(markup).toContain('>pilgrimage-redis</strong>');
+    expect(markup).not.toContain('sso-admin');
+    expect(markup).not.toContain('bonifacio-web');
   });
 });
 

@@ -86,14 +86,13 @@ MAX_SANITIZED_LOG_RECORD_BYTES = 4096
 MAX_CONTAINER_INPUT_BYTES = 1 * 1024 * 1024
 MAX_CONTAINER_INPUT_AGE_SECONDS = 180
 ALLOWED_COMPOSE_SERVICES = {
-    ("bonifacio", "bonifacio"): "bonifacio-web",
-    ("bonifacio", "bonifacioSso"): "bonifacio-sso",
-    ("bonifacio", "bonifacioSsoAdmin"): "bonifacio-sso-admin",
-    ("bonifacio", "bonifacioSsoRedis"): "bonifacio-sso-redis",
+    ("bonifacio", "bonifacio"): "bonifacio",
+    ("bonifacio", "bonifacioSso"): "sso",
+    ("bonifacio", "bonifacioSsoRedis"): "sso-redis",
     ("cks-database", "cksDB"): "cks-database",
     ("monitor", "monitor"): "monitor",
-    ("feelmyrythm", "fmrWeb"): "feelmyrythm-web",
-    ("feelmyrythm", "fmrServer"): "feelmyrythm-server",
+    ("feelmyrythm", "fmrWeb"): "feelmyrythm-frontend",
+    ("feelmyrythm", "fmrServer"): "feelmyrythm-backend",
     ("feelmyrythm", "fmrRedis"): "feelmyrythm-redis",
     ("pilgrimage", "pilgrimageFrontend"): "pilgrimage-frontend",
     ("pilgrimage", "pilgrimageBackend"): "pilgrimage-backend",
@@ -110,10 +109,23 @@ ALLOWED_COMPOSE_PROJECTS = tuple(sorted({
     project for project, _service in ALLOWED_COMPOSE_SERVICES
 }))
 CURRENT_CONTAINER_NAMES = frozenset(ALLOWED_COMPOSE_SERVICES.values())
-# Previous exporters emitted the app-level traffic labels or ``cks-workload``.
-# Keep both readable for retained snapshots/incidents, but never assign them to
-# a new Docker observation.
-SAFE_CONTAINER_NAMES = CURRENT_CONTAINER_NAMES | ALLOWED_TRAFFIC_APPS | frozenset({"cks-workload"})
+LEGACY_CONTAINER_SERVICE_NAMES = frozenset({
+    "bonifacio-web",
+    "bonifacio-sso",
+    "bonifacio-sso-admin",
+    "bonifacio-sso-redis",
+    "feelmyrythm-web",
+    "feelmyrythm-server",
+})
+# Previous exporters emitted app-level traffic labels, ``cks-workload``, or the
+# superseded service labels above. Keep every prior value readable for retained
+# snapshots/incidents, but never assign one to a new Docker observation.
+LEGACY_CONTAINER_NAMES = (
+    ALLOWED_TRAFFIC_APPS
+    | LEGACY_CONTAINER_SERVICE_NAMES
+    | frozenset({"cks-workload"})
+)
+SAFE_CONTAINER_NAMES = CURRENT_CONTAINER_NAMES | LEGACY_CONTAINER_NAMES
 _monotonic = time.monotonic
 VIRTUAL_FILESYSTEMS = {
     "autofs", "bpf", "cgroup", "cgroup2", "configfs", "debugfs", "devpts",
