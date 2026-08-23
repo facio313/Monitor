@@ -10,6 +10,8 @@ import {
   eventStatusTone,
   formatFlags,
   IncidentTimeline,
+  nextContainerSort,
+  sortContainers,
 } from './Dashboard';
 
 describe('container presentation', () => {
@@ -27,10 +29,69 @@ describe('container presentation', () => {
     { name: 'pilgrimage-backend', owner: 'cks', state: 'running', health: 'healthy', cpuPercent: 7.8, memoryBytes: 70_000, memoryPercent: 7 },
     { name: 'pilgrimage-redis', owner: 'cks', state: 'exited', health: 'none', cpuPercent: null, memoryBytes: null, memoryPercent: null },
     { name: 'bonifacio', owner: 'cks', state: 'paused', health: 'unknown', cpuPercent: null, memoryBytes: null, memoryPercent: null },
+    { name: 'cks-database', owner: 'cks', state: 'running', health: 'healthy', cpuPercent: 0.8, memoryBytes: 80_000, memoryPercent: 8 },
+    { name: 'monitor', owner: 'cks', state: 'running', health: 'healthy', cpuPercent: 0.9, memoryBytes: 81_000, memoryPercent: 8.1 },
+    { name: 'react', owner: 'cks', state: 'running', health: 'healthy', cpuPercent: 1, memoryBytes: 82_000, memoryPercent: 8.2 },
+    { name: 'vue', owner: 'cks', state: 'running', health: 'healthy', cpuPercent: 1.1, memoryBytes: 83_000, memoryPercent: 8.3 },
+    { name: 'dukkeobi', owner: 'cks', state: 'running', health: 'healthy', cpuPercent: 1.2, memoryBytes: 84_000, memoryPercent: 8.4 },
+    { name: 'ddit-finalproject', owner: 'cks', state: 'running', health: 'healthy', cpuPercent: 1.3, memoryBytes: 85_000, memoryPercent: 8.5 },
   ];
 
   it('separates running entries from stopped or other entries and retains the total', () => {
-    expect(containerSummaryLabel(containers)).toBe('11 running · 2 stopped/other · 13 tracked total · 1 unhealthy');
+    expect(containerSummaryLabel(containers)).toBe('17 running · 2 stopped/other · 19 tracked total · 1 unhealthy');
+  });
+
+  it('uses the requested grouped default order before sorting the remaining names', () => {
+    const originalNames = containers.map((container) => container.name);
+    const names = sortContainers(containers).map((container) => container.name);
+
+    expect(names).toEqual([
+      'bonifacio',
+      'sso',
+      'sso-redis',
+      'cks-database',
+      'ddit-finalproject',
+      'dukkeobi',
+      'feelmyrythm-backend',
+      'feelmyrythm-frontend',
+      'feelmyrythm-redis',
+      'monitor',
+      'multtara-backend',
+      'multtara-collector',
+      'multtara-database',
+      'multtara-frontend',
+      'pilgrimage-backend',
+      'pilgrimage-frontend',
+      'pilgrimage-redis',
+      'react',
+      'vue',
+    ]);
+    expect(containers.map((container) => container.name)).toEqual(originalNames);
+  });
+
+  it('sorts every displayed column in both directions and leaves missing values last', () => {
+    const sortable: ContainerStatus[] = [
+      { name: 'app-10', owner: null, state: null, health: null, cpuPercent: null, memoryBytes: null, memoryPercent: null },
+      { name: 'app-2', owner: 'Zulu', state: 'running', health: 'unhealthy', cpuPercent: 10, memoryBytes: 100, memoryPercent: 5 },
+      { name: 'app-1', owner: 'alpha', state: 'running', health: 'healthy', cpuPercent: 2, memoryBytes: 200, memoryPercent: 4 },
+    ];
+
+    expect(sortContainers(sortable, { key: 'name', direction: 'ascending' }).map(({ name }) => name)).toEqual(['app-1', 'app-2', 'app-10']);
+    expect(sortContainers(sortable, { key: 'name', direction: 'descending' }).map(({ name }) => name)).toEqual(['app-10', 'app-2', 'app-1']);
+    expect(sortContainers(sortable, { key: 'owner', direction: 'ascending' }).map(({ name }) => name)).toEqual(['app-1', 'app-2', 'app-10']);
+    expect(sortContainers(sortable, { key: 'owner', direction: 'descending' }).map(({ name }) => name)).toEqual(['app-2', 'app-1', 'app-10']);
+    expect(sortContainers(sortable, { key: 'status', direction: 'ascending' }).map(({ name }) => name)).toEqual(['app-1', 'app-2', 'app-10']);
+    expect(sortContainers(sortable, { key: 'status', direction: 'descending' }).map(({ name }) => name)).toEqual(['app-2', 'app-1', 'app-10']);
+    expect(sortContainers(sortable, { key: 'cpu', direction: 'ascending' }).map(({ name }) => name)).toEqual(['app-1', 'app-2', 'app-10']);
+    expect(sortContainers(sortable, { key: 'cpu', direction: 'descending' }).map(({ name }) => name)).toEqual(['app-2', 'app-1', 'app-10']);
+    expect(sortContainers(sortable, { key: 'memory', direction: 'ascending' }).map(({ name }) => name)).toEqual(['app-2', 'app-1', 'app-10']);
+    expect(sortContainers(sortable, { key: 'memory', direction: 'descending' }).map(({ name }) => name)).toEqual(['app-1', 'app-2', 'app-10']);
+  });
+
+  it('toggles the selected column and starts a new column ascending', () => {
+    expect(nextContainerSort({ key: null, direction: 'ascending' }, 'cpu')).toEqual({ key: 'cpu', direction: 'ascending' });
+    expect(nextContainerSort({ key: 'cpu', direction: 'ascending' }, 'cpu')).toEqual({ key: 'cpu', direction: 'descending' });
+    expect(nextContainerSort({ key: 'cpu', direction: 'descending' }, 'memory')).toEqual({ key: 'memory', direction: 'ascending' });
   });
 
   it('renders each final backend service name without legacy or removed names', () => {
@@ -49,6 +110,10 @@ describe('container presentation', () => {
     expect(markup).toContain('>pilgrimage-frontend</strong>');
     expect(markup).toContain('>pilgrimage-backend</strong>');
     expect(markup).toContain('>pilgrimage-redis</strong>');
+    expect(markup).toContain('>cks-database</strong>');
+    expect(markup.match(/class="container-sort-button"/g)).toHaveLength(5);
+    expect(markup).toContain('aria-sort="other"');
+    expect(markup).toContain('aria-label="Sort by Container ascending"');
     expect(markup).not.toContain('sso-admin');
     expect(markup).not.toContain('bonifacio-web');
   });

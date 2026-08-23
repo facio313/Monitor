@@ -49,6 +49,17 @@ const RANGES: Array<{ value: TimeRange; label: string }> = [
 type StatusTone = 'good' | 'warn' | 'critical' | 'neutral';
 const API_EVENT_CAP = 500;
 
+export type ContainerSortKey = 'name' | 'owner' | 'status' | 'cpu' | 'memory';
+export type ContainerSortDirection = 'ascending' | 'descending';
+
+export interface ContainerSort {
+  key: ContainerSortKey | null;
+  direction: ContainerSortDirection;
+}
+
+const DEFAULT_CONTAINER_SORT: ContainerSort = { key: null, direction: 'ascending' };
+const CONTAINER_SORT_COLLATOR = new Intl.Collator('en', { numeric: true, sensitivity: 'base' });
+
 interface DashboardProps {
   page: MonitorPage;
   navigationVersion: number;
@@ -866,13 +877,26 @@ function StatusBadge({ value, tone }: { value: unknown; tone?: StatusTone }) {
 }
 
 export function ContainerList({ containers }: { containers: ContainerStatus[] }) {
+  const [sort, setSort] = useState<ContainerSort>(DEFAULT_CONTAINER_SORT);
+  const sortedContainers = useMemo(() => sortContainers(containers, sort), [containers, sort]);
+
+  function handleSort(key: ContainerSortKey) {
+    setSort((current) => nextContainerSort(current, key));
+  }
+
   return (
     <>
       <div className="table-wrap">
         <table>
-          <thead><tr><th scope="col">Container</th><th scope="col">Owner</th><th scope="col">Status</th><th scope="col">CPU</th><th scope="col">Memory</th></tr></thead>
-          <tbody>{containers.map((container, index) => (
-            <tr key={`${container.name}-${index}`}>
+          <thead><tr>
+            <ContainerSortHeader column="name" label="Container" sort={sort} onSort={handleSort} defaultGrouped />
+            <ContainerSortHeader column="owner" label="Owner" sort={sort} onSort={handleSort} />
+            <ContainerSortHeader column="status" label="Status" sort={sort} onSort={handleSort} />
+            <ContainerSortHeader column="cpu" label="CPU" sort={sort} onSort={handleSort} />
+            <ContainerSortHeader column="memory" label="Memory" sort={sort} onSort={handleSort} />
+          </tr></thead>
+          <tbody>{sortedContainers.map((container) => (
+            <tr key={container.name}>
               <td><strong>{safeText(container.name, 'Unnamed', 70)}</strong></td>
               <td>{safeText(container.owner, '—', 50)}</td>
               <td>
@@ -889,8 +913,8 @@ export function ContainerList({ containers }: { containers: ContainerStatus[] })
           ))}</tbody>
         </table>
       </div>
-      <div className="container-cards">{containers.map((container, index) => (
-        <article className="container-card" key={`${container.name}-mobile-${index}`}>
+      <div className="container-cards">{sortedContainers.map((container) => (
+        <article className="container-card" key={`${container.name}-mobile`}>
           <div className="container-card-head">
             <div><strong>{safeText(container.name, 'Unnamed', 70)}</strong><span>{safeText(container.owner, 'No owner', 50)}</span></div>
             <StatusBadge value={container.health || container.state} />
@@ -904,6 +928,123 @@ export function ContainerList({ containers }: { containers: ContainerStatus[] })
       ))}</div>
     </>
   );
+}
+
+function ContainerSortHeader({
+  column,
+  label,
+  sort,
+  onSort,
+  defaultGrouped = false,
+}: {
+  column: ContainerSortKey;
+  label: string;
+  sort: ContainerSort;
+  onSort: (key: ContainerSortKey) => void;
+  defaultGrouped?: boolean;
+}) {
+  const active = sort.key === column;
+  const grouped = sort.key === null && defaultGrouped;
+  const ariaSort: ContainerSortDirection | 'other' | undefined = active ? sort.direction : grouped ? 'other' : undefined;
+  const nextDirection: ContainerSortDirection = active && sort.direction === 'ascending' ? 'descending' : 'ascending';
+  const indicator = active ? (sort.direction === 'ascending' ? '↑' : '↓') : grouped ? '◆' : '↕';
+
+  return (
+    <th scope="col" aria-sort={ariaSort}>
+      <button
+        className="container-sort-button"
+        type="button"
+        onClick={() => onSort(column)}
+        aria-label={`Sort by ${label} ${nextDirection}`}
+      >
+        <span>{label}</span>
+        <span className={`container-sort-indicator${active || grouped ? ' active' : ''}`} aria-hidden="true">{indicator}</span>
+      </button>
+    </th>
+  );
+}
+
+export function nextContainerSort(current: ContainerSort, key: ContainerSortKey): ContainerSort {
+  if (current.key !== key) return { key, direction: 'ascending' };
+  return { key, direction: current.direction === 'ascending' ? 'descending' : 'ascending' };
+}
+
+export function sortContainers(
+  containers: ContainerStatus[],
+  sort: ContainerSort = DEFAULT_CONTAINER_SORT,
+): ContainerStatus[] {
+  return containers
+    .map((container, index) => ({ container, index }))
+    .sort((left, right) => {
+      const primary = sort.key === null
+        ? compareDefaultContainerOrder(left.container, right.container)
+        : compareContainerColumn(left.container, right.container, sort.key, sort.direction);
+      if (primary !== 0) return primary;
+
+      const byName = compareText(left.container.name, right.container.name, 'ascending');
+      if (byName !== 0) return byName;
+      return left.index - right.index;
+    })
+    .map(({ container }) => container);
+}
+
+function compareDefaultContainerOrder(left: ContainerStatus, right: ContainerStatus): number {
+  const rankDifference = defaultContainerRank(left.name) - defaultContainerRank(right.name);
+  if (rankDifference !== 0) return rankDifference;
+  return compareText(left.name, right.name, 'ascending');
+}
+
+function defaultContainerRank(name: string): number {
+  const normalized = name.trim().toLowerCase();
+  if (normalized === 'bonifacio' || normalized.startsWith('bonifacio-')) return 0;
+  if (normalized === 'sso' || normalized.startsWith('sso-')) return 1;
+  if (normalized === 'cks-database') return 2;
+  return 3;
+}
+
+function compareContainerColumn(
+  left: ContainerStatus,
+  right: ContainerStatus,
+  key: ContainerSortKey,
+  direction: ContainerSortDirection,
+): number {
+  if (key === 'name') return compareText(left.name, right.name, direction);
+  if (key === 'owner') return compareText(left.owner, right.owner, direction);
+  if (key === 'cpu') return compareNumber(left.cpuPercent, right.cpuPercent, direction);
+  if (key === 'memory') {
+    return compareNumber(left.memoryBytes, right.memoryBytes, direction)
+      || compareNumber(left.memoryPercent, right.memoryPercent, direction);
+  }
+  return compareText(left.state, right.state, direction)
+    || compareText(left.health, right.health, direction);
+}
+
+function compareText(left: unknown, right: unknown, direction: ContainerSortDirection): number {
+  const leftValue = sortableText(left);
+  const rightValue = sortableText(right);
+  if (leftValue === null) return rightValue === null ? 0 : 1;
+  if (rightValue === null) return -1;
+  const comparison = CONTAINER_SORT_COLLATOR.compare(leftValue, rightValue);
+  return direction === 'ascending' ? comparison : -comparison;
+}
+
+function sortableText(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const normalized = value.trim();
+  return normalized || null;
+}
+
+function compareNumber(left: unknown, right: unknown, direction: ContainerSortDirection): number {
+  const leftValue = sortableNumber(left);
+  const rightValue = sortableNumber(right);
+  if (leftValue === null) return rightValue === null ? 0 : 1;
+  if (rightValue === null) return -1;
+  const comparison = leftValue - rightValue;
+  return direction === 'ascending' ? comparison : -comparison;
+}
+
+function sortableNumber(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
 }
 
 function InlineEmpty({ icon, text, positive }: { icon: IconName; text: string; positive?: boolean }) {

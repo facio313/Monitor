@@ -256,6 +256,11 @@ button:focus-visible, input:focus-visible, a:focus-visible { outline: 2px solid 
 .table-wrap { overflow-x: auto; }
 table { width: 100%; border-collapse: collapse; font-size: 10px; }
 th { padding: 0 13px 10px; color: var(--faint); font-size: 9px; font-weight: 600; letter-spacing: .06em; text-align: left; text-transform: uppercase; }
+.container-sort-button { min-height: 28px; padding: 4px 0; display: inline-flex; align-items: center; gap: 6px; border: 0; color: inherit; background: transparent; font: inherit; letter-spacing: inherit; text-transform: inherit; cursor: pointer; }
+.container-sort-button:hover { color: #aebfbb; }
+.container-sort-button:focus-visible { border-radius: 4px; outline: 2px solid var(--cyan); outline-offset: 3px; }
+.container-sort-indicator { width: 10px; color: #4f6460; font-size: 10px; line-height: 1; text-align: center; }
+.container-sort-indicator.active { color: var(--cyan); }
 td { padding: 13px; border-top: 1px solid var(--border-soft); color: #9faeab; vertical-align: middle; }
 td strong { color: #cdd8d5; font-family: "SFMono-Regular", Consolas, "Liberation Mono", ui-monospace, monospace; font-size: 10px; font-weight: 500; }
 .status-stack { display: flex; align-items: center; gap: 7px; }

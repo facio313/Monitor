@@ -133,6 +133,7 @@ describe('collector to server contract', () => {
       '--events-log', eventsLog,
       '--kernel-log', kernelLog,
       '--privilege-logs', privilegeLog,
+      '--traffic-log', '',
       '--docker-sockets', '',
       '--vcgencmd', vcgencmd,
       '--temperature-warn-c', '40',
