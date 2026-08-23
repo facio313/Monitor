@@ -121,7 +121,7 @@ describe('container presentation', () => {
     expect(nextContainerSort({ key: 'cpu', direction: 'descending' }, 'memory')).toEqual({ key: 'memory', direction: 'ascending' });
   });
 
-  it('renders each final backend service name without legacy or removed names', () => {
+  it('renders current and retained fixed service labels without arbitrary aliases', () => {
     const markup = renderToStaticMarkup(createElement(ContainerList, { containers }));
 
     expect(markup).toContain('>bonifacio</strong>');

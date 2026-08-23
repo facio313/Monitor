@@ -103,7 +103,6 @@ ALLOWED_COMPOSE_SERVICES = {
     ("vue", "vue"): "vue",
     ("pongdang-multtara", "backend"): "multtara-backend",
     ("pongdang-multtara", "collector"): "multtara-collector",
-    ("pongdang-multtara", "db"): "multtara-database",
     ("pongdang-multtara", "frontend"): "multtara-frontend",
 }
 ALLOWED_COMPOSE_PROJECTS = tuple(sorted({
@@ -117,6 +116,9 @@ LEGACY_CONTAINER_SERVICE_NAMES = frozenset({
     "bonifacio-sso-redis",
     "feelmyrythm-web",
     "feelmyrythm-server",
+    # The standalone PostgreSQL service is forbidden in the live cksDB
+    # topology, but retained snapshots/incidents must remain readable.
+    "multtara-database",
 })
 # Previous exporters emitted app-level traffic labels, ``cks-workload``, or the
 # superseded service labels above. Keep every prior value readable for retained
@@ -1179,6 +1181,20 @@ POWER_EVENT_DETAILS = {
         "Kernel reported an NVMe I/O error.",
     ),
 }
+MAINTENANCE_EVENT_DETAILS = {
+    ("multtara-cksdb-cutover", "started"): (
+        "info",
+        "Multtara database cutover maintenance started.",
+    ),
+    ("multtara-cksdb-cutover", "completed"): (
+        "info",
+        "Multtara now uses the shared cksDB PostgreSQL service.",
+    ),
+    ("multtara-cksdb-cutover", "rolled-back"): (
+        "warning",
+        "Multtara database cutover rolled back to the retained standalone PostgreSQL service.",
+    ),
+}
 
 
 def event_timestamp(line: str, fallback: str) -> str:
@@ -1229,6 +1245,21 @@ def alert_message(reason: str, recovered: bool = False) -> str:
 
 def sanitize_alert_line(line: str, fallback_timestamp: str) -> dict[str, Any] | None:
     timestamp = event_timestamp(line, fallback_timestamp)
+    match = re.search(
+        r"\bMAINTENANCE\s+event=(multtara-cksdb-cutover)\s+"
+        r"status=(started|completed|rolled-back)\b",
+        line,
+    )
+    if match:
+        event = (match.group(1), match.group(2))
+        severity, message = MAINTENANCE_EVENT_DETAILS[event]
+        return {
+            "timestamp": timestamp,
+            "severity": severity,
+            "kind": "topology",
+            "status": event[1],
+            "message": message,
+        }
     match = re.search(r"\bSNAPSHOT\s+reason=([A-Za-z0-9_.:-]+)", line)
     if match:
         reason = bounded_text(match.group(1), 64)

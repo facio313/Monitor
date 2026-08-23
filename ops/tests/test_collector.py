@@ -292,7 +292,6 @@ class ParsingTests(unittest.TestCase):
             ("vue", "vue"): "vue",
             ("pongdang-multtara", "backend"): "multtara-backend",
             ("pongdang-multtara", "collector"): "multtara-collector",
-            ("pongdang-multtara", "db"): "multtara-database",
             ("pongdang-multtara", "frontend"): "multtara-frontend",
         }
         self.assertEqual(collector.ALLOWED_COMPOSE_SERVICES, expected_pairs)
@@ -308,6 +307,10 @@ class ParsingTests(unittest.TestCase):
         )
         self.assertTrue(
             collector.LEGACY_CONTAINER_SERVICE_NAMES <= collector.SAFE_CONTAINER_NAMES
+        )
+        self.assertIn("multtara-database", collector.LEGACY_CONTAINER_SERVICE_NAMES)
+        self.assertNotIn(
+            ("pongdang-multtara", "db"), collector.ALLOWED_COMPOSE_SERVICES
         )
         paths = []
         stats_paths = []
@@ -354,6 +357,15 @@ class ParsingTests(unittest.TestCase):
                         "State": "running",
                     },
                 ])
+            if project == "pongdang-multtara":
+                records.append({
+                    "Id": "d" * 64,
+                    "Labels": {
+                        "com.docker.compose.project": "pongdang-multtara",
+                        "com.docker.compose.service": "db",
+                    },
+                    "State": "running",
+                })
             return records
 
         with mock.patch.object(collector, "docker_get", side_effect=fake_get):
@@ -1323,10 +1335,28 @@ class RedactionTests(unittest.TestCase):
         recovered = collector.sanitize_alert_line(
             "2026-08-19T01:02:05Z RECOVERED reason=power-throttle arbitrary secret", "fallback"
         )
+        maintenance_started = collector.sanitize_alert_line(
+            "2026-08-19T01:02:06Z MAINTENANCE "
+            "event=multtara-cksdb-cutover status=started raw=secret",
+            "fallback",
+        )
+        maintenance_completed = collector.sanitize_alert_line(
+            "2026-08-19T01:02:07Z MAINTENANCE "
+            "event=multtara-cksdb-cutover status=completed",
+            "fallback",
+        )
+        maintenance_rollback = collector.sanitize_alert_line(
+            "2026-08-19T01:02:08Z MAINTENANCE "
+            "event=multtara-cksdb-cutover status=rolled-back",
+            "fallback",
+        )
         contract = {"timestamp", "severity", "kind", "status", "message"}
         self.assertEqual(set(snapshot), contract)
         self.assertEqual(set(metrics), contract)
         self.assertEqual(set(recovered), contract)
+        self.assertEqual(set(maintenance_started), contract)
+        self.assertEqual(set(maintenance_completed), contract)
+        self.assertEqual(set(maintenance_rollback), contract)
         self.assertEqual(snapshot["status"], "active")
         self.assertEqual(metrics["severity"], "warning")
         self.assertEqual(metrics["message"], "CPU 91.2%; memory available 73%; temperature 82.5 C.")
@@ -1338,8 +1368,23 @@ class RedactionTests(unittest.TestCase):
             "CPU 2%; memory available 73%; temperature 63.9 C.",
         )
         self.assertEqual(recovered["status"], "recovered")
+        self.assertEqual(maintenance_started, {
+            "timestamp": "2026-08-19T01:02:06Z",
+            "severity": "info",
+            "kind": "topology",
+            "status": "started",
+            "message": "Multtara database cutover maintenance started.",
+        })
+        self.assertEqual(maintenance_completed["status"], "completed")
+        self.assertEqual(maintenance_rollback["severity"], "warning")
         self.assertIsNone(collector.sanitize_alert_line("totally unrelated token=secret", "fallback"))
-        self.assertNotIn("secret", json.dumps([snapshot, metrics, recovered]))
+        self.assertIsNone(collector.sanitize_alert_line(
+            "MAINTENANCE event=arbitrary status=started token=secret", "fallback"
+        ))
+        self.assertNotIn("secret", json.dumps([
+            snapshot, metrics, recovered, maintenance_started,
+            maintenance_completed, maintenance_rollback,
+        ]))
 
     def test_privilege_output_has_exact_fields_timestamp_and_no_command(self):
         line = (

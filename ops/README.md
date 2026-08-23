@@ -26,12 +26,12 @@ The default output root is `/var/lib/monitor-export`:
   are migrated by adding the two new nullable power fields; foreign fields,
   invalid timestamps, booleans in numeric fields, and non-finite numbers are
   not propagated.
-- `alerts.jsonl`: at most 5,000 semantic `SNAPSHOT`, `metrics`, or `RECOVERED`
-  events. Raw lines are never copied. On Raspberry Pi-class hosts with
-  `vcgencmd`, current throttle/power transitions are also emitted here. A
-  transition message includes the validated full flags and, when available,
-  the validated supply-voltage observation; voltage changes alone never create
-  an alert.
+- `alerts.jsonl`: at most 5,000 semantic `SNAPSHOT`, `metrics`, `RECOVERED`, or
+  fixed maintenance events. Raw lines are never copied. On Raspberry Pi-class
+  hosts with `vcgencmd`, current throttle/power transitions are also emitted
+  here. A transition message includes the validated full flags and, when
+  available, the validated supply-voltage observation; voltage changes alone
+  never create an alert.
 - `power.jsonl`: at most 5,000 fixed-message kernel power/storage events with
   exactly `timestamp`, `severity`, `kind`, `status`, and `message`. Only kernel
   `Undervoltage detected!`, `Voltage normalised`, NVMe controller-reset, and
@@ -123,9 +123,28 @@ public name. Unknown pairs are dropped before any stats request. New exports
 never use the old app-level labels or generic `cks-workload` label; both remain
 accepted only so retained snapshots and incident history can be read safely. Raw container names,
 environment, mounts, images, commands, IDs, and socket paths never persist.
+The retired `pongdang-multtara/db` pair is handled the same way: a live Docker
+observation is dropped before stats collection, while its fixed
+`multtara-database` label remains valid only when reading retained snapshots or
+incident history.
 The root collector accepts the snapshot only when it is a fresh, single-link,
 `cks:cks` mode-`0640` regular file under the exact production bind and every
 nested value satisfies the fixed schema.
+
+The existing server-watch event input can annotate the one-time database
+cutover without admitting arbitrary operator text. It accepts only these exact
+event/status pairs (an ISO timestamp may precede the token):
+
+```text
+MAINTENANCE event=multtara-cksdb-cutover status=started
+MAINTENANCE event=multtara-cksdb-cutover status=completed
+MAINTENANCE event=multtara-cksdb-cutover status=rolled-back
+```
+
+They become fixed `kind=topology` alert rows. Unknown events/statuses and every
+extra raw detail are discarded. The cutover runner must use the existing
+owner/locking policy of the configured `MONITOR_EVENTS_LOG`; the collector does
+not write back to that host log.
 
 The optional Nginx input is deliberately not a conventional access log.
 `nginx/monitor-traffic.conf` maps only explicitly allow-listed portfolio paths

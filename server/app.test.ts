@@ -741,7 +741,7 @@ describe('dashboard ingestion', () => {
     });
   });
 
-  it('preserves every reviewed Multtara component label', async () => {
+  it('preserves retained Multtara component labels at the API boundary', async () => {
     const directory = dataDirectory();
     const names = [
       'multtara-backend',
