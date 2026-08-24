@@ -12,8 +12,10 @@ import {
   formatFlags,
   groupContainers,
   IncidentTimeline,
+  nextContainerGroupExpansion,
   nextContainerSort,
   sortContainers,
+  toggleContainerGroupExpansion,
 } from './Dashboard';
 
 describe('container presentation', () => {
@@ -218,7 +220,20 @@ describe('container presentation', () => {
     expect(nextContainerSort({ key: 'cpu', direction: 'descending' }, 'memory')).toEqual({ key: 'memory', direction: 'ascending' });
   });
 
-  it('renders aggregate parents and accessible disclosure controls on desktop and mobile', () => {
+  it('expands partial groups and collapses groups when all are open', () => {
+    const groupKeys = ['sso', 'feelmyrythm', 'pilgrimage'];
+    const partial = new Set(['sso']);
+
+    expect([...toggleContainerGroupExpansion(partial, 'feelmyrythm')]).toEqual(['sso', 'feelmyrythm']);
+    expect([...toggleContainerGroupExpansion(partial, 'sso')]).toEqual([]);
+    expect([...nextContainerGroupExpansion(new Set(), groupKeys)]).toEqual(groupKeys);
+    expect([...nextContainerGroupExpansion(partial, groupKeys)]).toEqual(groupKeys);
+    expect([...partial]).toEqual(['sso']);
+    expect([...nextContainerGroupExpansion(new Set(groupKeys), groupKeys)]).toEqual([]);
+    expect([...nextContainerGroupExpansion(new Set(['stale']), [])]).toEqual([]);
+  });
+
+  it('renders collapsed aggregate parents and accessible disclosure controls on desktop and mobile', () => {
     const markup = renderToStaticMarkup(createElement(ContainerList, { containers }));
 
     expect(markup).toContain('>bonifacio</strong>');
@@ -240,10 +255,15 @@ describe('container presentation', () => {
     expect(markup).toContain('13.5%');
     expect(markup).toContain('1 unhealthy');
     expect(markup).toContain('Combined usage');
-    expect(markup.match(/aria-label="Collapse feelmyrythm containers"/g)).toHaveLength(2);
+    expect(markup.match(/class="container-groups-toggle-all"/g)).toHaveLength(1);
+    expect(markup).toContain('aria-label="Expand all container groups"');
+    expect(markup).toContain('>Expand all</button>');
+    expect(markup.match(/aria-label="Expand feelmyrythm containers"/g)).toHaveLength(2);
     expect(markup.match(/class="container-group-toggle"/g)).toHaveLength(10);
-    expect(markup.match(/aria-expanded="true"/g)).toHaveLength(10);
-    expect(markup).toContain('<span aria-hidden="true">−</span>');
+    expect(markup.match(/aria-expanded="false"/g)).toHaveLength(10);
+    expect(markup.match(/class="container-child-rows" hidden=""/g)).toHaveLength(5);
+    expect(markup.match(/class="container-mobile-children" hidden=""/g)).toHaveLength(5);
+    expect(markup).toContain('<span aria-hidden="true">+</span>');
     const controlledIds = Array.from(markup.matchAll(/aria-controls="([^"]+)"/g), (match) => match[1]);
     expect(new Set(controlledIds).size).toBe(controlledIds.length);
     controlledIds.forEach((id) => expect(markup).toContain(`id="${id}"`));

@@ -936,20 +936,21 @@ function StatusBadge({ value, tone }: { value: unknown; tone?: StatusTone }) {
 
 export function ContainerList({ containers }: { containers: ContainerStatus[] }) {
   const [sort, setSort] = useState<ContainerSort>(DEFAULT_CONTAINER_SORT);
-  const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(() => new Set());
+  const [expandedGroups, setExpandedGroups] = useState<Set<string>>(() => new Set());
   const groups = useMemo(() => groupContainers(containers, sort), [containers, sort]);
+  const groupedKeys = groups.filter((group) => group.grouped).map((group) => group.key);
+  const allGroupsExpanded = groupedKeys.length > 0 && groupedKeys.every((key) => expandedGroups.has(key));
 
   function handleSort(key: ContainerSortKey) {
     setSort((current) => nextContainerSort(current, key));
   }
 
   function toggleGroup(key: string) {
-    setCollapsedGroups((current) => {
-      const next = new Set(current);
-      if (next.has(key)) next.delete(key);
-      else next.add(key);
-      return next;
-    });
+    setExpandedGroups((current) => toggleContainerGroupExpansion(current, key));
+  }
+
+  function toggleAllGroups() {
+    setExpandedGroups((current) => nextContainerGroupExpansion(current, groupedKeys));
   }
 
   function handleMobileSortChange(event: ChangeEvent<HTMLSelectElement>) {
@@ -961,6 +962,16 @@ export function ContainerList({ containers }: { containers: ContainerStatus[] })
 
   return (
     <>
+      {groupedKeys.length > 0 && (
+        <div className="container-list-actions">
+          <button
+            className="container-groups-toggle-all"
+            type="button"
+            onClick={toggleAllGroups}
+            aria-label={`${allGroupsExpanded ? 'Collapse' : 'Expand'} all container groups`}
+          >{allGroupsExpanded ? 'Collapse all' : 'Expand all'}</button>
+        </div>
+      )}
       <div className="table-wrap">
         <table>
           <thead><tr>
@@ -971,7 +982,7 @@ export function ContainerList({ containers }: { containers: ContainerStatus[] })
             <ContainerSortHeader column="memory" label="Memory" sort={sort} onSort={handleSort} />
           </tr></thead>
           {groups.map((group, groupIndex) => {
-            const expanded = group.grouped && !collapsedGroups.has(group.key);
+            const expanded = group.grouped && expandedGroups.has(group.key);
             const childRegionId = containerGroupRegionId(group, groupIndex, 'desktop');
             return (
               <Fragment key={`${group.key}-desktop`}>
@@ -1024,7 +1035,7 @@ export function ContainerList({ containers }: { containers: ContainerStatus[] })
         </button>
       </div>
       <div className="container-cards">{groups.map((group, groupIndex) => {
-        const expanded = group.grouped && !collapsedGroups.has(group.key);
+        const expanded = group.grouped && expandedGroups.has(group.key);
         const childRegionId = containerGroupRegionId(group, groupIndex, 'mobile');
         if (!group.grouped) {
           const child = group.children[0];
@@ -1237,6 +1248,21 @@ function ContainerSortHeader({
 export function nextContainerSort(current: ContainerSort, key: ContainerSortKey): ContainerSort {
   if (current.key !== key) return { key, direction: 'ascending' };
   return { key, direction: current.direction === 'ascending' ? 'descending' : 'ascending' };
+}
+
+export function toggleContainerGroupExpansion(current: ReadonlySet<string>, key: string): Set<string> {
+  const next = new Set(current);
+  if (next.has(key)) next.delete(key);
+  else next.add(key);
+  return next;
+}
+
+export function nextContainerGroupExpansion(
+  current: ReadonlySet<string>,
+  groupKeys: string[],
+): Set<string> {
+  const allExpanded = groupKeys.length > 0 && groupKeys.every((key) => current.has(key));
+  return allExpanded ? new Set() : new Set(groupKeys);
 }
 
 export function groupContainers(
