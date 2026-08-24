@@ -288,6 +288,7 @@ td strong { color: #cdd8d5; font-family: "SFMono-Regular", Consolas, "Liberation
 .health-detail { color: var(--faint); font-size: 9px; }
 .memory-cell { display: flex; flex-direction: column; gap: 3px; }
 .memory-cell span { color: var(--faint); font-family: "SFMono-Regular", Consolas, "Liberation Mono", ui-monospace, monospace; font-size: 9px; }
+.combined-usage-mark { color: inherit; text-decoration: none; cursor: help; }
 .container-mobile-sort { display: none; }
 .container-cards { display: none; }
 

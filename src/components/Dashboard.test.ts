@@ -127,7 +127,7 @@ describe('container presentation', () => {
     expect(sso?.children.map((child) => child.component)).toEqual(['main', 'redis']);
     expect(sso?.aggregate).toMatchObject({
       name: 'sso', state: '2/2 running', health: 'healthy', cpuPercent: 3.5,
-      memoryBytes: 30_000, memoryPercent: null,
+      memoryBytes: 30_000, memoryPercent: 3,
     });
     expect(sso?.key).not.toBe(sso?.children[0].key);
 
@@ -136,14 +136,14 @@ describe('container presentation', () => {
     expect(feelmyrythm).toMatchObject({ grouped: true, runningCount: 3, tone: 'critical' });
     expect(feelmyrythm?.aggregate).toMatchObject({
       name: 'feelmyrythm', owner: 'cks', state: '3/3 running', health: '1 unhealthy',
-      cpuPercent: 13.5, memoryBytes: 120_000, memoryPercent: null,
+      cpuPercent: 13.5, memoryBytes: 120_000, memoryPercent: 12,
     });
 
     const pilgrimage = groups.find((group) => group.application === 'pilgrimage');
     expect(pilgrimage).toMatchObject({ grouped: true, runningCount: 2, tone: 'critical' });
     expect(pilgrimage?.aggregate).toMatchObject({
       state: '2/3 running', health: '2 healthy · 1 not checked', cpuPercent: 14.5,
-      memoryBytes: 130_000, memoryPercent: null,
+      memoryBytes: 130_000, memoryPercent: 13,
     });
     expect(groups.find((group) => group.application === 'bonifacio')).toMatchObject({ grouped: false });
     expect(containers).toEqual(original);
@@ -151,19 +151,21 @@ describe('container presentation', () => {
 
   it('does not publish a partial aggregate when a running child metric is unavailable', () => {
     const unavailable = containers.map((container) => container.name === 'feelmyrythm-backend'
-      ? { ...container, cpuPercent: null, memoryBytes: null }
+      ? { ...container, cpuPercent: null, memoryBytes: null, memoryPercent: null }
       : container);
     const feelmyrythm = groupContainers(unavailable).find((group) => group.application === 'feelmyrythm');
 
     expect(feelmyrythm?.aggregate.cpuPercent).toBeNull();
     expect(feelmyrythm?.aggregate.memoryBytes).toBeNull();
+    expect(feelmyrythm?.aggregate.memoryPercent).toBeNull();
 
     const paused = containers.map((container) => container.name === 'sso'
-      ? { ...container, state: 'paused', cpuPercent: null, memoryBytes: null }
+      ? { ...container, state: 'paused', cpuPercent: null, memoryBytes: null, memoryPercent: null }
       : container);
     const sso = groupContainers(paused).find((group) => group.application === 'sso');
     expect(sso?.aggregate.cpuPercent).toBeNull();
     expect(sso?.aggregate.memoryBytes).toBeNull();
+    expect(sso?.aggregate.memoryPercent).toBeNull();
 
     const stopped = containers
       .filter((container) => container.name === 'sso' || container.name === 'sso-redis')
@@ -177,8 +179,17 @@ describe('container presentation', () => {
       }));
     const stoppedSso = groupContainers(stopped)[0];
     expect(stoppedSso.aggregate).toMatchObject({
-      state: '0/2 running', health: 'not checked', cpuPercent: 0, memoryBytes: 0, memoryPercent: null,
+      state: '0/2 running', health: 'not checked', cpuPercent: 0, memoryBytes: 0, memoryPercent: 0,
     });
+  });
+
+  it('sums combined memory percentages without clamping the result', () => {
+    const highUsage: ContainerStatus[] = [
+      { name: 'feelmyrythm-frontend', owner: 'cks', state: 'running', health: 'healthy', cpuPercent: 1, memoryBytes: 100, memoryPercent: 60 },
+      { name: 'feelmyrythm-backend', owner: 'cks', state: 'running', health: 'healthy', cpuPercent: 1, memoryBytes: 100, memoryPercent: 75 },
+    ];
+
+    expect(groupContainers(highUsage)[0].aggregate.memoryPercent).toBe(135);
   });
 
   it('sorts every displayed column in both directions and leaves missing values last', () => {
@@ -254,7 +265,8 @@ describe('container presentation', () => {
     expect(markup).toContain('3/3 running');
     expect(markup).toContain('13.5%');
     expect(markup).toContain('1 unhealthy');
-    expect(markup).toContain('Combined usage');
+    expect(markup.match(/class="combined-usage-mark" title="Combined usage" aria-label="Combined usage">C<\/abbr>/g)).toHaveLength(10);
+    expect(markup.match(/12\.0% <abbr class="combined-usage-mark"/g)).toHaveLength(2);
     expect(markup.match(/class="container-groups-toggle-all"/g)).toHaveLength(1);
     expect(markup).toContain('aria-label="Expand all container groups"');
     expect(markup).toContain('>Expand all</button>');

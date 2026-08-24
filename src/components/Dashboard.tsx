@@ -1156,8 +1156,17 @@ function ContainerMemoryReading({ container, combined = false }: { container: Co
   return (
     <div className="memory-cell">
       <strong>{formatBytes(container.memoryBytes)}</strong>
-      <span>{combined ? 'Combined usage' : formatPercent(container.memoryPercent, 1)}</span>
+      <span><ContainerMemoryPercent container={container} combined={combined} /></span>
     </div>
+  );
+}
+
+function ContainerMemoryPercent({ container, combined = false }: { container: ContainerStatus; combined?: boolean }) {
+  return (
+    <>
+      {formatPercent(container.memoryPercent, 1)}
+      {combined && <> <abbr className="combined-usage-mark" title="Combined usage" aria-label="Combined usage">C</abbr></>}
+    </>
   );
 }
 
@@ -1187,7 +1196,7 @@ function ContainerCard({
       <dl>
         <div><dt>State</dt><dd>{safeText(container.state)}</dd></div>
         <div><dt>CPU</dt><dd>{formatPercent(container.cpuPercent, 1)}</dd></div>
-        <div><dt>Memory</dt><dd>{formatBytes(container.memoryBytes)}{combined ? ' · combined' : ` · ${formatPercent(container.memoryPercent, 1)}`}</dd></div>
+        <div><dt>Memory</dt><dd>{formatBytes(container.memoryBytes)} · <ContainerMemoryPercent container={container} combined={combined} /></dd></div>
       </dl>
     </article>
   );
@@ -1385,9 +1394,7 @@ function aggregateContainerGroup(application: string, containers: ContainerStatu
     health: aggregateContainerHealth(containers),
     cpuPercent: aggregateContainerMetric(containers, (container) => container.cpuPercent),
     memoryBytes: aggregateContainerMetric(containers, (container) => container.memoryBytes),
-    // Each percentage can have a different Docker memory limit. Without those
-    // denominators, adding the percentages would present a false total.
-    memoryPercent: null,
+    memoryPercent: aggregateContainerMetric(containers, (container) => container.memoryPercent),
   };
 }
 
