@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import { getSession, logout } from './api';
+import { BonifacioReturnLink } from './components/BonifacioReturnLink';
 import { Dashboard } from './components/Dashboard';
 import { Icon } from './components/Icon';
 import { LoginScreen } from './components/LoginScreen';
@@ -90,6 +91,7 @@ export default function App() {
   if (session === 'checking') {
     return (
       <main className="boot-screen" aria-live="polite">
+        <BonifacioReturnLink />
         <div className="brand-mark brand-mark-large"><Icon name="activity" size={26} /></div>
         <div className="boot-pulse" aria-hidden="true" />
         <p>Securing dashboard…</p>

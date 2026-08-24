@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { login } from '../api';
+import { BonifacioReturnLink } from './BonifacioReturnLink';
 import { Icon } from './Icon';
 
 interface LoginScreenProps {
@@ -33,6 +34,7 @@ export function LoginScreen({ onAuthenticated, sessionMessage }: LoginScreenProp
 
   return (
     <main className="login-shell">
+      <BonifacioReturnLink />
       <div className="login-ambient login-ambient-one" />
       <div className="login-ambient login-ambient-two" />
       <section className="login-card" aria-labelledby="login-title">

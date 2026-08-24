@@ -24,6 +24,7 @@ import type {
   TelemetrySample,
   TimeRange,
 } from '../types';
+import { BonifacioReturnLink } from './BonifacioReturnLink';
 import {
   clampPercent,
   formatBytes,
@@ -166,12 +167,15 @@ export function Dashboard({ page, navigationVersion, onNavigate, onLogout, onPas
   return (
     <div className="app-shell">
       <header className="topbar" inert={passwordDialogOpen || undefined}>
-        <div className="brand">
-          <div className="brand-mark"><Icon name="activity" size={20} /></div>
-          <div>
-            <span className="brand-name">Monitor</span>
-            <span className="brand-subtitle">Private host telemetry</span>
+        <div className="topbar-identity">
+          <div className="brand">
+            <div className="brand-mark"><Icon name="activity" size={20} /></div>
+            <div>
+              <span className="brand-name">Monitor</span>
+              <span className="brand-subtitle">Private host telemetry</span>
+            </div>
           </div>
+          <BonifacioReturnLink />
         </div>
         <div className="header-actions">
           <nav className="page-nav" aria-label="Monitor pages">
