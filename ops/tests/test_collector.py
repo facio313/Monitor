@@ -957,6 +957,8 @@ class IncidentTests(unittest.TestCase):
             ])
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o640)
             self.assertFalse(list(path.parent.glob(f".{path.name}.*")))
+            fresh_time = (start + dt.timedelta(minutes=5)).timestamp()
+            os.utime(path, (fresh_time, fresh_time))
             with mock.patch.object(collector, "rewrite_incident_lines") as rewrite:
                 collector.persist_incidents(config, start + dt.timedelta(minutes=6), None)
                 rewrite.assert_not_called()
