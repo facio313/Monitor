@@ -10,6 +10,7 @@ import {
   decodeThrottledFlags,
   eventStatusTone,
   formatFlags,
+  groupContainers,
   IncidentTimeline,
   nextContainerSort,
   sortContainers,
@@ -100,6 +101,84 @@ describe('container presentation', () => {
     expect(containerNameParts('redis-backup')).toEqual({ application: 'redis-backup', component: null });
   });
 
+  it('builds aggregate service parents while keeping components ordered and input immutable', () => {
+    const original = structuredClone(containers);
+    const groups = groupContainers(containers);
+
+    expect(groups.map((group) => group.application)).toEqual([
+      'bonifacio',
+      'sso',
+      'cks-database',
+      'monitor',
+      'blog',
+      'ddit-finalproject',
+      'dukkeobi',
+      'feelmyrythm',
+      'multtara',
+      'pilgrimage',
+      'react',
+      'vue',
+    ]);
+
+    const sso = groups.find((group) => group.application === 'sso');
+    expect(sso).toMatchObject({ grouped: true, runningCount: 2, tone: 'good' });
+    expect(sso?.children.map((child) => child.component)).toEqual(['main', 'redis']);
+    expect(sso?.aggregate).toMatchObject({
+      name: 'sso', state: '2/2 running', health: 'healthy', cpuPercent: 3.5,
+      memoryBytes: 30_000, memoryPercent: null,
+    });
+    expect(sso?.key).not.toBe(sso?.children[0].key);
+
+    const feelmyrythm = groups.find((group) => group.application === 'feelmyrythm');
+    expect(feelmyrythm?.children.map((child) => child.component)).toEqual(['frontend', 'backend', 'redis']);
+    expect(feelmyrythm).toMatchObject({ grouped: true, runningCount: 3, tone: 'critical' });
+    expect(feelmyrythm?.aggregate).toMatchObject({
+      name: 'feelmyrythm', owner: 'cks', state: '3/3 running', health: '1 unhealthy',
+      cpuPercent: 13.5, memoryBytes: 120_000, memoryPercent: null,
+    });
+
+    const pilgrimage = groups.find((group) => group.application === 'pilgrimage');
+    expect(pilgrimage).toMatchObject({ grouped: true, runningCount: 2, tone: 'critical' });
+    expect(pilgrimage?.aggregate).toMatchObject({
+      state: '2/3 running', health: '2 healthy · 1 not checked', cpuPercent: 14.5,
+      memoryBytes: 130_000, memoryPercent: null,
+    });
+    expect(groups.find((group) => group.application === 'bonifacio')).toMatchObject({ grouped: false });
+    expect(containers).toEqual(original);
+  });
+
+  it('does not publish a partial aggregate when a running child metric is unavailable', () => {
+    const unavailable = containers.map((container) => container.name === 'feelmyrythm-backend'
+      ? { ...container, cpuPercent: null, memoryBytes: null }
+      : container);
+    const feelmyrythm = groupContainers(unavailable).find((group) => group.application === 'feelmyrythm');
+
+    expect(feelmyrythm?.aggregate.cpuPercent).toBeNull();
+    expect(feelmyrythm?.aggregate.memoryBytes).toBeNull();
+
+    const paused = containers.map((container) => container.name === 'sso'
+      ? { ...container, state: 'paused', cpuPercent: null, memoryBytes: null }
+      : container);
+    const sso = groupContainers(paused).find((group) => group.application === 'sso');
+    expect(sso?.aggregate.cpuPercent).toBeNull();
+    expect(sso?.aggregate.memoryBytes).toBeNull();
+
+    const stopped = containers
+      .filter((container) => container.name === 'sso' || container.name === 'sso-redis')
+      .map((container) => ({
+        ...container,
+        state: 'exited',
+        health: 'none',
+        cpuPercent: null,
+        memoryBytes: null,
+        memoryPercent: null,
+      }));
+    const stoppedSso = groupContainers(stopped)[0];
+    expect(stoppedSso.aggregate).toMatchObject({
+      state: '0/2 running', health: 'not checked', cpuPercent: 0, memoryBytes: 0, memoryPercent: null,
+    });
+  });
+
   it('sorts every displayed column in both directions and leaves missing values last', () => {
     const sortable: ContainerStatus[] = [
       { name: 'app-10', owner: null, state: null, health: null, cpuPercent: null, memoryBytes: null, memoryPercent: null },
@@ -119,42 +198,62 @@ describe('container presentation', () => {
     expect(sortContainers(sortable, { key: 'memory', direction: 'descending' }).map(({ name }) => name)).toEqual(['app-1', 'app-2', 'app-10']);
   });
 
+  it('sorts aggregate parents without splitting children and keeps missing statuses last', () => {
+    const byCpu = groupContainers(containers, { key: 'cpu', direction: 'descending' });
+    expect(byCpu[0].application).toBe('multtara');
+    expect(byCpu[0].children.map((child) => child.component)).toEqual(['frontend', 'backend', 'database', 'collector']);
+    expect(byCpu.at(-1)?.application).toBe('bonifacio');
+
+    const statusRows: ContainerStatus[] = [
+      { name: 'missing', owner: 'cks', state: null, health: null, cpuPercent: 1, memoryBytes: 1, memoryPercent: 1 },
+      { name: 'healthy', owner: 'cks', state: 'running', health: 'healthy', cpuPercent: 1, memoryBytes: 1, memoryPercent: 1 },
+    ];
+    expect(groupContainers(statusRows, { key: 'status', direction: 'ascending' }).map((group) => group.application)).toEqual(['healthy', 'missing']);
+    expect(groupContainers(statusRows, { key: 'status', direction: 'descending' }).map((group) => group.application)).toEqual(['healthy', 'missing']);
+  });
+
   it('toggles the selected column and starts a new column ascending', () => {
     expect(nextContainerSort({ key: null, direction: 'ascending' }, 'cpu')).toEqual({ key: 'cpu', direction: 'ascending' });
     expect(nextContainerSort({ key: 'cpu', direction: 'ascending' }, 'cpu')).toEqual({ key: 'cpu', direction: 'descending' });
     expect(nextContainerSort({ key: 'cpu', direction: 'descending' }, 'memory')).toEqual({ key: 'memory', direction: 'ascending' });
   });
 
-  it('renders current and retained fixed service labels without arbitrary aliases', () => {
+  it('renders aggregate parents and accessible disclosure controls on desktop and mobile', () => {
     const markup = renderToStaticMarkup(createElement(ContainerList, { containers }));
 
     expect(markup).toContain('>bonifacio</strong>');
-    expect(markup).toContain('>sso</strong>');
-    expect(markup).toContain('>sso-redis</strong>');
-    expect(markup).toContain('blog-frontend');
-    expect(markup).toContain('blog-backend');
-    expect(markup).toContain('feelmyrythm-frontend');
-    expect(markup).toContain('feelmyrythm-backend');
-    expect(markup).toContain('feelmyrythm-redis');
-    expect(markup).toContain('multtara-backend');
-    expect(markup).toContain('multtara-collector');
-    expect(markup).toContain('multtara-database');
-    expect(markup).toContain('multtara-frontend');
-    expect(markup).toContain('pilgrimage-frontend');
-    expect(markup).toContain('pilgrimage-backend');
-    expect(markup).toContain('pilgrimage-redis');
     expect(markup).toContain('>cks-database</strong>');
-    expect(markup).toContain('class="container-name-hierarchy"');
-    expect(markup).toContain('class="container-name-component"');
-    expect(markup).toContain('<strong>multtara</strong><span class="container-name-component">frontend</span>');
-    expect(markup).toContain('<strong>blog</strong><span class="container-name-component">frontend</span>');
-    expect(markup).toContain('<span class="sr-only">multtara-frontend</span>');
+    expect(markup).toMatch(/<strong>feelmyrythm<\/strong><button class="container-group-toggle"/);
+    expect(markup).toMatch(/<strong>sso<\/strong><button class="container-group-toggle"/);
+    expect(markup).toContain('title="3 containers"');
+    expect(markup).not.toContain('class="container-group-row"');
+    expect(markup).not.toContain('container-group-card');
+    expect(markup).toContain('class="container-child-row"');
+    expect(markup.match(/class="container-child-row"/g)).toHaveLength(14);
+    expect(markup.match(/class="container-card container-child-card"/g)).toHaveLength(14);
+    expect(markup.match(/class="container-child-name"/g)).toHaveLength(28);
+    expect(markup).toContain('<strong aria-hidden="true">frontend</strong><span class="sr-only">feelmyrythm frontend container (feelmyrythm-frontend)</span>');
+    expect(markup).toContain('<strong aria-hidden="true">main</strong><span class="sr-only">sso main container (sso)</span>');
+    expect(markup).toContain('<strong aria-hidden="true">redis</strong><span class="sr-only">sso redis container (sso-redis)</span>');
+    expect(markup).toContain('<span class="sr-only">multtara frontend container (multtara-frontend)</span>');
+    expect(markup).toContain('3/3 running');
+    expect(markup).toContain('13.5%');
+    expect(markup).toContain('1 unhealthy');
+    expect(markup).toContain('Combined usage');
+    expect(markup.match(/aria-label="Collapse feelmyrythm containers"/g)).toHaveLength(2);
+    expect(markup.match(/class="container-group-toggle"/g)).toHaveLength(10);
+    expect(markup.match(/aria-expanded="true"/g)).toHaveLength(10);
+    expect(markup).toContain('<span aria-hidden="true">−</span>');
+    const controlledIds = Array.from(markup.matchAll(/aria-controls="([^"]+)"/g), (match) => match[1]);
+    expect(new Set(controlledIds).size).toBe(controlledIds.length);
+    controlledIds.forEach((id) => expect(markup).toContain(`id="${id}"`));
     expect(markup).toContain('aria-label="Container sorting controls"');
-    expect(markup).toContain('aria-label="Sort containers by"');
+    expect(markup).toContain('aria-label="Sort services and containers by"');
     expect(markup).toContain('<option value="default" selected="">App groups</option>');
     expect(markup.match(/class="container-sort-button"/g)).toHaveLength(5);
     expect(markup).toContain('aria-sort="other"');
-    expect(markup).toContain('aria-label="Sort by Container ascending"');
+    expect(markup).toContain('aria-label="Sort by Service / container ascending"');
+    expect(markup).not.toContain('class="container-name-hierarchy"');
     expect(markup).not.toContain('sso-admin');
     expect(markup).not.toContain('bonifacio-web');
   });

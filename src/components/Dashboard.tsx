@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type ChangeEvent, type MouseEvent, type ReactNode } from 'react';
+import { Fragment, useEffect, useMemo, useRef, useState, type ChangeEvent, type MouseEvent, type ReactNode } from 'react';
 import {
   Area,
   AreaChart,
@@ -68,6 +68,7 @@ const CONTAINER_SORT_OPTIONS: Array<{ key: ContainerSortKey; label: string }> = 
 ];
 const FIXED_CONTAINER_NAMES = new Set(['bonifacio', 'sso', 'sso-redis', 'cks-database', 'monitor']);
 const CONTAINER_COMPONENT_ORDER: Readonly<Record<string, number>> = {
+  main: -1,
   frontend: 0,
   backend: 1,
   db: 2,
@@ -75,10 +76,46 @@ const CONTAINER_COMPONENT_ORDER: Readonly<Record<string, number>> = {
   redis: 3,
   collector: 4,
 };
+// The API intentionally exposes fixed public names without Compose metadata.
+// Keep grouping exact so retained legacy labels and unrelated hyphenated names
+// remain visible as independent containers.
+const CONTAINER_GROUP_MEMBERS: Readonly<Record<string, ContainerNameParts>> = {
+  sso: { application: 'sso', component: 'main' },
+  'sso-redis': { application: 'sso', component: 'redis' },
+  'blog-frontend': { application: 'blog', component: 'frontend' },
+  'blog-backend': { application: 'blog', component: 'backend' },
+  'feelmyrythm-frontend': { application: 'feelmyrythm', component: 'frontend' },
+  'feelmyrythm-backend': { application: 'feelmyrythm', component: 'backend' },
+  'feelmyrythm-redis': { application: 'feelmyrythm', component: 'redis' },
+  'multtara-frontend': { application: 'multtara', component: 'frontend' },
+  'multtara-backend': { application: 'multtara', component: 'backend' },
+  'multtara-database': { application: 'multtara', component: 'database' },
+  'multtara-collector': { application: 'multtara', component: 'collector' },
+  'pilgrimage-frontend': { application: 'pilgrimage', component: 'frontend' },
+  'pilgrimage-backend': { application: 'pilgrimage', component: 'backend' },
+  'pilgrimage-redis': { application: 'pilgrimage', component: 'redis' },
+};
 
 export interface ContainerNameParts {
   application: string;
   component: string | null;
+}
+
+export interface ContainerGroupChild {
+  key: string;
+  application: string;
+  component: string;
+  container: ContainerStatus;
+}
+
+export interface ContainerGroup {
+  key: string;
+  application: string;
+  aggregate: ContainerStatus;
+  children: ContainerGroupChild[];
+  grouped: boolean;
+  runningCount: number;
+  tone: StatusTone;
 }
 
 interface DashboardProps {
@@ -899,10 +936,20 @@ function StatusBadge({ value, tone }: { value: unknown; tone?: StatusTone }) {
 
 export function ContainerList({ containers }: { containers: ContainerStatus[] }) {
   const [sort, setSort] = useState<ContainerSort>(DEFAULT_CONTAINER_SORT);
-  const sortedContainers = useMemo(() => sortContainers(containers, sort), [containers, sort]);
+  const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(() => new Set());
+  const groups = useMemo(() => groupContainers(containers, sort), [containers, sort]);
 
   function handleSort(key: ContainerSortKey) {
     setSort((current) => nextContainerSort(current, key));
+  }
+
+  function toggleGroup(key: string) {
+    setCollapsedGroups((current) => {
+      const next = new Set(current);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
   }
 
   function handleMobileSortChange(event: ChangeEvent<HTMLSelectElement>) {
@@ -917,34 +964,52 @@ export function ContainerList({ containers }: { containers: ContainerStatus[] })
       <div className="table-wrap">
         <table>
           <thead><tr>
-            <ContainerSortHeader column="name" label="Container" sort={sort} onSort={handleSort} defaultGrouped />
+            <ContainerSortHeader column="name" label="Service / container" sort={sort} onSort={handleSort} defaultGrouped />
             <ContainerSortHeader column="owner" label="Owner" sort={sort} onSort={handleSort} />
             <ContainerSortHeader column="status" label="Status" sort={sort} onSort={handleSort} />
             <ContainerSortHeader column="cpu" label="CPU" sort={sort} onSort={handleSort} />
             <ContainerSortHeader column="memory" label="Memory" sort={sort} onSort={handleSort} />
           </tr></thead>
-          <tbody>{sortedContainers.map((container) => (
-            <tr key={container.name}>
-              <td><ContainerName name={container.name} /></td>
-              <td>{safeText(container.owner, '—', 50)}</td>
-              <td>
-                <div className="status-stack">
-                  <StatusBadge value={container.state} />
-                  {container.health
-                    && (!container.state || container.health.toLowerCase() !== container.state.toLowerCase())
-                    && <span className="health-detail">{safeText(container.health, 'Unknown', 32)}</span>}
-                </div>
-              </td>
-              <td><strong>{formatPercent(container.cpuPercent, 1)}</strong></td>
-              <td><div className="memory-cell"><strong>{formatBytes(container.memoryBytes)}</strong><span>{formatPercent(container.memoryPercent, 1)}</span></div></td>
-            </tr>
-          ))}</tbody>
+          {groups.map((group, groupIndex) => {
+            const expanded = group.grouped && !collapsedGroups.has(group.key);
+            const childRegionId = containerGroupRegionId(group, groupIndex, 'desktop');
+            return (
+              <Fragment key={`${group.key}-desktop`}>
+                <tbody>
+                  <tr>
+                    <td>
+                      {group.grouped ? (
+                        <ContainerGroupName
+                          application={group.application}
+                          count={group.children.length}
+                          expanded={expanded}
+                          controls={childRegionId}
+                          onToggle={() => toggleGroup(group.key)}
+                        />
+                      ) : <ContainerName name={group.children[0].container.name} />}
+                    </td>
+                    <ContainerDataCells container={group.aggregate} tone={group.tone} combined={group.grouped} />
+                  </tr>
+                </tbody>
+                {group.grouped && (
+                  <tbody id={childRegionId} className="container-child-rows" hidden={!expanded}>
+                    {group.children.map((child) => (
+                      <tr className="container-child-row" key={`${child.key}-desktop`}>
+                        <td><ContainerChildName child={child} /></td>
+                        <ContainerDataCells container={child.container} />
+                      </tr>
+                    ))}
+                  </tbody>
+                )}
+              </Fragment>
+            );
+          })}
         </table>
       </div>
       <div className="container-mobile-sort" role="group" aria-label="Container sorting controls">
         <label>
           <span>Sort by</span>
-          <select value={sort.key ?? 'default'} onChange={handleMobileSortChange} aria-label="Sort containers by">
+          <select value={sort.key ?? 'default'} onChange={handleMobileSortChange} aria-label="Sort services and containers by">
             <option value="default">App groups</option>
             {CONTAINER_SORT_OPTIONS.map((option) => <option value={option.key} key={option.key}>{option.label}</option>)}
           </select>
@@ -958,19 +1023,42 @@ export function ContainerList({ containers }: { containers: ContainerStatus[] })
           {sort.key === null ? 'Grouped' : sort.direction === 'ascending' ? 'Ascending ↑' : 'Descending ↓'}
         </button>
       </div>
-      <div className="container-cards">{sortedContainers.map((container) => (
-        <article className="container-card" key={`${container.name}-mobile`}>
-          <div className="container-card-head">
-            <div><ContainerName name={container.name} /><span>{safeText(container.owner, 'No owner', 50)}</span></div>
-            <StatusBadge value={container.health || container.state} />
-          </div>
-          <dl>
-            <div><dt>State</dt><dd>{safeText(container.state)}</dd></div>
-            <div><dt>CPU</dt><dd>{formatPercent(container.cpuPercent, 1)}</dd></div>
-            <div><dt>Memory</dt><dd>{formatBytes(container.memoryBytes)} · {formatPercent(container.memoryPercent, 1)}</dd></div>
-          </dl>
-        </article>
-      ))}</div>
+      <div className="container-cards">{groups.map((group, groupIndex) => {
+        const expanded = group.grouped && !collapsedGroups.has(group.key);
+        const childRegionId = containerGroupRegionId(group, groupIndex, 'mobile');
+        if (!group.grouped) {
+          const child = group.children[0];
+          return <ContainerCard container={child.container} key={`${child.key}-mobile`} />;
+        }
+
+        return (
+          <section className="container-mobile-group" key={`${group.key}-mobile`}>
+            <ContainerCard
+              container={group.aggregate}
+              combined
+              tone={group.tone}
+              heading={(
+                <ContainerGroupName
+                  application={group.application}
+                  count={group.children.length}
+                  expanded={expanded}
+                  controls={childRegionId}
+                  onToggle={() => toggleGroup(group.key)}
+                />
+              )}
+            />
+            <div id={childRegionId} className="container-mobile-children" hidden={!expanded}>
+              {group.children.map((child) => (
+                <ContainerCard
+                  child={child}
+                  container={child.container}
+                  key={`${child.key}-mobile`}
+                />
+              ))}
+            </div>
+          </section>
+        );
+      })}</div>
     </>
   );
 }
@@ -978,18 +1066,138 @@ export function ContainerList({ containers }: { containers: ContainerStatus[] })
 function ContainerName({ name }: { name: string }) {
   const displayName = safeText(name, 'Unnamed', 70);
   const accessibleName = safeText(name, 'Unnamed', 140);
-  const parts = containerNameParts(name);
-  if (parts.component === null) return <strong title={accessibleName === displayName ? undefined : accessibleName}>{displayName}</strong>;
+  return <strong title={accessibleName === displayName ? undefined : accessibleName}>{displayName}</strong>;
+}
 
+function ContainerGroupName({
+  application,
+  count,
+  expanded,
+  controls,
+  onToggle,
+}: {
+  application: string;
+  count: number;
+  expanded: boolean;
+  controls: string;
+  onToggle: () => void;
+}) {
+  const displayName = safeText(application, 'Unnamed', 70);
+  const accessibleName = safeText(application, 'Unnamed', 140);
+  const action = expanded ? 'Collapse' : 'Expand';
   return (
-    <span className="container-name-hierarchy" title={accessibleName}>
-      <span className="container-name-visual" aria-hidden="true">
-        <strong>{safeText(parts.application, 'Unnamed', 56)}</strong>
-        <span className="container-name-component">{safeText(parts.component, 'component', 24)}</span>
-      </span>
+    <div className="container-group-name">
+      <strong title={accessibleName === displayName ? undefined : accessibleName}>{displayName}</strong>
+      <button
+        className="container-group-toggle"
+        type="button"
+        aria-expanded={expanded}
+        aria-controls={controls}
+        aria-label={`${action} ${accessibleName} containers`}
+        title={`${count} containers`}
+        onClick={onToggle}
+      ><span aria-hidden="true">{expanded ? '−' : '+'}</span></button>
+    </div>
+  );
+}
+
+function ContainerChildName({ child }: { child: ContainerGroupChild }) {
+  const fullName = safeText(child.container.name, 'Unnamed', 140);
+  const accessibleName = `${safeText(child.application, 'Unnamed', 70)} ${safeText(child.component, 'component', 28)} container (${fullName})`;
+  return (
+    <span className="container-child-name" title={fullName}>
+      <strong aria-hidden="true">{safeText(child.component, 'component', 28)}</strong>
       <span className="sr-only">{accessibleName}</span>
     </span>
   );
+}
+
+function ContainerDataCells({
+  container,
+  tone,
+  combined = false,
+}: {
+  container: ContainerStatus;
+  tone?: StatusTone;
+  combined?: boolean;
+}) {
+  return (
+    <>
+      <td>{safeText(container.owner, '—', 50)}</td>
+      <td><ContainerStatusReading container={container} tone={tone} /></td>
+      <td><strong>{formatPercent(container.cpuPercent, 1)}</strong></td>
+      <td><ContainerMemoryReading container={container} combined={combined} /></td>
+    </>
+  );
+}
+
+function ContainerStatusReading({ container, tone }: { container: ContainerStatus; tone?: StatusTone }) {
+  const status = containerStatusPresentation(container);
+  return (
+    <div className="status-stack">
+      <StatusBadge value={status.badge} tone={tone ?? containerOperationalTone(container)} />
+      {status.detail && <span className="health-detail">{safeText(status.detail, 'Unknown', 32)}</span>}
+    </div>
+  );
+}
+
+function ContainerMemoryReading({ container, combined = false }: { container: ContainerStatus; combined?: boolean }) {
+  return (
+    <div className="memory-cell">
+      <strong>{formatBytes(container.memoryBytes)}</strong>
+      <span>{combined ? 'Combined usage' : formatPercent(container.memoryPercent, 1)}</span>
+    </div>
+  );
+}
+
+function ContainerCard({
+  container,
+  child,
+  heading,
+  combined = false,
+  tone,
+}: {
+  container: ContainerStatus;
+  child?: ContainerGroupChild;
+  heading?: ReactNode;
+  combined?: boolean;
+  tone?: StatusTone;
+}) {
+  const status = containerStatusPresentation(container);
+  return (
+    <article className={`container-card${child ? ' container-child-card' : ''}`}>
+      <div className="container-card-head">
+        <div>
+          {heading ?? (child ? <ContainerChildName child={child} /> : <ContainerName name={container.name} />)}
+          <span className="container-card-owner">{safeText(container.owner, 'No owner', 50)}</span>
+        </div>
+        <StatusBadge value={status.badge} tone={tone ?? containerOperationalTone(container)} />
+      </div>
+      <dl>
+        <div><dt>State</dt><dd>{safeText(container.state)}</dd></div>
+        <div><dt>CPU</dt><dd>{formatPercent(container.cpuPercent, 1)}</dd></div>
+        <div><dt>Memory</dt><dd>{formatBytes(container.memoryBytes)}{combined ? ' · combined' : ` · ${formatPercent(container.memoryPercent, 1)}`}</dd></div>
+      </dl>
+    </article>
+  );
+}
+
+function containerStatusPresentation(container: ContainerStatus): { badge: string | null; detail: string | null } {
+  const state = sortableText(container.state);
+  const health = sortableText(container.health);
+  if (health && /(unhealthy|starting|unknown)/i.test(health)) {
+    return { badge: health, detail: state && state.toLowerCase() !== health.toLowerCase() ? state : null };
+  }
+  if (!state && health) return { badge: health, detail: null };
+  return {
+    badge: state,
+    detail: health && (!state || health.toLowerCase() !== state.toLowerCase()) ? health : null,
+  };
+}
+
+function containerGroupRegionId(group: ContainerGroup, index: number, surface: 'desktop' | 'mobile'): string {
+  const safeKey = group.key.replace(/[^a-zA-Z0-9_-]+/g, '-');
+  return `container-${surface}-${index}-${safeKey}`;
 }
 
 function ContainerSortHeader({
@@ -1029,6 +1237,201 @@ function ContainerSortHeader({
 export function nextContainerSort(current: ContainerSort, key: ContainerSortKey): ContainerSort {
   if (current.key !== key) return { key, direction: 'ascending' };
   return { key, direction: current.direction === 'ascending' ? 'descending' : 'ascending' };
+}
+
+export function groupContainers(
+  containers: ContainerStatus[],
+  sort: ContainerSort = DEFAULT_CONTAINER_SORT,
+): ContainerGroup[] {
+  const candidates = new Map<string, Array<{ container: ContainerStatus; component: string; index: number }>>();
+
+  containers.forEach((container, index) => {
+    const parts = containerGroupParts(container.name);
+    if (parts.component === null) return;
+    const key = parts.application.toLowerCase();
+    const members = candidates.get(key) ?? [];
+    members.push({ container, component: parts.component, index });
+    candidates.set(key, members);
+  });
+
+  const groupedApplications = new Set(
+    Array.from(candidates.entries())
+      .filter(([, members]) => members.length > 1)
+      .map(([application]) => application),
+  );
+  const emittedApplications = new Set<string>();
+  const groups: Array<ContainerGroup & { index: number }> = [];
+
+  containers.forEach((container, index) => {
+    const parts = containerGroupParts(container.name);
+    const applicationKey = parts.application.toLowerCase();
+    if (parts.component !== null && groupedApplications.has(applicationKey)) {
+      if (emittedApplications.has(applicationKey)) return;
+      emittedApplications.add(applicationKey);
+      const members = candidates.get(applicationKey) ?? [];
+      const children = members
+        .slice()
+        .sort((left, right) => {
+          const byComponent = containerComponentRank(left.component) - containerComponentRank(right.component);
+          return byComponent || compareText(left.container.name, right.container.name, 'ascending') || left.index - right.index;
+        })
+        .map((member) => ({
+          key: `container:${member.index}:${member.container.name}`,
+          application: parts.application,
+          component: member.component,
+          container: member.container,
+        }));
+      const aggregate = aggregateContainerGroup(parts.application, children.map((child) => child.container));
+      groups.push({
+        key: `group:${applicationKey}`,
+        application: parts.application,
+        aggregate,
+        children,
+        grouped: true,
+        runningCount: runningContainerCount(children.map((child) => child.container)),
+        tone: worstContainerTone(children.map((child) => child.container)),
+        index: members[0]?.index ?? index,
+      });
+      return;
+    }
+
+    groups.push({
+      key: `container:${index}:${container.name}`,
+      application: container.name,
+      aggregate: container,
+      children: [{
+        key: `container:${index}:${container.name}`,
+        application: container.name,
+        component: container.name,
+        container,
+      }],
+      grouped: false,
+      runningCount: runningContainerCount([container]),
+      tone: containerOperationalTone(container),
+      index,
+    });
+  });
+
+  return groups
+    .sort((left, right) => {
+      let primary: number;
+      if (sort.key === null) {
+        primary = compareDefaultContainerOrder(left.aggregate, right.aggregate);
+      } else if (sort.key === 'status') {
+        const leftMissing = containerStatusMissing(left.aggregate);
+        const rightMissing = containerStatusMissing(right.aggregate);
+        primary = leftMissing !== rightMissing
+          ? (leftMissing ? 1 : -1)
+          : compareNumber(containerToneRank(left.tone), containerToneRank(right.tone), sort.direction)
+            || compareContainerColumn(left.aggregate, right.aggregate, sort.key, sort.direction);
+      } else {
+        primary = compareContainerColumn(left.aggregate, right.aggregate, sort.key, sort.direction);
+      }
+      if (primary !== 0) return primary;
+      const byName = compareText(left.application, right.application, 'ascending');
+      return byName || left.index - right.index;
+    })
+    .map(({ index: _index, ...group }) => group);
+}
+
+function containerGroupParts(name: string): ContainerNameParts {
+  const fullName = name.trim();
+  const mapped = CONTAINER_GROUP_MEMBERS[fullName.toLowerCase()];
+  return mapped ?? { application: fullName, component: null };
+}
+
+function aggregateContainerGroup(application: string, containers: ContainerStatus[]): ContainerStatus {
+  const owners = containers
+    .map((container) => sortableText(container.owner))
+    .filter((owner): owner is string => owner !== null);
+  const uniqueOwners = Array.from(new Set(owners.map((owner) => owner.toLowerCase())));
+  const owner = owners.length === containers.length && uniqueOwners.length === 1
+    ? owners[0]
+    : uniqueOwners.length > 1
+      ? 'Multiple'
+      : null;
+  const running = runningContainerCount(containers);
+
+  return {
+    name: application,
+    owner,
+    state: `${running}/${containers.length} running`,
+    health: aggregateContainerHealth(containers),
+    cpuPercent: aggregateContainerMetric(containers, (container) => container.cpuPercent),
+    memoryBytes: aggregateContainerMetric(containers, (container) => container.memoryBytes),
+    // Each percentage can have a different Docker memory limit. Without those
+    // denominators, adding the percentages would present a false total.
+    memoryPercent: null,
+  };
+}
+
+function aggregateContainerMetric(
+  containers: ContainerStatus[],
+  select: (container: ContainerStatus) => number | null,
+): number | null {
+  let total = 0;
+  let available = 0;
+  for (const container of containers) {
+    const value = select(container);
+    if (typeof value === 'number' && Number.isFinite(value)) {
+      total += value;
+      available += 1;
+      continue;
+    }
+    const state = safeText(container.state, '').toLowerCase();
+    // These inactive states have no live resource usage. Other missing values
+    // (notably paused/restarting containers) make the combined reading unknown.
+    if (!/^(created|exited|dead)$/.test(state)) return null;
+    available += 1;
+  }
+  return available ? total : null;
+}
+
+function aggregateContainerHealth(containers: ContainerStatus[]): string {
+  const health = containers.map((container) => safeText(container.health, '').toLowerCase());
+  const unhealthy = health.filter((value) => value === 'unhealthy').length;
+  if (unhealthy) return `${unhealthy} unhealthy`;
+  const starting = health.filter((value) => value === 'starting').length;
+  if (starting) return `${starting} starting`;
+  const healthy = health.filter((value) => value === 'healthy').length;
+  if (healthy === health.length && health.length) return 'healthy';
+  const unknown = health.filter((value) => !value || value === 'unknown').length;
+  if (unknown) return `${unknown} unknown`;
+  const unchecked = health.filter((value) => value === 'none').length;
+  if (unchecked === health.length && health.length) return 'not checked';
+  if (healthy + unchecked === health.length) return `${healthy} healthy · ${unchecked} not checked`;
+  return 'mixed health';
+}
+
+function runningContainerCount(containers: ContainerStatus[]): number {
+  return containers.filter((container) => safeText(container.state, '').toLowerCase() === 'running').length;
+}
+
+function containerOperationalTone(container: ContainerStatus): StatusTone {
+  const state = safeText(container.state, '').toLowerCase();
+  const health = safeText(container.health, '').toLowerCase();
+  if (health === 'unhealthy' || /^(dead|exited)$/.test(state)) return 'critical';
+  if (/^(created|paused|restarting|removing|unknown)$/.test(state) || /^(starting|unknown)$/.test(health)) return 'warn';
+  if (state === 'running' && (!health || /^(healthy|none)$/.test(health))) return 'good';
+  return normalizeTone(health || state);
+}
+
+function worstContainerTone(containers: ContainerStatus[]): StatusTone {
+  return containers.reduce<StatusTone>((worst, container) => {
+    const tone = containerOperationalTone(container);
+    return containerToneRank(tone) > containerToneRank(worst) ? tone : worst;
+  }, 'neutral');
+}
+
+function containerToneRank(tone: StatusTone): number {
+  if (tone === 'critical') return 3;
+  if (tone === 'warn') return 2;
+  if (tone === 'good') return 1;
+  return 0;
+}
+
+function containerStatusMissing(container: ContainerStatus): boolean {
+  return sortableText(container.state) === null && sortableText(container.health) === null;
 }
 
 export function sortContainers(
