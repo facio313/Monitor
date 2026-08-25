@@ -32,6 +32,7 @@ export interface DashboardPayload {
     architecture: string | null;
     uptimeSeconds: number | null;
   };
+  reliability: ReliabilitySummary;
   latest: TelemetrySample | null;
   series: TelemetrySample[];
   incidents: PeakIncident[];
@@ -40,7 +41,37 @@ export interface DashboardPayload {
   alerts: AlertEvent[];
   privilegeEvents: PrivilegeEvent[];
   powerEvents: PowerEvent[];
+  reliabilityEvents: ReliabilityEvent[];
   powerSummary: PowerSummary;
+}
+
+export interface ReliabilitySummary {
+  bootStartedAt: string | null;
+  collectorGapSeconds: number | null;
+  sshListenersAvailable: boolean | null;
+  networkLinkAvailable: boolean | null;
+  nvmeMitigationActive: boolean | null;
+}
+
+export type ReliabilityEventKind =
+  | 'host-boot'
+  | 'collector-gap'
+  | 'ssh-listener'
+  | 'network-link'
+  | 'nvme-reset'
+  | 'nvme-io'
+  | 'rcu-stall'
+  | 'oom-kill'
+  | 'filesystem-error'
+  | 'nvme-mitigation';
+
+export interface ReliabilityEvent {
+  timestamp: string;
+  severity: 'info' | 'warning' | 'critical';
+  kind: ReliabilityEventKind;
+  status: string;
+  message: string;
+  durationSeconds: number | null;
 }
 
 export type IncidentPhase = 'active' | 'follow-up' | 'recovered';

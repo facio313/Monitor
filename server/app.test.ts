@@ -729,6 +729,14 @@ describe('dashboard ingestion', () => {
     expect(response.body.series).toEqual([]);
     expect(response.body.alerts).toEqual([]);
     expect(response.body.powerEvents).toEqual([]);
+    expect(response.body.reliability).toEqual({
+      bootStartedAt: null,
+      collectorGapSeconds: null,
+      sshListenersAvailable: null,
+      networkLinkAvailable: null,
+      nvmeMitigationActive: null,
+    });
+    expect(response.body.reliabilityEvents).toEqual([]);
     expect(response.body.incidents).toEqual([]);
     expect(response.body.powerSummary).toEqual({
       sampleCount: 0,
@@ -739,6 +747,98 @@ describe('dashboard ingestion', () => {
       underVoltageSampleCount: 0,
       throttledSampleCount: 0,
     });
+  });
+
+  it('strictly validates reliability state and merges dedicated events with legacy NVMe evidence', async () => {
+    const directory = dataDirectory();
+    writeFileSync(join(directory, 'current.json'), JSON.stringify({
+      timestamp: '2026-08-19T11:59:30Z',
+      reliability: {
+        bootStartedAt: '2026-08-19T06:21:35Z',
+        collectorGapSeconds: 125.5,
+        sshListenersAvailable: true,
+        networkLinkAvailable: false,
+        nvmeMitigationActive: true,
+        privateAddress: '192.0.2.10',
+      },
+    }));
+    writeFileSync(join(directory, 'reliability.jsonl'), [
+      {
+        timestamp: '2026-08-19T11:58:00.100Z', severity: 'critical', kind: 'nvme-reset', status: 'active',
+        message: 'Kernel reported an NVMe controller reset.', durationSeconds: null, privateAddress: '192.0.2.10',
+      },
+      {
+        timestamp: '2026-08-19T11:57:00Z', severity: 'critical', kind: 'ssh-listener', status: 'unavailable',
+        message: 'One or more expected SSH listeners are unavailable.', durationSeconds: null,
+      },
+      {
+        timestamp: '2026-08-19T11:56:30Z', severity: 'critical', kind: 'nvme-reset', status: 'active',
+        message: 'NVMe reset at 192.0.2.10 token=abc123', durationSeconds: null,
+      },
+      {
+        timestamp: '2026-08-19T11:56:00Z', severity: 'error', kind: 'filesystem-error', status: 'active',
+        message: 'Invalid severity must be excluded.', durationSeconds: null,
+      },
+      {
+        timestamp: '2026-08-19T11:55:00Z', severity: 'critical', kind: 'arbitrary-log', status: 'active',
+        message: 'Invalid kind must be excluded.', durationSeconds: null,
+      },
+      {
+        timestamp: '2026-08-19T12:02:00Z', severity: 'critical', kind: 'oom-kill', status: 'active',
+        message: 'Future event must be excluded.', durationSeconds: null,
+      },
+    ].map((event) => JSON.stringify(event)).join('\n'));
+    writeFileSync(join(directory, 'power.jsonl'), [
+      {
+        timestamp: '2026-08-19T11:58:00.900Z', severity: 'critical', kind: 'nvme-reset', status: 'active',
+        message: 'Kernel reported an NVMe controller reset.',
+      },
+      {
+        timestamp: '2026-08-19T11:54:00Z', severity: 'critical', kind: 'nvme-io', status: 'active',
+        message: 'Kernel reported an NVMe I/O error.',
+      },
+      {
+        timestamp: '2026-08-19T11:53:00Z', severity: 'warning', kind: 'under-voltage', status: 'active',
+        message: 'Power-only event must not enter reliability.',
+      },
+    ].map((event) => JSON.stringify(event)).join('\n'));
+
+    const app = appFor(directory);
+    const cookie = await loginCookie(app);
+    const response = await request(app)
+      .get('/monitor/api/dashboard?range=1h')
+      .set('Cookie', cookie)
+      .expect(200);
+
+    expect(response.body.reliability).toEqual({
+      bootStartedAt: '2026-08-19T06:21:35.000Z',
+      collectorGapSeconds: 125.5,
+      sshListenersAvailable: true,
+      networkLinkAvailable: false,
+      nvmeMitigationActive: true,
+    });
+    expect(response.body.reliabilityEvents).toEqual([
+      {
+        timestamp: '2026-08-19T11:58:00.100Z', severity: 'critical', kind: 'nvme-reset', status: 'active',
+        message: 'Kernel reported an NVMe controller reset.', durationSeconds: null,
+      },
+      {
+        timestamp: '2026-08-19T11:57:00.000Z', severity: 'critical', kind: 'ssh-listener', status: 'unavailable',
+        message: 'One or more expected SSH listeners are unavailable.', durationSeconds: null,
+      },
+      {
+        timestamp: '2026-08-19T11:54:00.000Z', severity: 'critical', kind: 'nvme-io', status: 'active',
+        message: 'Kernel reported an NVMe I/O error.', durationSeconds: null,
+      },
+    ]);
+    expect(Object.keys(response.body.reliabilityEvents[0])).toEqual([
+      'timestamp', 'severity', 'kind', 'status', 'message', 'durationSeconds',
+    ]);
+    expect(JSON.stringify(response.body)).not.toContain('abc123');
+    expect(JSON.stringify({
+      reliability: response.body.reliability,
+      reliabilityEvents: response.body.reliabilityEvents,
+    })).not.toContain('192.0.2.10');
   });
 
   it('preserves current Blog and retained Multtara component labels at the API boundary', async () => {
@@ -1277,7 +1377,7 @@ describe('dashboard ingestion', () => {
     });
   });
 
-  it('caps alerts, power events, privilege details, and incidents at 500 newest records', async () => {
+  it('caps alerts, power events, reliability events, privilege details, and incidents at 500 newest records', async () => {
     const directory = dataDirectory();
     const timestamps = Array.from({ length: 600 }, (_, index) => new Date(NOW - index * 1_000).toISOString());
     writeFileSync(join(directory, 'alerts.jsonl'), timestamps.map((timestamp, index) => JSON.stringify({
@@ -1293,6 +1393,14 @@ describe('dashboard ingestion', () => {
       kind: 'power',
       status: 'active',
       message: `Power event ${index}`,
+    })).join('\n'));
+    writeFileSync(join(directory, 'reliability.jsonl'), timestamps.map((timestamp, index) => JSON.stringify({
+      timestamp,
+      severity: 'warning',
+      kind: 'collector-gap',
+      status: 'detected',
+      message: 'Collector heartbeat gap exceeded the expected interval.',
+      durationSeconds: index,
     })).join('\n'));
     writeFileSync(join(directory, 'privilege.jsonl'), timestamps.map((timestamp, index) => JSON.stringify({
       timestamp,
@@ -1329,12 +1437,15 @@ describe('dashboard ingestion', () => {
       .expect(200);
     expect(response.body.alerts).toHaveLength(500);
     expect(response.body.powerEvents).toHaveLength(500);
+    expect(response.body.reliabilityEvents).toHaveLength(500);
     expect(response.body.privilegeEvents).toHaveLength(500);
     expect(response.body.incidents).toHaveLength(500);
     expect(response.body.alerts[0].message).toBe('Routine alert 0');
     expect(response.body.alerts.at(-1).message).toBe('Routine alert 499');
     expect(response.body.powerEvents[0].message).toBe('Power event 0');
     expect(response.body.powerEvents.at(-1).message).toBe('Power event 499');
+    expect(response.body.reliabilityEvents[0].durationSeconds).toBe(0);
+    expect(response.body.reliabilityEvents.at(-1).durationSeconds).toBe(499);
     expect(response.body.incidents[0].id).toBe('incident-20260819T120000Z');
     expect(response.body.incidents.at(-1).id).toBe('incident-20260819T115141Z');
   });
@@ -1363,6 +1474,12 @@ describe('dashboard ingestion', () => {
       message: 'token=outside-secret must not leak',
     })}\n`);
     symlinkSync(outsidePower, join(directory, 'power.jsonl'));
+    const outsideReliability = join(outsideDirectory, 'reliability.jsonl');
+    writeFileSync(outsideReliability, `${JSON.stringify({
+      timestamp: '2026-08-19T11:59:00Z', severity: 'critical', kind: 'ssh-listener', status: 'unavailable',
+      message: 'token=outside-reliability-secret must not leak', durationSeconds: null,
+    })}\n`);
+    symlinkSync(outsideReliability, join(directory, 'reliability.jsonl'));
     const outsideIncidents = join(outsideDirectory, 'incidents.jsonl');
     writeFileSync(outsideIncidents, `${JSON.stringify({
       id: 'incident-20260819T115800Z',
@@ -1394,9 +1511,11 @@ describe('dashboard ingestion', () => {
     expect(response.body.host.hostname).toBeNull();
     expect(response.body.latest.cpuPercent).toBeNull();
     expect(response.body.powerEvents).toEqual([]);
+    expect(response.body.reliabilityEvents).toEqual([]);
     expect(response.body.incidents).toEqual([]);
     expect(JSON.stringify(response.body)).not.toContain('outside-secret');
     expect(JSON.stringify(response.body)).not.toContain('outside-incident-secret');
+    expect(JSON.stringify(response.body)).not.toContain('outside-reliability-secret');
   });
 
   it('serves the built SPA with no-store caching while APIs remain JSON 404s', async () => {

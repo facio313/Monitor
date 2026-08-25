@@ -1,7 +1,7 @@
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it } from 'vitest';
-import type { ContainerStatus, PeakIncident } from '../types';
+import type { ContainerStatus, PeakIncident, ReliabilityEvent } from '../types';
 import {
   ContainerList,
   containerNameParts,
@@ -14,6 +14,7 @@ import {
   IncidentTimeline,
   nextContainerGroupExpansion,
   nextContainerSort,
+  ReliabilityEventList,
   sortContainers,
   toggleContainerGroupExpansion,
 } from './Dashboard';
@@ -321,6 +322,32 @@ describe('power presentation helpers', () => {
     expect(currentPowerStatusTone(0, 'thermal-limit')).toBe('warn');
     expect(currentPowerStatusTone(0, 'frequency-capped')).toBe('warn');
     expect(currentPowerStatusTone(0, 'critical')).toBe('critical');
+  });
+});
+
+describe('reliability event presentation', () => {
+  it('renders semantic labels, duration, and fixed status evidence', () => {
+    const events: ReliabilityEvent[] = [{
+      timestamp: '2026-08-26T06:22:21Z',
+      severity: 'critical',
+      kind: 'nvme-reset',
+      status: 'active',
+      message: 'The NVMe controller reset after a link failure.',
+      durationSeconds: 73,
+    }];
+
+    const markup = renderToStaticMarkup(createElement(ReliabilityEventList, { events }));
+    expect(markup).toContain('NVMe controller reset');
+    expect(markup).toContain('The NVMe controller reset after a link failure.');
+    expect(markup).toContain('Duration 1m');
+    expect(markup).toContain('critical');
+    expect(markup).toContain('active');
+  });
+
+  it('renders a positive bounded empty state', () => {
+    const markup = renderToStaticMarkup(createElement(ReliabilityEventList, { events: [] }));
+    expect(markup).toContain('No host reliability events in this snapshot');
+    expect(markup).toContain('inline-empty positive');
   });
 });
 

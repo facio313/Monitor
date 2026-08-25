@@ -32,6 +32,7 @@ const MAX_UINT32 = 0xffff_ffff;
 const MAX_INCIDENT_DURATION_SECONDS = 366 * 24 * 60 * 60;
 const MAX_RESPONSE_TIME_MS = 300_000;
 const MAX_INCIDENT_COUNT = 1_000_000_000;
+const MAX_RELIABILITY_DURATION_SECONDS = 366 * 24 * 60 * 60;
 const MAX_CONTAINER_CPU_PERCENT = 1024;
 const INCIDENT_REASON_ORDER: IncidentReason[] = [
   'cpu',
@@ -98,6 +99,34 @@ const SAFE_CONTAINER_STATES = new Set([
   'created', 'running', 'paused', 'restarting', 'removing', 'exited', 'dead', 'unknown',
 ]);
 const SAFE_CONTAINER_HEALTH = new Set(['healthy', 'unhealthy', 'starting', 'none', 'unknown']);
+const RELIABILITY_KINDS = new Set<DashboardResponse['reliabilityEvents'][number]['kind']>([
+  'host-boot',
+  'collector-gap',
+  'ssh-listener',
+  'network-link',
+  'nvme-reset',
+  'nvme-io',
+  'rcu-stall',
+  'oom-kill',
+  'filesystem-error',
+  'nvme-mitigation',
+]);
+const RELIABILITY_EVENT_CONTRACT = {
+  'host-boot:observed': { severity: 'info', message: 'Host boot was observed by the collector.' },
+  'host-boot:restarted': { severity: 'warning', message: 'Host boot followed a previous collector session.' },
+  'collector-gap:detected': { severity: 'warning', message: 'Collector heartbeat gap exceeded the expected interval.' },
+  'ssh-listener:unavailable': { severity: 'critical', message: 'One or more expected SSH listeners are unavailable.' },
+  'ssh-listener:recovered': { severity: 'info', message: 'All expected SSH listeners recovered.' },
+  'network-link:unavailable': { severity: 'critical', message: 'Primary network link became unavailable.' },
+  'network-link:recovered': { severity: 'info', message: 'Primary network link recovered.' },
+  'nvme-reset:active': { severity: 'critical', message: 'Kernel reported an NVMe controller reset.' },
+  'nvme-io:active': { severity: 'critical', message: 'Kernel reported an NVMe I/O error.' },
+  'rcu-stall:active': { severity: 'critical', message: 'Kernel reported an RCU stall.' },
+  'oom-kill:active': { severity: 'critical', message: 'Kernel reported an out-of-memory kill.' },
+  'filesystem-error:active': { severity: 'critical', message: 'Kernel reported a filesystem or block I/O error.' },
+  'nvme-mitigation:active': { severity: 'info', message: 'Runtime NVMe power-management mitigation is active.' },
+  'nvme-mitigation:incomplete': { severity: 'warning', message: 'Runtime NVMe power-management mitigation is not fully active.' },
+} as const;
 
 type JsonRecord = Record<string, unknown>;
 
@@ -504,6 +533,25 @@ function normalizeHost(current: JsonRecord | null): DashboardResponse['host'] {
   };
 }
 
+function optionalBoolean(value: unknown): boolean | null {
+  return typeof value === 'boolean' ? value : null;
+}
+
+function normalizeReliability(current: JsonRecord | null): DashboardResponse['reliability'] {
+  const reliability = recordAt(current ?? undefined, 'reliability');
+  return {
+    bootStartedAt: isoTimestamp(own(reliability, 'bootStartedAt')),
+    collectorGapSeconds: finite(
+      own(reliability, 'collectorGapSeconds'),
+      0,
+      MAX_RELIABILITY_DURATION_SECONDS,
+    ),
+    sshListenersAvailable: optionalBoolean(own(reliability, 'sshListenersAvailable')),
+    networkLinkAvailable: optionalBoolean(own(reliability, 'networkLinkAvailable')),
+    nvmeMitigationActive: optionalBoolean(own(reliability, 'nvmeMitigationActive')),
+  };
+}
+
 function normalizeDisks(current: JsonRecord | null): DashboardResponse['disks'] {
   const input = current ? first(current, ['disks', 'filesystems']) : undefined;
   if (!Array.isArray(input)) return [];
@@ -669,6 +717,95 @@ function normalizePowerEvents(
   return [...dedicatedCandidates, ...alertCandidates]
     .filter((event) => {
       const key = powerEventDedupeKey(event);
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .sort((left, right) => right.timestamp.localeCompare(left.timestamp))
+    .slice(0, MAX_EVENTS);
+}
+
+function normalizeReliabilitySeverity(
+  value: unknown,
+): DashboardResponse['reliabilityEvents'][number]['severity'] | null {
+  const severity = cleanText(value, 16)?.toLowerCase();
+  return severity === 'info' || severity === 'warning' || severity === 'critical'
+    ? severity
+    : null;
+}
+
+function reliabilityEventDedupeKey(
+  event: DashboardResponse['reliabilityEvents'][number],
+): string {
+  return [
+    event.timestamp.slice(0, 19),
+    event.kind,
+    event.status.toLowerCase(),
+    event.message.toLowerCase(),
+  ].join('\u0000');
+}
+
+function normalizeReliabilityRecord(
+  record: JsonRecord,
+  cutoff: number,
+  nowMs: number,
+  legacyPowerRecord = false,
+): DashboardResponse['reliabilityEvents'][number] | null {
+  const timestamp = timestampOf(record);
+  const time = timestamp ? new Date(timestamp).getTime() : Number.NaN;
+  if (!timestamp || time < cutoff || time > nowMs + 60_000) return null;
+
+  const rawKind = cleanText(first(record, ['kind']), 32)?.toLowerCase();
+  if (!rawKind || !RELIABILITY_KINDS.has(rawKind as DashboardResponse['reliabilityEvents'][number]['kind'])) {
+    return null;
+  }
+  if (legacyPowerRecord && rawKind !== 'nvme-reset' && rawKind !== 'nvme-io') return null;
+
+  const status = incidentToken(first(record, ['status']), 32)?.toLowerCase();
+  if (!status) return null;
+  const contractKey = `${rawKind}:${status}` as keyof typeof RELIABILITY_EVENT_CONTRACT;
+  const contract = RELIABILITY_EVENT_CONTRACT[contractKey];
+  const severity = normalizeReliabilitySeverity(first(record, ['severity']));
+  const message = safeMessage(first(record, ['message']));
+  if (!contract || severity !== contract.severity || message !== contract.message) return null;
+
+  const rawDuration = own(record, 'durationSeconds');
+  const durationSeconds = rawKind === 'collector-gap'
+    ? integer(rawDuration, 0, MAX_RELIABILITY_DURATION_SECONDS)
+    : null;
+  if (rawKind === 'collector-gap' && durationSeconds === null) return null;
+  if (!legacyPowerRecord && rawKind !== 'collector-gap' && rawDuration !== null) return null;
+
+  return {
+    timestamp,
+    severity,
+    kind: rawKind as DashboardResponse['reliabilityEvents'][number]['kind'],
+    status,
+    message: contract.message,
+    durationSeconds,
+  };
+}
+
+function normalizeReliabilityEvents(
+  dedicatedRecords: JsonRecord[],
+  legacyPowerRecords: JsonRecord[],
+  cutoff: number,
+  nowMs: number,
+): DashboardResponse['reliabilityEvents'] {
+  const dedicated = dedicatedRecords.flatMap((record) => {
+    const event = normalizeReliabilityRecord(record, cutoff, nowMs);
+    return event ? [event] : [];
+  });
+  const legacy = legacyPowerRecords.flatMap((record) => {
+    const event = normalizeReliabilityRecord(record, cutoff, nowMs, true);
+    return event ? [event] : [];
+  });
+  dedicated.sort((left, right) => right.timestamp.localeCompare(left.timestamp));
+  legacy.sort((left, right) => right.timestamp.localeCompare(left.timestamp));
+  const seen = new Set<string>();
+  return [...dedicated, ...legacy]
+    .filter((event) => {
+      const key = reliabilityEventDedupeKey(event);
       if (seen.has(key)) return false;
       seen.add(key);
       return true;
@@ -1018,6 +1155,7 @@ export function readDashboard(
   const latest = observedLatest ?? emptySample(new Date(nowMs).toISOString());
   const alerts = parseJsonLines(root, join(root, 'alerts.jsonl'), MAX_EVENT_FILE_BYTES);
   const power = parseJsonLines(root, join(root, 'power.jsonl'), MAX_EVENT_FILE_BYTES);
+  const reliability = parseJsonLines(root, join(root, 'reliability.jsonl'), MAX_EVENT_FILE_BYTES);
   const privilege = parseJsonLines(root, join(root, 'privilege.jsonl'), MAX_EVENT_FILE_BYTES);
   const incidents = parseJsonLines(root, join(root, 'incidents.jsonl'), MAX_INCIDENT_FILE_BYTES);
 
@@ -1026,6 +1164,7 @@ export function readDashboard(
     range,
     stale: !Number.isFinite(latestTime) || nowMs - latestTime > staleAfterMs,
     host: normalizeHost(current),
+    reliability: normalizeReliability(current),
     latest,
     series: downsampleTelemetry(samples, MAX_SERIES_POINTS),
     powerSummary: summarizePower(samples),
@@ -1033,6 +1172,7 @@ export function readDashboard(
     containers: normalizeContainers(current),
     alerts: normalizeAlerts(alerts, cutoff, nowMs),
     powerEvents: normalizePowerEvents(power, alerts, samples, cutoff, nowMs),
+    reliabilityEvents: normalizeReliabilityEvents(reliability, power, cutoff, nowMs),
     privilegeEvents: normalizePrivilege(privilege, cutoff, nowMs),
     incidents: normalizeIncidents(incidents, cutoff, nowMs),
   };
@@ -1044,5 +1184,5 @@ export const dataLimits = {
   maximumIncidents: MAX_INCIDENTS,
   maximumIncidentFileBytes: MAX_INCIDENT_FILE_BYTES,
   acceptedHistoryFilePattern: /^\d{4}-\d{2}-\d{2}\.jsonl$/,
-  fixedFiles: ['current.json', 'alerts.jsonl', 'power.jsonl', 'privilege.jsonl', 'incidents.jsonl'].map((path) => basename(path)),
+  fixedFiles: ['current.json', 'alerts.jsonl', 'power.jsonl', 'reliability.jsonl', 'privilege.jsonl', 'incidents.jsonl'].map((path) => basename(path)),
 } as const;

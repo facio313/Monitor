@@ -21,6 +21,8 @@ import type {
   PowerEvent,
   PowerSummary,
   PrivilegeEvent,
+  ReliabilityEvent,
+  ReliabilitySummary,
   TelemetrySample,
   TimeRange,
 } from '../types';
@@ -315,6 +317,12 @@ function OverviewContent({ data, range, onNavigate }: { data: DashboardPayload; 
 
       <PowerOverview latest={latest} onNavigate={onNavigate} />
 
+      <ReliabilityOverview
+        summary={data.reliability}
+        events={data.reliabilityEvents ?? []}
+        onNavigate={onNavigate}
+      />
+
       <Panel
         title="Recent peak incidents"
         subtitle={`Showing the latest ${Math.min(incidents.length, 3)} of ${incidents.length} incident captures`}
@@ -468,6 +476,40 @@ function PowerOverview({ latest, onNavigate }: { latest: TelemetrySample | null;
   );
 }
 
+function ReliabilityOverview({
+  summary,
+  events,
+  onNavigate,
+}: {
+  summary: ReliabilitySummary;
+  events: ReliabilityEvent[];
+  onNavigate: DashboardProps['onNavigate'];
+}) {
+  const issueCount = events.filter((event) => event.severity !== 'info').length;
+  const currentTone = reliabilitySummaryTone(summary);
+  return (
+    <Panel
+      title="Host reliability"
+      subtitle="Boot, collector, remote access, network, and NVMe state"
+      icon="server"
+      badge={summaryBadge(events.length)}
+    >
+      <div className="reliability-overview">
+        <ReliabilityState label="SSH listeners" value={availabilityLabel(summary.sshListenersAvailable)} tone={availabilityTone(summary.sshListenersAvailable)} />
+        <ReliabilityState label="Network link" value={availabilityLabel(summary.networkLinkAvailable)} tone={availabilityTone(summary.networkLinkAvailable)} />
+        <ReliabilityState label="NVMe mitigation" value={mitigationLabel(summary.nvmeMitigationActive)} tone={summary.nvmeMitigationActive === true ? 'good' : summary.nvmeMitigationActive === false ? 'warn' : 'neutral'} />
+        <ReliabilityState label="Collector gap" value={formatReliabilityDuration(summary.collectorGapSeconds)} tone={collectorGapTone(summary.collectorGapSeconds)} />
+        <ReliabilityState label="Boot started" value={formatDateTime(summary.bootStartedAt)} tone={currentTone} />
+      </div>
+      <p className="reliability-overview-note">
+        <StatusBadge value={currentTone === 'good' ? 'Current checks available' : currentTone === 'critical' ? 'Current issue' : 'Check incomplete'} tone={currentTone} />
+        <span>{events.length} event{events.length === 1 ? '' : 's'} in range · {issueCount} warning or critical</span>
+      </p>
+      <DetailsLink section="reliability" count={events.length} label="Inspect host reliability" onNavigate={onNavigate} />
+    </Panel>
+  );
+}
+
 function DetailsContent({ data, range, onNavigate }: { data: DashboardPayload; range: TimeRange; onNavigate: DashboardProps['onNavigate'] }) {
   const chartData = useMemo(
     () => data.series.map((point) => ({ ...point, label: formatTime(point.timestamp, range) })),
@@ -506,12 +548,37 @@ function DetailsContent({ data, range, onNavigate }: { data: DashboardPayload; r
   return (
     <div className="dashboard-content details-content">
       <nav className="detail-jump-nav" aria-label="Details sections">
+        <a href="/monitor/details#reliability" onClick={(event) => navigateInApp(event, onNavigate, 'details', '#reliability')}>Reliability</a>
         <a href="/monitor/details#power" onClick={(event) => navigateInApp(event, onNavigate, 'details', '#power')}>Power</a>
         <a href="/monitor/details#resources" onClick={(event) => navigateInApp(event, onNavigate, 'details', '#resources')}>Resources</a>
         <a href="/monitor/details#incidents" onClick={(event) => navigateInApp(event, onNavigate, 'details', '#incidents')}>Incidents</a>
         <a href="/monitor/details#alerts" onClick={(event) => navigateInApp(event, onNavigate, 'details', '#alerts')}>Alerts</a>
         <a href="/monitor/details#privilege" onClick={(event) => navigateInApp(event, onNavigate, 'details', '#privilege')}>Privilege</a>
       </nav>
+
+      <section id="reliability" tabIndex={-1} className="detail-section" aria-labelledby="reliability-detail-title">
+        <DetailSectionHeading
+          eyebrow="Host continuity"
+          title="Access, reboot, and storage reliability"
+          id="reliability-detail-title"
+          detail="Current semantic checks and a bounded event history. Addresses, accounts, commands, and raw logs are never displayed."
+        />
+        <div className="reliability-state-grid">
+          <ReliabilityState label="SSH listeners" value={availabilityLabel(data.reliability.sshListenersAvailable)} tone={availabilityTone(data.reliability.sshListenersAvailable)} />
+          <ReliabilityState label="Network link" value={availabilityLabel(data.reliability.networkLinkAvailable)} tone={availabilityTone(data.reliability.networkLinkAvailable)} />
+          <ReliabilityState label="NVMe mitigation" value={mitigationLabel(data.reliability.nvmeMitigationActive)} tone={data.reliability.nvmeMitigationActive === true ? 'good' : data.reliability.nvmeMitigationActive === false ? 'warn' : 'neutral'} />
+          <ReliabilityState label="Latest collector gap" value={formatReliabilityDuration(data.reliability.collectorGapSeconds)} tone={collectorGapTone(data.reliability.collectorGapSeconds)} />
+          <ReliabilityState label="Boot started" value={formatDateTime(data.reliability.bootStartedAt)} tone={data.reliability.bootStartedAt ? 'good' : 'neutral'} />
+        </div>
+        <Panel
+          title="Reliability event timeline"
+          subtitle={`${data.reliabilityEvents.length} newest fixed-schema events in this range (up to ${API_EVENT_CAP})`}
+          icon="alert"
+          badge={exactEventBadge(data.reliabilityEvents.length)}
+        >
+          <ReliabilityEventList events={data.reliabilityEvents} />
+        </Panel>
+      </section>
 
       <section id="power" tabIndex={-1} className="detail-section" aria-labelledby="power-detail-title">
         <DetailSectionHeading
@@ -849,6 +916,35 @@ function PowerEventList({ events }: { events: PowerEvent[] }) {
             <time dateTime={event.timestamp || undefined}>{formatDateTime(event.timestamp)}</time>
             {event.supplyVoltageVolts != null && <span>EXT5V {formatVoltage(event.supplyVoltageVolts)}</span>}
             {event.throttledFlags != null && <span>Flags {formatFlags(event.throttledFlags)}</span>}
+          </div>
+        </div>
+      </article>
+    );
+  })}</div>;
+}
+
+function ReliabilityState({ label, value, tone }: { label: string; value: string; tone: StatusTone }) {
+  return (
+    <div className={`reliability-state reliability-${tone}`}>
+      <span>{label}</span>
+      <strong>{value}</strong>
+    </div>
+  );
+}
+
+export function ReliabilityEventList({ events }: { events: ReliabilityEvent[] }) {
+  if (!events.length) return <InlineEmpty icon="check" text="No host reliability events in this snapshot" positive />;
+  return <div className="event-list reliability-event-list">{events.map((event, index) => {
+    const eventTone = eventStatusTone(event.severity, event.status);
+    return (
+      <article className="event-item reliability-event-item" key={`${event.timestamp}-${event.kind}-${event.status}-${index}`}>
+        <span className={`event-marker event-${eventTone}`}><Icon name={eventTone === 'critical' ? 'alert' : eventTone === 'warn' ? 'info' : 'check'} size={15} /></span>
+        <div className="event-body">
+          <div className="event-title"><strong>{reliabilityKindLabel(event.kind)}</strong><EventBadges severity={event.severity} status={event.status} /></div>
+          <p>{safeText(event.message, 'No semantic details provided', 300)}</p>
+          <div className="power-event-meta">
+            <time dateTime={event.timestamp || undefined}>{formatDateTime(event.timestamp)}</time>
+            {event.durationSeconds != null && <span>Duration {formatReliabilityDuration(event.durationSeconds)}</span>}
           </div>
         </div>
       </article>
@@ -1788,6 +1884,63 @@ function normalizeTone(value: unknown): StatusTone {
   if (/(warn|pending|degrad|unknown|starting|stale|under.?voltage|throttl|thermal.?limit|frequency.?cap)/.test(normalized)) return 'warn';
   if (/(ok|success|healthy|running|online|active|resolved|allowed|nominal)/.test(normalized) || /\b(?:normal|on)\b/.test(normalized)) return 'good';
   return 'neutral';
+}
+
+function availabilityLabel(value: boolean | null): string {
+  return value === true ? 'Available' : value === false ? 'Unavailable' : 'Not reported';
+}
+
+function availabilityTone(value: boolean | null): StatusTone {
+  return value === true ? 'good' : value === false ? 'critical' : 'neutral';
+}
+
+function mitigationLabel(value: boolean | null): string {
+  return value === true ? 'Active' : value === false ? 'Inactive' : 'Not reported';
+}
+
+function collectorGapTone(value: number | null): StatusTone {
+  if (value === null) return 'neutral';
+  if (value >= 300) return 'critical';
+  if (value >= 120) return 'warn';
+  return 'good';
+}
+
+function reliabilitySummaryTone(summary: ReliabilitySummary): StatusTone {
+  if (summary.sshListenersAvailable === false || summary.networkLinkAvailable === false) return 'critical';
+  const gapTone = collectorGapTone(summary.collectorGapSeconds);
+  if (gapTone === 'critical') return 'critical';
+  if (summary.nvmeMitigationActive === false || gapTone === 'warn') return 'warn';
+  const reported = [
+    summary.bootStartedAt,
+    summary.collectorGapSeconds,
+    summary.sshListenersAvailable,
+    summary.networkLinkAvailable,
+    summary.nvmeMitigationActive,
+  ].some((value) => value !== null);
+  return reported ? 'good' : 'neutral';
+}
+
+function formatReliabilityDuration(value: number | null): string {
+  if (value === null || !Number.isFinite(value) || value < 0) return 'Not reported';
+  if (value === 0) return 'None';
+  if (value < 60) return `${Math.round(value)}s`;
+  return formatUptime(value);
+}
+
+function reliabilityKindLabel(kind: ReliabilityEvent['kind']): string {
+  const labels: Record<ReliabilityEvent['kind'], string> = {
+    'host-boot': 'Host boot',
+    'collector-gap': 'Collector gap',
+    'ssh-listener': 'SSH listener',
+    'network-link': 'Network link',
+    'nvme-reset': 'NVMe controller reset',
+    'nvme-io': 'NVMe I/O error',
+    'rcu-stall': 'Kernel RCU stall',
+    'oom-kill': 'Out-of-memory kill',
+    'filesystem-error': 'Filesystem error',
+    'nvme-mitigation': 'NVMe mitigation',
+  };
+  return labels[kind];
 }
 
 export function eventStatusTone(severity: unknown, status: unknown): StatusTone {

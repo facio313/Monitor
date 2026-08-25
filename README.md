@@ -67,6 +67,9 @@ The dashboard provides:
 - CPU, memory, temperature, load, network, and disk-I/O summaries and charts;
 - `1h`, `24h`, `7d`, and `30d` ranges, with at most 360 chart points;
 - host, EXT5V supply/power/GPU, filesystem, and allow-listed `cks` container status;
+- host-reliability state and a fixed-message timeline for boot transitions,
+  collector heartbeat gaps, SSH listeners, the primary network link,
+  NVMe/RCU/OOM/filesystem signals, and NVMe runtime mitigation;
 - bounded peak-incident evidence with PSI, fixed executable classes,
   fixed-label `cks` workloads, and per-capture app request counts (not visitors);
 - recent semantic alerts and privilege outcomes without commands or arguments;
@@ -74,11 +77,12 @@ The dashboard provides:
   and a responsive table/card layout.
 
 The overview keeps operational scanning compact: it shows the latest EXT5V and
-throttle state, the latest three incident captures, and at most the newest 10
-alerts and 10 privilege records from the selected range. `/monitor/details`
+throttle state, current host-reliability checks and event counts, the latest
+three incident captures, and at most the newest 10 alerts and 10 privilege
+records from the selected range. `/monitor/details`
 uses the same authenticated API snapshot to show the full API-bounded event and
 incident lists (up to 500 each), the EXT5V history and power/storage event
-timeline, full-range power statistics, and expanded CPU, memory,
+timeline, the dedicated reliability timeline, full-range power statistics, and expanded CPU, memory,
 temperature/load, network, and disk-I/O charts.
 
 ## Requirements

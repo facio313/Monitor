@@ -95,6 +95,13 @@ export interface DashboardResponse {
     architecture: string | null;
     uptimeSeconds: number | null;
   };
+  reliability: {
+    bootStartedAt: string | null;
+    collectorGapSeconds: number | null;
+    sshListenersAvailable: boolean | null;
+    networkLinkAvailable: boolean | null;
+    nvmeMitigationActive: boolean | null;
+  };
   latest: TelemetrySample;
   series: TelemetrySample[];
   powerSummary: {
@@ -136,6 +143,24 @@ export interface DashboardResponse {
     message: string;
     supplyVoltageVolts: number | null;
     throttledFlags: number | null;
+  }>;
+  reliabilityEvents: Array<{
+    timestamp: string;
+    severity: 'info' | 'warning' | 'critical';
+    kind:
+      | 'host-boot'
+      | 'collector-gap'
+      | 'ssh-listener'
+      | 'network-link'
+      | 'nvme-reset'
+      | 'nvme-io'
+      | 'rcu-stall'
+      | 'oom-kill'
+      | 'filesystem-error'
+      | 'nvme-mitigation';
+    status: string;
+    message: string;
+    durationSeconds: number | null;
   }>;
   privilegeEvents: Array<{
     timestamp: string;

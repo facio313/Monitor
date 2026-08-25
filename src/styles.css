@@ -101,6 +101,14 @@ button:focus-visible, input:focus-visible, a:focus-visible { outline: 2px solid 
 .power-details-link { min-height: 36px; padding: 0 11px; border: 1px solid #31504c; border-radius: 8px; background: #102320; white-space: nowrap; }
 .panel-link-row { margin-top: 14px; padding-top: 13px; display: flex; justify-content: flex-end; border-top: 1px solid var(--border-soft); }
 
+.reliability-overview, .reliability-state-grid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 9px; }
+.reliability-state { min-width: 0; padding: 13px; display: flex; flex-direction: column; gap: 7px; border: 1px solid var(--border-soft); border-radius: 9px; background: #0a1513; box-shadow: inset 0 2px currentColor; }
+.reliability-state > span { color: var(--faint); font-size: 8px; font-weight: 650; letter-spacing: .05em; text-transform: uppercase; }
+.reliability-state > strong { color: currentColor; font-family: "SFMono-Regular", Consolas, "Liberation Mono", ui-monospace, monospace; font-size: 10px; font-weight: 550; line-height: 1.45; overflow-wrap: anywhere; }
+.reliability-good { color: var(--green); }.reliability-warn { color: var(--orange); }.reliability-critical { color: var(--red); }.reliability-neutral { color: #90aaa6; }
+.reliability-overview-note { margin: 12px 0 0; display: flex; align-items: center; justify-content: space-between; gap: 12px; color: var(--faint); font-size: 9px; }
+.reliability-overview-note > span:last-child { text-align: right; }
+
 .details-content { gap: 35px; }
 .detail-jump-nav { padding: 6px; display: flex; align-items: center; gap: 4px; overflow-x: auto; border: 1px solid var(--border-soft); border-radius: 10px; background: #0a1513; scrollbar-width: thin; }
 .detail-jump-nav a { padding: 7px 12px; flex: 0 0 auto; border-radius: 7px; color: var(--muted); font-size: 10px; font-weight: 650; text-decoration: none; }
@@ -404,6 +412,7 @@ td strong { color: #cdd8d5; font-family: "SFMono-Regular", Consolas, "Liberation
   .power-details-link { grid-column: 2 / -1; justify-self: end; }
   .power-card-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .power-summary-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .reliability-overview, .reliability-state-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .incident-detail-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .incident-traffic-block { grid-column: 1 / -1; }
 }
@@ -430,6 +439,7 @@ td strong { color: #cdd8d5; font-family: "SFMono-Regular", Consolas, "Liberation
   .power-details-link { grid-column: 1 / -1; width: 100%; justify-self: stretch; }
   .power-state-panel { grid-template-columns: 1fr; }
   .power-state-panel > div + div { padding: 14px 0 0; border-top: 1px solid var(--border-soft); border-left: 0; }
+  .reliability-overview, .reliability-state-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .incident-detail-grid { grid-template-columns: 1fr; }
   .incident-traffic-block { grid-column: auto; }
   .chart-frame { height: 235px; }
@@ -488,6 +498,9 @@ td strong { color: #cdd8d5; font-family: "SFMono-Regular", Consolas, "Liberation
   .power-card-grid { grid-template-columns: 1fr; gap: 9px; }
   .summary-card { min-height: 118px; }
   .power-summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .reliability-overview, .reliability-state-grid { grid-template-columns: 1fr; }
+  .reliability-overview-note { align-items: flex-start; flex-direction: column; }
+  .reliability-overview-note > span:last-child { text-align: left; }
   .incident-timeline { padding-left: 19px; }
   .incident-card::before { left: -19px; }
   .incident-header { align-items: flex-start; flex-direction: column; }

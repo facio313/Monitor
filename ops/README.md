@@ -13,13 +13,17 @@ starts. Neither helper changes Docker or host configuration.
 The default output root is `/var/lib/monitor-export`:
 
 - `current.json`: atomically replaced snapshot with exactly the public keys
-  `generatedAt`, `host`, `latest`, `disks`, and `containers`.
+  `generatedAt`, `host`, `latest`, `disks`, `containers`, and `reliability`.
   `latest` includes memory byte totals, all three load averages, current power
   state, supply voltage, the complete `get_throttled` flags integer, and GPU
   allocation/clock fields in addition to the rate metrics. The nullable fields
   `supplyVoltageVolts` and `throttledFlags` immediately follow `powerState` in
   both current and history samples.
   Each disk is exactly `mount`, `totalBytes`, `usedBytes`, and `usedPercent`.
+  `reliability` contains only the calculated boot time, the prior collector
+  heartbeat gap, expected SSH-listener availability, primary physical-link
+  availability, and runtime NVMe power-management mitigation state. The boot
+  ID used to detect a restart stays in private collector state.
 - `history/YYYY-MM-DD.jsonl`: atomically replaced daily sample series. At most
   2,000 valid rows are kept per day, and files older than 30 calendar days are
   pruned. On rewrite, valid rows from the immediately preceding sample contract
@@ -39,6 +43,14 @@ The default output root is `/var/lib/monitor-export`:
   details are never exported. Repeated events of the same kind and status in
   one second produce the same canonical public row and are collapsed, while an
   active/recovered pair remains distinct.
+- `reliability.jsonl`: at most 5,000 fixed-message host-availability events
+  with exactly `timestamp`, `severity`, `kind`, `status`, `message`, and
+  nullable `durationSeconds`. It records boot transitions, collector gaps over
+  three minutes, expected SSH listener loss/recovery, primary-link
+  loss/recovery, NVMe reset/I/O errors, RCU stalls, OOM kills, filesystem
+  errors, and runtime NVMe mitigation transitions. Kernel lines are mapped to
+  fixed messages; IP addresses, ports, PIDs, process names, paths, usernames,
+  commands, and raw log text are never exported.
 - `privilege.jsonl`: at most 5,000 records containing **only** `timestamp`,
   `actor`, `target`, `action`, and `result`. In particular, command text and
   arguments are never exported. The default source is the already-focused
@@ -77,6 +89,11 @@ deleted or overwritten. The sole linked-file exception is the collector's own
 interrupted no-replace publication: exactly one strict-name temporary sibling
 with the same device/inode, owner, mode, and link count is unlinked and the
 state directory fsynced before the journal is fully revalidated and replayed.
+Reliability rows and their boot/listener/link/kernel-cursor state use the same
+events-before-state invariant through a separate bounded mode-`0600`
+`.state/pending-reliability-commit.json`. A crash after the public atomic
+rewrite but before private state publication is replayed by digest without
+duplicating the event batch.
 
 Short-lived host-rate and hashed process counters live in
 `/run/monitor-collector/delta-state.json`; each run atomically replaces that

@@ -1478,6 +1478,89 @@ class RedactionTests(unittest.TestCase):
         self.assertIsNone(collector.existing_power_record({**valid, "message": "raw secret"}))
         self.assertIsNone(collector.existing_power_record({**valid, "severity": "critical"}))
 
+    def test_kernel_reliability_lines_are_fixed_and_drop_raw_details(self):
+        fallback = "2026-08-26T00:00:00Z"
+        cases = (
+            (
+                "2026-08-26T00:00:01Z kernel: nvme nvme0: controller is down; will reset token=secret",
+                "nvme-reset", "active",
+            ),
+            (
+                "2026-08-26T00:00:02Z kernel: blk_update_request: I/O error, dev nvme0n1 pid=123",
+                "nvme-io", "active",
+            ),
+            (
+                "2026-08-26T00:00:03Z kernel: rcu: INFO: rcu_preempt detected expedited stalls on CPUs/tasks",
+                "rcu-stall", "active",
+            ),
+            (
+                "2026-08-26T00:00:04Z kernel: Out of memory: Killed process 123 (private-name)",
+                "oom-kill", "active",
+            ),
+            (
+                "2026-08-26T00:00:05Z kernel: EXT4-fs error (device nvme0n1p2): private path",
+                "filesystem-error", "active",
+            ),
+            (
+                "2026-08-26T00:00:06Z kernel: eth0: Link is Down client=192.0.2.1",
+                "network-link", "unavailable",
+            ),
+            (
+                "2026-08-26T00:00:07Z kernel: eth0: Link is Up 1000 Mbps",
+                "network-link", "recovered",
+            ),
+        )
+        for line, kind, status in cases:
+            with self.subTest(kind=kind, status=status):
+                record = collector.sanitize_kernel_reliability_line(line, fallback)
+                self.assertIsNotNone(record)
+                self.assertEqual(record["kind"], kind)
+                self.assertEqual(record["status"], status)
+                self.assertEqual(set(record), set(collector.RELIABILITY_FIELDS))
+                self.assertEqual(collector.existing_reliability_record(record), record)
+                encoded = json.dumps(record).lower()
+                for forbidden in ("secret", "192.0.2.1", "private-name", "pid=123"):
+                    self.assertNotIn(forbidden, encoded)
+
+        self.assertIsNone(collector.sanitize_kernel_reliability_line(
+            "2026-08-26T00:00:08Z unrelated password=secret", fallback
+        ))
+        valid = collector.reliability_event(fallback, "host-boot", "observed")
+        self.assertIsNone(collector.existing_reliability_record({**valid, "raw": "secret"}))
+        self.assertIsNone(collector.existing_reliability_record({**valid, "message": "changed"}))
+
+    def test_tcp_listener_network_and_nvme_mitigation_observers(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            proc = root / "proc"
+            sys_root = root / "sys"
+            (proc / "net").mkdir(parents=True)
+            (sys_root / "class" / "net" / "eth0").mkdir(parents=True)
+            (sys_root / "module" / "nvme_core" / "parameters").mkdir(parents=True)
+            (sys_root / "module" / "pcie_aspm" / "parameters").mkdir(parents=True)
+            header = "sl local_address rem_address st\n"
+            (proc / "net" / "tcp").write_text(
+                header + "0: 00000000:0016 00000000:0000 0A\n"
+            )
+            (proc / "net" / "tcp6").write_text(
+                header + "1: 00000000000000000000000000000000:5606 00000000000000000000000000000000:0000 0A\n"
+            )
+            (sys_root / "class" / "net" / "eth0" / "carrier").write_text("1\n")
+            (sys_root / "class" / "net" / "eth0" / "operstate").write_text("up\n")
+            (sys_root / "module" / "nvme_core" / "parameters" / "default_ps_max_latency_us").write_text("0\n")
+            (sys_root / "module" / "pcie_aspm" / "parameters" / "policy").write_text(
+                "[performance] default powersave\n"
+            )
+            self.assertEqual(collector.parse_listening_tcp_ports(proc), {22, 22022})
+            self.assertTrue(collector.observed_ssh_listeners(proc, {22, 22022}))
+            self.assertTrue(collector.observed_network_link(sys_root, "eth0"))
+            self.assertTrue(collector.observed_nvme_mitigation(sys_root))
+
+            (proc / "net" / "tcp6").write_text(header)
+            (sys_root / "class" / "net" / "eth0" / "carrier").write_text("0\n")
+            self.assertFalse(collector.observed_ssh_listeners(proc, {22, 22022}))
+            self.assertFalse(collector.observed_network_link(sys_root, "eth0"))
+
 
 class FilesystemTests(unittest.TestCase):
     def test_atomic_write_leaves_complete_file_and_no_temp(self):
@@ -1488,6 +1571,157 @@ class FilesystemTests(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o640)
             self.assertEqual(stat.S_IMODE(path.parent.stat().st_mode), 0o750)
             self.assertEqual(list(path.parent.glob(".current.json.*")), [])
+
+    def test_reliability_boot_gap_transitions_and_crash_replay(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            proc = root / "proc"
+            sys_root = root / "sys"
+            output = root / "output"
+            (proc / "net").mkdir(parents=True)
+            (proc / "sys" / "kernel" / "random").mkdir(parents=True)
+            (sys_root / "class" / "net" / "eth0").mkdir(parents=True)
+            (sys_root / "module" / "nvme_core" / "parameters").mkdir(parents=True)
+            (sys_root / "module" / "pcie_aspm" / "parameters").mkdir(parents=True)
+            header = "sl local_address rem_address st\n"
+
+            def set_listeners(available):
+                rows = (
+                    "0: 00000000:0016 00000000:0000 0A\n"
+                    "1: 00000000000000000000000000000000:5606 "
+                    "00000000000000000000000000000000:0000 0A\n"
+                ) if available else ""
+                (proc / "net" / "tcp").write_text(header + rows)
+                (proc / "net" / "tcp6").write_text(header)
+
+            set_listeners(True)
+            (proc / "sys" / "kernel" / "random" / "boot_id").write_text(
+                "11111111-1111-4111-8111-111111111111\n"
+            )
+            (sys_root / "class" / "net" / "eth0" / "carrier").write_text("1\n")
+            (sys_root / "class" / "net" / "eth0" / "operstate").write_text("up\n")
+            (sys_root / "module" / "nvme_core" / "parameters" / "default_ps_max_latency_us").write_text("0\n")
+            (sys_root / "module" / "pcie_aspm" / "parameters" / "policy").write_text(
+                "[performance] default powersave\n"
+            )
+            kernel = root / "kern.log"
+            kernel.write_text(
+                "2026-08-26T00:09:01Z kernel: nvme nvme0: controller is down; will reset token=secret\n"
+                "2026-08-26T00:09:02Z kernel: rcu: INFO: rcu_preempt detected expedited stalls on CPUs/tasks\n"
+            )
+            config = collector.Config(
+                output_dir=output,
+                runtime_dir=root / "run",
+                proc_root=proc,
+                sys_root=sys_root,
+                kernel_log=kernel,
+                ssh_ports={22, 22022},
+                primary_interface="eth0",
+                max_log_records=50,
+            )
+            first_now = dt.datetime(2026, 8, 26, 0, 10, tzinfo=dt.timezone.utc)
+            first = collector.collect_reliability(config, first_now, 600)
+            self.assertEqual(first, {
+                "bootStartedAt": "2026-08-26T00:00:00Z",
+                "collectorGapSeconds": None,
+                "sshListenersAvailable": True,
+                "networkLinkAvailable": True,
+                "nvmeMitigationActive": True,
+            })
+            first_rows = [
+                json.loads(line)
+                for line in (output / "reliability.jsonl").read_text().splitlines()
+            ]
+            self.assertEqual(
+                {row["kind"] for row in first_rows},
+                {"host-boot", "nvme-mitigation", "nvme-reset", "rcu-stall"},
+            )
+            self.assertNotIn("secret", (output / "reliability.jsonl").read_text())
+            self.assertEqual(
+                stat.S_IMODE((output / ".state" / "reliability-state.json").stat().st_mode),
+                0o600,
+            )
+
+            (proc / "sys" / "kernel" / "random" / "boot_id").write_text(
+                "22222222-2222-4222-8222-222222222222\n"
+            )
+            set_listeners(False)
+            (sys_root / "class" / "net" / "eth0" / "carrier").write_text("0\n")
+            with kernel.open("a") as handle:
+                handle.write(
+                    "2026-08-26T00:14:30Z kernel: Out of memory: Killed process 999 secret-app\n"
+                )
+            second_now = dt.datetime(2026, 8, 26, 0, 15, tzinfo=dt.timezone.utc)
+            second = collector.collect_reliability(config, second_now, 60)
+            self.assertEqual(second["bootStartedAt"], "2026-08-26T00:14:00Z")
+            self.assertEqual(second["collectorGapSeconds"], 300)
+            self.assertFalse(second["sshListenersAvailable"])
+            self.assertFalse(second["networkLinkAvailable"])
+            rows = [
+                json.loads(line)
+                for line in (output / "reliability.jsonl").read_text().splitlines()
+            ]
+            latest_kinds = {row["kind"] for row in rows[len(first_rows):]}
+            self.assertEqual(
+                latest_kinds,
+                {"host-boot", "collector-gap", "ssh-listener", "network-link", "oom-kill"},
+            )
+            gap = next(row for row in rows if row["kind"] == "collector-gap")
+            self.assertEqual(gap["durationSeconds"], 300)
+
+            # A crash after the event file but before private state publication
+            # is replayed idempotently on the next run.
+            set_listeners(True)
+            (sys_root / "class" / "net" / "eth0" / "carrier").write_text("1\n")
+            original_atomic = collector.atomic_write_json
+
+            def fail_reliability_state(path, value, mode=0o640):
+                if Path(path).name == "reliability-state.json":
+                    raise OSError("injected reliability state failure")
+                return original_atomic(path, value, mode)
+
+            third_now = dt.datetime(2026, 8, 26, 0, 16, tzinfo=dt.timezone.utc)
+            with mock.patch.object(
+                collector, "atomic_write_json", side_effect=fail_reliability_state
+            ):
+                with self.assertRaises(OSError):
+                    collector.collect_reliability(config, third_now, 120)
+            pending = output / ".state" / "pending-reliability-commit.json"
+            self.assertTrue(pending.is_file())
+            collector.collect_reliability(
+                config, third_now + dt.timedelta(minutes=1), 180
+            )
+            self.assertFalse(pending.exists())
+            final_rows = [
+                json.loads(line)
+                for line in (output / "reliability.jsonl").read_text().splitlines()
+            ]
+            recovered = [
+                row for row in final_rows
+                if row["kind"] in {"ssh-listener", "network-link"}
+                and row["status"] == "recovered"
+            ]
+            self.assertEqual(len(recovered), 2)
+
+    def test_first_reliability_run_infers_existing_history_gap_around_boot(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "output"
+            history = output / "history"
+            history.mkdir(parents=True)
+            samples = (
+                incident_metrics("2026-08-26T00:03:00Z"),
+                incident_metrics("2026-08-26T00:11:00Z"),
+                incident_metrics("2026-08-26T00:12:00Z"),
+            )
+            (history / "2026-08-26.jsonl").write_text(
+                "".join(json.dumps(sample) + "\n" for sample in samples)
+            )
+            config = collector.Config(output_dir=output)
+            boot_started = dt.datetime(2026, 8, 26, 0, 10, tzinfo=dt.timezone.utc)
+            self.assertEqual(
+                collector.historical_collector_gap_at_boot(config, boot_started),
+                8 * 60,
+            )
 
     def test_line_cursor_preserves_appends_partial_tails_rotation_and_line_caps(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1813,8 +2047,14 @@ class FilesystemTests(unittest.TestCase):
                 docker_sample[0] = 1
                 second = collector.run(config, now + dt.timedelta(minutes=1))
 
-            self.assertEqual(set(current), {"generatedAt", "host", "latest", "disks", "containers"})
+            self.assertEqual(set(current), {
+                "generatedAt", "host", "latest", "disks", "containers", "reliability",
+            })
             self.assertEqual(set(current["host"]), {"hostname", "os", "architecture", "uptimeSeconds"})
+            self.assertEqual(set(current["reliability"]), {
+                "bootStartedAt", "collectorGapSeconds", "sshListenersAvailable",
+                "networkLinkAvailable", "nvmeMitigationActive",
+            })
             self.assertEqual(tuple(current["latest"]), collector.SAMPLE_FIELDS)
             for field_name in (
                 "cpuPercent", "memoryPercent", "memoryUsedBytes", "memoryTotalBytes",
@@ -1988,6 +2228,8 @@ class FilesystemTests(unittest.TestCase):
         self.assertEqual(config.traffic_log, Path("/var/log/nginx/monitor-traffic.jsonl"))
         self.assertEqual(config.docker_sockets, {"cks": Path("/run/user/1001/docker.sock")})
         self.assertEqual(config.process_uids, {0, 1001})
+        self.assertEqual(config.ssh_ports, {22, 22022})
+        self.assertEqual(config.primary_interface, "eth0")
         self.assertEqual(config.incident_retention_days, 30)
         self.assertEqual(config.max_incident_records, 1000)
         self.assertEqual(config.cpu_warn_samples, 1)
@@ -2045,6 +2287,8 @@ class FilesystemTests(unittest.TestCase):
         self.assertIn("MONITOR_DOCKER_SOCKETS=\n", defaults)
         self.assertIn("MONITOR_CONTAINER_INPUT=/run/monitor-container-exporter/containers.json", defaults)
         self.assertIn("MONITOR_PROCESS_UIDS=0,1001", defaults)
+        self.assertIn("MONITOR_SSH_PORTS=22,22022", defaults)
+        self.assertIn("MONITOR_PRIMARY_INTERFACE=eth0", defaults)
         self.assertIn("MONITOR_CPU_WARN_SAMPLES=1", defaults)
         self.assertIn("-o root -g cks -m 0750 /var/lib/monitor-export", installer)
         self.assertIn('had_default=false', installer)

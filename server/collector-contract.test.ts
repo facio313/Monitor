@@ -219,6 +219,7 @@ describe('collector to server contract', () => {
       },
     ]);
     expect(dataLimits.fixedFiles).toContain('power.jsonl');
+    expect(dataLimits.fixedFiles).toContain('reliability.jsonl');
     expect(dataLimits.fixedFiles).toContain('incidents.jsonl');
 
     expect(dashboard.incidents).toHaveLength(1);

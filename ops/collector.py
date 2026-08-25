@@ -78,10 +78,13 @@ ALLOWED_TRAFFIC_APPS = frozenset({
 MAX_TRAFFIC_REQUEST_SECONDS = 300.0
 MAX_TRAFFIC_INPUT_AGE_SECONDS = 600
 MAX_TRAFFIC_LINE_BYTES = 4096
+MAX_RELIABILITY_DURATION_SECONDS = 366 * 24 * 60 * 60
+RELIABILITY_GAP_WARN_SECONDS = 180
 MAX_INCIDENT_FILE_BYTES = 16 * 1024 * 1024
 MAX_INCIDENT_LINE_BYTES = 64 * 1024
 MAX_PENDING_INCIDENT_COMMIT_BYTES = 96 * 1024
 MAX_PENDING_SANITIZED_LOG_COMMIT_BYTES = 8 * 1024 * 1024
+MAX_PENDING_RELIABILITY_COMMIT_BYTES = 8 * 1024 * 1024
 MAX_SANITIZED_LOG_RECORD_BYTES = 4096
 MAX_CONTAINER_INPUT_BYTES = 1 * 1024 * 1024
 MAX_CONTAINER_INPUT_AGE_SECONDS = 180
@@ -1183,6 +1186,64 @@ POWER_EVENT_DETAILS = {
         "Kernel reported an NVMe I/O error.",
     ),
 }
+RELIABILITY_EVENT_DETAILS = {
+    ("host-boot", "observed"): (
+        "info",
+        "Host boot was observed by the collector.",
+    ),
+    ("host-boot", "restarted"): (
+        "warning",
+        "Host boot followed a previous collector session.",
+    ),
+    ("collector-gap", "detected"): (
+        "warning",
+        "Collector heartbeat gap exceeded the expected interval.",
+    ),
+    ("ssh-listener", "unavailable"): (
+        "critical",
+        "One or more expected SSH listeners are unavailable.",
+    ),
+    ("ssh-listener", "recovered"): (
+        "info",
+        "All expected SSH listeners recovered.",
+    ),
+    ("network-link", "unavailable"): (
+        "critical",
+        "Primary network link became unavailable.",
+    ),
+    ("network-link", "recovered"): (
+        "info",
+        "Primary network link recovered.",
+    ),
+    ("nvme-reset", "active"): (
+        "critical",
+        "Kernel reported an NVMe controller reset.",
+    ),
+    ("nvme-io", "active"): (
+        "critical",
+        "Kernel reported an NVMe I/O error.",
+    ),
+    ("rcu-stall", "active"): (
+        "critical",
+        "Kernel reported an RCU stall.",
+    ),
+    ("oom-kill", "active"): (
+        "critical",
+        "Kernel reported an out-of-memory kill.",
+    ),
+    ("filesystem-error", "active"): (
+        "critical",
+        "Kernel reported a filesystem or block I/O error.",
+    ),
+    ("nvme-mitigation", "active"): (
+        "info",
+        "Runtime NVMe power-management mitigation is active.",
+    ),
+    ("nvme-mitigation", "incomplete"): (
+        "warning",
+        "Runtime NVMe power-management mitigation is not fully active.",
+    ),
+}
 MAINTENANCE_EVENT_DETAILS = {
     ("multtara-cksdb-cutover", "started"): (
         "info",
@@ -1376,6 +1437,149 @@ def existing_power_record(record: Mapping[str, Any]) -> dict[str, str] | None:
         "status": event[1],
         "message": message,
     }
+
+
+def reliability_event(
+    timestamp: str,
+    kind: str,
+    status: str,
+    duration_seconds: int | None = None,
+) -> dict[str, Any]:
+    severity, message = RELIABILITY_EVENT_DETAILS[(kind, status)]
+    return {
+        "timestamp": event_timestamp(timestamp, ""),
+        "severity": severity,
+        "kind": kind,
+        "status": status,
+        "message": message,
+        "durationSeconds": duration_seconds,
+    }
+
+
+def existing_reliability_record(record: Mapping[str, Any]) -> dict[str, Any] | None:
+    required = {
+        "timestamp", "severity", "kind", "status", "message", "durationSeconds",
+    }
+    if set(record) != required:
+        return None
+    timestamp = event_timestamp(str(record.get("timestamp", "")), "")
+    if not timestamp:
+        return None
+    event = (str(record.get("kind", "")), str(record.get("status", "")))
+    details = RELIABILITY_EVENT_DETAILS.get(event)
+    if details is None:
+        return None
+    severity, message = details
+    if record.get("severity") != severity or record.get("message") != message:
+        return None
+    raw_duration = record.get("durationSeconds")
+    if raw_duration is None:
+        duration: int | None = None
+    elif (
+        isinstance(raw_duration, bool)
+        or not isinstance(raw_duration, int)
+        or not 0 <= raw_duration <= MAX_RELIABILITY_DURATION_SECONDS
+    ):
+        return None
+    else:
+        duration = raw_duration
+    if event != ("collector-gap", "detected") and duration is not None:
+        return None
+    return {
+        "timestamp": timestamp,
+        "severity": severity,
+        "kind": event[0],
+        "status": event[1],
+        "message": message,
+        "durationSeconds": duration,
+    }
+
+
+def sanitize_kernel_reliability_line(
+    line: str,
+    fallback_timestamp: str,
+    primary_interface: str = "eth0",
+) -> dict[str, Any] | None:
+    event: tuple[str, str] | None = None
+    lowered = line.lower()
+    if re.search(r"\bnvme\S*.*controller is down; will reset\b", line, re.IGNORECASE):
+        event = ("nvme-reset", "active")
+    elif re.search(r"\bnvme\S*", line, re.IGNORECASE) and (
+        "I/O Error" in line or re.search(r"I/O error,\s*dev\s+nvme", line, re.IGNORECASE)
+    ):
+        event = ("nvme-io", "active")
+    elif re.search(r"\brcu(?:_preempt)?:?.*(?:detected .*stalls?|stall detected|kthread starved)", lowered):
+        event = ("rcu-stall", "active")
+    elif re.search(r"\b(?:out of memory: killed process|oom-kill:)", lowered):
+        event = ("oom-kill", "active")
+    elif re.search(
+        r"\b(?:ext[234]-fs error|xfs.*(?:corruption|metadata i/o error)|"
+        r"buffer i/o error on dev|remounting filesystem read-only)\b",
+        lowered,
+    ):
+        event = ("filesystem-error", "active")
+    elif re.search(
+        rf"\b{re.escape(primary_interface)}\b.*\b(?:link is down|lost carrier|carrier lost)\b",
+        lowered,
+    ):
+        event = ("network-link", "unavailable")
+    elif re.search(
+        rf"\b{re.escape(primary_interface)}\b.*\b(?:link is up|gained carrier|carrier acquired)\b",
+        lowered,
+    ):
+        event = ("network-link", "recovered")
+    if event is None:
+        return None
+    return reliability_event(event_timestamp(line, fallback_timestamp), *event)
+
+
+def parse_listening_tcp_ports(proc_root: Path) -> set[int]:
+    ports: set[int] = set()
+    for path in (proc_root / "net" / "tcp", proc_root / "net" / "tcp6"):
+        for line in read_text(path, 2 * 1024 * 1024).splitlines()[1:]:
+            fields = line.split()
+            if len(fields) < 4 or fields[3].upper() != "0A":
+                continue
+            try:
+                port = int(fields[1].rsplit(":", 1)[1], 16)
+            except (IndexError, ValueError):
+                continue
+            if 0 < port <= 65535:
+                ports.add(port)
+    return ports
+
+
+def observed_ssh_listeners(proc_root: Path, expected_ports: set[int]) -> bool | None:
+    if not expected_ports:
+        return None
+    tcp = proc_root / "net" / "tcp"
+    tcp6 = proc_root / "net" / "tcp6"
+    if not tcp.is_file() and not tcp6.is_file():
+        return None
+    return expected_ports.issubset(parse_listening_tcp_ports(proc_root))
+
+
+def observed_network_link(sys_root: Path, interface: str) -> bool | None:
+    root = sys_root / "class" / "net" / interface
+    operstate = read_text(root / "operstate", 64).strip().lower()
+    carrier = read_text(root / "carrier", 64).strip()
+    if not operstate and not carrier:
+        return None
+    if carrier in {"0", "1"}:
+        return carrier == "1" and operstate not in {"down", "dormant", "notpresent", "lowerlayerdown"}
+    if operstate:
+        return operstate == "up"
+    return None
+
+
+def observed_nvme_mitigation(sys_root: Path) -> bool | None:
+    latency_path = sys_root / "module" / "nvme_core" / "parameters" / "default_ps_max_latency_us"
+    aspm_path = sys_root / "module" / "pcie_aspm" / "parameters" / "policy"
+    latency = read_text(latency_path, 64).strip()
+    aspm = read_text(aspm_path, 256).strip().lower()
+    if not latency and not aspm:
+        return None
+    return latency == "0" and ("[performance]" in aspm or aspm == "performance")
 
 
 def existing_sample_record(record: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -2564,6 +2768,218 @@ def replay_pending_incident_commit(config: "Config", now: dt.datetime) -> bool:
     return True
 
 
+RELIABILITY_FIELDS = (
+    "timestamp", "severity", "kind", "status", "message", "durationSeconds",
+)
+
+
+def existing_reliability_state(value: Any) -> dict[str, Any] | None:
+    required = {
+        "version", "bootId", "lastSeenAt", "sshListenersAvailable",
+        "networkLinkAvailable", "nvmeMitigationActive", "kernelCursor",
+    }
+    if not isinstance(value, Mapping) or set(value) != required or value.get("version") != 1:
+        return None
+    boot_id = value.get("bootId")
+    if boot_id is not None and (
+        not isinstance(boot_id, str)
+        or re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", boot_id) is None
+    ):
+        return None
+    last_seen = parse_iso_timestamp(value.get("lastSeenAt"))
+    if last_seen is None:
+        return None
+    states: dict[str, bool | None] = {}
+    for field_name in (
+        "sshListenersAvailable", "networkLinkAvailable", "nvmeMitigationActive",
+    ):
+        raw = value.get(field_name)
+        if raw is not None and not isinstance(raw, bool):
+            return None
+        states[field_name] = raw
+    kernel_cursor = existing_traffic_cursor(value.get("kernelCursor"))
+    if kernel_cursor is None:
+        return None
+    return {
+        "version": 1,
+        "bootId": boot_id,
+        "lastSeenAt": iso_timestamp(last_seen),
+        **states,
+        "kernelCursor": kernel_cursor,
+    }
+
+
+def load_reliability_records(config: "Config", limit: int) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for value in existing_json_lines(config.output_dir / "reliability.jsonl", limit):
+        normalized = existing_reliability_record(value)
+        if normalized is not None:
+            records.append(normalized)
+    return records[-limit:]
+
+
+def merge_reliability_records(
+    existing: Sequence[Mapping[str, Any]],
+    new_records: Sequence[Mapping[str, Any]],
+    limit: int,
+) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    for value in (*existing, *new_records):
+        record = existing_reliability_record(value)
+        if record is not None:
+            normalized.append(record)
+    return [
+        dict(record) for record in stable_deduplicate_records(normalized, RELIABILITY_FIELDS)
+    ][-limit:]
+
+
+def reliability_records_digest(records: Sequence[Mapping[str, Any]]) -> str:
+    digest = hashlib.sha256()
+    for record in records:
+        digest.update((json.dumps(
+            record, ensure_ascii=False, separators=(",", ":"), allow_nan=False
+        ) + "\n").encode())
+    return digest.hexdigest()
+
+
+def normalized_pending_reliability_commit(value: Any) -> dict[str, Any] | None:
+    required = {
+        "version", "baseDigest", "baseCount", "finalDigest", "finalCount",
+        "limit", "rows", "state",
+    }
+    if not isinstance(value, Mapping) or set(value) != required or value.get("version") != 1:
+        return None
+    limit = value.get("limit")
+    base_count = value.get("baseCount")
+    final_count = value.get("finalCount")
+    if (
+        isinstance(limit, bool) or not isinstance(limit, int) or not 10 <= limit <= 100_000
+        or isinstance(base_count, bool) or not isinstance(base_count, int) or not 0 <= base_count <= limit
+        or isinstance(final_count, bool) or not isinstance(final_count, int) or not 0 <= final_count <= limit
+    ):
+        return None
+    base_digest = value.get("baseDigest")
+    final_digest = value.get("finalDigest")
+    if (
+        not isinstance(base_digest, str) or re.fullmatch(r"[0-9a-f]{64}", base_digest) is None
+        or not isinstance(final_digest, str) or re.fullmatch(r"[0-9a-f]{64}", final_digest) is None
+    ):
+        return None
+    raw_rows = value.get("rows")
+    if not isinstance(raw_rows, list) or len(raw_rows) > limit:
+        return None
+    rows: list[dict[str, Any]] = []
+    for value_row in raw_rows:
+        if not isinstance(value_row, Mapping):
+            return None
+        record = existing_reliability_record(value_row)
+        if record is None:
+            return None
+        rows.append(record)
+    state = existing_reliability_state(value.get("state"))
+    if state is None:
+        return None
+    normalized = {
+        "version": 1,
+        "baseDigest": base_digest,
+        "baseCount": base_count,
+        "finalDigest": final_digest,
+        "finalCount": final_count,
+        "limit": limit,
+        "rows": rows,
+        "state": state,
+    }
+    encoded = (json.dumps(
+        normalized, ensure_ascii=False, separators=(",", ":"), allow_nan=False
+    ) + "\n").encode()
+    return normalized if len(encoded) <= MAX_PENDING_RELIABILITY_COMMIT_BYTES else None
+
+
+def load_pending_reliability_commit(path: Path) -> dict[str, Any] | None:
+    decoded = load_private_pending_json(path, MAX_PENDING_RELIABILITY_COMMIT_BYTES)
+    if decoded is None:
+        return None
+    normalized = normalized_pending_reliability_commit(decoded)
+    if normalized is None:
+        raise PendingJournalError("pending reliability journal failed schema validation")
+    return normalized
+
+
+def replay_pending_reliability_commit(config: "Config") -> bool:
+    path = config.output_dir / ".state" / "pending-reliability-commit.json"
+    pending = load_pending_reliability_commit(path)
+    if pending is None:
+        return False
+    current = load_reliability_records(config, pending["limit"])
+    current_digest = reliability_records_digest(current)
+    current_count = len(current)
+    final_matches = (
+        current_digest == pending["finalDigest"]
+        and current_count == pending["finalCount"]
+        and (config.output_dir / "reliability.jsonl").is_file()
+    )
+    if not final_matches:
+        if current_digest != pending["baseDigest"] or current_count != pending["baseCount"]:
+            raise PendingJournalError("reliability output diverged from pending transaction")
+        final = merge_reliability_records(current, pending["rows"], pending["limit"])
+        if (
+            reliability_records_digest(final) != pending["finalDigest"]
+            or len(final) != pending["finalCount"]
+        ):
+            raise PendingJournalError("reliability pending digest validation failed")
+        rewrite_json_lines(config.output_dir / "reliability.jsonl", final, pending["limit"])
+        saved = load_reliability_records(config, pending["limit"])
+        if (
+            reliability_records_digest(saved) != pending["finalDigest"]
+            or len(saved) != pending["finalCount"]
+        ):
+            raise PendingJournalError("reliability output verification failed")
+    atomic_write_json(
+        config.output_dir / ".state" / "reliability-state.json",
+        pending["state"],
+        0o600,
+    )
+    if not discard_pending_incident_commit(path):
+        raise OSError("pending reliability journal could not be removed")
+    return True
+
+
+def write_pending_reliability_commit(
+    config: "Config",
+    rows: Sequence[Mapping[str, Any]],
+    state: Mapping[str, Any],
+) -> Path:
+    path = config.output_dir / ".state" / "pending-reliability-commit.json"
+    require_pending_journal_absent(path)
+    limit = config.max_log_records
+    base = load_reliability_records(config, limit)
+    normalized_rows: list[dict[str, Any]] = []
+    for value in rows:
+        record = existing_reliability_record(value)
+        if record is None:
+            raise ValueError("reliability row did not satisfy the public contract")
+        normalized_rows.append(record)
+    bounded_rows = [
+        dict(record)
+        for record in stable_deduplicate_records(normalized_rows, RELIABILITY_FIELDS)
+    ][-limit:]
+    final = merge_reliability_records(base, bounded_rows, limit)
+    normalized = normalized_pending_reliability_commit({
+        "version": 1,
+        "baseDigest": reliability_records_digest(base),
+        "baseCount": len(base),
+        "finalDigest": reliability_records_digest(final),
+        "finalCount": len(final),
+        "limit": limit,
+        "rows": bounded_rows,
+        "state": dict(state),
+    })
+    if normalized is None:
+        raise ValueError("pending reliability commit did not satisfy the private state contract")
+    atomic_create_json(path, normalized, MAX_PENDING_RELIABILITY_COMMIT_BYTES, 0o600)
+    return path
+
+
 SANITIZED_LOG_FIELDS: dict[str, tuple[str, ...]] = {
     "alerts": ("timestamp", "severity", "kind", "status", "message"),
     "power": ("timestamp", "severity", "kind", "status", "message"),
@@ -2963,6 +3379,24 @@ def parse_uid_set(value: str) -> set[int]:
     return result
 
 
+def parse_port_set(value: str) -> set[int]:
+    result: set[int] = set()
+    for item in value.split(","):
+        item = item.strip()
+        if item.isdigit():
+            port = int(item)
+            if 0 < port <= 65535:
+                result.add(port)
+        if len(result) >= 16:
+            break
+    return result
+
+
+def safe_interface_name(value: str) -> str:
+    name = value.strip()
+    return name if re.fullmatch(r"[A-Za-z0-9_.-]{1,15}", name) else "eth0"
+
+
 @dataclass
 class Config:
     output_dir: Path = Path("/var/lib/monitor-export")
@@ -2981,6 +3415,8 @@ class Config:
         default_factory=lambda: {key: Path(value) for key, value in DEFAULT_SOCKETS.items()}
     )
     process_uids: set[int] = field(default_factory=lambda: {0, 1001})
+    ssh_ports: set[int] = field(default_factory=lambda: {22, 22022})
+    primary_interface: str = "eth0"
     curl: str = "/usr/bin/curl"
     vcgencmd: str = "/usr/bin/vcgencmd"
     command_timeout: float = 2.0
@@ -3033,6 +3469,10 @@ def config_from_environment(arguments: Sequence[str] | None = None) -> Config:
         "MONITOR_DOCKER_SOCKETS", ",".join(f"{owner}={path}" for owner, path in DEFAULT_SOCKETS.items())
     ))
     parser.add_argument("--process-uids", default=env.get("MONITOR_PROCESS_UIDS", "0,1001"))
+    parser.add_argument("--ssh-ports", default=env.get("MONITOR_SSH_PORTS", "22,22022"))
+    parser.add_argument(
+        "--primary-interface", default=env.get("MONITOR_PRIMARY_INTERFACE", "eth0")
+    )
     parser.add_argument("--curl", default=env.get("MONITOR_CURL", "/usr/bin/curl"))
     parser.add_argument("--vcgencmd", default=env.get("MONITOR_VCGENCMD", "/usr/bin/vcgencmd"))
     parser.add_argument("--command-timeout", type=float, default=float(env.get("MONITOR_COMMAND_TIMEOUT", "2")))
@@ -3107,6 +3547,8 @@ def config_from_environment(arguments: Sequence[str] | None = None) -> Config:
         container_input=Path(values.container_input) if values.container_input else None,
         docker_sockets=parse_socket_map(values.docker_sockets),
         process_uids=parse_uid_set(values.process_uids),
+        ssh_ports=parse_port_set(values.ssh_ports),
+        primary_interface=safe_interface_name(values.primary_interface),
         curl=values.curl, vcgencmd=values.vcgencmd,
         command_timeout=max(0.1, min(10.0, values.command_timeout)),
         retention_days=max(1, min(366, values.retention_days)),
@@ -3137,6 +3579,141 @@ def config_from_environment(arguments: Sequence[str] | None = None) -> Config:
     )
 
 
+def historical_collector_gap_at_boot(
+    config: Config,
+    boot_started: dt.datetime,
+) -> int | None:
+    """Infer one pre-existing reboot gap when reliability state is first introduced."""
+    timestamps: list[dt.datetime] = []
+    for file_date in (boot_started.date() - dt.timedelta(days=1), boot_started.date()):
+        path = config.output_dir / "history" / f"{file_date.isoformat()}.jsonl"
+        for value in existing_json_lines(path, 2000):
+            sample = existing_sample_record(value)
+            if sample is None:
+                continue
+            parsed = parse_iso_timestamp(sample.get("timestamp"))
+            if parsed is not None:
+                timestamps.append(parsed)
+    before = [value for value in timestamps if value < boot_started]
+    after = [value for value in timestamps if value >= boot_started]
+    if not before or not after:
+        return None
+    duration = int((min(after) - max(before)).total_seconds())
+    return max(0, min(MAX_RELIABILITY_DURATION_SECONDS, duration))
+
+
+def collect_reliability(
+    config: Config,
+    now: dt.datetime,
+    uptime_seconds: int | None,
+) -> dict[str, Any]:
+    """Persist bounded host-availability evidence and return its public summary."""
+    replay_pending_reliability_commit(config)
+    now_text = iso_timestamp(now)
+    state_path = config.output_dir / ".state" / "reliability-state.json"
+    previous = existing_reliability_state(load_json(state_path))
+
+    raw_boot_id = read_text(
+        config.proc_root / "sys" / "kernel" / "random" / "boot_id", 128
+    ).strip().lower()
+    boot_id = raw_boot_id if re.fullmatch(
+        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+        raw_boot_id,
+    ) else None
+    boot_started_at: str | None = None
+    if uptime_seconds is not None and 0 <= uptime_seconds <= MAX_RELIABILITY_DURATION_SECONDS:
+        boot_started_at = iso_timestamp(now - dt.timedelta(seconds=uptime_seconds))
+
+    ssh_available = observed_ssh_listeners(config.proc_root, config.ssh_ports)
+    network_available = observed_network_link(config.sys_root, config.primary_interface)
+    mitigation_active = observed_nvme_mitigation(config.sys_root)
+    events: list[dict[str, Any]] = []
+
+    previous_seen = parse_iso_timestamp(previous.get("lastSeenAt")) if previous else None
+    gap_seconds: int | None = None
+    if previous_seen is not None:
+        gap_seconds = max(0, min(
+            MAX_RELIABILITY_DURATION_SECONDS,
+            int((now - previous_seen).total_seconds()),
+        ))
+    elif previous is None and boot_started_at is not None:
+        parsed_boot_started = parse_iso_timestamp(boot_started_at)
+        if parsed_boot_started is not None:
+            gap_seconds = historical_collector_gap_at_boot(config, parsed_boot_started)
+
+    previous_boot = previous.get("bootId") if previous else None
+    boot_changed = bool(previous_boot and boot_id and previous_boot != boot_id)
+    if previous is None:
+        events.append(reliability_event(
+            boot_started_at or now_text, "host-boot", "observed",
+        ))
+    elif boot_changed:
+        events.append(reliability_event(
+            boot_started_at or now_text, "host-boot", "restarted",
+        ))
+    if gap_seconds is not None and gap_seconds > RELIABILITY_GAP_WARN_SECONDS:
+        events.append(reliability_event(
+            boot_started_at if (boot_changed or previous is None) and boot_started_at else now_text,
+            "collector-gap",
+            "detected",
+            gap_seconds,
+        ))
+
+    previous_ssh = previous.get("sshListenersAvailable") if previous else None
+    if ssh_available is False and previous_ssh is not False:
+        events.append(reliability_event(now_text, "ssh-listener", "unavailable"))
+    elif ssh_available is True and previous_ssh is False:
+        events.append(reliability_event(now_text, "ssh-listener", "recovered"))
+
+    previous_network = previous.get("networkLinkAvailable") if previous else None
+    if network_available is False and previous_network is not False:
+        events.append(reliability_event(now_text, "network-link", "unavailable"))
+    elif network_available is True and previous_network is False:
+        events.append(reliability_event(now_text, "network-link", "recovered"))
+
+    previous_mitigation = previous.get("nvmeMitigationActive") if previous else None
+    if mitigation_active is not None and mitigation_active != previous_mitigation:
+        events.append(reliability_event(
+            now_text,
+            "nvme-mitigation",
+            "active" if mitigation_active else "incomplete",
+        ))
+
+    prior_cursor = previous.get("kernelCursor", {}) if previous else {}
+    if not isinstance(prior_cursor, Mapping):
+        prior_cursor = {}
+    lines, kernel_cursor = read_new_lines(
+        config.kernel_log, prior_cursor, config.kernel_max_input_bytes
+    )
+    for line in lines:
+        record = sanitize_kernel_reliability_line(
+            line, now_text, config.primary_interface
+        )
+        if record is not None:
+            events.append(record)
+
+    state = {
+        "version": 1,
+        "bootId": boot_id,
+        "lastSeenAt": now_text,
+        "sshListenersAvailable": ssh_available,
+        "networkLinkAvailable": network_available,
+        "nvmeMitigationActive": mitigation_active,
+        "kernelCursor": kernel_cursor,
+    }
+    if existing_reliability_state(state) is None:
+        raise ValueError("reliability state did not satisfy the private contract")
+    write_pending_reliability_commit(config, events, state)
+    replay_pending_reliability_commit(config)
+    return {
+        "bootStartedAt": boot_started_at,
+        "collectorGapSeconds": gap_seconds,
+        "sshListenersAvailable": ssh_available,
+        "networkLinkAvailable": network_available,
+        "nvmeMitigationActive": mitigation_active,
+    }
+
+
 def run(config: Config, now: dt.datetime | None = None) -> dict[str, Any]:
     now = now or utc_now()
     now_text = iso_timestamp(now)
@@ -3149,6 +3726,7 @@ def run(config: Config, now: dt.datetime | None = None) -> dict[str, Any]:
         # lifecycle state or the traffic cursor can influence this sample.
         replay_pending_incident_commit(config, now)
         replay_pending_sanitized_log_commit(config)
+        replay_pending_reliability_commit(config)
         delta_path = config.runtime_dir / "delta-state.json"
         prior = load_json(delta_path)
         incident_lifecycle_path = config.output_dir / ".state" / "incident-lifecycle.json"
@@ -3217,11 +3795,12 @@ def run(config: Config, now: dt.datetime | None = None) -> dict[str, Any]:
         }
         assert tuple(latest) == SAMPLE_FIELDS
 
+        uptime_seconds = parse_uptime(read_text(config.proc_root / "uptime", 128))
         host = {
             "hostname": bounded_text(socket.gethostname(), 255),
             "os": parse_os_release(read_text(config.etc_root / "os-release", 8192)),
             "architecture": bounded_text(platform.machine() or "unknown", 64),
-            "uptimeSeconds": parse_uptime(read_text(config.proc_root / "uptime", 128)),
+            "uptimeSeconds": uptime_seconds,
         }
         if config.container_input is not None:
             containers = load_container_snapshot(config.container_input, now)
@@ -3234,12 +3813,14 @@ def run(config: Config, now: dt.datetime | None = None) -> dict[str, Any]:
             config.proc_root, prior.get("processes"), host_cpu_delta, config.process_uids
         )
         traffic, traffic_cursor, traffic_available = collect_traffic(config, now)
+        reliability = collect_reliability(config, now, uptime_seconds)
         current = {
             "generatedAt": now_text,
             "host": host,
             "latest": latest,
             "disks": collect_filesystems(read_text(config.mountinfo_path), config.mount_root),
             "containers": containers,
+            "reliability": reliability,
         }
         # The strict public snapshot schema has no GPU object. GPU temperature,
         # supply voltage, and throttle flags contribute only to the safe latest
