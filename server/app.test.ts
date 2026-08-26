@@ -22,7 +22,10 @@ const NOW = Date.parse('2026-08-19T12:00:00.000Z');
 const SECRET = 'test-session-secret-is-at-least-32-bytes-long';
 const EDGE_SECRET = 'test-edge-secret-is-at-least-32-bytes-long';
 
-function ssoHeaders(groups = 'user', edgeSecret = EDGE_SECRET): Record<string, string> {
+function ssoHeaders(
+  groups = 'user,portfolio-v2,access-monitor',
+  edgeSecret = EDGE_SECRET,
+): Record<string, string> {
   return {
     'Remote-User': 'portfolio-owner',
     'Remote-Email': 'owner@example.test',
@@ -209,9 +212,9 @@ describe('authentication', () => {
         expiresAt: null,
         mode: 'sso',
         user: 'portfolio-owner',
-        groups: ['user'],
+        groups: ['user', 'portfolio-v2', 'access-monitor'],
         role: 'user',
-        permissions: [],
+        permissions: ['dashboard:read'],
       });
     await request(app).post('/monitor/api/auth/login').send({ password: 'unused local password' }).expect(403);
     await request(app)
@@ -223,7 +226,11 @@ describe('authentication', () => {
     await request(app)
       .get('/monitor/api/dashboard?range=1h')
       .set(ssoHeaders())
-      .expect(403, { error: 'Developer role required', code: 'ROLE_REQUIRED' });
+      .expect(200);
+    await request(app)
+      .get('/monitor/api/dashboard?range=1h')
+      .set(ssoHeaders('user'))
+      .expect(401);
     await request(app)
       .get('/monitor/api/dashboard?range=1h')
       .set(ssoHeaders('user,developer'))
@@ -260,7 +267,20 @@ describe('authentication', () => {
       '',
       'developer',
       'admin',
+      'user',
       'user,admin',
+      'user,admin,portfolio-v2',
+      'user,admin,portfolio-v2,access-react',
+      'user,access-monitor',
+      'user,portfolio-v2',
+      'user,portfolio-v2,access-react',
+      'user,portfolio-v2,access-monitor,access-react',
+      'user,portfolio-v2,access-monitor,access-monitor',
+      'user,portfolio-v2,unknown',
+      'user,portfolio-v2,portfolio-v2,access-monitor',
+      'user,chief-admin,portfolio-v2',
+      'user,admin,chief-admin,portfolio-v2,access-monitor',
+      'user,admin,access-monitor,portfolio-v2',
       'developer,user',
       'user,user',
       'user,unknown',
@@ -276,13 +296,20 @@ describe('authentication', () => {
     await request(app)
       .get('/monitor/api/operations/auth-inventory')
       .set(ssoHeaders())
-      .expect(403, { error: 'Developer role required', code: 'ROLE_REQUIRED' });
-    const developer = await request(app)
+      .expect(403, { error: 'Admin role required', code: 'ROLE_REQUIRED' });
+    await request(app)
       .get('/monitor/api/operations/auth-inventory')
       .set('Cookie', 'monitor_session=legacy-local-cookie')
       .set(ssoHeaders('user,developer'))
+      .expect(403, { error: 'Admin role required', code: 'ROLE_REQUIRED' });
+    const admin = await request(app)
+      .get('/monitor/api/operations/auth-inventory')
+      .set('Cookie', 'monitor_session=legacy-local-cookie')
+      .set(ssoHeaders(
+        'user,admin,portfolio-v2,access-react,access-monitor,access-multtara',
+      ))
       .expect(200);
-    expect(developer.body).toEqual({
+    expect(admin.body).toEqual({
       localPasswordRecords: 1,
       unsafeLocalAuthArtifacts: 0,
       legacySessionCookies: 1,
@@ -303,8 +330,8 @@ describe('authentication', () => {
       .expect(200);
     expect(session.body).toMatchObject({
       authenticated: true,
-      groups: ['user', 'developer', 'admin'],
-      role: 'admin',
+      groups: ['user', 'admin', 'chief-admin', 'portfolio-v2'],
+      role: 'chief-admin',
       permissions: ['dashboard:read', 'auth-inventory:read'],
     });
     expect(String(session.headers['set-cookie'])).toContain('monitor_session=;');
@@ -312,9 +339,28 @@ describe('authentication', () => {
   });
 
   it('rejects whitespace before HTTP header normalization', () => {
-    for (const groups of [' user', 'user ', 'user, developer', 'user,developer ']) {
+    for (const groups of [
+      ' user,portfolio-v2,access-monitor',
+      'user,portfolio-v2,access-monitor ',
+      'user, portfolio-v2,access-monitor',
+      'user,portfolio-v2, access-monitor',
+    ]) {
       expect(parseSsoGroups(groups)).toBeNull();
     }
+  });
+
+  it('normalizes only the exact compatible v1 Monitor roles without exposing developer', () => {
+    expect(parseSsoGroups('user')).toBeNull();
+    expect(parseSsoGroups('user,developer')).toEqual({
+      groups: ['user', 'portfolio-v2', 'access-monitor'],
+      grants: ['access-monitor'],
+      role: 'user',
+    });
+    expect(parseSsoGroups('user,developer,admin')).toEqual({
+      groups: ['user', 'admin', 'chief-admin', 'portfolio-v2'],
+      grants: [],
+      role: 'chief-admin',
+    });
   });
 
   it('rejects bad credentials and issues a hardened session cookie', async () => {

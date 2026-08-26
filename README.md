@@ -47,14 +47,24 @@ runtime branch/mode overrides must match the branch and mode used to build the
 image.
 
 In `sso` mode Monitor still requires the edge secret and accepts `Remote-*`
-identity only when the Nginx-injected secret matches. `Remote-Groups` must be
-one whitespace-free, exact hierarchy-closed prefix: `user`, `user,developer`,
-or `user,developer,admin`; missing, empty, whitespace-padded, duplicate,
-unknown, or reordered groups fail closed. A valid `user` can inspect only its SSO session identity; both the
-dashboard and metadata-only legacy auth inventory require `developer` or
-`admin`, matching the outer `/monitor` ACL in a second application-level
-boundary. Roles are recalculated from the trusted headers on every request and
-are never stored in a Monitor cookie.
+identity only when the Nginx-injected secret matches. Canonical v2
+`Remote-Groups` starts with `user`, may add `admin` and then `chief-admin`, and
+must then include the `portfolio-v2` marker. Non-chief identities append their
+assigned grants in this fixed relative order: `access-react`, `access-vue`,
+`access-dukkeobi`, `access-ddit-finalproject`, `access-monitor`,
+`access-pilgrimage`, `access-multtara`, `access-feelmyrythm`, `access-garak`.
+Monitor requires `access-monitor`; `chief-admin` is universal and therefore
+carries no grants. Missing/reordered/duplicate markers, role gaps, unknown or
+out-of-order grants, whitespace, and missing Monitor entitlement fail closed.
+
+During central cutover only the exact v1 strings remain recognized. Legacy
+`user,developer` becomes an ordinary Monitor-entitled `user`, while
+`user,developer,admin` becomes `chief-admin`; legacy `user` keeps its former
+no-dashboard behavior. `developer` is never exposed as a current runtime role
+and never grants the admin-only auth inventory. Every entitled user can read the
+dashboard, while the metadata-only legacy auth inventory requires `admin` or
+`chief-admin`. Roles and grants are recalculated from trusted headers on every
+request and are never stored in a Monitor cookie.
 Local login and password changes stay disabled, and the SSO session check
 expires any legacy Monitor cookie presented by that browser. In `local` mode
 the existing password screen, scrypt state, and signed Monitor cookie remain
@@ -127,7 +137,7 @@ sudo chmod 0600 /home/cks/.config/monitor/edge-secret
 Do not mount `MONITOR_PASSWORD_FILE`, `MONITOR_SESSION_SECRET_FILE`, or
 `MONITOR_AUTH_STATE_FILE` in a `main`/ `dev` deployment. SSO mode does not
 read credential contents and does not instantiate the local password store.
-`GET /monitor/api/operations/auth-inventory` is developer-gated and reports
+`GET /monitor/api/operations/auth-inventory` is admin-gated and reports
 only aggregate file/cookie counts. If an old local state file remains, stop the
 container and run the explicit owner-only `retire` procedure described below;
 do not expose hash contents or remove a running local-mode store.
@@ -496,7 +506,7 @@ GET    /monitor/api/auth/session
 DELETE /monitor/api/auth/session
 POST   /monitor/api/auth/password
 GET    /monitor/api/dashboard?range=1h|24h|7d|30d
-GET    /monitor/api/operations/auth-inventory  # developer/admin, aggregate only
+GET    /monitor/api/operations/auth-inventory  # admin/chief-admin, aggregate only
 ```
 
 ## Security boundaries
@@ -531,7 +541,7 @@ GET    /monitor/api/operations/auth-inventory  # developer/admin, aggregate only
   overwrites `Remote-User`/`Remote-Email`/`Remote-Groups`, and overwrites a
   dedicated secret header which the application compares in constant time;
   port `5181` remains loopback-only. Identity headers without the matching
-  secret and canonical hierarchy-closed groups fail closed.
+  secret and canonical v2 app-entitled groups fail closed.
   Signing out redirects to the central `/sso/logout` endpoint. Local password
   authentication remains available only when the canonical authentication mode
   is `local`.

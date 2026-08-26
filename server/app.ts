@@ -228,10 +228,6 @@ export function createApp(options: AppOptions = {}) {
         apiError(response, 401, 'AUTH_REQUIRED', 'Authentication required');
         return;
       }
-      if (!ssoRoleAtLeast(identity, 'developer')) {
-        apiError(response, 403, 'ROLE_REQUIRED', 'Developer role required');
-        return;
-      }
     } else {
       const session = verifySession(
         request,
@@ -267,8 +263,8 @@ export function createApp(options: AppOptions = {}) {
       apiError(response, 401, 'AUTH_REQUIRED', 'Authentication required');
       return;
     }
-    if (!ssoRoleAtLeast(identity, 'developer')) {
-      apiError(response, 403, 'ROLE_REQUIRED', 'Developer role required');
+    if (!ssoRoleAtLeast(identity, 'admin')) {
+      apiError(response, 403, 'ROLE_REQUIRED', 'Admin role required');
       return;
     }
     response.status(200).json(inventoryLegacyAuth(request, config.legacyAuthStateFile));
