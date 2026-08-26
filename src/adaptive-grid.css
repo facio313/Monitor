@@ -1,0 +1,237 @@
+.adaptive-grid {
+  min-width: 0;
+  position: relative;
+}
+
+.adaptive-grid__toolbar {
+  min-height: 40px;
+  margin-bottom: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+
+.adaptive-grid__toolbar button,
+.adaptive-grid__widget-controls button {
+  border: 1px solid var(--border, #20312f);
+  color: var(--text, #e9f0ee);
+  background: var(--surface-high, #12201e);
+  font: inherit;
+  cursor: pointer;
+  touch-action: manipulation;
+  transition: border-color .16s ease, background .16s ease, opacity .16s ease, transform .16s ease;
+}
+
+.adaptive-grid__toolbar button {
+  min-height: 36px;
+  padding: 0 12px;
+  border-radius: 9px;
+  color: #b8c8c4;
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.adaptive-grid__toolbar button:hover:not(:disabled),
+.adaptive-grid__widget-controls button:hover:not(:disabled) {
+  border-color: #3b5a55;
+  background: #17302c;
+}
+
+.adaptive-grid__toolbar button:active:not(:disabled),
+.adaptive-grid__widget-controls button:active:not(:disabled) {
+  transform: translateY(1px);
+}
+
+.adaptive-grid__toolbar button:focus-visible,
+.adaptive-grid__widget-controls button:focus-visible {
+  outline: 2px solid var(--cyan, #48d6cf);
+  outline-offset: 2px;
+}
+
+.adaptive-grid__toolbar button:disabled,
+.adaptive-grid__widget-controls button:disabled {
+  opacity: .42;
+  cursor: not-allowed;
+}
+
+.adaptive-grid__toolbar .adaptive-grid__save {
+  border-color: #2a6962;
+  color: #d7fffa;
+  background: #17433e;
+}
+
+.adaptive-grid__grid {
+  min-width: 0;
+  margin: 0 -8px;
+  touch-action: pan-y pinch-zoom;
+}
+
+.adaptive-grid__widget {
+  min-width: 0;
+}
+
+.adaptive-grid__widget-content {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden !important;
+  border: 1px solid var(--border-soft, #182724);
+  border-radius: 13px;
+  color: var(--text, #e9f0ee);
+  background: linear-gradient(145deg, rgb(15 27 25 / 98%), rgb(9 19 17 / 99%));
+  box-shadow: inset 0 1px rgb(255 255 255 / 2%);
+  touch-action: pan-y pinch-zoom;
+}
+
+.adaptive-grid--editing .adaptive-grid__widget-content {
+  border-color: #31534e;
+  box-shadow: inset 0 0 0 1px rgb(72 214 207 / 8%);
+}
+
+.adaptive-grid__widget-header {
+  min-height: 48px;
+  padding: 8px 10px 8px 14px;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  flex: 0 0 auto;
+  border-bottom: 1px solid var(--border-soft, #182724);
+  background: rgb(10 22 20 / 92%);
+}
+
+.adaptive-grid__widget-header h2 {
+  min-width: 0;
+  margin: 0;
+  flex: 1 1 auto;
+  overflow: hidden;
+  color: #dce8e5;
+  font-size: 11px;
+  font-weight: 650;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.adaptive-grid__drag-handle {
+  width: 30px;
+  height: 30px;
+  display: none;
+  place-items: center;
+  flex: 0 0 auto;
+  border: 1px solid #2b4541;
+  border-radius: 7px;
+  color: #78918c;
+  background: #0d1b19;
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+}
+
+.adaptive-grid--editing .adaptive-grid__drag-handle {
+  display: grid;
+}
+
+.adaptive-grid__drag-handle:active {
+  cursor: grabbing;
+}
+
+.adaptive-grid__widget-controls {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 4px;
+}
+
+.adaptive-grid__widget-controls[hidden] {
+  display: none;
+}
+
+.adaptive-grid__widget-controls button {
+  min-width: 30px;
+  height: 30px;
+  padding: 0 5px;
+  border-radius: 7px;
+  color: #a9bcb8;
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", ui-monospace, monospace;
+  font-size: 9px;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.adaptive-grid__widget-body {
+  min-width: 0;
+  min-height: 0;
+  flex: 1 1 auto;
+  overflow: auto;
+  overscroll-behavior: contain;
+  touch-action: pan-y pinch-zoom;
+}
+
+.adaptive-grid__live {
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  position: absolute;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  clip-path: inset(50%);
+  border: 0;
+  white-space: nowrap;
+}
+
+.adaptive-grid--editing .grid-stack-item > .ui-resizable-se {
+  width: 26px;
+  height: 26px;
+  opacity: .8;
+}
+
+@media (max-width: 767px) {
+  .adaptive-grid__toolbar {
+    justify-content: flex-start;
+  }
+
+  .adaptive-grid__widget-header {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .adaptive-grid__widget-header h2 {
+    min-height: 30px;
+    display: flex;
+    align-items: center;
+  }
+
+  .adaptive-grid__widget-controls {
+    width: 100%;
+    justify-content: flex-start;
+  }
+}
+
+/* Coarse pointers keep native page scrolling. Editing remains fully available
+   through the explicit buttons, without accidental drag/resize gestures. */
+@media (any-pointer: coarse) {
+  .adaptive-grid__drag-handle {
+    display: none !important;
+    pointer-events: none;
+  }
+
+  .adaptive-grid .grid-stack-item > .ui-resizable-handle {
+    display: none !important;
+    pointer-events: none !important;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .adaptive-grid *,
+  .adaptive-grid *::before,
+  .adaptive-grid *::after {
+    scroll-behavior: auto !important;
+    transition-duration: .01ms !important;
+    animation-duration: .01ms !important;
+    animation-iteration-count: 1 !important;
+  }
+}

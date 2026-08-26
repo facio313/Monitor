@@ -1,20 +1,22 @@
 import { useCallback, useEffect, useState } from 'react';
-import { getSession, logout } from './api';
+import { getSession, logout, type SessionInfo } from './api';
 import { BonifacioReturnLink } from './components/BonifacioReturnLink';
-import { Dashboard } from './components/Dashboard';
+import { MonitorDashboard } from './components/MonitorDashboard';
 import { Icon } from './components/Icon';
 import { LoginScreen } from './components/LoginScreen';
+import { monitorPageFromPath, monitorPathForPage } from './dashboard-model';
 import type { MonitorPage } from './types';
 
 type SessionState = 'checking' | 'authenticated' | 'anonymous';
 
 function pageFromLocation(): MonitorPage {
-  return /^\/monitor\/details\/?$/.test(window.location.pathname) ? 'details' : 'overview';
+  return monitorPageFromPath(window.location.pathname);
 }
 
 export default function App() {
   const [session, setSession] = useState<SessionState>('checking');
   const [authMode, setAuthMode] = useState<'local' | 'sso'>('local');
+  const [viewer, setViewer] = useState<SessionInfo | null>(null);
   const [sessionMessage, setSessionMessage] = useState<string | null>(null);
   const [page, setPage] = useState<MonitorPage>(pageFromLocation);
   const [navigationVersion, setNavigationVersion] = useState(0);
@@ -24,6 +26,7 @@ export default function App() {
     getSession(controller.signal)
       .then((result) => {
         setAuthMode(result.mode);
+        setViewer(result);
         if (!result.authenticated && result.mode === 'sso') {
           window.location.assign(`/sso/?rd=${encodeURIComponent(window.location.href)}`);
           return;
@@ -51,10 +54,9 @@ export default function App() {
     };
   }, []);
 
-  const handleNavigate = useCallback((nextPage: MonitorPage, hash = '') => {
-    const pathname = nextPage === 'details' ? '/monitor/details' : '/monitor/';
-    const target = `${pathname}${hash}`;
-    if (`${window.location.pathname}${window.location.hash}` !== target) {
+  const handleNavigate = useCallback((nextPage: MonitorPage) => {
+    const target = monitorPathForPage(nextPage);
+    if (window.location.pathname !== target || window.location.hash) {
       window.history.pushState(null, '', target);
     }
     setPage(nextPage);
@@ -90,11 +92,11 @@ export default function App() {
 
   if (session === 'checking') {
     return (
-      <main className="boot-screen" aria-live="polite">
+      <main className="boot-screen" aria-live="polite" lang="ko">
         <BonifacioReturnLink />
         <div className="brand-mark brand-mark-large"><Icon name="activity" size={26} /></div>
         <div className="boot-pulse" aria-hidden="true" />
-        <p>Securing dashboard…</p>
+        <p>보안 세션과 계기판을 확인하는 중…</p>
       </main>
     );
   }
@@ -104,7 +106,7 @@ export default function App() {
   }
 
   return (
-    <Dashboard
+    <MonitorDashboard
       page={page}
       navigationVersion={navigationVersion}
       onNavigate={handleNavigate}
@@ -112,6 +114,7 @@ export default function App() {
       onPasswordChanged={handlePasswordChanged}
       onUnauthorized={handleUnauthorized}
       ssoEnabled={authMode === 'sso'}
+      viewer={viewer}
     />
   );
 }

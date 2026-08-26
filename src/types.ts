@@ -1,5 +1,17 @@
 export type TimeRange = '1h' | '24h' | '7d' | '30d';
-export type MonitorPage = 'overview' | 'details';
+export type MonitorDetailPage =
+  | 'resources'
+  | 'network'
+  | 'storage'
+  | 'containers'
+  | 'reliability'
+  | 'power'
+  | 'incidents'
+  | 'logs';
+// `details` remains a compatibility-only route token for the legacy dashboard
+// component and old deep links. New navigation resolves it to `resources`.
+export type MonitorPage = 'overview' | 'details' | MonitorDetailPage;
+export type MonitorLocale = 'ko' | 'en';
 
 export interface TelemetrySample {
   timestamp: string | null;
@@ -35,6 +47,7 @@ export interface DashboardPayload {
   reliability: ReliabilitySummary;
   latest: TelemetrySample | null;
   series: TelemetrySample[];
+  telemetrySummary: TelemetrySummary;
   incidents: PeakIncident[];
   disks: DiskUsage[];
   containers: ContainerStatus[];
@@ -43,6 +56,22 @@ export interface DashboardPayload {
   powerEvents: PowerEvent[];
   reliabilityEvents: ReliabilityEvent[];
   powerSummary: PowerSummary;
+}
+
+export interface TelemetrySummary {
+  sampleCount: number;
+  cpuAveragePercent: number | null;
+  cpuPeakPercent: number | null;
+  memoryAveragePercent: number | null;
+  memoryPeakPercent: number | null;
+  temperatureAverageC: number | null;
+  temperaturePeakC: number | null;
+  load1Average: number | null;
+  load1Peak: number | null;
+  networkReceivedBytes: number;
+  networkTransmittedBytes: number;
+  diskReadBytes: number;
+  diskWrittenBytes: number;
 }
 
 export interface ReliabilitySummary {

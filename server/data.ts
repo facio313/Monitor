@@ -479,20 +479,39 @@ function downsampleTelemetry(values: TelemetrySample[], maximum: number): Teleme
   if (values.length <= maximum) return values;
 
   const required = new Set<number>([0, values.length - 1]);
-  let minimumVoltageIndex: number | null = null;
-  let maximumVoltageIndex: number | null = null;
+  const extremaFields: Array<keyof TelemetrySample> = [
+    'cpuPercent',
+    'memoryPercent',
+    'temperatureC',
+    'load1',
+    'load5',
+    'load15',
+    'supplyVoltageVolts',
+    'networkRxBytesPerSecond',
+    'networkTxBytesPerSecond',
+    'diskReadBytesPerSecond',
+    'diskWriteBytesPerSecond',
+  ];
+  const extrema = new Map<keyof TelemetrySample, { minimum: number; minimumIndex: number; maximum: number; maximumIndex: number }>();
   const transitions: number[] = [];
   for (let index = 0; index < values.length; index += 1) {
     const sample = values[index]!;
-    if (sample.supplyVoltageVolts !== null) {
-      if (
-        minimumVoltageIndex === null
-        || sample.supplyVoltageVolts < values[minimumVoltageIndex]!.supplyVoltageVolts!
-      ) minimumVoltageIndex = index;
-      if (
-        maximumVoltageIndex === null
-        || sample.supplyVoltageVolts > values[maximumVoltageIndex]!.supplyVoltageVolts!
-      ) maximumVoltageIndex = index;
+    for (const field of extremaFields) {
+      const value = sample[field];
+      if (typeof value !== 'number' || !Number.isFinite(value)) continue;
+      const current = extrema.get(field);
+      if (!current) {
+        extrema.set(field, { minimum: value, minimumIndex: index, maximum: value, maximumIndex: index });
+        continue;
+      }
+      if (value < current.minimum) {
+        current.minimum = value;
+        current.minimumIndex = index;
+      }
+      if (value > current.maximum) {
+        current.maximum = value;
+        current.maximumIndex = index;
+      }
     }
     if (index > 0) {
       const previous = values[index - 1]!;
@@ -502,8 +521,10 @@ function downsampleTelemetry(values: TelemetrySample[], maximum: number): Teleme
       ) transitions.push(index);
     }
   }
-  if (minimumVoltageIndex !== null) required.add(minimumVoltageIndex);
-  if (maximumVoltageIndex !== null) required.add(maximumVoltageIndex);
+  for (const value of extrema.values()) {
+    required.add(value.minimumIndex);
+    required.add(value.maximumIndex);
+  }
 
   const transitionCapacity = Math.max(0, maximum - required.size);
   for (const index of evenlySelect(transitions, transitionCapacity)) required.add(index);
@@ -852,6 +873,63 @@ function summarizePower(samples: TelemetrySample[]): DashboardResponse['powerSum
   };
 }
 
+function telemetryValues(samples: TelemetrySample[], field: keyof TelemetrySample): number[] {
+  return samples
+    .map((sample) => sample[field])
+    .filter((value): value is number => typeof value === 'number' && Number.isFinite(value));
+}
+
+function telemetryAverage(values: number[]): number | null {
+  return values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : null;
+}
+
+function telemetryPeak(values: number[]): number | null {
+  if (!values.length) return null;
+  let maximum = values[0]!;
+  for (let index = 1; index < values.length; index += 1) {
+    if (values[index]! > maximum) maximum = values[index]!;
+  }
+  return maximum;
+}
+
+function integrateTelemetryRate(samples: TelemetrySample[], field: keyof TelemetrySample): number {
+  let total = 0;
+  for (let index = 1; index < samples.length; index += 1) {
+    const previous = samples[index - 1]!;
+    const current = samples[index]!;
+    const rate = current[field];
+    if (typeof rate !== 'number' || !Number.isFinite(rate) || rate < 0) continue;
+    const before = new Date(previous.timestamp).getTime();
+    const after = new Date(current.timestamp).getTime();
+    if (!Number.isFinite(before) || !Number.isFinite(after) || after <= before) continue;
+    const contribution = rate * Math.min((after - before) / 1_000, 300);
+    total = Math.min(Number.MAX_SAFE_INTEGER, total + contribution);
+  }
+  return total;
+}
+
+function summarizeTelemetry(samples: TelemetrySample[]): DashboardResponse['telemetrySummary'] {
+  const cpu = telemetryValues(samples, 'cpuPercent');
+  const memory = telemetryValues(samples, 'memoryPercent');
+  const temperature = telemetryValues(samples, 'temperatureC');
+  const load1 = telemetryValues(samples, 'load1');
+  return {
+    sampleCount: samples.length,
+    cpuAveragePercent: telemetryAverage(cpu),
+    cpuPeakPercent: telemetryPeak(cpu),
+    memoryAveragePercent: telemetryAverage(memory),
+    memoryPeakPercent: telemetryPeak(memory),
+    temperatureAverageC: telemetryAverage(temperature),
+    temperaturePeakC: telemetryPeak(temperature),
+    load1Average: telemetryAverage(load1),
+    load1Peak: telemetryPeak(load1),
+    networkReceivedBytes: integrateTelemetryRate(samples, 'networkRxBytesPerSecond'),
+    networkTransmittedBytes: integrateTelemetryRate(samples, 'networkTxBytesPerSecond'),
+    diskReadBytes: integrateTelemetryRate(samples, 'diskReadBytesPerSecond'),
+    diskWrittenBytes: integrateTelemetryRate(samples, 'diskWriteBytesPerSecond'),
+  };
+}
+
 function privilegeAction(record: JsonRecord): DashboardResponse['privilegeEvents'][number]['action'] {
   const value = cleanText(first(record, ['action', 'type', 'event']), 64)?.toLowerCase() ?? '';
   if (value.includes('sudo')) return 'sudo';
@@ -1167,6 +1245,7 @@ export function readDashboard(
     reliability: normalizeReliability(current),
     latest,
     series: downsampleTelemetry(samples, MAX_SERIES_POINTS),
+    telemetrySummary: summarizeTelemetry(samples),
     powerSummary: summarizePower(samples),
     disks: normalizeDisks(current),
     containers: normalizeContainers(current),

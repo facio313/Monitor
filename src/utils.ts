@@ -24,7 +24,7 @@ export function formatRate(value: number | null | undefined): string {
 }
 
 export function formatClock(hz: number | null): string {
-  if (hz == null || !Number.isFinite(hz)) return 'Not available';
+  if (hz == null || !Number.isFinite(hz)) return '—';
   return hz >= 1_000_000_000 ? `${(hz / 1_000_000_000).toFixed(2)} GHz` : `${Math.round(hz / 1_000_000)} MHz`;
 }
 
@@ -39,12 +39,13 @@ export function formatUptime(seconds: number | null | undefined): string {
   return `${minutes}m`;
 }
 
-export function formatTime(value: string | null | undefined, range?: string): string {
-  if (!value) return 'Unknown';
+export function formatTime(value: string | null | undefined, range?: string, locale?: 'ko' | 'en'): string {
+  const fallback = locale === 'ko' ? '시각 미확인' : 'Unknown';
+  if (!value) return fallback;
   const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return 'Unknown';
+  if (Number.isNaN(date.getTime())) return fallback;
   const includeDate = range === '7d' || range === '30d';
-  return new Intl.DateTimeFormat(undefined, {
+  return new Intl.DateTimeFormat(locale === 'ko' ? 'ko-KR' : locale === 'en' ? 'en-US' : undefined, {
     month: includeDate ? 'short' : undefined,
     day: includeDate ? 'numeric' : undefined,
     hour: '2-digit',
@@ -52,11 +53,12 @@ export function formatTime(value: string | null | undefined, range?: string): st
   }).format(date);
 }
 
-export function formatDateTime(value: string | null | undefined): string {
-  if (!value) return 'Unknown time';
+export function formatDateTime(value: string | null | undefined, locale?: 'ko' | 'en'): string {
+  const fallback = locale === 'ko' ? '시각 미확인' : 'Unknown time';
+  if (!value) return fallback;
   const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return 'Unknown time';
-  return new Intl.DateTimeFormat(undefined, {
+  if (Number.isNaN(date.getTime())) return fallback;
+  return new Intl.DateTimeFormat(locale === 'ko' ? 'ko-KR' : locale === 'en' ? 'en-US' : undefined, {
     month: 'short',
     day: 'numeric',
     hour: '2-digit',

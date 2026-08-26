@@ -40,17 +40,36 @@ async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
 export interface SessionInfo {
   authenticated: boolean;
   mode: 'local' | 'sso';
+  user: string | null;
+  role: 'user' | 'admin' | 'chief-admin' | null;
+  permissions: string[];
 }
 
 export async function getSession(signal?: AbortSignal): Promise<SessionInfo> {
   try {
-    const session = await apiFetch<{ authenticated?: boolean; mode?: string }>('/auth/session', { signal });
+    const session = await apiFetch<{
+      authenticated?: boolean;
+      mode?: string;
+      user?: unknown;
+      role?: unknown;
+      permissions?: unknown;
+    }>('/auth/session', { signal });
+    const role = session.role === 'user' || session.role === 'admin' || session.role === 'chief-admin'
+      ? session.role
+      : null;
     return {
       authenticated: session.authenticated === true,
       mode: session.mode === 'sso' ? 'sso' : 'local',
+      user: typeof session.user === 'string' && /^[a-z0-9][a-z0-9_-]{0,63}$/.test(session.user) ? session.user : null,
+      role,
+      permissions: Array.isArray(session.permissions)
+        ? session.permissions.filter((value): value is string => typeof value === 'string' && /^[a-z][a-z-]{0,63}$/.test(value)).slice(0, 32)
+        : [],
     };
   } catch (error) {
-    if (error instanceof ApiError && error.status === 401) return { authenticated: false, mode: 'local' };
+    if (error instanceof ApiError && error.status === 401) {
+      return { authenticated: false, mode: 'local', user: null, role: null, permissions: [] };
+    }
     throw error;
   }
 }

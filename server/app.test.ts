@@ -793,6 +793,21 @@ describe('dashboard ingestion', () => {
       underVoltageSampleCount: 0,
       throttledSampleCount: 0,
     });
+    expect(response.body.telemetrySummary).toEqual({
+      sampleCount: 0,
+      cpuAveragePercent: null,
+      cpuPeakPercent: null,
+      memoryAveragePercent: null,
+      memoryPeakPercent: null,
+      temperatureAverageC: null,
+      temperaturePeakC: null,
+      load1Average: null,
+      load1Peak: null,
+      networkReceivedBytes: 0,
+      networkTransmittedBytes: 0,
+      diskReadBytes: 0,
+      diskWrittenBytes: 0,
+    });
   });
 
   it('strictly validates reliability state and merges dedicated events with legacy NVMe evidence', async () => {
@@ -1390,11 +1405,16 @@ describe('dashboard ingestion', () => {
     });
   });
 
-  it('downsamples history while preserving endpoints, voltage extrema, and power transitions', async () => {
+  it('downsamples history while preserving endpoints, resource extrema, and power transitions', async () => {
     const directory = dataDirectory();
     const samples = Array.from({ length: 1_000 }, (_, index) => ({
       timestamp: new Date(NOW - 3_600_000 + index * 3_000).toISOString(),
       cpu: { percent: index % 101 },
+      memoryPercent: index === 723 ? 99.7 : 42,
+      temperatureC: index === 612 ? 91.2 : 48,
+      load1: index === 522 ? 18 : 0.8,
+      networkRxBytesPerSecond: index === 333 ? 98_000_000 : 1_000,
+      diskWriteBytesPerSecond: index === 277 ? 77_000_000 : 2_000,
       powerState: index === 400 ? 'under-voltage' : 'normal',
       supplyVoltageVolts: index === 137 ? 4.2 : index === 811 ? 5.8 : 5.1,
       throttledFlags: index === 400 ? 1 : 0,
@@ -1409,7 +1429,7 @@ describe('dashboard ingestion', () => {
       .expect(200);
     expect(response.body.series).toHaveLength(360);
     const timestamps = new Set(response.body.series.map((sample: { timestamp: string }) => sample.timestamp));
-    for (const index of [0, 137, 400, 401, 811, 999]) {
+    for (const index of [0, 137, 277, 333, 400, 401, 522, 612, 723, 811, 999]) {
       expect(timestamps.has(samples[index]!.timestamp)).toBe(true);
     }
     expect(response.body.powerSummary).toEqual({
@@ -1421,6 +1441,20 @@ describe('dashboard ingestion', () => {
       underVoltageSampleCount: 1,
       throttledSampleCount: 0,
     });
+    expect(response.body.telemetrySummary.sampleCount).toBe(1_000);
+    expect(response.body.telemetrySummary.cpuAveragePercent).toBeCloseTo(
+      samples.reduce((sum, sample) => sum + sample.cpu.percent, 0) / samples.length,
+    );
+    expect(response.body.telemetrySummary.cpuPeakPercent).toBe(100);
+    expect(response.body.telemetrySummary.memoryPeakPercent).toBe(99.7);
+    expect(response.body.telemetrySummary.temperaturePeakC).toBe(91.2);
+    expect(response.body.telemetrySummary.load1Peak).toBe(18);
+    expect(response.body.telemetrySummary.networkReceivedBytes).toBe(
+      samples.slice(1).reduce((sum, sample) => sum + sample.networkRxBytesPerSecond * 3, 0),
+    );
+    expect(response.body.telemetrySummary.diskWrittenBytes).toBe(
+      samples.slice(1).reduce((sum, sample) => sum + sample.diskWriteBytesPerSecond * 3, 0),
+    );
   });
 
   it('caps alerts, power events, reliability events, privilege details, and incidents at 500 newest records', async () => {

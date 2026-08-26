@@ -1,0 +1,409 @@
+import { describe, expect, it } from 'vitest';
+import {
+  ADAPTIVE_GRID_BASE_COLUMNS,
+  ADAPTIVE_GRID_MAX_ROWS,
+  ADAPTIVE_GRID_SCHEMA_VERSION,
+  adaptiveGridStorageKey,
+  applyAdaptiveGridCommand,
+  applyAdaptiveGridListCommand,
+  getCuratedAdaptiveGridLayout,
+  inflateGridStackSavedLayout,
+  normalizeAdaptiveGridLayout,
+  parseAdaptiveGridLayout,
+  serializeAdaptiveGridLayout,
+  type AdaptiveGridItem,
+  type AdaptiveGridLayoutItem,
+} from './AdaptiveGrid';
+
+type LayoutDefinition = Pick<AdaptiveGridItem, 'id' | 'layout'>;
+
+const definitions: LayoutDefinition[] = [
+  {
+    id: 'health',
+    layout: { x: 0, y: 0, w: 4, h: 3, minW: 2, minH: 2, maxW: 6, maxH: 5 },
+  },
+  {
+    id: 'traffic',
+    layout: { x: 4, y: 0, w: 8, h: 3, minW: 3, minH: 2, maxW: 10, maxH: 6 },
+  },
+  {
+    id: 'events',
+    layout: { x: 0, y: 3, w: 12, h: 4, minW: 1, minH: 2, maxH: 8 },
+  },
+];
+
+const curated: AdaptiveGridLayoutItem[] = [
+  { id: 'health', x: 0, y: 0, w: 4, h: 3 },
+  { id: 'traffic', x: 4, y: 0, w: 8, h: 3 },
+  { id: 'events', x: 0, y: 3, w: 12, h: 4 },
+];
+
+function stored(layout: unknown, overrides: Record<string, unknown> = {}) {
+  return JSON.stringify({
+    schemaVersion: ADAPTIVE_GRID_SCHEMA_VERSION,
+    columns: ADAPTIVE_GRID_BASE_COLUMNS,
+    layout,
+    ...overrides,
+  });
+}
+
+describe('adaptive-grid curated layout and storage identity', () => {
+  it('returns a fresh, exact copy of the curated 12-column layout', () => {
+    const first = getCuratedAdaptiveGridLayout(definitions);
+    const second = getCuratedAdaptiveGridLayout(definitions);
+
+    expect(first).toEqual(curated);
+    expect(second).toEqual(curated);
+    expect(first).not.toBe(second);
+    expect(first[0]).not.toBe(second[0]);
+
+    first[0].x = 2;
+    expect(getCuratedAdaptiveGridLayout(definitions)).toEqual(curated);
+  });
+
+  it('rejects malformed definitions, duplicate ids, invalid constraints, and curated overlap', () => {
+    expect(() => getCuratedAdaptiveGridLayout([
+      definitions[0],
+      { ...definitions[1], id: definitions[0].id },
+    ])).toThrow(/duplicate/i);
+    expect(() => getCuratedAdaptiveGridLayout([
+      { id: '../unsafe', layout: { x: 0, y: 0, w: 1, h: 1 } },
+    ])).toThrow(/widget id/i);
+    expect(() => getCuratedAdaptiveGridLayout([
+      { id: 'bad-size', layout: { x: 0, y: 0, w: 1, h: 1, minW: 3, maxW: 2 } },
+    ])).toThrow(/constraint/i);
+    expect(() => getCuratedAdaptiveGridLayout([
+      { id: 'one', layout: { x: 0, y: 0, w: 4, h: 2 } },
+      { id: 'two', layout: { x: 3, y: 1, w: 4, h: 2 } },
+    ])).toThrow(/overlap/i);
+  });
+
+  it('namespaces a per-user key with the schema version and encodes it exactly', () => {
+    expect(adaptiveGridStorageKey('alice@example.com')).toBe(
+      'monitor.adaptive-grid.v1.alice%40example.com',
+    );
+    expect(adaptiveGridStorageKey('alice')).not.toBe(adaptiveGridStorageKey('bob'));
+    expect(() => adaptiveGridStorageKey('')).toThrow(/storageKey/);
+    expect(() => adaptiveGridStorageKey(' alice')).toThrow(/storageKey/);
+    expect(() => adaptiveGridStorageKey('alice\nadmin')).toThrow(/storageKey/);
+  });
+});
+
+describe('adaptive-grid layout parser and serializer', () => {
+  it('restores minimum dimensions omitted by GridStack at responsive columns', () => {
+    expect(inflateGridStackSavedLayout([
+      { id: 'health', x: 0, y: 0, w: 2, h: 3 },
+      { id: 'traffic', x: 2, y: 0, h: 3 },
+      { id: 'events', x: 0, y: 3, w: 8 },
+    ], definitions, 8)).toEqual([
+      { id: 'health', x: 0, y: 0, w: 2, h: 3 },
+      { id: 'traffic', x: 2, y: 0, w: 3, h: 3 },
+      { id: 'events', x: 0, y: 3, w: 8, h: 2 },
+    ]);
+    expect(inflateGridStackSavedLayout([{ id: 'unknown' }], definitions, 8)).toBeNull();
+  });
+
+  it('round-trips a valid layout and canonicalizes it to the known widget order', () => {
+    const unordered = [curated[2], curated[0], curated[1]];
+    const serialized = serializeAdaptiveGridLayout(unordered, definitions);
+
+    expect(JSON.parse(serialized)).toEqual({
+      schemaVersion: 1,
+      columns: 12,
+      layout: curated,
+    });
+    expect(parseAdaptiveGridLayout(serialized, definitions)).toEqual(curated);
+  });
+
+  it('returns detached objects rather than caller-owned layout references', () => {
+    const parsed = normalizeAdaptiveGridLayout(curated, definitions)!;
+    expect(parsed).toEqual(curated);
+    expect(parsed).not.toBe(curated);
+    expect(parsed[0]).not.toBe(curated[0]);
+  });
+
+  it('fails closed on malformed JSON, oversized input, schema drift, or extra envelope fields', () => {
+    expect(parseAdaptiveGridLayout('{', definitions)).toBeNull();
+    expect(parseAdaptiveGridLayout('', definitions)).toBeNull();
+    expect(parseAdaptiveGridLayout(' '.repeat(64 * 1024 + 1), definitions)).toBeNull();
+    expect(parseAdaptiveGridLayout(stored(curated, { schemaVersion: 2 }), definitions)).toBeNull();
+    expect(parseAdaptiveGridLayout(stored(curated, { columns: 8 }), definitions)).toBeNull();
+    expect(parseAdaptiveGridLayout(JSON.stringify({
+      schemaVersion: 1,
+      columns: 12,
+      layout: curated,
+      owner: 'alice',
+    }), definitions)).toBeNull();
+  });
+
+  it('requires exactly all known widget ids with no unknowns or duplicates', () => {
+    expect(parseAdaptiveGridLayout(stored(curated.slice(0, 2)), definitions)).toBeNull();
+    expect(parseAdaptiveGridLayout(stored([
+      curated[0],
+      curated[1],
+      { ...curated[2], id: 'unknown' },
+    ]), definitions)).toBeNull();
+    expect(parseAdaptiveGridLayout(stored([
+      curated[0],
+      curated[1],
+      { ...curated[2], id: curated[1].id },
+    ]), definitions)).toBeNull();
+  });
+
+  it('rejects extra item fields and every non-integer or unsafe coordinate form', () => {
+    expect(parseAdaptiveGridLayout(stored([
+      { ...curated[0], label: 'forged' },
+      curated[1],
+      curated[2],
+    ]), definitions)).toBeNull();
+
+    for (const invalid of [1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1]) {
+      expect(normalizeAdaptiveGridLayout([
+        { ...curated[0], x: invalid },
+        curated[1],
+        curated[2],
+      ], definitions)).toBeNull();
+    }
+  });
+
+  it('enforces grid bounds, per-widget min/max size, maximum rows, and collision freedom', () => {
+    const invalidLayouts: AdaptiveGridLayoutItem[][] = [
+      [{ ...curated[0], x: -1 }, curated[1], curated[2]],
+      [{ ...curated[0], x: 10 }, curated[1], curated[2]],
+      [{ ...curated[0], w: 1 }, curated[1], curated[2]],
+      [{ ...curated[0], w: 7 }, curated[1], curated[2]],
+      [{ ...curated[0], h: 1 }, curated[1], curated[2]],
+      [{ ...curated[0], h: 6 }, curated[1], curated[2]],
+      [{ ...curated[0], y: ADAPTIVE_GRID_MAX_ROWS - curated[0].h + 1 }, curated[1], curated[2]],
+      [curated[0], { ...curated[1], x: 3 }, curated[2]],
+    ];
+
+    for (const layout of invalidLayouts) {
+      expect(normalizeAdaptiveGridLayout(layout, definitions)).toBeNull();
+      expect(() => serializeAdaptiveGridLayout(layout, definitions)).toThrow(/invalid/i);
+    }
+  });
+
+  it('validates responsive layouts against their actual 8/4/1-column bounds', () => {
+    const compactDefinitions: LayoutDefinition[] = [
+      { id: 'a', layout: { x: 0, y: 0, w: 6, h: 2, minW: 2 } },
+      { id: 'b', layout: { x: 6, y: 0, w: 6, h: 2, minW: 2 } },
+    ];
+    const fourColumns = [
+      { id: 'a', x: 0, y: 0, w: 2, h: 2 },
+      { id: 'b', x: 2, y: 0, w: 2, h: 2 },
+    ];
+    const eightColumns = [
+      { id: 'a', x: 0, y: 0, w: 4, h: 2 },
+      { id: 'b', x: 4, y: 0, w: 4, h: 2 },
+    ];
+    const oneColumn = [
+      { id: 'a', x: 0, y: 0, w: 1, h: 2 },
+      { id: 'b', x: 0, y: 2, w: 1, h: 2 },
+    ];
+
+    expect(normalizeAdaptiveGridLayout(eightColumns, compactDefinitions, 8)).toEqual(eightColumns);
+    expect(normalizeAdaptiveGridLayout(fourColumns, compactDefinitions, 4)).toEqual(fourColumns);
+    expect(normalizeAdaptiveGridLayout(oneColumn, compactDefinitions, 1)).toEqual(oneColumn);
+    expect(normalizeAdaptiveGridLayout(fourColumns, compactDefinitions, 1)).toBeNull();
+    expect(normalizeAdaptiveGridLayout(fourColumns, compactDefinitions, 0)).toBeNull();
+    expect(normalizeAdaptiveGridLayout(fourColumns, compactDefinitions, 13)).toBeNull();
+  });
+});
+
+describe('adaptive-grid keyboard layout commands', () => {
+  const commandDefinitions: LayoutDefinition[] = [
+    {
+      id: 'target',
+      layout: { x: 2, y: 2, w: 3, h: 3, minW: 2, minH: 2, maxW: 5, maxH: 5 },
+    },
+    {
+      id: 'neighbour',
+      layout: { x: 7, y: 2, w: 3, h: 3, minW: 1, minH: 1 },
+    },
+  ];
+  const commandLayout = getCuratedAdaptiveGridLayout(commandDefinitions);
+
+  it.each([
+    ['move-left', { x: 1, y: 2, w: 3, h: 3 }],
+    ['move-right', { x: 3, y: 2, w: 3, h: 3 }],
+    ['move-up', { x: 2, y: 1, w: 3, h: 3 }],
+    ['move-down', { x: 2, y: 3, w: 3, h: 3 }],
+    ['grow-width', { x: 2, y: 2, w: 4, h: 3 }],
+    ['shrink-width', { x: 2, y: 2, w: 2, h: 3 }],
+    ['grow-height', { x: 2, y: 2, w: 3, h: 4 }],
+    ['shrink-height', { x: 2, y: 2, w: 3, h: 2 }],
+  ] as const)('applies %s one grid unit at a time', (command, expected) => {
+    const result = applyAdaptiveGridCommand(
+      commandLayout,
+      'target',
+      command,
+      commandDefinitions,
+    );
+
+    expect(result.changed).toBe(true);
+    expect(result.reason).toBeUndefined();
+    expect(result.layout[0]).toEqual({ id: 'target', ...expected });
+    expect(commandLayout).toEqual(getCuratedAdaptiveGridLayout(commandDefinitions));
+  });
+
+  it('rejects commands that cross a boundary, minimum, maximum, or another widget', () => {
+    const boundaryLayout = [
+      { id: 'target', x: 0, y: 0, w: 5, h: 5 },
+      { id: 'neighbour', x: 5, y: 0, w: 3, h: 3 },
+    ];
+
+    expect(applyAdaptiveGridCommand(
+      boundaryLayout,
+      'target',
+      'move-left',
+      commandDefinitions,
+    ).reason).toBe('boundary');
+    expect(applyAdaptiveGridCommand(
+      boundaryLayout,
+      'target',
+      'move-up',
+      commandDefinitions,
+    ).reason).toBe('boundary');
+    expect(applyAdaptiveGridCommand(
+      boundaryLayout,
+      'target',
+      'grow-width',
+      commandDefinitions,
+    ).reason).toBe('maximum');
+    expect(applyAdaptiveGridCommand(
+      boundaryLayout,
+      'target',
+      'grow-height',
+      commandDefinitions,
+    ).reason).toBe('maximum');
+
+    const minimumLayout = [
+      { id: 'target', x: 0, y: 0, w: 2, h: 2 },
+      { id: 'neighbour', x: 4, y: 0, w: 3, h: 3 },
+    ];
+    expect(applyAdaptiveGridCommand(
+      minimumLayout,
+      'target',
+      'shrink-width',
+      commandDefinitions,
+    ).reason).toBe('minimum');
+    expect(applyAdaptiveGridCommand(
+      minimumLayout,
+      'target',
+      'shrink-height',
+      commandDefinitions,
+    ).reason).toBe('minimum');
+
+    const collisionLayout = [
+      { id: 'target', x: 2, y: 2, w: 3, h: 3 },
+      { id: 'neighbour', x: 5, y: 2, w: 3, h: 3 },
+    ];
+    expect(applyAdaptiveGridCommand(
+      collisionLayout,
+      'target',
+      'move-right',
+      commandDefinitions,
+    ).reason).toBe('collision');
+    expect(applyAdaptiveGridCommand(
+      collisionLayout,
+      'target',
+      'grow-width',
+      commandDefinitions,
+    ).reason).toBe('collision');
+  });
+
+  it('fails without partial output for an invalid layout and preserves valid input for an unknown id', () => {
+    expect(applyAdaptiveGridCommand(
+      [{ ...commandLayout[0], x: -1 }, commandLayout[1]],
+      'target',
+      'move-right',
+      commandDefinitions,
+    )).toEqual({ layout: [], changed: false, reason: 'invalid-layout' });
+
+    expect(applyAdaptiveGridCommand(
+      commandLayout,
+      'missing',
+      'move-right',
+      commandDefinitions,
+    )).toEqual({ layout: commandLayout, changed: false, reason: 'unknown-widget' });
+  });
+
+  it('keeps one-column mobile commands within one column while retaining vertical controls', () => {
+    const mobileDefinitions: LayoutDefinition[] = [
+      { id: 'only', layout: { x: 0, y: 0, w: 12, h: 3, minW: 3, minH: 2 } },
+    ];
+    const mobileLayout = [{ id: 'only', x: 0, y: 0, w: 1, h: 3 }];
+
+    expect(applyAdaptiveGridCommand(
+      mobileLayout,
+      'only',
+      'grow-width',
+      mobileDefinitions,
+      1,
+    ).changed).toBe(false);
+    expect(applyAdaptiveGridCommand(
+      mobileLayout,
+      'only',
+      'move-right',
+      mobileDefinitions,
+      1,
+    ).changed).toBe(false);
+    expect(applyAdaptiveGridCommand(
+      mobileLayout,
+      'only',
+      'move-down',
+      mobileDefinitions,
+      1,
+    ).layout[0].y).toBe(1);
+  });
+});
+
+describe('adaptive-grid single-column list commands', () => {
+  const visible = [
+    { id: 'health', x: 0, y: 0, w: 1, h: 3 },
+    { id: 'traffic', x: 0, y: 3, w: 1, h: 3 },
+    { id: 'events', x: 0, y: 6, w: 1, h: 4 },
+  ];
+
+  it('reorders a mobile list and deterministically repacks the canonical layout', () => {
+    expect(applyAdaptiveGridListCommand(
+      curated,
+      visible,
+      'health',
+      'move-down',
+      definitions,
+    )).toEqual({
+      changed: true,
+      layout: [
+        { id: 'health', x: 8, y: 0, w: 4, h: 3 },
+        { id: 'traffic', x: 0, y: 0, w: 8, h: 3 },
+        { id: 'events', x: 0, y: 3, w: 12, h: 4 },
+      ],
+    });
+  });
+
+  it('resizes a mobile item and shifts following canonical rows without overlap', () => {
+    expect(applyAdaptiveGridListCommand(
+      curated,
+      visible,
+      'health',
+      'grow-height',
+      definitions,
+    )).toEqual({
+      changed: true,
+      layout: [
+        { id: 'health', x: 0, y: 0, w: 4, h: 4 },
+        { id: 'traffic', x: 4, y: 0, w: 8, h: 3 },
+        { id: 'events', x: 0, y: 4, w: 12, h: 4 },
+      ],
+    });
+    expect(applyAdaptiveGridListCommand(
+      curated,
+      visible,
+      'health',
+      'move-up',
+      definitions,
+    ).reason).toBe('boundary');
+  });
+});

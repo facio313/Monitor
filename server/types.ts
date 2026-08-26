@@ -104,6 +104,21 @@ export interface DashboardResponse {
   };
   latest: TelemetrySample;
   series: TelemetrySample[];
+  telemetrySummary: {
+    sampleCount: number;
+    cpuAveragePercent: number | null;
+    cpuPeakPercent: number | null;
+    memoryAveragePercent: number | null;
+    memoryPeakPercent: number | null;
+    temperatureAverageC: number | null;
+    temperaturePeakC: number | null;
+    load1Average: number | null;
+    load1Peak: number | null;
+    networkReceivedBytes: number;
+    networkTransmittedBytes: number;
+    diskReadBytes: number;
+    diskWrittenBytes: number;
+  };
   powerSummary: {
     sampleCount: number;
     voltageSampleCount: number;

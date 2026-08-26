@@ -74,7 +74,12 @@ it must agree with the canonical mode.
 
 The dashboard provides:
 
-- CPU, memory, temperature, load, network, and disk-I/O summaries and charts;
+- a Korean-first control-room view with an explicit English switch, large page
+  and panel headings, persistent critical-state strip, and an in-product guide
+  for load, throughput, PSI, stale data, and peak incidents;
+- CPU, memory, temperature, 1/5/15-minute load, network, disk-I/O, filesystem,
+  container, power, reliability, incident, and event views using area, line,
+  composed, horizontal/stacked bar, histogram, and donut charts;
 - `1h`, `24h`, `7d`, and `30d` ranges, with at most 360 chart points;
 - host, EXT5V supply/power/GPU, filesystem, and allow-listed `cks` container status;
 - host-reliability state and a fixed-message timeline for boot transitions,
@@ -83,17 +88,20 @@ The dashboard provides:
 - bounded peak-incident evidence with PSI, fixed executable classes,
   fixed-label `cks` workloads, and per-capture app request counts (not visitors);
 - recent semantic alerts and privilege outcomes without commands or arguments;
-- stale-data and refresh-error indicators, one-minute visible-tab refreshes,
-  and a responsive table/card layout.
+- stale-data and refresh-error indicators and one-minute visible-tab refreshes;
+- a 12/8/4/1-column adaptive GridStack layout. Pointer move/resize is available
+  only in explicit edit mode; keyboard controls, undo, cancel, save, and curated
+  default reset remain available. Strictly validated schema-versioned geometry
+  is stored per SSO subject in browser local storage and contains no telemetry.
 
-The overview keeps operational scanning compact: it shows the latest EXT5V and
-throttle state, current host-reliability checks and event counts, the latest
-three incident captures, and at most the newest 10 alerts and 10 privilege
-records from the selected range. `/monitor/details`
-uses the same authenticated API snapshot to show the full API-bounded event and
-incident lists (up to 500 each), the EXT5V history and power/storage event
-timeline, the dedicated reliability timeline, full-range power statistics, and expanded CPU, memory,
-temperature/load, network, and disk-I/O charts.
+The overview keeps operational scanning compact while every subsystem has a
+reload-safe detail route under `/monitor/details/:section`: `resources`,
+`network`, `storage`, `containers`, `reliability`, `power`, `incidents`, and
+`logs`. Detail pages use the same authenticated, bounded API snapshot and add
+range summaries, full charts, service tables, incident evidence, traffic
+status-class aggregates, and searchable structured event records. The event
+view never presents those reduced records as raw logs and states that commands,
+arguments, and credentials are not collected.
 
 ## Requirements
 
@@ -486,11 +494,15 @@ mount, or a raw log line.
 The API validates and bounds the files again, rejects malformed, out-of-range,
 or future data, and marks a response stale when no recent sample exists. It
 returns at most 360 chart samples and 500 each of incidents, alerts, power
-events, and privilege events. Chart downsampling preferentially retains the first/last
-sample, voltage extrema, and power-state/flag transitions. `powerSummary` is
-calculated from every valid sample in the selected range before downsampling
-and contains `sampleCount`, `voltageSampleCount`, minimum/average/maximum EXT5V,
-and active under-voltage/throttle sample counts. `powerEvents` contains exactly
+events, and privilege events. Chart downsampling retains the first/last sample,
+power-state/flag transitions, and global minima/maxima for CPU, memory,
+temperature, 1/5/15-minute load, voltage, network receive/transmit, and disk
+read/write rates. `telemetrySummary` is calculated from every valid sample
+before downsampling and contains exact range sample count, resource averages
+and peaks, plus gap-capped network and disk transfer totals. `powerSummary` is
+also calculated from every valid sample and contains `sampleCount`,
+`voltageSampleCount`, minimum/average/maximum EXT5V, and active
+under-voltage/throttle sample counts. `powerEvents` contains exactly
 `timestamp`, `severity`, `kind`, `status`, `message`,
 `supplyVoltageVolts`, and `throttledFlags`; dedicated `power.jsonl` events take
 precedence, legacy power alerts are merged with semantic deduplication, and
