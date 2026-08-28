@@ -1,21 +1,29 @@
 import { describe, expect, it } from 'vitest';
 import {
   ADAPTIVE_GRID_BASE_COLUMNS,
+  ADAPTIVE_GRID_DETAILS_SCHEMA_VERSION,
   ADAPTIVE_GRID_MAX_ROWS,
   ADAPTIVE_GRID_SCHEMA_VERSION,
+  adaptiveGridDetailsStorageKey,
   adaptiveGridStorageKey,
   applyAdaptiveGridCommand,
   applyAdaptiveGridListCommand,
+  getCuratedAdaptiveGridDetailVisibility,
   getCuratedAdaptiveGridLayout,
   inflateGridStackSavedLayout,
+  normalizeAdaptiveGridDetailVisibility,
   normalizeAdaptiveGridLayout,
+  parseAdaptiveGridDetailVisibility,
   parseAdaptiveGridLayout,
+  serializeAdaptiveGridDetailVisibility,
   serializeAdaptiveGridLayout,
+  type AdaptiveGridDetailVisibilityItem,
   type AdaptiveGridItem,
   type AdaptiveGridLayoutItem,
 } from './AdaptiveGrid';
 
 type LayoutDefinition = Pick<AdaptiveGridItem, 'id' | 'layout'>;
+type DetailDefinition = Pick<AdaptiveGridItem, 'id' | 'details'>;
 
 const definitions: LayoutDefinition[] = [
   {
@@ -36,6 +44,32 @@ const curated: AdaptiveGridLayoutItem[] = [
   { id: 'health', x: 0, y: 0, w: 4, h: 3 },
   { id: 'traffic', x: 4, y: 0, w: 8, h: 3 },
   { id: 'events', x: 0, y: 3, w: 12, h: 4 },
+];
+
+const detailDefinitions: DetailDefinition[] = [
+  {
+    id: 'health',
+    details: [
+      { id: 'cpu', label: 'CPU' },
+      { id: 'memory', label: 'Memory' },
+    ],
+  },
+  {
+    id: 'traffic',
+    details: [
+      { id: 'receive', label: 'Receive' },
+      { id: 'transmit', label: 'Transmit' },
+    ],
+  },
+  { id: 'events', details: [{ id: 'timeline', label: 'Timeline' }] },
+];
+
+const curatedDetailVisibility: AdaptiveGridDetailVisibilityItem[] = [
+  { widgetId: 'health', detailId: 'cpu', visible: true },
+  { widgetId: 'health', detailId: 'memory', visible: true },
+  { widgetId: 'traffic', detailId: 'receive', visible: true },
+  { widgetId: 'traffic', detailId: 'transmit', visible: true },
+  { widgetId: 'events', detailId: 'timeline', visible: true },
 ];
 
 function stored(layout: unknown, overrides: Record<string, unknown> = {}) {
@@ -83,6 +117,10 @@ describe('adaptive-grid curated layout and storage identity', () => {
       'monitor.adaptive-grid.v1.alice%40example.com',
     );
     expect(adaptiveGridStorageKey('alice')).not.toBe(adaptiveGridStorageKey('bob'));
+    expect(adaptiveGridDetailsStorageKey('alice@example.com')).toBe(
+      'monitor.adaptive-grid-details.v1.alice%40example.com',
+    );
+    expect(ADAPTIVE_GRID_DETAILS_SCHEMA_VERSION).toBe(1);
     expect(() => adaptiveGridStorageKey('')).toThrow(/storageKey/);
     expect(() => adaptiveGridStorageKey(' alice')).toThrow(/storageKey/);
     expect(() => adaptiveGridStorageKey('alice\nadmin')).toThrow(/storageKey/);
@@ -208,6 +246,87 @@ describe('adaptive-grid layout parser and serializer', () => {
     expect(normalizeAdaptiveGridLayout(fourColumns, compactDefinitions, 1)).toBeNull();
     expect(normalizeAdaptiveGridLayout(fourColumns, compactDefinitions, 0)).toBeNull();
     expect(normalizeAdaptiveGridLayout(fourColumns, compactDefinitions, 13)).toBeNull();
+  });
+});
+
+describe('adaptive-grid detail visibility', () => {
+  it('defaults every declared detail to visible in stable widget and detail order', () => {
+    const first = getCuratedAdaptiveGridDetailVisibility(detailDefinitions);
+    const second = getCuratedAdaptiveGridDetailVisibility(detailDefinitions);
+
+    expect(first).toEqual(curatedDetailVisibility);
+    expect(second).toEqual(curatedDetailVisibility);
+    expect(first).not.toBe(second);
+    expect(first[0]).not.toBe(second[0]);
+  });
+
+  it('round-trips hidden details and canonicalizes partial saved visibility', () => {
+    const saved = [
+      { widgetId: 'traffic', detailId: 'transmit', visible: false },
+      { widgetId: 'health', detailId: 'cpu', visible: false },
+    ];
+    const normalized = normalizeAdaptiveGridDetailVisibility(saved, detailDefinitions)!;
+    const serialized = serializeAdaptiveGridDetailVisibility(normalized, detailDefinitions);
+
+    expect(normalized).toEqual([
+      { widgetId: 'health', detailId: 'cpu', visible: false },
+      { widgetId: 'health', detailId: 'memory', visible: true },
+      { widgetId: 'traffic', detailId: 'receive', visible: true },
+      { widgetId: 'traffic', detailId: 'transmit', visible: false },
+      { widgetId: 'events', detailId: 'timeline', visible: true },
+    ]);
+    expect(JSON.parse(serialized)).toEqual({
+      schemaVersion: 1,
+      visibility: normalized,
+    });
+    expect(parseAdaptiveGridDetailVisibility(serialized, detailDefinitions)).toEqual(normalized);
+  });
+
+  it('ignores stale unknown definitions while making newly introduced details visible', () => {
+    const source = JSON.stringify({
+      schemaVersion: 1,
+      visibility: [
+        { widgetId: 'health', detailId: 'cpu', visible: false },
+        { widgetId: 'retired-widget', detailId: 'old-detail', visible: false },
+      ],
+    });
+
+    expect(parseAdaptiveGridDetailVisibility(source, detailDefinitions)).toEqual([
+      { widgetId: 'health', detailId: 'cpu', visible: false },
+      { widgetId: 'health', detailId: 'memory', visible: true },
+      { widgetId: 'traffic', detailId: 'receive', visible: true },
+      { widgetId: 'traffic', detailId: 'transmit', visible: true },
+      { widgetId: 'events', detailId: 'timeline', visible: true },
+    ]);
+  });
+
+  it('rejects malformed storage, duplicate entries, and unsafe detail definitions', () => {
+    expect(parseAdaptiveGridDetailVisibility('{', detailDefinitions)).toBeNull();
+    expect(parseAdaptiveGridDetailVisibility(JSON.stringify({
+      schemaVersion: 2,
+      visibility: [],
+    }), detailDefinitions)).toBeNull();
+    expect(parseAdaptiveGridDetailVisibility(JSON.stringify({
+      schemaVersion: 1,
+      visibility: [{ widgetId: 'health', detailId: 'cpu', visible: 'yes' }],
+    }), detailDefinitions)).toBeNull();
+    expect(parseAdaptiveGridDetailVisibility(JSON.stringify({
+      schemaVersion: 1,
+      visibility: [
+        { widgetId: 'health', detailId: 'cpu', visible: true },
+        { widgetId: 'health', detailId: 'cpu', visible: false },
+      ],
+    }), detailDefinitions)).toBeNull();
+    expect(() => getCuratedAdaptiveGridDetailVisibility([
+      {
+        id: 'health',
+        details: [
+          { id: 'cpu', label: 'CPU' },
+          { id: 'cpu', label: 'Duplicate CPU' },
+        ],
+      },
+    ])).toThrow(/detail id/i);
+    expect(() => serializeAdaptiveGridDetailVisibility('invalid', detailDefinitions)).toThrow(/invalid/i);
   });
 });
 

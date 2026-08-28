@@ -44,6 +44,7 @@ import {
   safeText,
 } from '../utils';
 import { Icon, type IconName } from './Icon';
+import { useAdaptiveGridDetailVisibility } from './AdaptiveGrid';
 import { OperationalLogView } from './OperationalLogView';
 
 const CHART_COLORS = {
@@ -161,6 +162,10 @@ function ChartEmpty({ locale }: { locale: MonitorLocale }) {
   return <div className="cockpit-chart-empty"><Icon name="activity" size={20} />{t(locale, '선택한 기간에 표본이 없습니다.', 'No samples in this range.')}</div>;
 }
 
+function SelectionEmpty({ locale }: { locale: MonitorLocale }) {
+  return <div className="cockpit-chart-empty cockpit-selection-empty"><Icon name="info" size={20} />{t(locale, '표시할 항목이 꺼져 있습니다.', 'All details in this widget are hidden.')}</div>;
+}
+
 function Vital({ label, value, note, tone = 'ok', term }: { label: string; value: string; note: string; tone?: 'ok' | 'caution' | 'danger' | 'unknown'; term?: string }) {
   return (
     <div className={`cockpit-vital vital-${tone}`}>
@@ -172,6 +177,7 @@ function Vital({ label, value, note, tone = 'ok', term }: { label: string; value
 }
 
 export function VitalSignsWidget({ data, locale, onOpen }: Omit<VisualProps, 'range'>) {
+  const detailVisible = useAdaptiveGridDetailVisibility();
   const latest = data.latest;
   const running = data.containers.filter((container) => safeText(container.state, '').toLowerCase() === 'running').length;
   const unhealthy = data.containers.filter((container) => /unhealthy|dead|exited/i.test(`${container.health} ${container.state}`)).length;
@@ -200,36 +206,43 @@ export function VitalSignsWidget({ data, locale, onOpen }: Omit<VisualProps, 'ra
       className="vitals-panel"
     >
       <div className="cockpit-vital-grid">
-        <Vital label="CPU" value={formatPercent(latest?.cpuPercent, 1)} note={statusWord(statusTone(latest?.cpuPercent), locale)} tone={statusTone(latest?.cpuPercent)} />
-        <Vital label={t(locale, '메모리', 'Memory')} value={formatPercent(latest?.memoryPercent, 1)} note={`${formatBytes(latest?.memoryUsedBytes)} / ${formatBytes(latest?.memoryTotalBytes)}`} tone={statusTone(latest?.memoryPercent)} />
-        <Vital label={t(locale, '온도', 'Temperature')} value={temperature(latest?.temperatureC)} note={t(locale, '기기 센서', 'Device sensor')} tone={statusTone(latest?.temperatureC, 75, 85)} />
-        <Vital label={t(locale, '시스템 부하', 'System load')} term={t(locale, '실행 중이거나 실행을 기다리는 작업의 양입니다. CPU 개수와 함께 판단합니다.', 'Work running or waiting to run; interpret alongside CPU count.')} value={decimal(latest?.load1)} note={t(locale, '최근 1분 평균', '1-minute average')} tone={statusTone(latest?.load1, 4, 8)} />
-        <Vital label={t(locale, '서비스', 'Services')} value={data.containers.length ? `${running}/${data.containers.length}` : '—'} note={!data.containers.length ? t(locale, '추적 대상 없음', 'No services reported') : unhealthy ? t(locale, `${unhealthy}개 이상`, `${unhealthy} abnormal`) : t(locale, '모두 정상', 'All nominal')} tone={!data.containers.length ? 'unknown' : unhealthy ? 'danger' : 'ok'} />
-        <Vital label={t(locale, '디스크 최고 사용률', 'Highest disk usage')} value={formatPercent(highestDisk, 0)} note={t(locale, `${data.disks.length}개 볼륨`, `${data.disks.length} volumes`)} tone={statusTone(highestDisk)} />
-        <Vital label={t(locale, '수신 처리량', 'Network receive')} value={formatRate(latest?.networkRxBytesPerSecond)} note={t(locale, '현재 초당 수신량', 'Current receive rate')} tone={latest?.networkRxBytesPerSecond == null ? 'unknown' : 'ok'} />
-        <Vital label={t(locale, '송신 처리량', 'Network transmit')} value={formatRate(latest?.networkTxBytesPerSecond)} note={t(locale, '현재 초당 송신량', 'Current transmit rate')} tone={latest?.networkTxBytesPerSecond == null ? 'unknown' : 'ok'} />
-        <Vital label={t(locale, '디스크 입출력', 'Disk I/O')} value={formatRate(diskIo)} note={`${t(locale, '읽기', 'read')} ${formatRate(latest?.diskReadBytesPerSecond)} · ${t(locale, '쓰기', 'write')} ${formatRate(latest?.diskWriteBytesPerSecond)}`} tone={diskIo == null ? 'unknown' : 'ok'} />
-        <Vital label={t(locale, '공급 전압', 'Supply voltage')} value={voltage(latest?.supplyVoltageVolts)} note={t(locale, 'EXT5V 입력', 'EXT5V input')} tone={voltageTone} />
-        <Vital label={t(locale, 'GPU 메모리 할당', 'GPU memory allocation')} value={formatBytes(latest?.gpuMemoryBytes)} note={t(locale, '사용량이 아닌 예약 용량', 'Reserved allocation, not usage')} tone={latest?.gpuMemoryBytes == null ? 'unknown' : 'ok'} />
-        <Vital label={t(locale, 'GPU 클럭', 'GPU clock')} value={formatClock(latest?.gpuClockHz ?? null)} note={t(locale, '현재 그래픽 코어 주파수', 'Current graphics core frequency')} tone={latest?.gpuClockHz == null ? 'unknown' : 'ok'} />
-        <Vital label={t(locale, '가동 시간', 'Uptime')} value={localUptime(data.host.uptimeSeconds, locale)} note={safeText(data.host.os, t(locale, '운영체제 미확인', 'OS unavailable'), 72)} tone={data.host.uptimeSeconds == null ? 'unknown' : 'ok'} />
+        {detailVisible('cpu') && <Vital label="CPU" value={formatPercent(latest?.cpuPercent, 1)} note={statusWord(statusTone(latest?.cpuPercent), locale)} tone={statusTone(latest?.cpuPercent)} />}
+        {detailVisible('memory') && <Vital label={t(locale, '메모리', 'Memory')} value={formatPercent(latest?.memoryPercent, 1)} note={`${formatBytes(latest?.memoryUsedBytes)} / ${formatBytes(latest?.memoryTotalBytes)}`} tone={statusTone(latest?.memoryPercent)} />}
+        {detailVisible('temperature') && <Vital label={t(locale, '온도', 'Temperature')} value={temperature(latest?.temperatureC)} note={t(locale, '기기 센서', 'Device sensor')} tone={statusTone(latest?.temperatureC, 75, 85)} />}
+        {detailVisible('load') && <Vital label={t(locale, '시스템 부하', 'System load')} term={t(locale, '실행 중이거나 실행을 기다리는 작업의 양입니다. CPU 개수와 함께 판단합니다.', 'Work running or waiting to run; interpret alongside CPU count.')} value={decimal(latest?.load1)} note={t(locale, '최근 1분 평균', '1-minute average')} tone={statusTone(latest?.load1, 4, 8)} />}
+        {detailVisible('services') && <Vital label={t(locale, '서비스', 'Services')} value={data.containers.length ? `${running}/${data.containers.length}` : '—'} note={!data.containers.length ? t(locale, '추적 대상 없음', 'No services reported') : unhealthy ? t(locale, `${unhealthy}개 이상`, `${unhealthy} abnormal`) : t(locale, '모두 정상', 'All nominal')} tone={!data.containers.length ? 'unknown' : unhealthy ? 'danger' : 'ok'} />}
+        {detailVisible('disk-usage') && <Vital label={t(locale, '디스크 최고 사용률', 'Highest disk usage')} value={formatPercent(highestDisk, 0)} note={t(locale, `${data.disks.length}개 볼륨`, `${data.disks.length} volumes`)} tone={statusTone(highestDisk)} />}
+        {detailVisible('network-rx') && <Vital label={t(locale, '수신 처리량', 'Network receive')} value={formatRate(latest?.networkRxBytesPerSecond)} note={t(locale, '현재 초당 수신량', 'Current receive rate')} tone={latest?.networkRxBytesPerSecond == null ? 'unknown' : 'ok'} />}
+        {detailVisible('network-tx') && <Vital label={t(locale, '송신 처리량', 'Network transmit')} value={formatRate(latest?.networkTxBytesPerSecond)} note={t(locale, '현재 초당 송신량', 'Current transmit rate')} tone={latest?.networkTxBytesPerSecond == null ? 'unknown' : 'ok'} />}
+        {detailVisible('disk-io') && <Vital label={t(locale, '디스크 입출력', 'Disk I/O')} value={formatRate(diskIo)} note={`${t(locale, '읽기', 'read')} ${formatRate(latest?.diskReadBytesPerSecond)} · ${t(locale, '쓰기', 'write')} ${formatRate(latest?.diskWriteBytesPerSecond)}`} tone={diskIo == null ? 'unknown' : 'ok'} />}
+        {detailVisible('voltage') && <Vital label={t(locale, '공급 전압', 'Supply voltage')} value={voltage(latest?.supplyVoltageVolts)} note={t(locale, 'EXT5V 입력', 'EXT5V input')} tone={voltageTone} />}
+        {detailVisible('gpu-memory') && <Vital label={t(locale, 'GPU 메모리 할당', 'GPU memory allocation')} value={formatBytes(latest?.gpuMemoryBytes)} note={t(locale, '사용량이 아닌 예약 용량', 'Reserved allocation, not usage')} tone={latest?.gpuMemoryBytes == null ? 'unknown' : 'ok'} />}
+        {detailVisible('gpu-clock') && <Vital label={t(locale, 'GPU 클럭', 'GPU clock')} value={formatClock(latest?.gpuClockHz ?? null)} note={t(locale, '현재 그래픽 코어 주파수', 'Current graphics core frequency')} tone={latest?.gpuClockHz == null ? 'unknown' : 'ok'} />}
+        {detailVisible('uptime') && <Vital label={t(locale, '가동 시간', 'Uptime')} value={localUptime(data.host.uptimeSeconds, locale)} note={safeText(data.host.os, t(locale, '운영체제 미확인', 'OS unavailable'), 72)} tone={data.host.uptimeSeconds == null ? 'unknown' : 'ok'} />}
+        {![
+          'cpu', 'memory', 'temperature', 'load', 'services', 'disk-usage', 'network-rx',
+          'network-tx', 'disk-io', 'voltage', 'gpu-memory', 'gpu-clock', 'uptime',
+        ].some(detailVisible) && <SelectionEmpty locale={locale} />}
       </div>
     </CockpitPanel>
   );
 }
 
 export function ResourceWidget({ data, range, locale, onOpen }: VisualProps) {
+  const detailVisible = useAdaptiveGridDetailVisibility();
+  const cpuVisible = detailVisible('cpu');
+  const memoryVisible = detailVisible('memory');
   const series = useMemo(() => chartSeries(data, range, locale), [data, range, locale]);
   const statistics = data.telemetrySummary;
   return (
     <CockpitPanel title={t(locale, '자원 사용 추세', 'Resource utilization')} description={t(locale, 'CPU와 메모리의 사용률 변화', 'CPU and memory utilization over time')} icon="cpu" badge={range.toUpperCase()} detailPage="resources" onOpen={onOpen} locale={locale}>
-      <div className="cockpit-mini-summary">
-        <span>{t(locale, '평균 CPU', 'Avg CPU')} <strong>{formatPercent(statistics.cpuAveragePercent, 1)}</strong></span>
-        <span>{t(locale, '최고 CPU', 'Peak CPU')} <strong>{formatPercent(statistics.cpuPeakPercent, 1)}</strong></span>
-        <span>{t(locale, '최고 메모리', 'Peak memory')} <strong>{formatPercent(statistics.memoryPeakPercent, 1)}</strong></span>
-      </div>
+      {(cpuVisible || memoryVisible) && <div className="cockpit-mini-summary">
+        {cpuVisible && <span>{t(locale, '평균 CPU', 'Avg CPU')} <strong>{formatPercent(statistics.cpuAveragePercent, 1)}</strong></span>}
+        {cpuVisible && <span>{t(locale, '최고 CPU', 'Peak CPU')} <strong>{formatPercent(statistics.cpuPeakPercent, 1)}</strong></span>}
+        {memoryVisible && <span>{t(locale, '최고 메모리', 'Peak memory')} <strong>{formatPercent(statistics.memoryPeakPercent, 1)}</strong></span>}
+      </div>}
       <div className="cockpit-chart">
-        {!series.length ? <ChartEmpty locale={locale} /> : (
+        {!cpuVisible && !memoryVisible ? <SelectionEmpty locale={locale} /> : !series.length ? <ChartEmpty locale={locale} /> : (
           <ResponsiveContainer width="100%" height="100%">
             <AreaChart data={series} margin={{ top: 12, right: 12, left: -12, bottom: 0 }}>
               <defs>
@@ -242,8 +255,8 @@ export function ResourceWidget({ data, range, locale, onOpen }: VisualProps) {
               <Tooltip contentStyle={TOOLTIP_STYLE} labelFormatter={(_label, payload) => payload?.[0]?.payload?.fullTime ?? _label} formatter={(value: any, name: any) => [formatPercent(Number(value), 1), name]} />
               <Legend />
               <ReferenceLine y={75} stroke={CHART_COLORS.orange} strokeDasharray="4 4" />
-              <Area type="monotone" dataKey="cpuPercent" name="CPU" stroke={CHART_COLORS.cyan} fill="url(#v2CpuFill)" strokeWidth={2} connectNulls />
-              <Area type="monotone" dataKey="memoryPercent" name={t(locale, '메모리', 'Memory')} stroke={CHART_COLORS.violet} fill="url(#v2MemoryFill)" strokeWidth={2} connectNulls />
+              {cpuVisible && <Area type="monotone" dataKey="cpuPercent" name="CPU" stroke={CHART_COLORS.cyan} fill="url(#v2CpuFill)" strokeWidth={2} connectNulls />}
+              {memoryVisible && <Area type="monotone" dataKey="memoryPercent" name={t(locale, '메모리', 'Memory')} stroke={CHART_COLORS.violet} fill="url(#v2MemoryFill)" strokeWidth={2} connectNulls />}
             </AreaChart>
           </ResponsiveContainer>
         )}
@@ -253,17 +266,20 @@ export function ResourceWidget({ data, range, locale, onOpen }: VisualProps) {
 }
 
 export function LoadWidget({ data, range, locale, onOpen }: VisualProps) {
+  const detailVisible = useAdaptiveGridDetailVisibility();
+  const loadVisible = detailVisible('load');
+  const temperatureVisible = detailVisible('temperature');
   const series = useMemo(() => chartSeries(data, range, locale), [data, range, locale]);
   return (
     <CockpitPanel title={t(locale, '부하와 온도', 'Load and thermal')} description={t(locale, '1·5·15분 부하와 기기 온도', '1, 5, and 15-minute load with device temperature')} icon="temperature" badge={range.toUpperCase()} detailPage="resources" onOpen={onOpen} locale={locale}>
-      <p className="cockpit-explainer"><Icon name="info" size={15} />{t(locale, '부하는 CPU 사용률이 아니라 실행 중·대기 중인 작업의 양입니다.', 'Load is queued and running work, not CPU percentage.')}</p>
-      <div className="cockpit-mini-summary">
-        <span>{t(locale, '평균 1분 부하', 'Avg 1m load')} <strong>{decimal(data.telemetrySummary.load1Average)}</strong></span>
-        <span>{t(locale, '최고 1분 부하', 'Peak 1m load')} <strong>{decimal(data.telemetrySummary.load1Peak)}</strong></span>
-        <span>{t(locale, '최고 온도', 'Peak temperature')} <strong>{temperature(data.telemetrySummary.temperaturePeakC)}</strong></span>
-      </div>
+      {loadVisible && <p className="cockpit-explainer"><Icon name="info" size={15} />{t(locale, '부하는 CPU 사용률이 아니라 실행 중·대기 중인 작업의 양입니다.', 'Load is queued and running work, not CPU percentage.')}</p>}
+      {(loadVisible || temperatureVisible) && <div className="cockpit-mini-summary">
+        {loadVisible && <span>{t(locale, '평균 1분 부하', 'Avg 1m load')} <strong>{decimal(data.telemetrySummary.load1Average)}</strong></span>}
+        {loadVisible && <span>{t(locale, '최고 1분 부하', 'Peak 1m load')} <strong>{decimal(data.telemetrySummary.load1Peak)}</strong></span>}
+        {temperatureVisible && <span>{t(locale, '최고 온도', 'Peak temperature')} <strong>{temperature(data.telemetrySummary.temperaturePeakC)}</strong></span>}
+      </div>}
       <div className="cockpit-chart">
-        {!series.length ? <ChartEmpty locale={locale} /> : (
+        {!loadVisible && !temperatureVisible ? <SelectionEmpty locale={locale} /> : !series.length ? <ChartEmpty locale={locale} /> : (
           <ResponsiveContainer width="100%" height="100%">
             <ComposedChart data={series} margin={{ top: 12, right: 10, left: -15, bottom: 0 }}>
               <CartesianGrid stroke={CHART_COLORS.grid} strokeDasharray="3 5" vertical={false} />
@@ -272,10 +288,10 @@ export function LoadWidget({ data, range, locale, onOpen }: VisualProps) {
               <YAxis yAxisId="temp" orientation="right" stroke={CHART_COLORS.axis} tickFormatter={(value) => `${value}°`} tickLine={false} axisLine={false} width={42} />
               <Tooltip contentStyle={TOOLTIP_STYLE} labelFormatter={(_label, payload) => payload?.[0]?.payload?.fullTime ?? _label} />
               <Legend />
-              <Line yAxisId="load" type="monotone" dataKey="load1" name={t(locale, '부하 1분', 'Load 1m')} stroke={CHART_COLORS.green} strokeWidth={2.2} dot={false} connectNulls />
-              <Line yAxisId="load" type="monotone" dataKey="load5" name={t(locale, '부하 5분', 'Load 5m')} stroke={CHART_COLORS.cyan} strokeWidth={1.6} dot={false} connectNulls />
-              <Line yAxisId="load" type="monotone" dataKey="load15" name={t(locale, '부하 15분', 'Load 15m')} stroke={CHART_COLORS.violet} strokeWidth={1.4} dot={false} connectNulls />
-              <Line yAxisId="temp" type="monotone" dataKey="temperatureC" name={t(locale, '온도 °C', 'Temperature °C')} stroke={CHART_COLORS.orange} strokeWidth={1.8} strokeDasharray="5 3" dot={false} connectNulls />
+              {loadVisible && <Line yAxisId="load" type="monotone" dataKey="load1" name={t(locale, '부하 1분', 'Load 1m')} stroke={CHART_COLORS.green} strokeWidth={2.2} dot={false} connectNulls />}
+              {loadVisible && <Line yAxisId="load" type="monotone" dataKey="load5" name={t(locale, '부하 5분', 'Load 5m')} stroke={CHART_COLORS.cyan} strokeWidth={1.6} dot={false} connectNulls />}
+              {loadVisible && <Line yAxisId="load" type="monotone" dataKey="load15" name={t(locale, '부하 15분', 'Load 15m')} stroke={CHART_COLORS.violet} strokeWidth={1.4} dot={false} connectNulls />}
+              {temperatureVisible && <Line yAxisId="temp" type="monotone" dataKey="temperatureC" name={t(locale, '온도 °C', 'Temperature °C')} stroke={CHART_COLORS.orange} strokeWidth={1.8} strokeDasharray="5 3" dot={false} connectNulls />}
             </ComposedChart>
           </ResponsiveContainer>
         )}
@@ -285,17 +301,20 @@ export function LoadWidget({ data, range, locale, onOpen }: VisualProps) {
 }
 
 export function NetworkWidget({ data, range, locale, onOpen }: VisualProps) {
+  const detailVisible = useAdaptiveGridDetailVisibility();
+  const receiveVisible = detailVisible('receive');
+  const transmitVisible = detailVisible('transmit');
   const series = useMemo(() => chartSeries(data, range, locale), [data, range, locale]);
   const stats = data.telemetrySummary;
   return (
     <CockpitPanel title={t(locale, '네트워크 처리량', 'Network throughput')} description={t(locale, '초당 송수신량과 기간 누적 추정치', 'Transfer rates with range totals estimated from samples')} icon="network" badge={t(locale, '초당', 'PER SECOND')} detailPage="network" onOpen={onOpen} locale={locale}>
-      <div className="cockpit-mini-summary">
-        <span>{t(locale, '현재 수신', 'Receive now')} <strong>{formatRate(data.latest?.networkRxBytesPerSecond)}</strong></span>
-        <span>{t(locale, '기간 수신', 'Range received')} <strong>{formatBytes(stats.networkReceivedBytes)}</strong></span>
-        <span>{t(locale, '기간 송신', 'Range sent')} <strong>{formatBytes(stats.networkTransmittedBytes)}</strong></span>
-      </div>
+      {(receiveVisible || transmitVisible) && <div className="cockpit-mini-summary">
+        {receiveVisible && <span>{t(locale, '현재 수신', 'Receive now')} <strong>{formatRate(data.latest?.networkRxBytesPerSecond)}</strong></span>}
+        {receiveVisible && <span>{t(locale, '기간 수신', 'Range received')} <strong>{formatBytes(stats.networkReceivedBytes)}</strong></span>}
+        {transmitVisible && <span>{t(locale, '기간 송신', 'Range sent')} <strong>{formatBytes(stats.networkTransmittedBytes)}</strong></span>}
+      </div>}
       <div className="cockpit-chart">
-        {!series.length ? <ChartEmpty locale={locale} /> : (
+        {!receiveVisible && !transmitVisible ? <SelectionEmpty locale={locale} /> : !series.length ? <ChartEmpty locale={locale} /> : (
           <ResponsiveContainer width="100%" height="100%">
             <AreaChart data={series} margin={{ top: 12, right: 12, left: 4, bottom: 0 }}>
               <defs>
@@ -307,8 +326,8 @@ export function NetworkWidget({ data, range, locale, onOpen }: VisualProps) {
               <YAxis stroke={CHART_COLORS.axis} tickFormatter={(value) => formatRate(Number(value)).replace('/s', '')} tickLine={false} axisLine={false} width={58} />
               <Tooltip contentStyle={TOOLTIP_STYLE} formatter={(value: any, name: any) => [formatRate(Number(value)), name]} />
               <Legend />
-              <Area type="monotone" dataKey="networkRxBytesPerSecond" name={t(locale, '수신', 'Receive')} stroke={CHART_COLORS.cyan} fill="url(#networkRxFill)" strokeWidth={2} connectNulls />
-              <Area type="monotone" dataKey="networkTxBytesPerSecond" name={t(locale, '송신', 'Transmit')} stroke={CHART_COLORS.violet} fill="url(#networkTxFill)" strokeWidth={2} connectNulls />
+              {receiveVisible && <Area type="monotone" dataKey="networkRxBytesPerSecond" name={t(locale, '수신', 'Receive')} stroke={CHART_COLORS.cyan} fill="url(#networkRxFill)" strokeWidth={2} connectNulls />}
+              {transmitVisible && <Area type="monotone" dataKey="networkTxBytesPerSecond" name={t(locale, '송신', 'Transmit')} stroke={CHART_COLORS.violet} fill="url(#networkTxFill)" strokeWidth={2} connectNulls />}
             </AreaChart>
           </ResponsiveContainer>
         )}
@@ -318,17 +337,22 @@ export function NetworkWidget({ data, range, locale, onOpen }: VisualProps) {
 }
 
 export function StorageWidget({ data, range, locale, onOpen }: VisualProps) {
+  const detailVisible = useAdaptiveGridDetailVisibility();
+  const capacityVisible = detailVisible('capacity');
+  const readVisible = detailVisible('read');
+  const writeVisible = detailVisible('write');
+  const ioVisible = readVisible || writeVisible;
   const series = useMemo(() => chartSeries(data, range, locale), [data, range, locale]);
   const diskBars = data.disks.map((disk) => ({ name: safeText(disk.mount, 'volume', 24), used: disk.usedPercent ?? 0 }));
   return (
     <CockpitPanel title={t(locale, '저장장치', 'Storage')} description={t(locale, '볼륨 용량과 디스크 입출력', 'Volume capacity and disk I/O')} icon="database" badge={`${data.disks.length} VOL`} detailPage="storage" onOpen={onOpen} locale={locale}>
-      <div className="cockpit-mini-summary">
-        <span>{t(locale, '기간 읽기', 'Range read')} <strong>{formatBytes(data.telemetrySummary.diskReadBytes)}</strong></span>
-        <span>{t(locale, '기간 쓰기', 'Range written')} <strong>{formatBytes(data.telemetrySummary.diskWrittenBytes)}</strong></span>
+      {ioVisible && <div className="cockpit-mini-summary">
+        {readVisible && <span>{t(locale, '기간 읽기', 'Range read')} <strong>{formatBytes(data.telemetrySummary.diskReadBytes)}</strong></span>}
+        {writeVisible && <span>{t(locale, '기간 쓰기', 'Range written')} <strong>{formatBytes(data.telemetrySummary.diskWrittenBytes)}</strong></span>}
         <span>{t(locale, '원본 표본', 'Raw samples')} <strong>{data.telemetrySummary.sampleCount.toLocaleString()}</strong></span>
-      </div>
-      <div className="cockpit-split-chart">
-        <div className="cockpit-chart">
+      </div>}
+      {!capacityVisible && !ioVisible ? <SelectionEmpty locale={locale} /> : <div className={`cockpit-split-chart${capacityVisible !== ioVisible ? ' cockpit-split-chart-single' : ''}`}>
+        {capacityVisible && <div className="cockpit-chart">
           {!diskBars.length ? <ChartEmpty locale={locale} /> : (
             <ResponsiveContainer width="100%" height="100%">
               <BarChart data={diskBars} layout="vertical" margin={{ top: 6, right: 15, left: 8, bottom: 0 }}>
@@ -343,8 +367,8 @@ export function StorageWidget({ data, range, locale, onOpen }: VisualProps) {
               </BarChart>
             </ResponsiveContainer>
           )}
-        </div>
-        <div className="cockpit-chart">
+        </div>}
+        {ioVisible && <div className="cockpit-chart">
           {!series.length ? <ChartEmpty locale={locale} /> : (
             <ResponsiveContainer width="100%" height="100%">
               <BarChart data={series} margin={{ top: 6, right: 8, left: 4, bottom: 0 }}>
@@ -353,13 +377,13 @@ export function StorageWidget({ data, range, locale, onOpen }: VisualProps) {
                 <YAxis stroke={CHART_COLORS.axis} tickFormatter={(value) => formatBytes(Number(value), 0).replace(' ', '')} tickLine={false} axisLine={false} width={56} />
                 <Tooltip contentStyle={TOOLTIP_STYLE} formatter={(value: any, name: any) => [formatRate(Number(value)), name]} />
                 <Legend />
-                <Bar dataKey="diskReadBytesPerSecond" name={t(locale, '읽기', 'Read')} stackId="io" fill={CHART_COLORS.green} />
-                <Bar dataKey="diskWriteBytesPerSecond" name={t(locale, '쓰기', 'Write')} stackId="io" fill={CHART_COLORS.orange} />
+                {readVisible && <Bar dataKey="diskReadBytesPerSecond" name={t(locale, '읽기', 'Read')} stackId="io" fill={CHART_COLORS.green} />}
+                {writeVisible && <Bar dataKey="diskWriteBytesPerSecond" name={t(locale, '쓰기', 'Write')} stackId="io" fill={CHART_COLORS.orange} />}
               </BarChart>
             </ResponsiveContainer>
           )}
-        </div>
-      </div>
+        </div>}
+      </div>}
     </CockpitPanel>
   );
 }
@@ -373,6 +397,9 @@ function containerTone(container: ContainerStatus): 'ok' | 'caution' | 'danger' 
 }
 
 export function ContainersWidget({ data, locale, onOpen }: Omit<VisualProps, 'range'>) {
+  const detailVisible = useAdaptiveGridDetailVisibility();
+  const cpuVisible = detailVisible('cpu');
+  const memoryVisible = detailVisible('memory');
   const chart = data.containers.slice().sort((left, right) => (right.cpuPercent ?? 0) - (left.cpuPercent ?? 0)).slice(0, 10).map((container) => ({
     name: safeText(container.name, 'container', 24),
     cpu: container.cpuPercent ?? 0,
@@ -382,7 +409,7 @@ export function ContainersWidget({ data, locale, onOpen }: Omit<VisualProps, 'ra
   return (
     <CockpitPanel title={t(locale, '서비스와 컨테이너', 'Services and containers')} description={t(locale, '현재 상태와 상대 자원 사용량', 'Current health and relative resource usage')} icon="server" badge={`${nominal}/${data.containers.length}`} detailPage="containers" onOpen={onOpen} locale={locale}>
       <div className="cockpit-chart container-chart">
-        {!chart.length ? <ChartEmpty locale={locale} /> : (
+        {!cpuVisible && !memoryVisible ? <SelectionEmpty locale={locale} /> : !chart.length ? <ChartEmpty locale={locale} /> : (
           <ResponsiveContainer width="100%" height="100%">
             <BarChart data={chart} layout="vertical" margin={{ top: 5, right: 12, left: 10, bottom: 0 }}>
               <CartesianGrid stroke={CHART_COLORS.grid} strokeDasharray="3 5" horizontal={false} />
@@ -390,8 +417,8 @@ export function ContainersWidget({ data, locale, onOpen }: Omit<VisualProps, 'ra
               <YAxis type="category" dataKey="name" width={92} stroke={CHART_COLORS.axis} tickLine={false} axisLine={false} />
               <Tooltip contentStyle={TOOLTIP_STYLE} formatter={(value: any, name: any) => [formatPercent(Number(value), 1), name]} />
               <Legend />
-              <Bar dataKey="cpu" name="CPU" fill={CHART_COLORS.cyan} radius={[0, 4, 4, 0]} />
-              <Bar dataKey="memory" name={t(locale, '메모리', 'Memory')} fill={CHART_COLORS.violet} radius={[0, 4, 4, 0]} />
+              {cpuVisible && <Bar dataKey="cpu" name="CPU" fill={CHART_COLORS.cyan} radius={[0, 4, 4, 0]} />}
+              {memoryVisible && <Bar dataKey="memory" name={t(locale, '메모리', 'Memory')} fill={CHART_COLORS.violet} radius={[0, 4, 4, 0]} />}
             </BarChart>
           </ResponsiveContainer>
         )}
@@ -401,6 +428,11 @@ export function ContainersWidget({ data, locale, onOpen }: Omit<VisualProps, 'ra
 }
 
 export function PowerWidget({ data, range, locale, onOpen }: VisualProps) {
+  const detailVisible = useAdaptiveGridDetailVisibility();
+  const currentVisible = detailVisible('current');
+  const minimumVisible = detailVisible('minimum');
+  const averageVisible = detailVisible('average');
+  const trendVisible = detailVisible('trend');
   const series = useMemo(() => chartSeries(data, range, locale), [data, range, locale]);
   const summary = data.powerSummary;
   const currentFlags = data.latest?.throttledFlags;
@@ -412,12 +444,12 @@ export function PowerWidget({ data, range, locale, onOpen }: VisualProps) {
       : t(locale, '정상', 'NOMINAL');
   return (
     <CockpitPanel title={t(locale, '전원과 전압', 'Power and voltage')} description={t(locale, 'EXT5V 공급 전압과 제한 신호', 'EXT5V supply and throttle indicators')} icon="zap" badge={powerBadge} detailPage="power" onOpen={onOpen} locale={locale}>
-      <div className="cockpit-mini-summary">
-        <span>{t(locale, '현재', 'Current')} <strong>{voltage(data.latest?.supplyVoltageVolts)}</strong></span>
-        <span>{t(locale, '최저', 'Minimum')} <strong>{voltage(summary.minSupplyVoltageVolts)}</strong></span>
-        <span>{t(locale, '평균', 'Average')} <strong>{voltage(summary.averageSupplyVoltageVolts)}</strong></span>
-      </div>
-      <div className="cockpit-chart">
+      {(currentVisible || minimumVisible || averageVisible) && <div className="cockpit-mini-summary">
+        {currentVisible && <span>{t(locale, '현재', 'Current')} <strong>{voltage(data.latest?.supplyVoltageVolts)}</strong></span>}
+        {minimumVisible && <span>{t(locale, '최저', 'Minimum')} <strong>{voltage(summary.minSupplyVoltageVolts)}</strong></span>}
+        {averageVisible && <span>{t(locale, '평균', 'Average')} <strong>{voltage(summary.averageSupplyVoltageVolts)}</strong></span>}
+      </div>}
+      {!currentVisible && !minimumVisible && !averageVisible && !trendVisible ? <SelectionEmpty locale={locale} /> : trendVisible && <div className="cockpit-chart">
         {!series.some((point) => typeof point.supplyVoltageVolts === 'number') ? <ChartEmpty locale={locale} /> : (
           <ResponsiveContainer width="100%" height="100%">
             <LineChart data={series} margin={{ top: 12, right: 12, left: 0, bottom: 0 }}>
@@ -430,12 +462,13 @@ export function PowerWidget({ data, range, locale, onOpen }: VisualProps) {
             </LineChart>
           </ResponsiveContainer>
         )}
-      </div>
+      </div>}
     </CockpitPanel>
   );
 }
 
 export function ReliabilityWidget({ data, locale, onOpen }: Omit<VisualProps, 'range'>) {
+  const detailVisible = useAdaptiveGridDetailVisibility();
   const summary = data.reliability;
   const stateDetail = (value: boolean | null, unavailable: string, available: string) => value === null
     ? t(locale, '보고 없음', 'Not reported')
@@ -443,11 +476,12 @@ export function ReliabilityWidget({ data, locale, onOpen }: Omit<VisualProps, 'r
       ? available
       : unavailable;
   const checks = [
-    { label: t(locale, 'SSH 접속 경로', 'SSH listeners'), value: summary.sshListenersAvailable, detail: stateDetail(summary.sshListenersAvailable, t(locale, '수신 포트 없음', 'No listener detected'), t(locale, '접속 경로 확인', 'Listener available')) },
-    { label: t(locale, '주 네트워크', 'Primary network'), value: summary.networkLinkAvailable, detail: stateDetail(summary.networkLinkAvailable, t(locale, '연결 끊김', 'Link unavailable'), t(locale, '연결 유지', 'Link available')) },
-    { label: t(locale, 'NVMe 보호 설정', 'NVMe mitigation'), value: summary.nvmeMitigationActive, detail: stateDetail(summary.nvmeMitigationActive, t(locale, '보호 설정 불완전', 'Mitigation incomplete'), t(locale, '보호 설정 적용', 'Mitigation active')) },
-    { label: t(locale, '수집 지연', 'Collector gap'), value: summary.collectorGapSeconds == null ? null : summary.collectorGapSeconds < 120, detail: summary.collectorGapSeconds == null ? t(locale, '보고 없음', 'Not reported') : `${Math.round(summary.collectorGapSeconds)}s` },
-  ];
+    { id: 'ssh', label: t(locale, 'SSH 접속 경로', 'SSH listeners'), value: summary.sshListenersAvailable, detail: stateDetail(summary.sshListenersAvailable, t(locale, '수신 포트 없음', 'No listener detected'), t(locale, '접속 경로 확인', 'Listener available')) },
+    { id: 'network', label: t(locale, '주 네트워크', 'Primary network'), value: summary.networkLinkAvailable, detail: stateDetail(summary.networkLinkAvailable, t(locale, '연결 끊김', 'Link unavailable'), t(locale, '연결 유지', 'Link available')) },
+    { id: 'nvme', label: t(locale, 'NVMe 보호 설정', 'NVMe mitigation'), value: summary.nvmeMitigationActive, detail: stateDetail(summary.nvmeMitigationActive, t(locale, '보호 설정 불완전', 'Mitigation incomplete'), t(locale, '보호 설정 적용', 'Mitigation active')) },
+    { id: 'collector-gap', label: t(locale, '수집 지연', 'Collector gap'), value: summary.collectorGapSeconds == null ? null : summary.collectorGapSeconds < 120, detail: summary.collectorGapSeconds == null ? t(locale, '보고 없음', 'Not reported') : `${Math.round(summary.collectorGapSeconds)}s` },
+  ].filter((check) => detailVisible(check.id));
+  const lastBootVisible = detailVisible('last-boot');
   return (
     <CockpitPanel title={t(locale, '호스트 신뢰성', 'Host reliability')} description={t(locale, '연결·수집·저장장치 보호 상태', 'Connectivity, collection, and storage safeguards')} icon="shield" badge={`${data.reliabilityEvents.length}`} detailPage="reliability" onOpen={onOpen} locale={locale}>
       <div className="cockpit-check-grid">
@@ -457,8 +491,9 @@ export function ReliabilityWidget({ data, locale, onOpen }: Omit<VisualProps, 'r
             <div><strong>{check.label}</strong><small>{check.detail}</small></div>
           </div>
         ))}
+        {!checks.length && !lastBootVisible && <SelectionEmpty locale={locale} />}
       </div>
-      <p className="cockpit-footnote">{t(locale, '최근 부팅', 'Last boot')} · {formatDateTime(summary.bootStartedAt, locale)}</p>
+      {lastBootVisible && <p className="cockpit-footnote">{t(locale, '최근 부팅', 'Last boot')} · {formatDateTime(summary.bootStartedAt, locale)}</p>}
     </CockpitPanel>
   );
 }
@@ -484,12 +519,15 @@ function incidentDistribution(incidents: PeakIncident[], locale: MonitorLocale) 
 }
 
 export function IncidentsWidget({ data, locale, onOpen }: Omit<VisualProps, 'range'>) {
+  const detailVisible = useAdaptiveGridDetailVisibility();
+  const distributionVisible = detailVisible('distribution');
+  const recentVisible = detailVisible('recent');
   const distribution = incidentDistribution(data.incidents, locale);
   const palette = [CHART_COLORS.red, CHART_COLORS.orange, CHART_COLORS.violet, CHART_COLORS.cyan, CHART_COLORS.green, CHART_COLORS.blue];
   return (
     <CockpitPanel title={t(locale, '피크 사건', 'Peak incidents')} description={t(locale, '임계치를 넘은 순간의 원인과 증거', 'Reasons and evidence captured at threshold crossings')} icon="alert" badge={`${data.incidents.length}`} detailPage="incidents" onOpen={onOpen} locale={locale}>
-      <div className="incident-widget-layout">
-        <div className="cockpit-chart incident-donut">
+      {!distributionVisible && !recentVisible ? <SelectionEmpty locale={locale} /> : <div className={`incident-widget-layout${distributionVisible !== recentVisible ? ' incident-widget-layout-single' : ''}`}>
+        {distributionVisible && <div className="cockpit-chart incident-donut">
           {!distribution.length ? <ChartEmpty locale={locale} /> : (
             <ResponsiveContainer width="100%" height="100%">
               <PieChart>
@@ -501,8 +539,8 @@ export function IncidentsWidget({ data, locale, onOpen }: Omit<VisualProps, 'ran
               </PieChart>
             </ResponsiveContainer>
           )}
-        </div>
-        <ol className="incident-compact-list">
+        </div>}
+        {recentVisible && <ol className="incident-compact-list">
           {data.incidents.slice(0, 4).map((incident) => (
             <li key={incident.id}>
               <span className={`phase-${incident.phase}`}>{incident.phase === 'active' ? '▲' : incident.phase === 'follow-up' ? '●' : '✓'}</span>
@@ -510,13 +548,16 @@ export function IncidentsWidget({ data, locale, onOpen }: Omit<VisualProps, 'ran
             </li>
           ))}
           {!data.incidents.length && <li className="positive-empty">✓ {t(locale, '선택한 기간에 피크 사건이 없습니다.', 'No peak incidents in this range.')}</li>}
-        </ol>
-      </div>
+        </ol>}
+      </div>}
     </CockpitPanel>
   );
 }
 
 export function EventsWidget({ data, locale, onOpen }: Omit<VisualProps, 'range'>) {
+  const detailVisible = useAdaptiveGridDetailVisibility();
+  const timelineVisible = detailVisible('timeline');
+  const logVisible = detailVisible('log');
   const logs = useMemo(() => operationalLogs(data), [data]);
   const buckets = useMemo(() => eventBuckets(logs, 10).map((bucket) => ({
     ...bucket,
@@ -524,8 +565,8 @@ export function EventsWidget({ data, locale, onOpen }: Omit<VisualProps, 'range'
   })), [logs]);
   return (
     <CockpitPanel title={t(locale, '운영 이벤트', 'Operational events')} description={t(locale, '경고·신뢰성·전원·권한 기록을 한 시간축으로 통합', 'Alerts, reliability, power, and privilege records on one timeline')} icon="clock" badge={`${logs.length}`} detailPage="logs" onOpen={onOpen} locale={locale}>
-      <div className="event-widget-layout">
-        <div className="cockpit-chart event-histogram">
+      {!timelineVisible && !logVisible ? <SelectionEmpty locale={locale} /> : <div className={`event-widget-layout${timelineVisible !== logVisible ? ' event-widget-layout-single' : ''}`}>
+        {timelineVisible && <div className="cockpit-chart event-histogram">
           {!buckets.length ? <ChartEmpty locale={locale} /> : (
             <ResponsiveContainer width="100%" height="100%">
               <BarChart data={buckets} margin={{ top: 8, right: 8, left: -14, bottom: 0 }}>
@@ -540,9 +581,9 @@ export function EventsWidget({ data, locale, onOpen }: Omit<VisualProps, 'range'
               </BarChart>
             </ResponsiveContainer>
           )}
-        </div>
-        <OperationalLogView entries={logs} locale={locale} compact />
-      </div>
+        </div>}
+        {logVisible && <OperationalLogView entries={logs} locale={locale} compact />}
+      </div>}
     </CockpitPanel>
   );
 }

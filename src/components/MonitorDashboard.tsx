@@ -71,6 +71,10 @@ function t(locale: MonitorLocale, korean: string, english: string): string {
   return localized(locale, korean, english);
 }
 
+function detail(locale: MonitorLocale, id: string, korean: string, english: string) {
+  return { id, label: t(locale, korean, english) };
+}
+
 function normalizePage(page: MonitorPage): 'overview' | MonitorDetailPage {
   return page === 'details' ? 'resources' : page;
 }
@@ -165,16 +169,123 @@ export function MonitorDashboard({
     if (!data) return [];
     const common = { data, locale, onOpen: (next: MonitorDetailPage) => onNavigate(next) };
     return [
-      { id: 'vitals', label: t(locale, '핵심 계기', 'Primary instruments'), layout: DEFAULT_LAYOUT.vitals, content: <VitalSignsWidget {...common} /> },
-      { id: 'resources', label: t(locale, '자원 사용 추세', 'Resource utilization'), layout: DEFAULT_LAYOUT.resources, content: <ResourceWidget {...common} range={range} /> },
-      { id: 'load', label: t(locale, '부하와 온도', 'Load and thermal'), layout: DEFAULT_LAYOUT.load, content: <LoadWidget {...common} range={range} /> },
-      { id: 'network', label: t(locale, '네트워크 처리량', 'Network throughput'), layout: DEFAULT_LAYOUT.network, content: <NetworkWidget {...common} range={range} /> },
-      { id: 'storage', label: t(locale, '저장장치', 'Storage'), layout: DEFAULT_LAYOUT.storage, content: <StorageWidget {...common} range={range} /> },
-      { id: 'containers', label: t(locale, '서비스와 컨테이너', 'Services and containers'), layout: DEFAULT_LAYOUT.containers, content: <ContainersWidget {...common} /> },
-      { id: 'power', label: t(locale, '전원과 전압', 'Power and voltage'), layout: DEFAULT_LAYOUT.power, content: <PowerWidget {...common} range={range} /> },
-      { id: 'reliability', label: t(locale, '호스트 신뢰성', 'Host reliability'), layout: DEFAULT_LAYOUT.reliability, content: <ReliabilityWidget {...common} /> },
-      { id: 'incidents', label: t(locale, '피크 사건', 'Peak incidents'), layout: DEFAULT_LAYOUT.incidents, content: <IncidentsWidget {...common} /> },
-      { id: 'events', label: t(locale, '운영 이벤트', 'Operational events'), layout: DEFAULT_LAYOUT.events, content: <EventsWidget {...common} /> },
+      {
+        id: 'vitals',
+        label: t(locale, '핵심 계기', 'Primary instruments'),
+        layout: DEFAULT_LAYOUT.vitals,
+        details: [
+          detail(locale, 'cpu', 'CPU', 'CPU'),
+          detail(locale, 'memory', '메모리', 'Memory'),
+          detail(locale, 'temperature', '온도', 'Temperature'),
+          detail(locale, 'load', '시스템 부하', 'System load'),
+          detail(locale, 'services', '서비스', 'Services'),
+          detail(locale, 'disk-usage', '디스크 사용률', 'Disk usage'),
+          detail(locale, 'network-rx', '네트워크 수신', 'Network receive'),
+          detail(locale, 'network-tx', '네트워크 송신', 'Network transmit'),
+          detail(locale, 'disk-io', '디스크 입출력', 'Disk I/O'),
+          detail(locale, 'voltage', '공급 전압', 'Supply voltage'),
+          detail(locale, 'gpu-memory', 'GPU 메모리', 'GPU memory'),
+          detail(locale, 'gpu-clock', 'GPU 클럭', 'GPU clock'),
+          detail(locale, 'uptime', '가동 시간', 'Uptime'),
+        ],
+        content: <VitalSignsWidget {...common} />,
+      },
+      {
+        id: 'resources',
+        label: t(locale, '자원 사용 추세', 'Resource utilization'),
+        layout: DEFAULT_LAYOUT.resources,
+        details: [
+          detail(locale, 'cpu', 'CPU', 'CPU'),
+          detail(locale, 'memory', '메모리', 'Memory'),
+        ],
+        content: <ResourceWidget {...common} range={range} />,
+      },
+      {
+        id: 'load',
+        label: t(locale, '부하와 온도', 'Load and thermal'),
+        layout: DEFAULT_LAYOUT.load,
+        details: [
+          detail(locale, 'load', '시스템 부하', 'System load'),
+          detail(locale, 'temperature', '온도', 'Temperature'),
+        ],
+        content: <LoadWidget {...common} range={range} />,
+      },
+      {
+        id: 'network',
+        label: t(locale, '네트워크 처리량', 'Network throughput'),
+        layout: DEFAULT_LAYOUT.network,
+        details: [
+          detail(locale, 'receive', '수신', 'Receive'),
+          detail(locale, 'transmit', '송신', 'Transmit'),
+        ],
+        content: <NetworkWidget {...common} range={range} />,
+      },
+      {
+        id: 'storage',
+        label: t(locale, '저장장치', 'Storage'),
+        layout: DEFAULT_LAYOUT.storage,
+        details: [
+          detail(locale, 'capacity', '볼륨 용량', 'Volume capacity'),
+          detail(locale, 'read', '디스크 읽기', 'Disk read'),
+          detail(locale, 'write', '디스크 쓰기', 'Disk write'),
+        ],
+        content: <StorageWidget {...common} range={range} />,
+      },
+      {
+        id: 'containers',
+        label: t(locale, '서비스와 컨테이너', 'Services and containers'),
+        layout: DEFAULT_LAYOUT.containers,
+        details: [
+          detail(locale, 'cpu', 'CPU', 'CPU'),
+          detail(locale, 'memory', '메모리', 'Memory'),
+        ],
+        content: <ContainersWidget {...common} />,
+      },
+      {
+        id: 'power',
+        label: t(locale, '전원과 전압', 'Power and voltage'),
+        layout: DEFAULT_LAYOUT.power,
+        details: [
+          detail(locale, 'current', '현재 전압', 'Current voltage'),
+          detail(locale, 'minimum', '최저 전압', 'Minimum voltage'),
+          detail(locale, 'average', '평균 전압', 'Average voltage'),
+          detail(locale, 'trend', '전압 추세', 'Voltage trend'),
+        ],
+        content: <PowerWidget {...common} range={range} />,
+      },
+      {
+        id: 'reliability',
+        label: t(locale, '호스트 신뢰성', 'Host reliability'),
+        layout: DEFAULT_LAYOUT.reliability,
+        details: [
+          detail(locale, 'ssh', 'SSH 접속 경로', 'SSH listeners'),
+          detail(locale, 'network', '주 네트워크', 'Primary network'),
+          detail(locale, 'nvme', 'NVMe 보호 설정', 'NVMe mitigation'),
+          detail(locale, 'collector-gap', '수집 지연', 'Collector gap'),
+          detail(locale, 'last-boot', '최근 부팅', 'Last boot'),
+        ],
+        content: <ReliabilityWidget {...common} />,
+      },
+      {
+        id: 'incidents',
+        label: t(locale, '피크 사건', 'Peak incidents'),
+        layout: DEFAULT_LAYOUT.incidents,
+        details: [
+          detail(locale, 'distribution', '원인 분포', 'Cause distribution'),
+          detail(locale, 'recent', '최근 사건', 'Recent incidents'),
+        ],
+        content: <IncidentsWidget {...common} />,
+      },
+      {
+        id: 'events',
+        label: t(locale, '운영 이벤트', 'Operational events'),
+        layout: DEFAULT_LAYOUT.events,
+        details: [
+          detail(locale, 'timeline', '이벤트 시간축', 'Event timeline'),
+          detail(locale, 'log', '이벤트 목록', 'Event list'),
+        ],
+        content: <EventsWidget {...common} />,
+      },
     ];
   }, [data, locale, onNavigate, range]);
 

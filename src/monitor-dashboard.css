@@ -238,9 +238,13 @@
 .cockpit-chart .recharts-text { fill: var(--control-faint); font-size: 10px; }
 .cockpit-chart .recharts-legend-item-text { color: var(--control-muted) !important; font-size: 11px; }
 .cockpit-chart-empty { height: 100%; min-height: 160px; display: grid; place-items: center; align-content: center; gap: 8px; color: var(--control-faint); font-size: 12px; }
+.cockpit-selection-empty { width: 100%; min-height: 120px; flex: 1; text-align: center; }
+.cockpit-vital-grid > .cockpit-selection-empty,
+.cockpit-check-grid > .cockpit-selection-empty { grid-column: 1 / -1; }
 .cockpit-explainer { margin: 0 0 8px; padding: 8px 10px; display: flex; align-items: flex-start; gap: 7px; color: #a8c8c4; border: 1px solid rgb(85 217 209 / 18%); border-radius: 7px; background: rgb(85 217 209 / 4%); font-size: 10px; }
 .cockpit-explainer svg { flex: 0 0 auto; }
 .cockpit-split-chart { min-height: 0; display: grid; grid-template-columns: minmax(0, .8fr) minmax(0, 1.2fr); flex: 1; gap: 10px; }
+.cockpit-split-chart-single { grid-template-columns: minmax(0, 1fr); }
 .container-chart { min-height: 250px; }
 .cockpit-footnote { margin: 8px 0 0; color: var(--control-faint); font-size: 10px; line-height: 1.5; }
 
@@ -254,6 +258,7 @@
 .cockpit-check small { color: var(--control-muted); font-size: 10px; }
 
 .incident-widget-layout { min-height: 0; display: grid; grid-template-columns: minmax(220px, .9fr) minmax(250px, 1.1fr); flex: 1; gap: 10px; }
+.incident-widget-layout-single { grid-template-columns: minmax(0, 1fr); }
 .incident-donut { min-height: 210px; }
 .incident-compact-list { margin: 0; padding: 0; display: grid; align-content: start; gap: 7px; list-style: none; overflow: auto; }
 .incident-compact-list li { min-width: 0; padding: 10px; display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: 9px; border: 1px solid var(--control-border); border-radius: 7px; background: #091411; }
@@ -266,6 +271,7 @@
 .incident-compact-list .positive-empty { display: block; color: var(--control-green); font-size: 11px; }
 
 .event-widget-layout { min-height: 0; display: grid; grid-template-columns: minmax(280px, .85fr) minmax(360px, 1.15fr); flex: 1; gap: 15px; }
+.event-widget-layout-single { grid-template-columns: minmax(0, 1fr); }
 .event-histogram { min-height: 260px; }
 
 .ops-log { min-width: 0; display: flex; flex-direction: column; }

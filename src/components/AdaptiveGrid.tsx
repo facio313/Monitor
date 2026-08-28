@@ -1,4 +1,7 @@
 import {
+  createContext,
+  useCallback,
+  useContext,
   useEffect,
   useId,
   useMemo,
@@ -16,6 +19,7 @@ import 'gridstack/dist/gridstack.min.css';
 import '../adaptive-grid.css';
 
 export const ADAPTIVE_GRID_SCHEMA_VERSION = 1 as const;
+export const ADAPTIVE_GRID_DETAILS_SCHEMA_VERSION = 1 as const;
 export const ADAPTIVE_GRID_BASE_COLUMNS = 12;
 export const ADAPTIVE_GRID_MAX_ROWS = 256;
 
@@ -24,6 +28,7 @@ const ADAPTIVE_GRID_MAX_JSON_LENGTH = 64 * 1024;
 const ADAPTIVE_GRID_HISTORY_LIMIT = 24;
 const ADAPTIVE_GRID_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,79}$/;
 const STORAGE_PREFIX = 'monitor.adaptive-grid';
+const DETAILS_STORAGE_PREFIX = 'monitor.adaptive-grid-details';
 
 export interface AdaptiveGridPosition {
   x: number;
@@ -40,7 +45,19 @@ export interface AdaptiveGridItem {
   id: string;
   label: string;
   layout: AdaptiveGridPosition;
+  details?: readonly AdaptiveGridDetailItem[];
   content: ReactNode;
+}
+
+export interface AdaptiveGridDetailItem {
+  id: string;
+  label: string;
+}
+
+export interface AdaptiveGridDetailVisibilityItem {
+  widgetId: string;
+  detailId: string;
+  visible: boolean;
 }
 
 export interface AdaptiveGridLayoutItem {
@@ -60,6 +77,7 @@ export interface AdaptiveGridProps {
   ariaLabel?: string;
   className?: string;
   onLayoutChange?: (layout: readonly AdaptiveGridLayoutItem[]) => void;
+  onDetailVisibilityChange?: (visibility: readonly AdaptiveGridDetailVisibilityItem[]) => void;
 }
 
 export type AdaptiveGridCommand =
@@ -100,6 +118,21 @@ interface StoredAdaptiveGridLayout {
   layout: AdaptiveGridLayoutItem[];
 }
 
+interface StoredAdaptiveGridDetails {
+  schemaVersion: typeof ADAPTIVE_GRID_DETAILS_SCHEMA_VERSION;
+  visibility: AdaptiveGridDetailVisibilityItem[];
+}
+
+interface AdaptiveGridEditSnapshot {
+  layout: AdaptiveGridLayoutItem[];
+  hiddenDetailTokens: Set<string>;
+}
+
+interface AdaptiveGridDetailContextValue {
+  widgetId: string;
+  hiddenDetailTokens: ReadonlySet<string>;
+}
+
 interface Announcement {
   sequence: number;
   text: string;
@@ -113,6 +146,11 @@ interface AdaptiveGridStrings {
   cancel: string;
   undo: string;
   reset: string;
+  detailTitle: string;
+  detailHint: string;
+  detailControls: (label: string) => string;
+  detailToggle: (label: string, visible: boolean) => string;
+  detailState: (visible: boolean) => string;
   controls: (label: string) => string;
   dragHandle: (label: string) => string;
   command: Record<AdaptiveGridCommand, string>;
@@ -126,6 +164,8 @@ interface AdaptiveGridStrings {
   saveFailed: string;
   invalidLayout: string;
   changed: string;
+  detailShown: (label: string) => string;
+  detailHidden: (label: string) => string;
   commandApplied: (label: string, command: string) => string;
   commandBlocked: (label: string, command: string) => string;
 }
@@ -150,6 +190,11 @@ const STRINGS: Record<AdaptiveGridLocale, AdaptiveGridStrings> = {
     cancel: 'Cancel editing',
     undo: 'Undo',
     reset: 'Reset to default',
+    detailTitle: 'Visible details',
+    detailHint: 'Choose the details shown inside each widget, then save the layout.',
+    detailControls: (label) => `${label} visible details`,
+    detailToggle: (label, visible) => `${visible ? 'Hide' : 'Show'} ${label}`,
+    detailState: (visible) => visible ? 'ON' : 'OFF',
     controls: (label) => `${label} layout controls`,
     dragHandle: (label) => `Drag ${label}`,
     command: {
@@ -181,6 +226,8 @@ const STRINGS: Record<AdaptiveGridLocale, AdaptiveGridStrings> = {
     saveFailed: 'The layout could not be saved in this browser.',
     invalidLayout: 'The visible layout is invalid. Cancel or reset before saving.',
     changed: 'Layout changed. Save to keep it.',
+    detailShown: (label) => `${label} is now shown. Save to keep it.`,
+    detailHidden: (label) => `${label} is now hidden. Save to keep it.`,
     commandApplied: (label, command) => `${label}: ${command.toLowerCase()}.`,
     commandBlocked: (label, command) => `${label}: cannot ${command.toLowerCase()}.`,
   },
@@ -192,6 +239,11 @@ const STRINGS: Record<AdaptiveGridLocale, AdaptiveGridStrings> = {
     cancel: '편집 취소',
     undo: '되돌리기',
     reset: '기본 배치로 초기화',
+    detailTitle: '표시 항목',
+    detailHint: '각 위젯 안에서 표시할 항목을 선택한 뒤 배치를 저장하세요.',
+    detailControls: (label) => `${label} 표시 항목`,
+    detailToggle: (label, visible) => `${label} ${visible ? '숨기기' : '보이기'}`,
+    detailState: (visible) => visible ? 'ON' : 'OFF',
     controls: (label) => `${label} 배치 제어`,
     dragHandle: (label) => `${label} 드래그`,
     command: {
@@ -223,10 +275,26 @@ const STRINGS: Record<AdaptiveGridLocale, AdaptiveGridStrings> = {
     saveFailed: '이 브라우저에 배치를 저장하지 못했습니다.',
     invalidLayout: '현재 배치를 검증하지 못했습니다. 저장하기 전에 취소하거나 초기화하세요.',
     changed: '배치가 변경되었습니다. 저장하면 유지됩니다.',
+    detailShown: (label) => `${label} 항목을 표시합니다. 저장하면 유지됩니다.`,
+    detailHidden: (label) => `${label} 항목을 숨깁니다. 저장하면 유지됩니다.`,
     commandApplied: (label, command) => `${label}: ${command}.`,
     commandBlocked: (label, command) => `${label}: ${command}할 수 없습니다.`,
   },
 };
+
+const AdaptiveGridDetailContext = createContext<AdaptiveGridDetailContextValue | null>(null);
+
+function detailToken(widgetId: string, detailId: string): string {
+  return JSON.stringify([widgetId, detailId]);
+}
+
+export function useAdaptiveGridDetailVisibility(): (detailId: string) => boolean {
+  const context = useContext(AdaptiveGridDetailContext);
+  return useCallback((detailId: string) => {
+    if (!context) return true;
+    return !context.hiddenDetailTokens.has(detailToken(context.widgetId, detailId));
+  }, [context]);
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
@@ -242,6 +310,44 @@ function hasExactKeys(value: Record<string, unknown>, expected: readonly string[
 
 function isSafeInteger(value: unknown): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value);
+}
+
+function detailDefinitionsForItems(
+  items: readonly Pick<AdaptiveGridItem, 'id' | 'details'>[],
+): Array<{ widgetId: string; detailId: string }> {
+  const definitions: Array<{ widgetId: string; detailId: string }> = [];
+  const seenWidgets = new Set<string>();
+  for (const item of items) {
+    if (!ADAPTIVE_GRID_ID_PATTERN.test(item.id) || seenWidgets.has(item.id)) {
+      throw new TypeError(`Invalid or duplicate adaptive-grid widget id: ${item.id}`);
+    }
+    seenWidgets.add(item.id);
+    const seen = new Set<string>();
+    for (const detail of item.details ?? []) {
+      if (
+        !ADAPTIVE_GRID_ID_PATTERN.test(detail.id)
+        || seen.has(detail.id)
+        || typeof detail.label !== 'string'
+        || detail.label.length < 1
+        || detail.label.length > 160
+        || detail.label.trim() !== detail.label
+        || /[\u0000-\u001f\u007f]/.test(detail.label)
+      ) {
+        throw new TypeError(`Invalid or duplicate adaptive-grid detail id: ${item.id}.${detail.id}`);
+      }
+      seen.add(detail.id);
+      definitions.push({ widgetId: item.id, detailId: detail.id });
+    }
+  }
+  return definitions;
+}
+
+function cloneHiddenDetailTokens(tokens: ReadonlySet<string>): Set<string> {
+  return new Set(tokens);
+}
+
+function hiddenDetailTokensEqual(left: ReadonlySet<string>, right: ReadonlySet<string>): boolean {
+  return left.size === right.size && [...left].every((token) => right.has(token));
 }
 
 function cloneLayout(layout: readonly AdaptiveGridLayoutItem[]): AdaptiveGridLayoutItem[] {
@@ -400,7 +506,7 @@ export function getCuratedAdaptiveGridLayout(
   return normalized;
 }
 
-export function adaptiveGridStorageKey(storageKey: string): string {
+function validatedStorageKey(storageKey: string): string {
   if (
     typeof storageKey !== 'string'
     || storageKey.length < 1
@@ -410,7 +516,15 @@ export function adaptiveGridStorageKey(storageKey: string): string {
   ) {
     throw new TypeError('Adaptive-grid storageKey must be a non-empty per-user key without control characters.');
   }
-  return `${STORAGE_PREFIX}.v${ADAPTIVE_GRID_SCHEMA_VERSION}.${encodeURIComponent(storageKey)}`;
+  return encodeURIComponent(storageKey);
+}
+
+export function adaptiveGridStorageKey(storageKey: string): string {
+  return `${STORAGE_PREFIX}.v${ADAPTIVE_GRID_SCHEMA_VERSION}.${validatedStorageKey(storageKey)}`;
+}
+
+export function adaptiveGridDetailsStorageKey(storageKey: string): string {
+  return `${DETAILS_STORAGE_PREFIX}.v${ADAPTIVE_GRID_DETAILS_SCHEMA_VERSION}.${validatedStorageKey(storageKey)}`;
 }
 
 export function parseAdaptiveGridLayout(
@@ -446,6 +560,84 @@ export function serializeAdaptiveGridLayout(
     schemaVersion: ADAPTIVE_GRID_SCHEMA_VERSION,
     columns: ADAPTIVE_GRID_BASE_COLUMNS,
     layout: normalized,
+  };
+  return JSON.stringify(stored);
+}
+
+export function getCuratedAdaptiveGridDetailVisibility(
+  items: readonly Pick<AdaptiveGridItem, 'id' | 'details'>[],
+): AdaptiveGridDetailVisibilityItem[] {
+  return detailDefinitionsForItems(items).map(({ widgetId, detailId }) => ({
+    widgetId,
+    detailId,
+    visible: true,
+  }));
+}
+
+export function normalizeAdaptiveGridDetailVisibility(
+  value: unknown,
+  items: readonly Pick<AdaptiveGridItem, 'id' | 'details'>[],
+): AdaptiveGridDetailVisibilityItem[] | null {
+  let definitions: Array<{ widgetId: string; detailId: string }>;
+  try {
+    definitions = detailDefinitionsForItems(items);
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(value) || value.length > 1_024) return null;
+
+  const known = new Set(definitions.map(({ widgetId, detailId }) => detailToken(widgetId, detailId)));
+  const overrides = new Map<string, boolean>();
+  const seen = new Set<string>();
+  for (const candidate of value) {
+    if (!isRecord(candidate) || !hasExactKeys(candidate, ['widgetId', 'detailId', 'visible'])) return null;
+    if (
+      typeof candidate.widgetId !== 'string'
+      || typeof candidate.detailId !== 'string'
+      || typeof candidate.visible !== 'boolean'
+      || !ADAPTIVE_GRID_ID_PATTERN.test(candidate.widgetId)
+      || !ADAPTIVE_GRID_ID_PATTERN.test(candidate.detailId)
+    ) return null;
+    const token = detailToken(candidate.widgetId, candidate.detailId);
+    if (seen.has(token)) return null;
+    seen.add(token);
+    if (known.has(token)) overrides.set(token, candidate.visible);
+  }
+
+  return definitions.map(({ widgetId, detailId }) => ({
+    widgetId,
+    detailId,
+    visible: overrides.get(detailToken(widgetId, detailId)) ?? true,
+  }));
+}
+
+export function parseAdaptiveGridDetailVisibility(
+  source: string | null | undefined,
+  items: readonly Pick<AdaptiveGridItem, 'id' | 'details'>[],
+): AdaptiveGridDetailVisibilityItem[] | null {
+  if (typeof source !== 'string' || source.length === 0 || source.length > ADAPTIVE_GRID_MAX_JSON_LENGTH) {
+    return null;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(source);
+  } catch {
+    return null;
+  }
+  if (!isRecord(parsed) || !hasExactKeys(parsed, ['schemaVersion', 'visibility'])) return null;
+  if (parsed.schemaVersion !== ADAPTIVE_GRID_DETAILS_SCHEMA_VERSION) return null;
+  return normalizeAdaptiveGridDetailVisibility(parsed.visibility, items);
+}
+
+export function serializeAdaptiveGridDetailVisibility(
+  visibility: unknown,
+  items: readonly Pick<AdaptiveGridItem, 'id' | 'details'>[],
+): string {
+  const normalized = normalizeAdaptiveGridDetailVisibility(visibility, items);
+  if (!normalized) throw new TypeError('Cannot serialize invalid adaptive-grid detail visibility.');
+  const stored: StoredAdaptiveGridDetails = {
+    schemaVersion: ADAPTIVE_GRID_DETAILS_SCHEMA_VERSION,
+    visibility: normalized,
   };
   return JSON.stringify(stored);
 }
@@ -656,8 +848,43 @@ function initialStoredLayout(
   }
 }
 
-function configurationSignature(items: readonly Pick<AdaptiveGridItem, 'id' | 'layout'>[]): string {
-  return JSON.stringify(items.map(({ id, layout }) => ({
+function initialStoredDetailVisibility(
+  namespacedStorageKey: string,
+  items: readonly Pick<AdaptiveGridItem, 'id' | 'details'>[],
+  curated: readonly AdaptiveGridDetailVisibilityItem[],
+): AdaptiveGridDetailVisibilityItem[] {
+  if (typeof window === 'undefined') return curated.map((entry) => ({ ...entry }));
+  try {
+    return parseAdaptiveGridDetailVisibility(window.localStorage.getItem(namespacedStorageKey), items)
+      ?? curated.map((entry) => ({ ...entry }));
+  } catch {
+    return curated.map((entry) => ({ ...entry }));
+  }
+}
+
+function hiddenTokensFromVisibility(
+  visibility: readonly AdaptiveGridDetailVisibilityItem[],
+): Set<string> {
+  return new Set(
+    visibility
+      .filter((entry) => !entry.visible)
+      .map((entry) => detailToken(entry.widgetId, entry.detailId)),
+  );
+}
+
+function visibilityFromHiddenTokens(
+  items: readonly Pick<AdaptiveGridItem, 'id' | 'details'>[],
+  hiddenTokens: ReadonlySet<string>,
+): AdaptiveGridDetailVisibilityItem[] {
+  return getCuratedAdaptiveGridDetailVisibility(items).map((entry) => ({
+    ...entry,
+    visible: !hiddenTokens.has(detailToken(entry.widgetId, entry.detailId)),
+  }));
+}
+
+function configurationSignature(items: readonly Pick<AdaptiveGridItem, 'id' | 'layout' | 'details'>[]): string {
+  detailDefinitionsForItems(items);
+  return JSON.stringify(items.map(({ id, layout, details }) => ({
     id,
     x: layout.x,
     y: layout.y,
@@ -667,6 +894,7 @@ function configurationSignature(items: readonly Pick<AdaptiveGridItem, 'id' | 'l
     minH: layout.minH ?? 1,
     maxW: layout.maxW ?? ADAPTIVE_GRID_BASE_COLUMNS,
     maxH: layout.maxH ?? ADAPTIVE_GRID_MAX_WIDGET_HEIGHT,
+    details: (details ?? []).map((detail) => detail.id),
   })));
 }
 
@@ -681,16 +909,33 @@ export function AdaptiveGrid({
   ariaLabel,
   className,
   onLayoutChange,
+  onDetailVisibilityChange,
 }: AdaptiveGridProps) {
   const strings = STRINGS[locale] ?? STRINGS.en;
   const curatedLayout = getCuratedAdaptiveGridLayout(items);
+  const curatedDetailVisibility = getCuratedAdaptiveGridDetailVisibility(items);
   const namespacedStorageKey = adaptiveGridStorageKey(storageKey);
+  const namespacedDetailsStorageKey = adaptiveGridDetailsStorageKey(storageKey);
   const configSignature = configurationSignature(items);
   const initialLayout = useMemo(
     () => initialStoredLayout(namespacedStorageKey, items, curatedLayout),
     // configSignature captures all layout fields while allowing content to update independently.
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [configSignature, namespacedStorageKey],
+  );
+  const initialDetailVisibility = useMemo(
+    () => initialStoredDetailVisibility(
+      namespacedDetailsStorageKey,
+      items,
+      curatedDetailVisibility,
+    ),
+    // Detail labels and live content can change without changing persistence identity.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [configSignature, namespacedDetailsStorageKey],
+  );
+  const initialHiddenDetailTokens = useMemo(
+    () => hiddenTokensFromVisibility(initialDetailVisibility),
+    [initialDetailVisibility],
   );
   const gridId = useId().replace(/:/g, '');
   const gridElementRef = useRef<HTMLDivElement>(null);
@@ -699,13 +944,20 @@ export function AdaptiveGrid({
   const stringsRef = useRef(strings);
   const curatedRef = useRef(curatedLayout);
   const onLayoutChangeRef = useRef(onLayoutChange);
+  const onDetailVisibilityChangeRef = useRef(onDetailVisibilityChange);
   const committedLayoutRef = useRef(cloneLayout(initialLayout));
   const workingLayoutRef = useRef(cloneLayout(initialLayout));
   const editSnapshotRef = useRef<AdaptiveGridLayoutItem[] | null>(null);
-  const historyRef = useRef<AdaptiveGridLayoutItem[][]>([]);
+  const committedHiddenDetailTokensRef = useRef(cloneHiddenDetailTokens(initialHiddenDetailTokens));
+  const workingHiddenDetailTokensRef = useRef(cloneHiddenDetailTokens(initialHiddenDetailTokens));
+  const editHiddenDetailSnapshotRef = useRef<Set<string> | null>(null);
+  const historyRef = useRef<AdaptiveGridEditSnapshot[]>([]);
   const editingRef = useRef(false);
   const suppressGridChangeRef = useRef(false);
   const [renderLayout, setRenderLayout] = useState(() => cloneLayout(initialLayout));
+  const [renderHiddenDetailTokens, setRenderHiddenDetailTokens] = useState(
+    () => cloneHiddenDetailTokens(initialHiddenDetailTokens),
+  );
   const [editing, setEditing] = useState(false);
   const [ready, setReady] = useState(false);
   const [canUndo, setCanUndo] = useState(false);
@@ -715,6 +967,7 @@ export function AdaptiveGrid({
   stringsRef.current = strings;
   curatedRef.current = curatedLayout;
   onLayoutChangeRef.current = onLayoutChange;
+  onDetailVisibilityChangeRef.current = onDetailVisibilityChange;
 
   const layoutById = new Map(renderLayout.map((entry) => [entry.id, entry]));
 
@@ -749,14 +1002,28 @@ export function AdaptiveGrid({
     }
   }
 
-  function recordWorkingLayout(next: readonly AdaptiveGridLayoutItem[]) {
-    if (layoutsEqual(workingLayoutRef.current, next)) return;
+  function recordWorkingConfiguration(
+    nextLayout: readonly AdaptiveGridLayoutItem[],
+    nextHiddenDetailTokens: ReadonlySet<string>,
+  ) {
+    if (
+      layoutsEqual(workingLayoutRef.current, nextLayout)
+      && hiddenDetailTokensEqual(workingHiddenDetailTokensRef.current, nextHiddenDetailTokens)
+    ) return;
     historyRef.current = [
       ...historyRef.current,
-      cloneLayout(workingLayoutRef.current),
+      {
+        layout: cloneLayout(workingLayoutRef.current),
+        hiddenDetailTokens: cloneHiddenDetailTokens(workingHiddenDetailTokensRef.current),
+      },
     ].slice(-ADAPTIVE_GRID_HISTORY_LIMIT);
-    workingLayoutRef.current = cloneLayout(next);
+    workingLayoutRef.current = cloneLayout(nextLayout);
+    workingHiddenDetailTokensRef.current = cloneHiddenDetailTokens(nextHiddenDetailTokens);
     setCanUndo(historyRef.current.length > 0);
+  }
+
+  function recordWorkingLayout(next: readonly AdaptiveGridLayoutItem[]) {
+    recordWorkingConfiguration(next, workingHiddenDetailTokensRef.current);
   }
 
   useEffect(() => {
@@ -764,12 +1031,22 @@ export function AdaptiveGrid({
     if (!element) return undefined;
     let cancelled = false;
     const selected = initialStoredLayout(namespacedStorageKey, items, curatedLayout);
+    const selectedDetailVisibility = initialStoredDetailVisibility(
+      namespacedDetailsStorageKey,
+      items,
+      curatedDetailVisibility,
+    );
+    const selectedHiddenDetailTokens = hiddenTokensFromVisibility(selectedDetailVisibility);
     committedLayoutRef.current = cloneLayout(selected);
     workingLayoutRef.current = cloneLayout(selected);
     editSnapshotRef.current = null;
+    committedHiddenDetailTokensRef.current = cloneHiddenDetailTokens(selectedHiddenDetailTokens);
+    workingHiddenDetailTokensRef.current = cloneHiddenDetailTokens(selectedHiddenDetailTokens);
+    editHiddenDetailSnapshotRef.current = null;
     historyRef.current = [];
     editingRef.current = false;
     setRenderLayout(cloneLayout(selected));
+    setRenderHiddenDetailTokens(cloneHiddenDetailTokens(selectedHiddenDetailTokens));
     setEditing(false);
     setCanUndo(false);
     setReady(false);
@@ -861,7 +1138,7 @@ export function AdaptiveGrid({
     };
     // The string signature intentionally controls re-initialization, rather than item content identity.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [configSignature, namespacedStorageKey]);
+  }, [configSignature, namespacedDetailsStorageKey, namespacedStorageKey]);
 
   function beginEditing() {
     const grid = gridRef.current;
@@ -877,6 +1154,12 @@ export function AdaptiveGrid({
     committedLayoutRef.current = cloneLayout(current);
     workingLayoutRef.current = cloneLayout(current);
     editSnapshotRef.current = cloneLayout(current);
+    workingHiddenDetailTokensRef.current = cloneHiddenDetailTokens(
+      committedHiddenDetailTokensRef.current,
+    );
+    editHiddenDetailSnapshotRef.current = cloneHiddenDetailTokens(
+      committedHiddenDetailTokensRef.current,
+    );
     historyRef.current = [];
     setCanUndo(false);
     setGridInteraction(true);
@@ -885,13 +1168,18 @@ export function AdaptiveGrid({
 
   function cancelEditing() {
     const snapshot = editSnapshotRef.current ?? committedLayoutRef.current;
+    const hiddenDetailSnapshot = editHiddenDetailSnapshotRef.current
+      ?? committedHiddenDetailTokensRef.current;
     loadWithoutRemovingReactNodes(snapshot);
     workingLayoutRef.current = cloneLayout(snapshot);
+    workingHiddenDetailTokensRef.current = cloneHiddenDetailTokens(hiddenDetailSnapshot);
     historyRef.current = [];
     editSnapshotRef.current = null;
+    editHiddenDetailSnapshotRef.current = null;
     setCanUndo(false);
     setGridInteraction(false);
     setRenderLayout(cloneLayout(committedLayoutRef.current));
+    setRenderHiddenDetailTokens(cloneHiddenDetailTokens(committedHiddenDetailTokensRef.current));
     announce(strings.cancelled);
   }
 
@@ -906,24 +1194,58 @@ export function AdaptiveGrid({
       announce(strings.saveFailed);
       return;
     }
+    const nextDetailVisibility = visibilityFromHiddenTokens(
+      items,
+      workingHiddenDetailTokensRef.current,
+    );
+    let previousLayout: string | null = null;
+    let previousDetails: string | null = null;
+    let layoutWritten = false;
+    let detailsWritten = false;
     try {
+      previousLayout = window.localStorage.getItem(namespacedStorageKey);
+      previousDetails = window.localStorage.getItem(namespacedDetailsStorageKey);
       window.localStorage.setItem(
         namespacedStorageKey,
         serializeAdaptiveGridLayout(next, items),
       );
+      layoutWritten = true;
+      window.localStorage.setItem(
+        namespacedDetailsStorageKey,
+        serializeAdaptiveGridDetailVisibility(nextDetailVisibility, items),
+      );
+      detailsWritten = true;
     } catch {
+      try {
+        if (layoutWritten) {
+          if (previousLayout === null) window.localStorage.removeItem(namespacedStorageKey);
+          else window.localStorage.setItem(namespacedStorageKey, previousLayout);
+        }
+        if (detailsWritten) {
+          if (previousDetails === null) window.localStorage.removeItem(namespacedDetailsStorageKey);
+          else window.localStorage.setItem(namespacedDetailsStorageKey, previousDetails);
+        }
+      } catch {
+        // Best-effort rollback. The in-memory committed state stays unchanged.
+      }
       announce(strings.saveFailed);
       return;
     }
 
     committedLayoutRef.current = cloneLayout(next);
     workingLayoutRef.current = cloneLayout(next);
+    committedHiddenDetailTokensRef.current = cloneHiddenDetailTokens(
+      workingHiddenDetailTokensRef.current,
+    );
     editSnapshotRef.current = null;
+    editHiddenDetailSnapshotRef.current = null;
     historyRef.current = [];
     setCanUndo(false);
     setRenderLayout(cloneLayout(next));
+    setRenderHiddenDetailTokens(cloneHiddenDetailTokens(workingHiddenDetailTokensRef.current));
     setGridInteraction(false);
     onLayoutChangeRef.current?.(cloneLayout(next));
+    onDetailVisibilityChangeRef.current?.(nextDetailVisibility.map((entry) => ({ ...entry })));
     announce(strings.saved);
   }
 
@@ -931,18 +1253,33 @@ export function AdaptiveGrid({
     const previous = historyRef.current.at(-1);
     if (!previous) return;
     historyRef.current = historyRef.current.slice(0, -1);
-    workingLayoutRef.current = cloneLayout(previous);
+    workingLayoutRef.current = cloneLayout(previous.layout);
+    workingHiddenDetailTokensRef.current = cloneHiddenDetailTokens(previous.hiddenDetailTokens);
     setCanUndo(historyRef.current.length > 0);
-    loadWithoutRemovingReactNodes(previous);
+    loadWithoutRemovingReactNodes(previous.layout);
+    setRenderHiddenDetailTokens(cloneHiddenDetailTokens(previous.hiddenDetailTokens));
     announce(strings.undone);
   }
 
   function resetToCuratedLayout() {
     const curated = cloneLayout(curatedRef.current);
-    recordWorkingLayout(curated);
-    workingLayoutRef.current = cloneLayout(curated);
+    const curatedHiddenDetailTokens = new Set<string>();
+    recordWorkingConfiguration(curated, curatedHiddenDetailTokens);
     loadWithoutRemovingReactNodes(curated);
+    setRenderHiddenDetailTokens(curatedHiddenDetailTokens);
     announce(strings.resetApplied);
+  }
+
+  function toggleDetailVisibility(widgetId: string, detail: AdaptiveGridDetailItem) {
+    if (!editingRef.current) return;
+    const token = detailToken(widgetId, detail.id);
+    const nextHiddenDetailTokens = cloneHiddenDetailTokens(workingHiddenDetailTokensRef.current);
+    const currentlyVisible = !nextHiddenDetailTokens.has(token);
+    if (currentlyVisible) nextHiddenDetailTokens.add(token);
+    else nextHiddenDetailTokens.delete(token);
+    recordWorkingConfiguration(workingLayoutRef.current, nextHiddenDetailTokens);
+    setRenderHiddenDetailTokens(cloneHiddenDetailTokens(nextHiddenDetailTokens));
+    announce(currentlyVisible ? strings.detailHidden(detail.label) : strings.detailShown(detail.label));
   }
 
   function applyKeyboardCommand(widgetId: string, command: AdaptiveGridCommand) {
@@ -976,7 +1313,10 @@ export function AdaptiveGrid({
         announce(strings.commandBlocked(item.label, strings.command[command]));
         return;
       }
-      historyRef.current = [...historyRef.current, cloneLayout(previous)]
+      historyRef.current = [...historyRef.current, {
+        layout: cloneLayout(previous),
+        hiddenDetailTokens: cloneHiddenDetailTokens(workingHiddenDetailTokensRef.current),
+      }]
         .slice(-ADAPTIVE_GRID_HISTORY_LIMIT);
       workingLayoutRef.current = cloneLayout(result.layout);
       setCanUndo(true);
@@ -1020,7 +1360,10 @@ export function AdaptiveGrid({
       return;
     }
     if (!layoutsEqual(previous, next)) {
-      historyRef.current = [...historyRef.current, cloneLayout(previous)]
+      historyRef.current = [...historyRef.current, {
+        layout: cloneLayout(previous),
+        hiddenDetailTokens: cloneHiddenDetailTokens(workingHiddenDetailTokensRef.current),
+      }]
         .slice(-ADAPTIVE_GRID_HISTORY_LIMIT);
       workingLayoutRef.current = cloneLayout(next);
       setCanUndo(true);
@@ -1043,6 +1386,7 @@ export function AdaptiveGrid({
           </button>
         ) : (
           <>
+            <span className="adaptive-grid__edit-hint">{strings.detailHint}</span>
             <button type="button" onClick={undoLayoutChange} disabled={!canUndo}>
               {strings.undo}
             </button>
@@ -1063,6 +1407,10 @@ export function AdaptiveGrid({
         {items.map((item, index) => {
           const layout = layoutById.get(item.id) ?? curatedLayout[index];
           const headingId = `${gridId}-widget-${index}`;
+          const detailContext: AdaptiveGridDetailContextValue = {
+            widgetId: item.id,
+            hiddenDetailTokens: renderHiddenDetailTokens,
+          };
           const attributes = {
             'gs-id': item.id,
             'gs-x': String(layout.x),
@@ -1113,8 +1461,45 @@ export function AdaptiveGrid({
                     ))}
                   </div>
                 </header>
+                {(item.details?.length ?? 0) > 0 && (
+                  <div
+                    className="adaptive-grid__detail-controls"
+                    role="group"
+                    aria-label={strings.detailControls(item.label)}
+                    hidden={!editing}
+                    data-grid-no-drag
+                  >
+                    <span className="adaptive-grid__detail-controls-title">
+                      {strings.detailTitle}
+                    </span>
+                    <div className="adaptive-grid__detail-switches">
+                      {item.details?.map((detail) => {
+                        const visible = !renderHiddenDetailTokens.has(detailToken(item.id, detail.id));
+                        return (
+                          <button
+                            key={detail.id}
+                            type="button"
+                            className="adaptive-grid__detail-switch"
+                            role="switch"
+                            aria-checked={visible}
+                            aria-label={strings.detailToggle(detail.label, visible)}
+                            title={strings.detailToggle(detail.label, visible)}
+                            data-detail-id={detail.id}
+                            data-detail-visible={visible ? 'true' : 'false'}
+                            onClick={() => toggleDetailVisibility(item.id, detail)}
+                          >
+                            <b aria-hidden="true">{strings.detailState(visible)}</b>
+                            <span>{detail.label}</span>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
                 <div className="adaptive-grid__widget-body" data-grid-no-drag>
-                  {item.content}
+                  <AdaptiveGridDetailContext.Provider value={detailContext}>
+                    {item.content}
+                  </AdaptiveGridDetailContext.Provider>
                 </div>
               </div>
             </div>
