@@ -4,6 +4,7 @@ import { agentHeartbeatLabel, containerCollectionLabel } from '../collection-sta
 import { chooseInitialLocale, localized, MONITOR_STALE_AFTER_MS, monitorPathForPage, monitorRangeFromSearch, monitorSnapshotIsStale, operationalAssessmentPresentation } from '../dashboard-model';
 import { useDashboard } from '../hooks/useDashboard';
 import { operationalFindings, operationalServiceState } from '../operational-health';
+import { deriveSystemEmotion } from '../system-emotion';
 import type { DashboardPayload, MonitorDetailPage, MonitorLocale, MonitorPage, TimeRange } from '../types';
 import { formatDateTime, safeText } from '../utils';
 import { AdaptiveGrid, type AdaptiveGridItem } from './AdaptiveGrid';
@@ -31,6 +32,7 @@ import { OperationalHeadroom } from './OperationalHeadroom';
 import { PasswordChangeDialog } from './PasswordChangeDialog';
 import { RuleHealthSummary } from './RuleHealthSummary';
 import { SystemMaintenance } from './SystemMaintenance';
+import { SystemEmotionEngine } from './SystemEmotionEngine';
 import { SystemUpdateControls } from './SystemUpdateControls';
 
 const LOCALE_STORAGE_KEY = 'monitor.locale.v2';
@@ -295,6 +297,13 @@ export function MonitorDashboard({
     : counts.caution
       ? 'caution'
       : 'nominal';
+  const emotionModel = useMemo(() => deriveSystemEmotion({
+    data: assessedData ?? null,
+    stale: effectiveStale,
+    dangerCount: counts.danger,
+    cautionCount: counts.caution,
+    primaryFinding: findings[0] ?? null,
+  }), [assessedData, counts.caution, counts.danger, effectiveStale, findings]);
   const selectedRange = RANGES.find((item) => item.value === range)!;
   const serviceCollectionNotCurrent = Boolean(data && data.containerCollection.status !== 'fresh');
   const storageSubject = viewer?.user ?? 'local';
@@ -441,6 +450,14 @@ export function MonitorDashboard({
           )}
 
           {error && normalizedPage !== 'logs' && <div className="control-notice" role="alert"><Icon name="alert" size={19} /><div><strong>{t(locale, '원격 측정 갱신 실패', 'Telemetry refresh failed')}</strong><span>{safeText(error)} {data ? t(locale, '마지막 정상 화면을 유지합니다.', 'The last good snapshot remains visible.') : ''}</span></div><button type="button" onClick={() => void refresh()}>{t(locale, '재시도', 'Retry')}</button></div>}
+
+          {normalizedPage === 'overview' && (
+            <SystemEmotionEngine
+              locale={locale}
+              model={emotionModel}
+              paused={passwordDialogOpen || helpOpen}
+            />
+          )}
 
           {normalizedPage === 'infrastructure'
             ? <InfrastructureLedger locale={locale} onUnauthorized={onUnauthorized} />
