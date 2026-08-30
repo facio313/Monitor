@@ -111,6 +111,129 @@ export function getInfrastructureLedger(signal?: AbortSignal): Promise<Infrastru
   return apiFetch<InfrastructureLedgerResponse>('/infrastructure-ledger', { signal });
 }
 
+export type GenericLogSourceKind = 'docker' | 'file' | 'journald';
+export type GenericLogPriority = 'debug' | 'normal' | 'incident' | 'security';
+export type GenericLogSeverity = 'trace' | 'debug' | 'info' | 'notice' | 'warning' | 'error' | 'critical';
+export type GenericLogParser = 'json' | 'logfmt' | 'syslog' | 'plain';
+export type GenericLogSourceStatusValue =
+  | 'fresh'
+  | 'no_data'
+  | 'truncated'
+  | 'unsupported'
+  | 'permission_denied'
+  | 'failed';
+export type GenericLogCollectionStatus =
+  | 'fresh'
+  | 'degraded'
+  | 'stale'
+  | 'no_data'
+  | 'unsupported'
+  | 'collection_error';
+
+export interface GenericLogRecord {
+  schemaVersion: 1;
+  timestamp: string;
+  observedAt: string;
+  timestampSource: 'event' | 'observed';
+  sourceKind: GenericLogSourceKind;
+  sourceId: string;
+  priority: GenericLogPriority;
+  severity: GenericLogSeverity;
+  parser: GenericLogParser;
+  message: string;
+  truncated: boolean;
+  multilineLineCount: number;
+  hostId: string | null;
+  containerName: string | null;
+  composeProject: string | null;
+  composeService: string | null;
+  processName: string | null;
+  systemdUnit: string | null;
+  stream: 'stdout' | 'stderr' | null;
+  fields: Record<string, string | number | boolean | null>;
+  redactionVersion: 'monitor-log-redaction-v2';
+}
+
+export interface GenericLogSourceStatus {
+  schemaVersion: 1;
+  sourceId: string;
+  sourceKind: GenericLogSourceKind;
+  status: GenericLogSourceStatusValue;
+  observedAt: string;
+  lastSuccessAt: string | null;
+  errorClass: string | null;
+  seenLines: number;
+  seenBytes: number;
+  parsedEvents: number;
+  admittedEvents: number;
+  droppedLines: number;
+  dropped: {
+    inputLineLimit: number;
+    inputByteLimit: number;
+    oversizedLine: number;
+    multilineLineLimit: number;
+    oversizedEvent: number;
+    sourceQuota: number;
+    globalQuota: number;
+    acquisition: number;
+  };
+}
+
+export interface GenericLogQuery {
+  limit?: number;
+  cursor?: string;
+  text?: string;
+  sourceIds?: string[];
+  sourceKinds?: GenericLogSourceKind[];
+  priorities?: GenericLogPriority[];
+  severities?: GenericLogSeverity[];
+  from?: string;
+  to?: string;
+}
+
+export interface GenericLogPage {
+  schemaVersion: 1;
+  generatedAt: string;
+  collection: {
+    status: GenericLogCollectionStatus;
+    observedAt: string | null;
+    sources: GenericLogSourceStatus[];
+  };
+  query: {
+    limit: number;
+    text: string | null;
+    sourceIds: string[];
+    sourceKinds: GenericLogSourceKind[];
+    priorities: GenericLogPriority[];
+    severities: GenericLogSeverity[];
+    from: string | null;
+    to: string | null;
+  };
+  items: GenericLogRecord[];
+  page: {
+    limit: number;
+    returned: number;
+    total: number;
+    nextCursor: string | null;
+    cursorStatus: 'current' | 'stale';
+  };
+}
+
+export function getGenericLogs(query: GenericLogQuery = {}, signal?: AbortSignal): Promise<GenericLogPage> {
+  const parameters = new URLSearchParams();
+  if (query.limit !== undefined) parameters.set('limit', String(query.limit));
+  if (query.cursor !== undefined) parameters.set('cursor', query.cursor);
+  if (query.text !== undefined) parameters.set('text', query.text);
+  if (query.from !== undefined) parameters.set('from', query.from);
+  if (query.to !== undefined) parameters.set('to', query.to);
+  query.sourceIds?.forEach((value) => parameters.append('sourceId', value));
+  query.sourceKinds?.forEach((value) => parameters.append('sourceKind', value));
+  query.priorities?.forEach((value) => parameters.append('priority', value));
+  query.severities?.forEach((value) => parameters.append('severity', value));
+  const search = parameters.size ? `?${parameters.toString()}` : '';
+  return apiFetch<GenericLogPage>(`/generic-logs${search}`, { signal });
+}
+
 export type SystemUpdateState =
   | 'idle'
   | 'checking'

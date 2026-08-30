@@ -1088,7 +1088,7 @@ export function IncidentDetail({ data, locale }: { data: DashboardPayload; local
 }
 
 export function DetailPage({ page, data, findings, range, locale, onOpen }: VisualProps & {
-  page: Exclude<MonitorDetailPage, 'maintenance' | 'infrastructure'>;
+  page: Exclude<MonitorDetailPage, 'maintenance' | 'infrastructure' | 'logs'>;
   findings: readonly OperationalFinding[];
 }) {
   const logs = useMemo(() => operationalLogs(data), [data]);
@@ -1101,9 +1101,7 @@ export function DetailPage({ page, data, findings, range, locale, onOpen }: Visu
 
   let content: ReactNode;
   let targetClass = 'detail-system-target detail-dashboard';
-  if (page === 'logs') {
-    content = <><EventsWidget data={data} locale={locale} onOpen={onOpen} /><CockpitPanel title={t(locale, '전체 이벤트 탐색', 'Explore all events')} description={t(locale, '분류·심각도·문구로 최대 500건의 안전한 기록 검색', 'Search up to 500 sanitized records by source, severity, and text')} icon="clock" badge={`${logs.length}`} locale={locale}><OperationalLogView entries={logs} locale={locale} /></CockpitPanel></>;
-  } else if (page === 'resources') {
+  if (page === 'resources') {
     targetClass += ' detail-two-column';
     content = <><VitalSignsWidget data={data} locale={locale} onOpen={onOpen} /><ResourceWidget data={data} range={range} locale={locale} onOpen={onOpen} /><LoadWidget data={data} range={range} locale={locale} onOpen={onOpen} />{commonLogs}</>;
   } else if (page === 'network') {
@@ -1147,7 +1145,7 @@ export function pageTitle(page: MonitorDetailPage, locale: MonitorLocale): { eye
     infrastructure: [['인프라 작업 원장', 'INFRASTRUCTURE LEDGER'], ['변경·검증·미조치 작업 게시판', 'Changes, evidence, and action backlog'], ['서버 작업의 이유·영향·검증 근거와 앞으로 해야 할 일을 날짜·분류·상태별로 확인합니다.', 'Review server work, rationale, impact, evidence, and follow-up by date, category, and status.']],
     power: [['전원 계통', 'POWER SYSTEM'], ['전원 품질과 제한 상태', 'Power quality and throttling'], ['공급 전압과 현재·과거 제한 플래그, 전원 이벤트를 함께 봅니다.', 'Inspect supply voltage, current and historic throttle flags, and power events.']],
     incidents: [['사건 분석', 'INCIDENT ANALYSIS'], ['피크 사건과 증거', 'Peak incidents and evidence'], ['임계치를 넘은 시점의 자원·압박·프로세스·서비스 요청 증거를 검토합니다.', 'Review resource, pressure, process, and service-request evidence at threshold crossings.']],
-    logs: [['운영 기록', 'OPERATIONS JOURNAL'], ['통합 이벤트 로그', 'Unified event log'], ['경고·신뢰성·전원·권한 감사 기록을 분류하고 검색합니다.', 'Filter and search alert, reliability, power, and privilege-audit records.']],
+    logs: [['로그', 'LOGS'], ['일반 로그 탐색', 'Generic log explorer'], ['정규화되고 저장 전에 민감정보가 제거된 로그를 검색하고 상세 정보를 확인합니다.', 'Search normalized logs, then inspect metadata that was redacted before storage.']],
   };
   const [eyebrow, title, description] = pages[page];
   return { eyebrow: t(locale, ...eyebrow), title: t(locale, ...title), description: t(locale, ...description) };

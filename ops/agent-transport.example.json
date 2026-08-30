@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "baseUrl": "https://agents.monitor.example/monitor/api",
+  "stateDirectory": "/var/lib/monitor-agent",
+  "clientCertificateFile": "/etc/monitor-agent/client.crt",
+  "clientKeyFile": "/etc/monitor-agent/client.key",
+  "caCertificateFile": "/etc/monitor-agent/agent-ca.crt",
+  "machineIdentityFile": "/etc/machine-id",
+  "agentVersion": "1.0.0",
+  "heartbeatIntervalSeconds": 60,
+  "lifecycle": "active",
+  "requestTimeoutSeconds": 10,
+  "maxBatchRecords": 500,
+  "maxBatchBytes": 262144,
+  "maxSpoolEntries": 64,
+  "maxSpoolBytes": 4194304,
+  "gzipMinimumBytes": 1024,
+  "backoffInitialSeconds": 1,
+  "backoffMaximumSeconds": 300,
+  "retryAfterMaximumSeconds": 86400
+}

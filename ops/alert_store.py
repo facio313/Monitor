@@ -54,6 +54,9 @@ MAX_EVALUATION_BYTES = 8 * 1024 * 1024
 MAX_EVENT_FILE_BYTES = 32 * 1024 * 1024
 MAX_EVENT_LINE_BYTES = 8192
 MAX_EVENT_RECORDS = 5000
+DELIVERY_CONFIG_ENV = "MONITOR_ALERT_DELIVERY_CONFIG"
+DEFAULT_DELIVERY_CONFIG_PATH = Path("/etc/monitor/alert-delivery.json")
+MAX_DELIVERY_STATUS_BYTES = 4096
 TIMESTAMP = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 PHASES = frozenset({
     "inactive", "pending", "firing", "recovering", "no_data",
@@ -519,12 +522,90 @@ def failure_evaluation(now: dt.datetime) -> dict[str, Any]:
     }
 
 
+def _delivery_config_path(explicit: Path | None) -> Path | None:
+    if explicit is not None:
+        candidate = explicit
+    else:
+        configured = os.environ.get(DELIVERY_CONFIG_ENV)
+        if configured is not None:
+            if not configured or len(configured) > 512 or "\x00" in configured:
+                raise ValueError("alert delivery configuration path is invalid")
+            candidate = Path(configured)
+        elif DEFAULT_DELIVERY_CONFIG_PATH.exists():
+            candidate = DEFAULT_DELIVERY_CONFIG_PATH
+        else:
+            return None
+    if not candidate.is_absolute():
+        raise ValueError("alert delivery configuration path must be absolute")
+    return candidate
+
+
+def _enqueue_delivery_events(
+    events: Sequence[Mapping[str, Any]],
+    now: dt.datetime,
+    output_dir: Path,
+    explicit_config: Path | None,
+) -> dict[str, int] | None:
+    """Enqueue without importing adapters or performing network I/O.
+
+    This is deliberately called after event/state/evaluation persistence and
+    isolated by the caller.  Replaying recent retained events is safe because
+    the outbox delivery key is deterministic per event, channel, and purpose.
+    """
+
+    config_path = _delivery_config_path(explicit_config)
+    if config_path is None:
+        return None
+    try:
+        from .alert_delivery import (
+            DeliveryOutbox, enqueue_operational_events, load_delivery_config,
+        )
+    except ImportError:  # pragma: no cover - installed modules are top-level
+        from alert_delivery import (  # type: ignore[no-redef]
+            DeliveryOutbox, enqueue_operational_events, load_delivery_config,
+        )
+    config = load_delivery_config(config_path)
+    outbox = DeliveryOutbox(
+        output_dir / ".state" / "alert-delivery" / "alert-delivery.sqlite",
+        config.queue,
+    )
+    return enqueue_operational_events(outbox, config, events, now)
+
+
+def _write_delivery_enqueue_status(
+    output_dir: Path,
+    now: dt.datetime,
+    status: str,
+    counts: Mapping[str, Any] | None = None,
+) -> None:
+    if status not in {"ok", "error"}:
+        raise ValueError("alert delivery enqueue status is invalid")
+    normalized_counts = {key: 0 for key in ("enqueued", "deduplicated", "dropped", "skipped")}
+    if counts is not None:
+        for key in normalized_counts:
+            value = counts.get(key)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError("alert delivery enqueue counters are invalid")
+            normalized_counts[key] = value
+    _atomic_write(
+        output_dir / "alert-delivery-enqueue.json",
+        _json_payload({
+            "schemaVersion": 1,
+            "status": status,
+            "observedAt": _utc_timestamp(now),
+            **normalized_counts,
+        }, MAX_DELIVERY_STATUS_BYTES),
+        0o640,
+    )
+
+
 def evaluate_and_persist(
     snapshot: Mapping[str, Any],
     now: dt.datetime,
     rule_pack_path: Path,
     output_dir: Path,
     max_records: int = MAX_EVENT_RECORDS,
+    delivery_config_path: Path | None = None,
 ) -> dict[str, Any]:
     """Evaluate one snapshot and publish bounded state without raising.
 
@@ -563,6 +644,20 @@ def evaluate_and_persist(
             0o600,
         )
         _atomic_write(public_path, _json_payload(evaluation, MAX_EVALUATION_BYTES), 0o640)
+        try:
+            delivery_counts = _enqueue_delivery_events(
+                events, now, output_dir, delivery_config_path,
+            )
+            if delivery_counts is not None:
+                _write_delivery_enqueue_status(output_dir, now, "ok", delivery_counts)
+        except Exception:
+            # Delivery configuration, SQLite, and adapter installation are a
+            # separate failure domain.  Recent events are retried on the next
+            # evaluation and deterministic keys prevent duplicate queue rows.
+            try:
+                _write_delivery_enqueue_status(output_dir, now, "error")
+            except Exception:
+                pass
         return evaluation
     except Exception:
         failure = failure_evaluation(now)

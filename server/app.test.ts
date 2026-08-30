@@ -219,7 +219,7 @@ describe('authentication', () => {
         user: 'portfolio-owner',
         groups: ['user', 'portfolio-v2', 'access-monitor'],
         role: 'user',
-        permissions: ['dashboard:read'],
+        permissions: ['dashboard:read', 'logs:read'],
       });
     await request(app).post('/monitor/api/auth/login').send({ password: 'unused local password' }).expect(403);
     await request(app)
@@ -339,6 +339,7 @@ describe('authentication', () => {
       role: 'chief-admin',
       permissions: [
         'dashboard:read',
+        'logs:read',
         'auth-inventory:read',
         'infrastructure-ledger:read',
         'system-updates:check',

@@ -1,0 +1,66 @@
+[Unit]
+Description=Monitor central agent mTLS transport
+Documentation=file:/usr/local/share/doc/monitor-agent/agent-transport.md
+Wants=network-online.target
+After=local-fs.target network-online.target
+ConditionPathExists=/etc/monitor-agent/transport.json
+ConditionPathExists=/etc/monitor-agent/client.crt
+ConditionPathExists=/etc/monitor-agent/client.key
+ConditionPathExists=/etc/monitor-agent/agent-ca.crt
+RequiresMountsFor=/var/lib/monitor-agent
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+Environment=PYTHONPATH=/usr/local/lib/monitor-agent
+ExecStart=/usr/bin/python3 -m agent_transport --config /etc/monitor-agent/transport.json run-once
+UMask=0077
+StateDirectory=monitor-agent
+StateDirectoryMode=0700
+
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+PrivateMounts=true
+NoNewPrivileges=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RemoveIPC=true
+KeyringMode=private
+CapabilityBoundingSet=
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+ReadOnlyPaths=/etc/monitor-agent/transport.json
+ReadOnlyPaths=/etc/monitor-agent/client.crt /etc/monitor-agent/client.key /etc/monitor-agent/agent-ca.crt
+ReadOnlyPaths=/etc/machine-id
+ReadOnlyPaths=-/etc/hosts -/etc/host.conf -/etc/nsswitch.conf -/etc/resolv.conf -/etc/gai.conf
+ReadOnlyPaths=-/etc/ssl/openssl.cnf
+ReadWritePaths=/var/lib/monitor-agent
+InaccessiblePaths=/var/cache /var/log /var/spool
+
+MemoryHigh=64M
+MemoryMax=96M
+TasksMax=16
+# A valid config may perform enrollment, heartbeat, and ingest serially at the
+# 60-second per-request ceiling. Keep a finite deadline with recovery margin.
+TimeoutStartSec=4min
+TimeoutStopSec=10s
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+SyslogIdentifier=monitor-agent-transport

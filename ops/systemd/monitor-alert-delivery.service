@@ -1,0 +1,64 @@
+[Unit]
+Description=Bounded alert delivery worker for Monitor
+Documentation=file:/usr/local/share/doc/monitor-collector/alert-delivery.md
+Wants=network-online.target
+After=local-fs.target network-online.target monitor-collector.service
+ConditionPathExists=/etc/monitor/alert-delivery.json
+ConditionPathExists=/var/lib/monitor-export/.state/alert-delivery/alert-delivery.sqlite
+RequiresMountsFor=/var/lib/monitor-export
+
+[Service]
+Type=oneshot
+User=root
+Group=cks
+EnvironmentFile=-/etc/monitor/alert-delivery.env
+ExecStart=/usr/bin/python3 /usr/local/lib/monitor-collector/alert_delivery.py --config=/etc/monitor/alert-delivery.json --db=/var/lib/monitor-export/.state/alert-delivery/alert-delivery.sqlite drain --worker-id=monitor-alert-delivery --max-items=10 --max-runtime-seconds=45
+UMask=0077
+
+# The root collector owns the mode-0600 outbox. This process shares that file
+# identity but receives no capabilities, no home access, and write access only
+# to the private outbox directory. It is the sole network-capable alert path.
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+PrivateMounts=true
+TemporaryFileSystem=/etc:ro /run:ro /var/lib:ro
+BindReadOnlyPaths=-/etc/monitor/alert-delivery.json -/etc/monitor/secrets
+BindReadOnlyPaths=-/etc/hosts -/etc/host.conf -/etc/nsswitch.conf -/etc/resolv.conf -/etc/gai.conf
+BindReadOnlyPaths=/etc/ssl/certs
+BindReadOnlyPaths=-/etc/ssl/openssl.cnf
+BindPaths=/var/lib/monitor-export/.state/alert-delivery
+InaccessiblePaths=/var/cache /var/log /var/spool
+NoNewPrivileges=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RemoveIPC=true
+KeyringMode=private
+CapabilityBoundingSet=
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+ReadWritePaths=/var/lib/monitor-export/.state/alert-delivery
+
+MemoryHigh=96M
+MemoryMax=128M
+TasksMax=32
+TimeoutStartSec=5min
+TimeoutStopSec=15s
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+SyslogIdentifier=monitor-alert-delivery

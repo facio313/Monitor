@@ -498,3 +498,93 @@ export interface InfrastructureLedgerResponse {
   references: InfrastructureLedgerReference[];
   entries: InfrastructureLedgerEntry[];
 }
+
+export type CentralAgentLifecycle = 'active' | 'maintenance' | 'inactive';
+export type CentralAgentStatus =
+  | 'healthy'
+  | 'delayed'
+  | 'disconnected'
+  | 'maintenance'
+  | 'inactive'
+  | 'revoked';
+
+export interface CentralAgentInventory {
+  agentVersion: string;
+  hostname: string;
+  ipAddresses: string[];
+  operatingSystem: string;
+  ubuntuVersion: string | null;
+  kernelVersion: string;
+  architecture: string;
+  cpuModel: string;
+  memoryBytes: number;
+}
+
+export interface AgentEnrollmentRequestV1 {
+  schemaVersion: 1;
+  enrollmentToken: string;
+  hostId: string;
+  agentId: string;
+  /** Domain-separated SHA-256 input; a raw machine-id is forbidden. */
+  machineIdentityDigest: string;
+  installationEpoch: string;
+  heartbeatIntervalSeconds: number;
+  inventory: CentralAgentInventory;
+}
+
+export interface AgentHeartbeatRequestV1 {
+  schemaVersion: 1;
+  agentId: string;
+  sequence: number;
+  observedAt: string;
+  expectedIntervalSeconds: number;
+  lifecycle: CentralAgentLifecycle;
+  inventory: CentralAgentInventory;
+}
+
+export interface AgentIngestRecordV1 {
+  kind: 'metric' | 'event';
+  metric: string;
+  target: string;
+  observedAt: string;
+  sequence: number;
+  value: number | null;
+  severity: 'info' | 'warning' | 'critical' | null;
+}
+
+export interface AgentIngestBatchV1 {
+  schemaVersion: 1;
+  agentId: string;
+  batchId: string;
+  sentAt: string;
+  firstSequence: number;
+  lastSequence: number;
+  records: AgentIngestRecordV1[];
+}
+
+export interface CentralAgentSummary {
+  registered: true;
+  duplicate: boolean;
+  agentId: string;
+  hostId: string;
+  installationEpoch: string;
+  registeredAt: string;
+  lastSeenAt: string;
+  lastObservedAt: string;
+  lifecycle: CentralAgentLifecycle;
+  status: CentralAgentStatus;
+  expectedHeartbeatIntervalSeconds: number;
+  maxSequence: number;
+  inventory: CentralAgentInventory;
+  certificate: {
+    expiresAt: string;
+    renewalRequired: boolean;
+  };
+  clockRejections: {
+    count: number;
+    lastRejectedAt: string | null;
+  };
+  revokedAt: string | null;
+  revokedReason: 'compromised' | 'decommissioned' | 'operator' | 'reinstalled' | null;
+  serverTime: string;
+}

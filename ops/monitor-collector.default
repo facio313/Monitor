@@ -14,10 +14,18 @@ MONITOR_TRAFFIC_LOG=/var/log/nginx/monitor-traffic.jsonl
 MONITOR_DOCKER_SOCKETS=
 MONITOR_CONTAINER_INPUT=/run/monitor-container-exporter/containers.json
 MONITOR_PROCESS_UIDS=0,1001
+# Exact process comm names and system service units explicitly approved for
+# detailed status. Process argv and environment are never collected.
+MONITOR_PROCESS_ALLOWLIST=
+MONITOR_SYSTEMD_UNITS=monitor-collector.service,monitor-container-exporter.service,containerd.service,nginx.service,ssh.service,systemd-timesyncd.service
 MONITOR_SSH_PORTS=22,22022
 MONITOR_PRIMARY_INTERFACE=eth0
 MONITOR_CURL=/usr/bin/curl
 MONITOR_VCGENCMD=/usr/bin/vcgencmd
+MONITOR_SYSTEMCTL=/usr/bin/systemctl
+MONITOR_TIMEDATECTL=/usr/bin/timedatectl
+MONITOR_SYSTEMD_STATE_DIR=/run/systemd/units
+MONITOR_DOCKER_DATA_ROOT=/var/lib/docker
 MONITOR_COMMAND_TIMEOUT=2
 MONITOR_EXPECTED_INTERVAL_SECONDS=60
 MONITOR_AGENT_LIFECYCLE=active
@@ -43,6 +51,16 @@ MONITOR_TRAFFIC_SLOW_SECONDS=1
 MONITOR_MAX_INPUT_BYTES=1048576
 MONITOR_KERNEL_MAX_INPUT_BYTES=8388608
 MONITOR_RULE_PACK=/usr/local/lib/monitor-collector/rules/default-rules.v1.json
+# Reviewed generic-log allowlist. Missing is an explicit no-data state unless
+# MONITOR_LOG_SOURCES_REQUIRED is true; unsafe configs fail closed.
+MONITOR_LOG_SOURCES_CONFIG=/etc/monitor-collector/log-sources.json
+MONITOR_LOG_SOURCES_REQUIRED=false
+MONITOR_JOURNALCTL=/usr/bin/journalctl
+MONITOR_GENERIC_LOG_RETENTION_DAYS=30
+MONITOR_GENERIC_LOG_MAX_RECORDS=20000
+MONITOR_GENERIC_LOG_MAX_FILE_BYTES=16777216
+# One collection cycle spends at most this many seconds across journald sources.
+MONITOR_GENERIC_LOG_TOTAL_TIMEOUT=15
 
 # Fixture-only overrides (normally leave unset):
 # MONITOR_MOUNTINFO=/path/to/fixture/mountinfo

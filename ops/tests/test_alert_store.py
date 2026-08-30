@@ -5,6 +5,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from ops import alert_delivery
+from ops.alert_engine import load_rule_pack
+from ops.alert_runtime import observations_for_snapshot
 from ops.alert_store import evaluate_and_persist, normalize_evaluation, normalize_event
 
 
@@ -52,6 +55,50 @@ class AlertStoreTests(unittest.TestCase):
         path.write_text(json.dumps(rule_pack(version)), encoding="utf-8")
         return path
 
+    def create_delivery_config(self, root: Path) -> Path:
+        path = root / "delivery.json"
+        path.write_text(json.dumps({
+            "schemaVersion": 1,
+            "queue": {
+                "maxPending": 10, "maxHistory": 20, "maxDeliveryLog": 40,
+                "leaseSeconds": 10, "batchSize": 5, "replayWindowSeconds": 900,
+            },
+            "channels": [{
+                "id": "ops-webhook", "kind": "webhook", "enabled": True,
+                "timeoutSeconds": 2, "maxAttempts": 3,
+                "baseBackoffSeconds": 10, "maxBackoffSeconds": 60,
+                "secretRef": {"provider": "env", "key": "MONITOR_TEST_WEBHOOK"},
+                "settings": {"headers": {}},
+            }],
+            "routes": [{
+                "id": "all", "priority": 100, "enabled": True,
+                "severities": ["warning"], "transitions": ["firing", "resolved"],
+                "labels": {}, "channels": ["ops-webhook"], "continue": False,
+            }],
+        }), encoding="utf-8")
+        path.chmod(0o600)
+        return path
+
+    def test_notification_delivery_final_failure_is_a_real_rule_observation(self):
+        pack = load_rule_pack(
+            Path(__file__).resolve().parents[1] / "rules" / "default-rules.v1.json"
+        )
+        base = snapshot(10)
+        base["_monitor"] = {
+            "notificationDeliveryStatus": "ok",
+            "notificationFinalFailureDelta": 2,
+        }
+        observed = observations_for_snapshot(pack, base)["NotificationDeliveryFailure"]
+        self.assertEqual(len(observed), 1)
+        self.assertEqual((observed[0].status, observed[0].value), ("ok", 2.0))
+
+        base["_monitor"] = {
+            "notificationDeliveryStatus": "collection_error",
+            "notificationFinalFailureDelta": None,
+        }
+        failed = observations_for_snapshot(pack, base)["NotificationDeliveryFailure"]
+        self.assertEqual((failed[0].status, failed[0].value), ("collection_error", None))
+
     def test_persists_pending_then_one_firing_event_with_exact_modes(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -84,6 +131,75 @@ class AlertStoreTests(unittest.TestCase):
             self.assertEqual(replay["status"], "ok")
             self.assertEqual(len(events), 1)
             self.assertEqual(events[0]["openedAt"], "2026-08-30T12:00:00Z")
+
+    def test_recent_durable_event_is_enqueued_after_delivery_subsystem_recovers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pack = self.create_pack(root)
+            delivery = self.create_delivery_config(root)
+            evaluate_and_persist(snapshot(95), NOW, pack, root)
+            evaluate_and_persist(snapshot(95), NOW + dt.timedelta(minutes=1), pack, root)
+            self.assertFalse(
+                (root / ".state" / "alert-delivery" / "alert-delivery.sqlite").exists()
+            )
+
+            evaluation = evaluate_and_persist(
+                snapshot(95), NOW + dt.timedelta(minutes=2), pack, root,
+                delivery_config_path=delivery,
+            )
+            self.assertEqual(evaluation["status"], "ok")
+            config = alert_delivery.load_delivery_config(delivery)
+            outbox = alert_delivery.DeliveryOutbox(
+                root / ".state" / "alert-delivery" / "alert-delivery.sqlite",
+                config.queue,
+            )
+            self.assertEqual(outbox.status()["states"]["pending"], 1)
+            enqueue_status = json.loads(
+                (root / "alert-delivery-enqueue.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(enqueue_status["status"], "ok")
+            self.assertEqual(enqueue_status["enqueued"], 1)
+            self.assertEqual(
+                stat.S_IMODE((root / "alert-delivery-enqueue.json").stat().st_mode),
+                0o640,
+            )
+
+            evaluate_and_persist(
+                snapshot(95), NOW + dt.timedelta(minutes=3), pack, root,
+                delivery_config_path=delivery,
+            )
+            self.assertEqual(outbox.status()["states"]["pending"], 1)
+
+    def test_delivery_failure_never_turns_rule_evaluation_into_collection_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pack = self.create_pack(root)
+            delivery = root / "delivery.json"
+            delivery.write_text('{"inlineSecret":"forbidden"}', encoding="utf-8")
+            first = evaluate_and_persist(
+                snapshot(95), NOW, pack, root, delivery_config_path=delivery,
+            )
+            second = evaluate_and_persist(
+                snapshot(95), NOW + dt.timedelta(minutes=1), pack, root,
+                delivery_config_path=delivery,
+            )
+            self.assertEqual(first["status"], "ok")
+            self.assertEqual(second["summary"], {"firing": 1})
+            enqueue_status = json.loads(
+                (root / "alert-delivery-enqueue.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(enqueue_status, {
+                "schemaVersion": 1,
+                "status": "error",
+                "observedAt": "2026-08-30T12:01:00Z",
+                "enqueued": 0,
+                "deduplicated": 0,
+                "dropped": 0,
+                "skipped": 0,
+            })
+            self.assertEqual(
+                len((root / "rule-alerts.jsonl").read_text().splitlines()), 1,
+            )
 
     def test_immediate_firing_crash_rehydrates_from_durable_event(self):
         with tempfile.TemporaryDirectory() as directory:

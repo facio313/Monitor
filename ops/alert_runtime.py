@@ -89,6 +89,7 @@ def observations_for_snapshot(pack: RulePack, snapshot: Mapping[str, Any]) -> di
     host = _mapping(snapshot.get("host"))
     latest = _mapping(snapshot.get("latest"))
     system = _mapping(snapshot.get("system"))
+    monitor_internal = _mapping(snapshot.get("_monitor"))
     kernel = _mapping(system.get("kernel"))
     host_id = identity.get("hostId")
     if not isinstance(host_id, str) or OPAQUE_UUID.fullmatch(host_id) is None:
@@ -127,6 +128,19 @@ def observations_for_snapshot(pack: RulePack, snapshot: Mapping[str, Any]) -> di
     ) if _number(latest.get("networkRxDroppedPerSecond")) is not None
        and _number(latest.get("networkTxDroppedPerSecond")) is not None else None)
     host_metric("TemperatureHigh", latest.get("temperatureC"))
+    if "NotificationDeliveryFailure" in result:
+        delivery_status = monitor_internal.get("notificationDeliveryStatus")
+        delivery_delta = monitor_internal.get("notificationFinalFailureDelta")
+        if delivery_status == "ok":
+            result["NotificationDeliveryFailure"] = [
+                _observation(host_target, delivery_delta)
+            ]
+        elif delivery_status in {
+            "no_data", "unsupported", "permission_denied", "collection_error"
+        }:
+            result["NotificationDeliveryFailure"] = [
+                Observation(host_target, None, delivery_status)
+            ]
     flags = latest.get("throttledFlags")
     if isinstance(flags, int) and not isinstance(flags, bool) and 0 <= flags <= 0xFFFF_FFFF:
         host_metric("RaspberryPiThrottling", 1 if flags & 0xC else 0)

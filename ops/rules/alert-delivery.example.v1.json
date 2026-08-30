@@ -1,0 +1,87 @@
+{
+  "schemaVersion": 1,
+  "queue": {
+    "maxPending": 1000,
+    "maxHistory": 5000,
+    "maxDeliveryLog": 10000,
+    "leaseSeconds": 300,
+    "batchSize": 10,
+    "replayWindowSeconds": 900
+  },
+  "channels": [
+    {
+      "id": "generic-webhook",
+      "kind": "webhook",
+      "enabled": false,
+      "timeoutSeconds": 5,
+      "maxAttempts": 5,
+      "baseBackoffSeconds": 5,
+      "maxBackoffSeconds": 300,
+      "secretRef": {"provider": "file", "key": "/etc/monitor/secrets/generic-webhook-url"},
+      "settings": {"headers": {"X-Monitor-Source": "host-monitor"}}
+    },
+    {
+      "id": "slack-operations",
+      "kind": "slack",
+      "enabled": false,
+      "timeoutSeconds": 5,
+      "maxAttempts": 5,
+      "baseBackoffSeconds": 5,
+      "maxBackoffSeconds": 300,
+      "secretRef": {"provider": "env", "key": "MONITOR_SLACK_WEBHOOK_URL"},
+      "settings": {"username": "Monitor"}
+    },
+    {
+      "id": "discord-operations",
+      "kind": "discord",
+      "enabled": false,
+      "timeoutSeconds": 5,
+      "maxAttempts": 5,
+      "baseBackoffSeconds": 5,
+      "maxBackoffSeconds": 300,
+      "secretRef": {"provider": "file", "key": "/etc/monitor/secrets/discord-webhook-url"},
+      "settings": {"username": "Monitor"}
+    },
+    {
+      "id": "telegram-operations",
+      "kind": "telegram",
+      "enabled": false,
+      "timeoutSeconds": 5,
+      "maxAttempts": 5,
+      "baseBackoffSeconds": 5,
+      "maxBackoffSeconds": 300,
+      "secretRef": {"provider": "env", "key": "MONITOR_TELEGRAM_BOT_TOKEN"},
+      "settings": {"chatId": "-1000000000000", "disableNotification": false}
+    },
+    {
+      "id": "smtp-operations",
+      "kind": "smtp",
+      "enabled": false,
+      "timeoutSeconds": 10,
+      "maxAttempts": 5,
+      "baseBackoffSeconds": 10,
+      "maxBackoffSeconds": 600,
+      "secretRef": {"provider": "file", "key": "/etc/monitor/secrets/smtp-password"},
+      "settings": {
+        "host": "smtp.example.net",
+        "port": 465,
+        "from": "monitor@example.net",
+        "to": ["operations@example.net"],
+        "username": "monitor@example.net",
+        "tlsMode": "implicit"
+      }
+    }
+  ],
+  "routes": [
+    {
+      "id": "critical-primary",
+      "priority": 100,
+      "enabled": false,
+      "severities": ["critical"],
+      "transitions": ["firing", "resolved"],
+      "labels": {},
+      "channels": ["slack-operations", "smtp-operations"],
+      "continue": false
+    }
+  ]
+}

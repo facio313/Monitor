@@ -25,6 +25,7 @@ import {
   VitalSignsWidget,
 } from './CockpitVisuals';
 import { Icon, type IconName } from './Icon';
+import { GenericLogExplorer } from './GenericLogExplorer';
 import { InfrastructureLedger } from './InfrastructureLedger';
 import { OperationalGuidance, OperationalHealthOverview } from './OperationalHealth';
 import { OperationalHeadroom } from './OperationalHeadroom';
@@ -53,7 +54,7 @@ const NAVIGATION: Array<{ page: MonitorPage; icon: IconName; ko: string; en: str
   { page: 'infrastructure', icon: 'clock', ko: '인프라 원장', en: 'Infrastructure ledger', koHint: '변경 · 근거 · 미조치', enHint: 'Changes · evidence · backlog' },
   { page: 'power', icon: 'zap', ko: '전원', en: 'Power', koHint: '전압 · 제한 상태', enHint: 'Voltage · throttle' },
   { page: 'incidents', icon: 'alert', ko: '사건 분석', en: 'Incidents', koHint: '피크 증거', enHint: 'Peak evidence' },
-  { page: 'logs', icon: 'clock', ko: '이벤트 로그', en: 'Event log', koHint: '안전한 운영 기록', enHint: 'Sanitized records' },
+  { page: 'logs', icon: 'clock', ko: '로그', en: 'Logs', koHint: '정규화된 기록 검색', enHint: 'Search normalized records' },
 ];
 
 const DEFAULT_LAYOUT = {
@@ -426,7 +427,7 @@ export function MonitorDashboard({
               <p>{heading.description}</p>
             </div>
             <div className="control-actions">
-              {normalizedPage !== 'infrastructure' && <><label className="range-selector"><span>{t(locale, '분석 기간', 'TIME RANGE')}</span><select value={range} onChange={(event) => handleRangeChange(event.target.value as TimeRange)}>{RANGES.map((item) => <option key={item.value} value={item.value}>{locale === 'ko' ? item.ko : item.en}</option>)}</select></label>
+              {normalizedPage !== 'infrastructure' && normalizedPage !== 'logs' && <><label className="range-selector"><span>{t(locale, '분석 기간', 'TIME RANGE')}</span><select value={range} onChange={(event) => handleRangeChange(event.target.value as TimeRange)}>{RANGES.map((item) => <option key={item.value} value={item.value}>{locale === 'ko' ? item.ko : item.en}</option>)}</select></label>
               <button className="refresh-control" type="button" onClick={() => void refresh()} disabled={refreshing}><Icon name="refresh" size={18} className={refreshing ? 'spin' : ''} /><span>{refreshing ? t(locale, '갱신 중', 'Refreshing') : t(locale, '지금 갱신', 'Refresh now')}</span></button></>}
             </div>
           </section>
@@ -448,7 +449,7 @@ export function MonitorDashboard({
             <RuleHealthSummary evaluation={data.ruleEvaluation} alerts={data.ruleAlerts} locale={locale} stale={effectiveStale} />
           )}
 
-          {error && <div className="control-notice" role="alert"><Icon name="alert" size={19} /><div><strong>{t(locale, '원격 측정 갱신 실패', 'Telemetry refresh failed')}</strong><span>{safeText(error)} {data ? t(locale, '마지막 정상 화면을 유지합니다.', 'The last good snapshot remains visible.') : ''}</span></div><button type="button" onClick={() => void refresh()}>{t(locale, '재시도', 'Retry')}</button></div>}
+          {error && normalizedPage !== 'logs' && <div className="control-notice" role="alert"><Icon name="alert" size={19} /><div><strong>{t(locale, '원격 측정 갱신 실패', 'Telemetry refresh failed')}</strong><span>{safeText(error)} {data ? t(locale, '마지막 정상 화면을 유지합니다.', 'The last good snapshot remains visible.') : ''}</span></div><button type="button" onClick={() => void refresh()}>{t(locale, '재시도', 'Retry')}</button></div>}
 
           {normalizedPage === 'overview' && (
             <SystemEmotionEngine
@@ -460,6 +461,8 @@ export function MonitorDashboard({
 
           {normalizedPage === 'infrastructure'
             ? <InfrastructureLedger locale={locale} onUnauthorized={onUnauthorized} />
+            : normalizedPage === 'logs'
+              ? <GenericLogExplorer locale={locale} onUnauthorized={onUnauthorized} />
             : initialLoading && !data ? <ControlSkeleton locale={locale} /> : data ? (
             normalizedPage === 'overview'
               ? <>
@@ -480,7 +483,7 @@ export function MonitorDashboard({
                       />
                     </div>
                   </div>
-                : <DetailPage page={normalizedPage as Exclude<MonitorDetailPage, 'maintenance' | 'infrastructure'>} data={data} findings={findings} range={range} locale={locale} onOpen={(next, anchor) => navigate(next, anchor)} />
+                : <DetailPage page={normalizedPage as Exclude<MonitorDetailPage, 'maintenance' | 'infrastructure' | 'logs'>} data={data} findings={findings} range={range} locale={locale} onOpen={(next, anchor) => navigate(next, anchor)} />
           ) : <div className="control-empty"><Icon name="server" size={32} /><h2>{t(locale, '수집 데이터가 아직 없습니다', 'Telemetry is not available yet')}</h2><p>{t(locale, '수집기가 첫 스냅샷을 만들면 계기판이 자동으로 나타납니다.', 'The instruments will appear after the collector writes its first snapshot.')}</p><button type="button" onClick={() => void refresh()}>{t(locale, '다시 확인', 'Try again')}</button></div>}
         </main>
       </div>

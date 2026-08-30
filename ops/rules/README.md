@@ -47,9 +47,16 @@ tested.
 - A firing parent suppresses child delivery while preserving child state.
 - A transition carries a deterministic SHA-256 idempotency key.
 - The engine performs no delivery and no file mutation itself. The collector
-  persists returned state and a bounded transition log; notification adapters,
-  retry scheduling, and a delivery outbox are not implemented yet and must
-  remain a separate failure domain when added.
+  persists returned state and a bounded transition log. When an explicit
+  delivery configuration is present, `alert_store.py` only inserts recent
+  `ready` transitions into the finite SQLite outbox; it performs no network I/O.
+- `alert_delivery.py` owns leasing, crash recovery, timeout, capped exponential
+  retry with jitter, final-failure accounting, and the common webhook, Slack,
+  Discord, Telegram, and SMTP adapters. Secrets are env/private-file references
+  resolved at send time and never outbox fields. See `docs/alert-delivery.md`
+  and `alert-delivery.example.v1.json`.
+- Delivery tests use a separate `purpose=test` identity and counters. They do
+  not mutate evaluator state, the transition log, or incident statistics.
 
 The default cadence is one minute. A future remote-agent path may use elapsed
 duration in addition to sample counts, but it must preserve the rule-pack

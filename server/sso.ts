@@ -141,7 +141,7 @@ export function ssoRoleAtLeast(identity: TrustedSsoIdentity, minimumRole: SsoRol
 }
 
 export function permissionsForRole(role: SsoRole, allowSystemApply = true): string[] {
-  const permissions = ['dashboard:read'];
+  const permissions = ['dashboard:read', 'logs:read'];
   if (ROLE_RANK[role] >= ROLE_RANK.admin) {
     permissions.push('auth-inventory:read', 'infrastructure-ledger:read', 'system-updates:check');
   }

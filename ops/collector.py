@@ -32,6 +32,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from generic_log_collector import collect_generic_logs
+from linux_telemetry import collect_linux_telemetry
+
 
 DEFAULT_RULE_PACK_PATH = Path(__file__).resolve().parent / "rules" / "default-rules.v1.json"
 
@@ -116,6 +119,7 @@ COLLECTOR_VERSION = "1.0.0"
 CURRENT_SCHEMA_VERSION = 2
 IDENTITY_STATE_SCHEMA_VERSION = 1
 MAX_IDENTITY_STATE_BYTES = 4096
+MAX_DELTA_STATE_BYTES = 8 * 1024 * 1024
 MAX_HEARTBEAT_INTERVAL_SECONDS = 86_400
 AGENT_LIFECYCLES = frozenset({"active", "maintenance", "inactive"})
 DEFAULT_SOCKETS = {
@@ -393,9 +397,16 @@ def ensure_directory(path: Path, mode: int = 0o750) -> None:
         pass
 
 
-def atomic_write_json(path: Path, value: Any, mode: int = 0o640) -> None:
+def atomic_write_json(
+    path: Path,
+    value: Any,
+    mode: int = 0o640,
+    maximum_bytes: int | None = None,
+) -> None:
     ensure_directory(path.parent)
     payload = json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False) + "\n"
+    if maximum_bytes is not None and len(payload.encode("utf-8")) > maximum_bytes:
+        raise ValueError("JSON payload exceeds its configured size limit")
     temporary: str | None = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -750,11 +761,24 @@ def rewrite_json_lines(path: Path, records: Sequence[Mapping[str, Any]], limit: 
                 pass
 
 
-def load_json(path: Path) -> dict[str, Any]:
+def load_json(path: Path, maximum_bytes: int = 1_048_576) -> dict[str, Any]:
+    if not 1 <= maximum_bytes <= 64 * 1024 * 1024:
+        return {}
     try:
-        value = json.loads(read_text(path))
+        with path.open("rb") as handle:
+            encoded = handle.read(maximum_bytes + 1)
+        if len(encoded) > maximum_bytes:
+            return {}
+        value = json.loads(encoded.decode("utf-8"))
         return value if isinstance(value, dict) else {}
-    except (json.JSONDecodeError, TypeError):
+    except (
+        OSError,
+        UnicodeDecodeError,
+        ValueError,
+        TypeError,
+        OverflowError,
+        RecursionError,
+    ):
         return {}
 
 
@@ -5244,6 +5268,39 @@ def safe_interface_name(value: str) -> str:
     return name if re.fullmatch(r"[A-Za-z0-9_.-]{1,15}", name) else "eth0"
 
 
+def parse_process_allowlist(value: str) -> set[str]:
+    """Parse explicit comm-name allowlisting without accepting argv fragments."""
+    result: set[str] = set()
+    for raw in value.split(",")[:128]:
+        name = raw.strip()
+        if (
+            re.fullmatch(r"[A-Za-z0-9_.@+-]{1,64}", name)
+            and re.search(r"password|passwd|secret|token|api.?key", name, re.IGNORECASE) is None
+        ):
+            result.add(name)
+        if len(result) >= 64:
+            break
+    return result
+
+
+def parse_systemd_allowlist(value: str) -> set[str]:
+    result: set[str] = set()
+    for raw in value.split(",")[:128]:
+        unit = raw.strip()
+        if re.fullmatch(r"[A-Za-z0-9_.@:-]{1,128}\.service", unit):
+            result.add(unit)
+        if len(result) >= 32:
+            break
+    return result
+
+
+def safe_absolute_path(value: str, default: str) -> Path:
+    path = Path(value)
+    if not path.is_absolute() or ".." in path.parts or len(str(path)) > 512:
+        return Path(default)
+    return path
+
+
 @dataclass
 class Config:
     output_dir: Path = Path("/var/lib/monitor-export")
@@ -5263,10 +5320,16 @@ class Config:
         default_factory=lambda: {key: Path(value) for key, value in DEFAULT_SOCKETS.items()}
     )
     process_uids: set[int] = field(default_factory=lambda: {0, 1001})
+    process_allowlist: set[str] = field(default_factory=set)
+    systemd_units: set[str] = field(default_factory=set)
     ssh_ports: set[int] = field(default_factory=lambda: {22, 22022})
     primary_interface: str = "eth0"
     curl: str = "/usr/bin/curl"
     vcgencmd: str = "/usr/bin/vcgencmd"
+    systemctl: str = "/usr/bin/systemctl"
+    timedatectl: str = "/usr/bin/timedatectl"
+    systemd_state_dir: Path = Path("/run/systemd/units")
+    docker_data_root: Path = Path("/var/lib/docker")
     command_timeout: float = 2.0
     expected_interval_seconds: int = 60
     agent_lifecycle: str = "active"
@@ -5292,6 +5355,13 @@ class Config:
     max_input_bytes: int = 1_048_576
     kernel_max_input_bytes: int = DEFAULT_KERNEL_MAX_INPUT_BYTES
     rule_pack: Path = DEFAULT_RULE_PACK_PATH
+    log_sources_config: Path = Path("/etc/monitor-collector/log-sources.json")
+    log_sources_required: bool = False
+    journalctl: str = "/usr/bin/journalctl"
+    generic_log_retention_days: int = 30
+    generic_log_max_records: int = 20_000
+    generic_log_max_file_bytes: int = 16 * 1024 * 1024
+    generic_log_total_timeout: float = 15.0
 
     @property
     def mountinfo_path(self) -> Path:
@@ -5321,12 +5391,27 @@ def config_from_environment(arguments: Sequence[str] | None = None) -> Config:
         "MONITOR_DOCKER_SOCKETS", ",".join(f"{owner}={path}" for owner, path in DEFAULT_SOCKETS.items())
     ))
     parser.add_argument("--process-uids", default=env.get("MONITOR_PROCESS_UIDS", "0,1001"))
+    parser.add_argument(
+        "--process-allowlist", default=env.get("MONITOR_PROCESS_ALLOWLIST", "")
+    )
+    parser.add_argument(
+        "--systemd-units", default=env.get("MONITOR_SYSTEMD_UNITS", "")
+    )
     parser.add_argument("--ssh-ports", default=env.get("MONITOR_SSH_PORTS", "22,22022"))
     parser.add_argument(
         "--primary-interface", default=env.get("MONITOR_PRIMARY_INTERFACE", "eth0")
     )
     parser.add_argument("--curl", default=env.get("MONITOR_CURL", "/usr/bin/curl"))
     parser.add_argument("--vcgencmd", default=env.get("MONITOR_VCGENCMD", "/usr/bin/vcgencmd"))
+    parser.add_argument("--systemctl", default=env.get("MONITOR_SYSTEMCTL", "/usr/bin/systemctl"))
+    parser.add_argument("--timedatectl", default=env.get("MONITOR_TIMEDATECTL", "/usr/bin/timedatectl"))
+    parser.add_argument(
+        "--systemd-state-dir",
+        default=env.get("MONITOR_SYSTEMD_STATE_DIR", "/run/systemd/units"),
+    )
+    parser.add_argument(
+        "--docker-data-root", default=env.get("MONITOR_DOCKER_DATA_ROOT", "/var/lib/docker")
+    )
     parser.add_argument("--command-timeout", type=float, default=float(env.get("MONITOR_COMMAND_TIMEOUT", "2")))
     parser.add_argument(
         "--expected-interval-seconds",
@@ -5395,6 +5480,40 @@ def config_from_environment(arguments: Sequence[str] | None = None) -> Config:
         "--rule-pack",
         default=env.get("MONITOR_RULE_PACK", str(DEFAULT_RULE_PACK_PATH)),
     )
+    parser.add_argument(
+        "--log-sources-config",
+        default=env.get(
+            "MONITOR_LOG_SOURCES_CONFIG", "/etc/monitor-collector/log-sources.json"
+        ),
+    )
+    parser.add_argument(
+        "--log-sources-required",
+        choices=("true", "false"),
+        default=env.get("MONITOR_LOG_SOURCES_REQUIRED", "false"),
+    )
+    parser.add_argument(
+        "--journalctl", default=env.get("MONITOR_JOURNALCTL", "/usr/bin/journalctl")
+    )
+    parser.add_argument(
+        "--generic-log-retention-days",
+        type=int,
+        default=int(env.get("MONITOR_GENERIC_LOG_RETENTION_DAYS", "30")),
+    )
+    parser.add_argument(
+        "--generic-log-max-records",
+        type=int,
+        default=int(env.get("MONITOR_GENERIC_LOG_MAX_RECORDS", "20000")),
+    )
+    parser.add_argument(
+        "--generic-log-max-file-bytes",
+        type=int,
+        default=int(env.get("MONITOR_GENERIC_LOG_MAX_FILE_BYTES", str(16 * 1024 * 1024))),
+    )
+    parser.add_argument(
+        "--generic-log-total-timeout",
+        type=float,
+        default=float(env.get("MONITOR_GENERIC_LOG_TOTAL_TIMEOUT", "15")),
+    )
     values = parser.parse_args(arguments)
     cpu_warn = max(0.0, min(100.0, values.cpu_warn_percent))
     memory_warn = max(0.0, min(100.0, values.memory_available_warn_percent))
@@ -5414,9 +5533,14 @@ def config_from_environment(arguments: Sequence[str] | None = None) -> Config:
         container_input=Path(values.container_input) if values.container_input else None,
         docker_sockets=parse_socket_map(values.docker_sockets),
         process_uids=parse_uid_set(values.process_uids),
+        process_allowlist=parse_process_allowlist(values.process_allowlist),
+        systemd_units=parse_systemd_allowlist(values.systemd_units),
         ssh_ports=parse_port_set(values.ssh_ports),
         primary_interface=safe_interface_name(values.primary_interface),
         curl=values.curl, vcgencmd=values.vcgencmd,
+        systemctl=values.systemctl, timedatectl=values.timedatectl,
+        systemd_state_dir=safe_absolute_path(values.systemd_state_dir, "/run/systemd/units"),
+        docker_data_root=safe_absolute_path(values.docker_data_root, "/var/lib/docker"),
         command_timeout=max(0.1, min(10.0, values.command_timeout)),
         expected_interval_seconds=max(
             10, min(MAX_HEARTBEAT_INTERVAL_SECONDS, values.expected_interval_seconds)
@@ -5448,6 +5572,17 @@ def config_from_environment(arguments: Sequence[str] | None = None) -> Config:
         max_input_bytes=max(4096, min(16_777_216, values.max_input_bytes)),
         kernel_max_input_bytes=max(65_536, min(16_777_216, values.kernel_max_input_bytes)),
         rule_pack=Path(values.rule_pack),
+        log_sources_config=safe_absolute_path(
+            values.log_sources_config, "/etc/monitor-collector/log-sources.json"
+        ),
+        log_sources_required=values.log_sources_required == "true",
+        journalctl=str(safe_absolute_path(values.journalctl, "/usr/bin/journalctl")),
+        generic_log_retention_days=max(1, min(3650, values.generic_log_retention_days)),
+        generic_log_max_records=max(100, min(20_000, values.generic_log_max_records)),
+        generic_log_max_file_bytes=max(
+            1024 * 1024, min(16 * 1024 * 1024, values.generic_log_max_file_bytes)
+        ),
+        generic_log_total_timeout=max(1.0, min(30.0, values.generic_log_total_timeout)),
     )
 
 
@@ -5672,6 +5807,7 @@ def publish_rule_evaluation(
     config: Config,
     snapshot: Mapping[str, Any],
     now: dt.datetime,
+    monitor_internal: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Evaluate rules without allowing this optional subsystem to stop collection."""
     failure = {
@@ -5685,8 +5821,11 @@ def publish_rule_evaluation(
     try:
         from alert_store import evaluate_and_persist
 
+        evaluation_snapshot = dict(snapshot)
+        if monitor_internal is not None:
+            evaluation_snapshot["_monitor"] = dict(monitor_internal)
         return evaluate_and_persist(
-            snapshot,
+            evaluation_snapshot,
             now,
             config.rule_pack,
             config.output_dir,
@@ -5700,6 +5839,98 @@ def publish_rule_evaluation(
         except Exception:
             pass
         return failure
+
+
+def publish_rules_and_commit_delivery_checkpoint(
+    config: Config,
+    snapshot: Mapping[str, Any],
+    now: dt.datetime,
+    monitor_internal: Mapping[str, Any],
+    delta_path: Path,
+    delta_state: Mapping[str, Any],
+    notification_counter: int | None,
+) -> dict[str, Any]:
+    """Advance the delivery counter only after rule state is durable.
+
+    The caller has already persisted the newest telemetry baselines with the
+    prior delivery checkpoint.  If evaluation fails, the durable outbox delta
+    is therefore retried without rolling back unrelated CPU/network state.  A
+    crash after evaluation but before this second write also safely replays the
+    deterministic transition on the next collection.
+    """
+
+    evaluation = publish_rule_evaluation(config, snapshot, now, monitor_internal)
+    if evaluation.get("status") != "ok":
+        return evaluation
+    committed_delta = dict(delta_state)
+    committed_delta["notificationFinalFailures"] = notification_counter
+    atomic_write_json(delta_path, committed_delta, 0o600, MAX_DELTA_STATE_BYTES)
+    return evaluation
+
+
+def notification_delivery_signal(
+    output_dir: Path,
+    prior_counter: Any,
+) -> tuple[dict[str, Any], int | None]:
+    """Reduce outbox final-failure totals to one interval delta for rules."""
+
+    retained = (
+        prior_counter
+        if isinstance(prior_counter, int) and not isinstance(prior_counter, bool)
+        and prior_counter >= 0
+        else None
+    )
+    configured = os.environ.get("MONITOR_ALERT_DELIVERY_CONFIG")
+    if configured is not None:
+        if not configured or len(configured) > 512 or "\x00" in configured:
+            return {
+                "notificationDeliveryStatus": "collection_error",
+                "notificationFinalFailureDelta": None,
+            }, retained
+        config_path = Path(configured)
+        if not config_path.is_absolute():
+            return {
+                "notificationDeliveryStatus": "collection_error",
+                "notificationFinalFailureDelta": None,
+            }, retained
+    else:
+        config_path = Path("/etc/monitor/alert-delivery.json")
+        try:
+            if not config_path.exists():
+                return {
+                    "notificationDeliveryStatus": "unsupported",
+                    "notificationFinalFailureDelta": None,
+                }, retained
+        except OSError:
+            return {
+                "notificationDeliveryStatus": "permission_denied",
+                "notificationFinalFailureDelta": None,
+            }, retained
+    try:
+        from alert_delivery import DeliveryOutbox, load_delivery_config
+
+        delivery_config = load_delivery_config(config_path)
+        status = DeliveryOutbox(
+            output_dir / ".state" / "alert-delivery" / "alert-delivery.sqlite",
+            delivery_config.queue,
+        ).status()
+        stats = status.get("stats")
+        counter = stats.get("operational_final_failure", 0) if isinstance(stats, Mapping) else None
+        if isinstance(counter, bool) or not isinstance(counter, int) or counter < 0:
+            raise ValueError("alert delivery counter is invalid")
+        delta = counter - retained if retained is not None and counter >= retained else 0
+        return {
+            "notificationDeliveryStatus": "ok",
+            "notificationFinalFailureDelta": delta,
+        }, counter
+    except PermissionError:
+        status_value = "permission_denied"
+    except Exception:
+        status_value = "collection_error"
+    return {
+        "notificationDeliveryStatus": status_value,
+        "notificationFinalFailureDelta": None,
+    }, retained
 
 
 def run(config: Config, now: dt.datetime | None = None) -> dict[str, Any]:
@@ -5716,7 +5947,7 @@ def run(config: Config, now: dt.datetime | None = None) -> dict[str, Any]:
         replay_pending_sanitized_log_commit(config)
         replay_pending_reliability_commit(config)
         delta_path = config.runtime_dir / "delta-state.json"
-        prior = load_json(delta_path)
+        prior = load_json(delta_path, MAX_DELTA_STATE_BYTES)
         incident_lifecycle_path = config.output_dir / ".state" / "incident-lifecycle.json"
         durable_incident_state = load_json(incident_lifecycle_path)
         previous_incident_state = durable_incident_state or prior.get("incident")
@@ -5818,6 +6049,28 @@ def run(config: Config, now: dt.datetime | None = None) -> dict[str, Any]:
             config, now, uptime_seconds, include_kernel_summary=True
         )
         system = collect_system(config, kernel_summary)
+        linux, linux_delta_state = collect_linux_telemetry(
+            proc_root=config.proc_root,
+            sys_root=config.sys_root,
+            mountinfo_path=config.mountinfo_path,
+            mount_root=config.mount_root,
+            docker_data_root=config.docker_data_root,
+            kernel_log=config.kernel_log,
+            kernel_summary=kernel_summary,
+            previous=prior.get("linux"),
+            elapsed_seconds=elapsed,
+            now=now,
+            loadavg=(load1, load5, load15),
+            allowed_uids=set(config.process_uids) & set(ALLOWED_PROCESS_UIDS),
+            process_allowlist=config.process_allowlist,
+            process_name_sanitizer=safe_process_name,
+            systemd_units=config.systemd_units,
+            systemd_state_dir=config.systemd_state_dir,
+            systemctl=config.systemctl,
+            timedatectl=config.timedatectl,
+            command_timeout=config.command_timeout,
+            rpi_data=gpu,
+        )
         identity, heartbeat = prepare_identity(config, now)
         current = {
             "schemaVersion": CURRENT_SCHEMA_VERSION,
@@ -5832,6 +6085,7 @@ def run(config: Config, now: dt.datetime | None = None) -> dict[str, Any]:
             "currentTraffic": traffic,
             "reliability": reliability,
             "system": system,
+            "linux": linux,
         }
         # The strict public snapshot schema has no GPU object. GPU temperature,
         # supply voltage, and throttle flags contribute only to the safe latest
@@ -5860,16 +6114,49 @@ def run(config: Config, now: dt.datetime | None = None) -> dict[str, Any]:
         write_pending_incident_commit(config, incident, incident_state, traffic_cursor)
         replay_pending_incident_commit(config, now)
         export_sanitized_logs(config, now_text, gpu)
-        atomic_write_json(delta_path, {
+        collect_generic_logs(
+            config.output_dir,
+            config.log_sources_config,
+            now,
+            required=config.log_sources_required,
+            journalctl=config.journalctl,
+            command_timeout=config.command_timeout,
+            retention_days=config.generic_log_retention_days,
+            max_records=config.generic_log_max_records,
+            max_file_bytes=config.generic_log_max_file_bytes,
+            total_timeout=config.generic_log_total_timeout,
+        )
+        prior_notification_counter = prior.get("notificationFinalFailures")
+        if (
+            isinstance(prior_notification_counter, bool)
+            or not isinstance(prior_notification_counter, int)
+            or prior_notification_counter < 0
+        ):
+            prior_notification_counter = None
+        notification_signal, notification_counter = notification_delivery_signal(
+            config.output_dir, prior_notification_counter
+        )
+        delta_state = {
             "monotonic": monotonic,
             "cpu": list(cpu) if cpu else None,
             "network": list(network) if network is not None else None,
             "disk": list(disk) if disk is not None else None,
             "containers": container_cpu_state,
             "processes": process_cpu_state,
+            "linux": linux_delta_state,
+            "notificationFinalFailures": prior_notification_counter,
             "incident": incident_state,
-        }, 0o600)
-        publish_rule_evaluation(config, current, now)
+        }
+        atomic_write_json(delta_path, delta_state, 0o600, MAX_DELTA_STATE_BYTES)
+        publish_rules_and_commit_delivery_checkpoint(
+            config,
+            current,
+            now,
+            notification_signal,
+            delta_path,
+            delta_state,
+            notification_counter,
+        )
         return current
 
 

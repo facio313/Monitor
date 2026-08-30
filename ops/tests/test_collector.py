@@ -2515,6 +2515,51 @@ class FilesystemTests(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(path.parent.stat().st_mode), 0o750)
             self.assertEqual(list(path.parent.glob(".current.json.*")), [])
 
+    def test_large_bounded_delta_state_round_trips_without_default_truncation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "delta-state.json"
+            processes = {
+                f"{index:024x}": {
+                    "cpuTicks": index,
+                    "readBytes": index,
+                    "writeBytes": index,
+                    "name": "p" * 64,
+                    "allowlisted": False,
+                }
+                for index in range(collector.MAX_PROCESS_STATE_ENTRIES)
+            }
+            payload = {"linux": {"processes": processes}}
+            self.assertGreater(
+                len(json.dumps(payload, separators=(",", ":")).encode("utf-8")),
+                1_048_576,
+            )
+
+            collector.atomic_write_json(
+                path, payload, 0o600, collector.MAX_DELTA_STATE_BYTES
+            )
+
+            self.assertEqual(collector.load_json(path), {})
+            self.assertEqual(
+                collector.load_json(path, collector.MAX_DELTA_STATE_BYTES), payload
+            )
+            with self.assertRaisesRegex(ValueError, "size limit"):
+                collector.atomic_write_json(path, {"large": "x" * 2048}, 0o600, 1024)
+            self.assertEqual(
+                collector.load_json(path, collector.MAX_DELTA_STATE_BYTES), payload
+            )
+
+    def test_private_json_loader_rejects_pathological_valid_size_values(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "delta-state.json"
+            path.write_text('{"nested":' * 10_000 + "0" + "}" * 10_000)
+            self.assertEqual(
+                len(collector.load_json(path, collector.MAX_DELTA_STATE_BYTES)), 0
+            )
+            path.write_text('{"integer":' + "9" * 5_000 + "}")
+            self.assertEqual(
+                len(collector.load_json(path, collector.MAX_DELTA_STATE_BYTES)), 0
+            )
+
     def test_identity_is_stable_and_rekeys_a_copied_state_on_machine_change(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -3190,7 +3235,7 @@ class FilesystemTests(unittest.TestCase):
             self.assertEqual(set(current), {
                 "schemaVersion", "generatedAt", "identity", "heartbeat",
                 "host", "latest", "disks", "containers",
-                "containerCollection", "currentTraffic", "reliability", "system",
+                "containerCollection", "currentTraffic", "reliability", "system", "linux",
             })
             self.assertEqual(current["schemaVersion"], collector.CURRENT_SCHEMA_VERSION)
             self.assertEqual(set(current["identity"]), {
@@ -3239,6 +3284,23 @@ class FilesystemTests(unittest.TestCase):
                 "networkLinkAvailable", "nvmeMitigationActive",
             })
             self.assertEqual(set(current["system"]), {"versions", "pcie", "kernel"})
+            self.assertEqual(current["linux"]["schemaVersion"], 1)
+            self.assertEqual(current["linux"]["collectedAt"], current["generatedAt"])
+            self.assertEqual(current["linux"]["privacy"], {
+                "processCommandLinesCollected": False,
+                "processEnvironmentsCollected": False,
+                "rawKernelMessagesCollected": False,
+            })
+            self.assertEqual(current["linux"]["cpu"]["status"], "invalid")
+            self.assertEqual(current["linux"]["memory"]["status"], "invalid")
+            self.assertEqual(current["linux"]["blockDevices"]["status"], "invalid")
+            self.assertEqual(current["linux"]["network"]["status"], "supported")
+            self.assertEqual(
+                second["linux"]["network"]["items"][0]["counterIdentityStatus"],
+                "unsupported",
+            )
+            self.assertEqual(second["linux"]["network"]["items"][0]["rateStatus"], "warmup")
+            self.assertIsNone(second["linux"]["network"]["items"][0]["rxBytesPerSecond"])
             self.assertEqual(tuple(current["latest"]), collector.SAMPLE_FIELDS)
             for field_name in (
                 "cpuPercent", "memoryPercent", "memoryUsedBytes", "memoryTotalBytes",
@@ -3451,12 +3513,30 @@ class FilesystemTests(unittest.TestCase):
         self.assertEqual(config.traffic_log, Path("/var/log/nginx/monitor-traffic.jsonl"))
         self.assertEqual(config.docker_sockets, {"cks": Path("/run/user/1001/docker.sock")})
         self.assertEqual(config.process_uids, {0, 1001})
+        self.assertEqual(config.process_allowlist, set())
+        self.assertEqual(config.systemd_units, set())
+        self.assertEqual(config.systemctl, "/usr/bin/systemctl")
+        self.assertEqual(config.timedatectl, "/usr/bin/timedatectl")
+        self.assertEqual(config.systemd_state_dir, Path("/run/systemd/units"))
+        self.assertEqual(config.docker_data_root, Path("/var/lib/docker"))
         self.assertEqual(config.ssh_ports, {22, 22022})
         self.assertEqual(config.primary_interface, "eth0")
         self.assertEqual(config.incident_retention_days, 30)
         self.assertEqual(config.max_incident_records, 1000)
         self.assertEqual(config.cpu_warn_samples, 2)
         self.assertEqual(config.rule_pack, collector.DEFAULT_RULE_PACK_PATH)
+        self.assertEqual(
+            config.log_sources_config, Path("/etc/monitor-collector/log-sources.json")
+        )
+        self.assertFalse(config.log_sources_required)
+        self.assertEqual(config.generic_log_max_records, 20_000)
+        self.assertEqual(config.generic_log_max_file_bytes, 16 * 1024 * 1024)
+        bounded_logs = collector.config_from_environment([
+            "--generic-log-max-records", "1000000",
+            "--generic-log-max-file-bytes", str(1024 * 1024 * 1024),
+        ])
+        self.assertEqual(bounded_logs.generic_log_max_records, 20_000)
+        self.assertEqual(bounded_logs.generic_log_max_file_bytes, 16 * 1024 * 1024)
         self.assertEqual(config.memory_available_warn_percent, 20)
         self.assertEqual(config.memory_available_recover_percent, 25)
         self.assertEqual(config.load_warn, 4)
@@ -3467,6 +3547,18 @@ class FilesystemTests(unittest.TestCase):
         ])
         self.assertEqual(restricted.docker_sockets, {})
         self.assertEqual(restricted.process_uids, {0, 1001})
+        configured = collector.config_from_environment([
+            "--process-allowlist", "nginx,python3,bad value,api-token-worker",
+            "--systemd-units", "nginx.service,ssh.service,bad;unit.service",
+            "--docker-data-root", "/srv/docker",
+        ])
+        self.assertEqual(configured.process_allowlist, {"nginx", "python3"})
+        self.assertEqual(configured.systemd_units, {"nginx.service", "ssh.service"})
+        self.assertEqual(configured.docker_data_root, Path("/srv/docker"))
+        self.assertEqual(
+            collector.safe_absolute_path("../../unsafe", "/var/lib/docker"),
+            Path("/var/lib/docker"),
+        )
         self.assertEqual(collector.parse_uid_set(""), set())
         clamped = collector.config_from_environment([
             "--cpu-warn-percent", "80", "--cpu-recover-percent", "90",
@@ -3516,10 +3608,19 @@ class FilesystemTests(unittest.TestCase):
         self.assertIn("MONITOR_AGENT_LIFECYCLE=active", defaults)
         self.assertIn("MONITOR_KERNEL_MAX_INPUT_BYTES=8388608", defaults)
         self.assertIn("MONITOR_RULE_PACK=/usr/local/lib/monitor-collector/rules/default-rules.v1.json", defaults)
+        self.assertIn("MONITOR_LOG_SOURCES_CONFIG=/etc/monitor-collector/log-sources.json", defaults)
+        self.assertIn("MONITOR_GENERIC_LOG_MAX_RECORDS=20000", defaults)
         self.assertIn("MONITOR_TRAFFIC_LOG=/var/log/nginx/monitor-traffic.jsonl", defaults)
         self.assertIn("MONITOR_DOCKER_SOCKETS=\n", defaults)
         self.assertIn("MONITOR_CONTAINER_INPUT=/run/monitor-container-exporter/containers.json", defaults)
         self.assertIn("MONITOR_PROCESS_UIDS=0,1001", defaults)
+        self.assertIn("MONITOR_PROCESS_ALLOWLIST=", defaults)
+        self.assertIn("MONITOR_SYSTEMD_UNITS=monitor-collector.service", defaults)
+        self.assertIn("MONITOR_SYSTEMCTL=/usr/bin/systemctl", defaults)
+        self.assertIn("MONITOR_TIMEDATECTL=/usr/bin/timedatectl", defaults)
+        self.assertIn("MONITOR_SYSTEMD_STATE_DIR=/run/systemd/units", defaults)
+        self.assertIn("MONITOR_DOCKER_DATA_ROOT=/var/lib/docker", defaults)
+        self.assertIn("BindReadOnlyPaths=-/run/systemd/units -/run/systemd/timesync", unit)
         self.assertIn("MONITOR_SSH_PORTS=22,22022", defaults)
         self.assertIn("MONITOR_PRIMARY_INTERFACE=eth0", defaults)
         self.assertIn("MONITOR_CPU_WARN_SAMPLES=2", defaults)
@@ -3528,9 +3629,47 @@ class FilesystemTests(unittest.TestCase):
         self.assertIn('restore_file "$backup_dir/monitor-collector.default" "$default_target" "$had_default"', installer)
         self.assertIn('install -m 0640 "$script_dir/monitor-collector.default" "$default_target"', installer)
         self.assertIn('install -m 0644 "$script_dir/alert_store.py" "$alert_store_target"', installer)
+        self.assertIn('install -m 0755 "$script_dir/alert_delivery.py" "$alert_delivery_target"', installer)
+        self.assertIn('restore_file "$backup_dir/alert_delivery.py" "$alert_delivery_target" "$had_alert_delivery"', installer)
+        self.assertNotIn('systemctl enable --now monitor-alert-delivery.timer', installer)
+        self.assertIn('if [ "$was_delivery_timer_enabled" = true ]', installer)
+        self.assertIn('systemctl enable monitor-alert-delivery.timer', installer)
+        self.assertIn('if [ "$was_delivery_timer_active" = true ]', installer)
+        self.assertIn('systemctl start monitor-alert-delivery.timer', installer)
+        self.assertIn('install -m 0644 "$script_dir/linux_telemetry.py" "$linux_telemetry_target"', installer)
+        self.assertIn('restore_file "$backup_dir/linux_telemetry.py" "$linux_telemetry_target" "$had_linux_telemetry"', installer)
+        for module in ("log_pipeline", "log_sources", "log_store", "generic_log_collector"):
+            self.assertIn(
+                f'install -m 0644 "$script_dir/{module}.py" "${module}_target"',
+                installer,
+            )
+            self.assertIn(
+                f'restore_file "$backup_dir/{module}.py" "${module}_target" "$had_{module}"',
+                installer,
+            )
         self.assertIn('install -m 0644 "$script_dir/rules/default-rules.v1.json" "$rule_target"', installer)
         self.assertIn('restore_file "$backup_dir/default-rules.v1.json" "$rule_target" "$had_rule"', installer)
         self.assertIn('if [ "$transaction_started" = true ] && [ "$committed" != true ]', installer)
+        self.assertIn("stat -c '%u %g %a'", installer)
+        for directory in (
+            "/var/lib/monitor-export",
+            "/run/monitor-collector",
+            "/run/monitor-container-exporter",
+        ):
+            self.assertIn(f"capture_directory_metadata {directory}", installer)
+            self.assertLess(
+                installer.index(f"capture_directory_metadata {directory}"),
+                installer.index("transaction_started=true"),
+            )
+        self.assertIn('restore_directory /var/lib/monitor-export "$had_output_directory"', installer)
+        self.assertIn('restore_directory /run/monitor-collector "$had_collector_runtime_directory"', installer)
+        self.assertIn('restore_directory /run/monitor-container-exporter "$had_exporter_runtime_directory"', installer)
+        self.assertIn('"$created_output_directory" "$output_directory_uid"', installer)
+        self.assertIn('"$created_collector_runtime_directory" "$collector_runtime_directory_uid"', installer)
+        self.assertIn('"$created_exporter_runtime_directory" "$exporter_runtime_directory_uid"', installer)
+        self.assertIn('elif [ "$created" != true ]; then', installer)
+        self.assertIn('chown "$owner:$group" "$target" && chmod "$mode" "$target"', installer)
+        self.assertIn('rmdir "$target"', installer)
         self.assertLess(
             installer.index('cp -p "$default_target" "$backup_dir/monitor-collector.default"'),
             installer.index('transaction_started=true'),
@@ -3544,6 +3683,121 @@ class FilesystemTests(unittest.TestCase):
         )
         self.assertIn('"$(id -u cks)" -ne 1001', installer)
         self.assertIn('"$(getent group cks | cut -d: -f3)" -ne 1001', installer)
+
+    def test_notification_delivery_counter_becomes_a_restart_safe_delta(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = Path(temporary) / "delivery.json"
+            config.write_text("{}")
+            fake_outbox = mock.Mock()
+            fake_outbox.status.return_value = {
+                "schemaVersion": 1,
+                "states": {},
+                "stats": {"operational_final_failure": 5},
+            }
+            with mock.patch.dict(
+                os.environ, {"MONITOR_ALERT_DELIVERY_CONFIG": str(config)}
+            ), mock.patch("alert_delivery.load_delivery_config", return_value=mock.Mock(queue=mock.Mock())), mock.patch(
+                "alert_delivery.DeliveryOutbox", return_value=fake_outbox
+            ):
+                signal, counter = collector.notification_delivery_signal(
+                    Path(temporary), 3
+                )
+            self.assertEqual(signal, {
+                "notificationDeliveryStatus": "ok",
+                "notificationFinalFailureDelta": 2,
+            })
+            self.assertEqual(counter, 5)
+
+            with mock.patch.dict(
+                os.environ, {"MONITOR_ALERT_DELIVERY_CONFIG": "relative.json"}
+            ):
+                failed, retained = collector.notification_delivery_signal(
+                    Path(temporary), 5
+                )
+            self.assertEqual(failed["notificationDeliveryStatus"], "collection_error")
+            self.assertIsNone(failed["notificationFinalFailureDelta"])
+            self.assertEqual(retained, 5)
+
+    def test_delivery_checkpoint_waits_for_durable_rule_evaluation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = collector.Config(
+                output_dir=root / "out", runtime_dir=root / "run",
+            )
+            delta_path = config.runtime_dir / "delta-state.json"
+            delta_state = {
+                "monotonic": 200.0,
+                "cpu": [200, 150],
+                "network": [20, 30],
+                "notificationFinalFailures": 3,
+            }
+            collector.atomic_write_json(
+                delta_path, delta_state, 0o600, collector.MAX_DELTA_STATE_BYTES,
+            )
+            failure = {
+                "schemaVersion": 1,
+                "status": "collection_error",
+                "rulePackVersion": None,
+                "evaluatedAt": "2026-08-30T12:00:00Z",
+                "summary": {},
+                "states": {},
+            }
+            success = {**failure, "status": "ok"}
+            signal = {
+                "notificationDeliveryStatus": "ok",
+                "notificationFinalFailureDelta": 2,
+            }
+            now = dt.datetime(2026, 8, 30, 12, 0, tzinfo=dt.timezone.utc)
+
+            with mock.patch.object(
+                collector, "publish_rule_evaluation", return_value=failure,
+            ):
+                result = collector.publish_rules_and_commit_delivery_checkpoint(
+                    config, {}, now, signal, delta_path, delta_state, 5,
+                )
+            self.assertEqual(result["status"], "collection_error")
+            retained = json.loads(delta_path.read_text())
+            self.assertEqual(retained["notificationFinalFailures"], 3)
+            self.assertEqual(retained["cpu"], [200, 150])
+            self.assertEqual(retained["network"], [20, 30])
+
+            with mock.patch.object(
+                collector, "publish_rule_evaluation", side_effect=OSError("injected"),
+            ):
+                with self.assertRaises(OSError):
+                    collector.publish_rules_and_commit_delivery_checkpoint(
+                        config, {}, now, signal, delta_path, delta_state, 5,
+                    )
+            self.assertEqual(
+                json.loads(delta_path.read_text())["notificationFinalFailures"], 3,
+            )
+
+            with (
+                mock.patch.object(
+                    collector, "publish_rule_evaluation", return_value=success,
+                ),
+                mock.patch.object(
+                    collector, "atomic_write_json", side_effect=OSError("crash window"),
+                ),
+            ):
+                with self.assertRaises(OSError):
+                    collector.publish_rules_and_commit_delivery_checkpoint(
+                        config, {}, now, signal, delta_path, delta_state, 5,
+                    )
+            self.assertEqual(
+                json.loads(delta_path.read_text())["notificationFinalFailures"], 3,
+            )
+
+            with mock.patch.object(
+                collector, "publish_rule_evaluation", return_value=success,
+            ):
+                collector.publish_rules_and_commit_delivery_checkpoint(
+                    config, {}, now, signal, delta_path, delta_state, 5,
+                )
+            committed = json.loads(delta_path.read_text())
+            self.assertEqual(committed["notificationFinalFailures"], 5)
+            self.assertEqual(committed["cpu"], [200, 150])
+            self.assertEqual(committed["network"], [20, 30])
 
     def test_power_state_is_normal_only_without_active_or_historical_flags(self):
         def fixture(flags):

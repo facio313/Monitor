@@ -1,0 +1,47 @@
+{
+  "schemaVersion": 1,
+  "sources": [
+    {
+      "id": "journal:ssh",
+      "kind": "journald",
+      "unit": "ssh.service",
+      "priority": "security",
+      "parser": "json",
+      "multiline": "auto",
+      "maxLines": 500
+    },
+    {
+      "id": "journal:monitor-collector",
+      "kind": "journald",
+      "unit": "monitor-collector.service",
+      "priority": "incident",
+      "parser": "json",
+      "multiline": "auto",
+      "maxLines": 500
+    },
+    {
+      "id": "journal:nginx",
+      "kind": "journald",
+      "unit": "nginx.service",
+      "priority": "normal",
+      "parser": "json",
+      "multiline": "auto",
+      "maxLines": 500
+    },
+    {
+      "id": "file:application",
+      "kind": "file",
+      "path": "/var/log/monitor-app/application.log",
+      "priority": "normal",
+      "parser": "auto",
+      "multiline": "auto",
+      "fieldAllowlist": [
+        "service",
+        "environment",
+        "version",
+        "status"
+      ],
+      "maxLines": 1000
+    }
+  ]
+}

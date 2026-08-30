@@ -1,0 +1,12 @@
+[Unit]
+Description=Run the Monitor alert delivery worker regularly
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=15s
+AccuracySec=2s
+RandomizedDelaySec=2s
+Unit=monitor-alert-delivery.service
+
+[Install]
+WantedBy=timers.target

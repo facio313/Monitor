@@ -90,7 +90,11 @@ class InfrastructureLedgerTests(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
         self.private = self.root / "private"
+        self.private.mkdir(mode=0o700)
+        self.private.chmod(0o700)
         self.public = self.root / "export" / "infrastructure-ledger.json"
+        self.public.parent.mkdir(mode=0o750)
+        self.public.parent.chmod(0o750)
         self.seed = self.root / "seed.json"
         self.uid = os.geteuid()
         self.gid = os.getegid()

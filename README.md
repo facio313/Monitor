@@ -49,12 +49,21 @@ specific password hash and signed cookie under the worktree so the application
 can be developed without the SSO stack. That state is a local development aid,
 not a second production identity system.
 
-The collector now gives this single-host file path stable random host/agent
-UUIDs, private machine binding, a reduced per-boot digest, and a sequenced
-heartbeat. This is continuity metadata for the local snapshot/API path, not a
-completed fleet agent. Central registration and enrollment, mTLS transport,
-bounded offline spool/ack/retry, central duplicate or out-of-order merge, and an
-administrator lifecycle workflow remain unimplemented.
+The collector gives the single-host file path stable random host/agent UUIDs,
+private machine binding, a reduced per-boot digest, and a sequenced heartbeat.
+An optional, default-off central control path now adds short-lived one-use
+enrollment, proxy-verified mTLS fingerprint binding/rotation/revocation,
+network heartbeat, idempotent compressed batch admission, clock-skew policy,
+and an encrypted finite disk queue. Its mTLS proxy uses a second, domain-
+separated edge secret; reusing the SSO origin secret fails startup. A
+standalone, default-off client package
+implements private enrollment state, mTLS, deterministic gzip batches, bounded
+offline spool and stable timeout/Retry-After/backoff retries. It is deliberately
+not wired into the existing local collector or installer: the external
+PKI/mTLS listener, certificate lifecycle, persistent server state mount,
+reduced-record producer and downstream queue consumer remain deployment
+dependencies. See [the central agent contract](docs/agent-ingest-contract.md)
+and [the transport package guide](docs/agent-transport.md).
 
 ## Branch authentication contract
 
@@ -121,6 +130,9 @@ The dashboard provides:
 - bounded peak-incident evidence with PSI, fixed executable classes,
   fixed-label `cks` workloads, and per-capture app request counts (not visitors);
 - recent semantic alerts and privilege outcomes without commands or arguments;
+- a privacy-first generic log explorer for reviewed file and journald sources,
+  with pre-parse credential/PII redaction, source health, bounded literal
+  search, digest-bound pagination, and explicit stale/no-data/error states;
 - a separate administrator-only infrastructure work ledger for completed,
   observed, pending, deferred, and standards-recommended work, including
   revision history, rationale, impact, evidence, and follow-up filters;
@@ -177,8 +189,24 @@ sudo python3 -m json.tool /var/lib/monitor-export/current.json >/dev/null
 ```
 
 The timer runs the one-shot collector approximately once per minute. Local
-overrides belong in `/etc/default/monitor-collector`; the installer preserves
-an existing file.
+overrides belong in `/etc/default/monitor-collector`. Each successful upgrade
+replaces that file with the reviewed repository baseline (and restores the
+prior copy only if installation fails), so keep intended changes in the
+tracked baseline or reapply them deliberately after review.
+
+The installer seeds `/etc/monitor-collector/log-sources.json` only when it is
+absent. Review that allowlist before enabling application sources; see
+[Generic log collection and explorer](docs/generic-logs.md). Existing source
+configuration is never overwritten by an upgrade.
+
+The same transaction installs the isolated alert-delivery worker and timer,
+but never creates or overwrites operator secrets or
+`/etc/monitor/alert-delivery.json`. Without that reviewed configuration the
+worker is skipped. Upgrades retain the timer's prior enabled/active state, and
+a first install leaves it disabled. To enable routing, start from the installed
+example and follow [Alert delivery outbox](docs/alert-delivery.md); the
+collector only enqueues, while the separate network-capable worker performs
+delivery.
 
 ### 2. Create the production edge credential
 
@@ -190,6 +218,12 @@ sudo install -d -o cks -g cks -m 0700 /home/cks/.config/monitor
 sudo -u cks sh -c 'umask 077; openssl rand -hex 32 > /home/cks/.config/monitor/edge-secret'
 sudo chmod 0600 /home/cks/.config/monitor/edge-secret
 ```
+
+That is the SSO origin secret only. If the default-off central agent ingress is
+enabled, generate and mount a separate `MONITOR_AGENT_EDGE_SECRET_FILE` for its
+private mTLS proxy. It must not contain the same value as
+`MONITOR_EDGE_SECRET_FILE`; startup fails closed when the agent secret is
+missing, shorter than 32 bytes, or equal to the SSO secret.
 
 Do not mount `MONITOR_PASSWORD_FILE`, `MONITOR_SESSION_SECRET_FILE`, or
 `MONITOR_AUTH_STATE_FILE` in a `main`/ `dev` deployment. SSO mode does not
@@ -209,7 +243,10 @@ edge secret at `/run/secrets/monitor_edge_secret`, and binds only the narrow
 `/run/monitor-update` directory for the updater socket. It
 requires an explicit image tag. There must be no writable auth-state mount,
 local password/session secret, Docker socket, or broader host path mount in
-this definition.
+this definition. This baseline leaves central agent ingress disabled. A
+reviewed agent-ingress deployment must additionally mount its distinct agent
+edge-secret file, private encrypted state directory, and storage keyring as
+documented in `docs/agent-ingest-contract.md`.
 
 Install the separate updater broker before adding that socket-directory bind. The
 installer creates no package plan and runs no package action:
@@ -485,13 +522,45 @@ Application variables:
 | `MONITOR_SSO_ENABLED` | unset | Deprecated compatibility assertion; when present it must agree with `PORTFOLIO_AUTH_MODE` |
 | `MONITOR_SESSION_TTL_SECONDS` | `3600` | Signed-session lifetime; capped at 24 hours |
 | `MONITOR_STALE_AFTER_SECONDS` | `300` | Age at which telemetry is marked stale |
+| `MONITOR_AGENT_INGEST_ENABLED` | `false` | Enables the optional SSO-only central enrollment/ingest path; missing prerequisites fail startup |
+| `MONITOR_AGENT_EDGE_SECRET_FILE` | unset | Required private mTLS-proxy-to-origin secret file when agent ingest is enabled; at least 32 bytes and unequal to `MONITOR_EDGE_SECRET_FILE` |
+| `MONITOR_AGENT_EDGE_SECRET` | unset | Agent-edge-secret fallback; use the private file in production |
+| `MONITOR_AGENT_STATE_DIR` | unset | Required explicit private writable persistent root when central ingest is enabled; its host bind source/ancestor ownership and anti-rollback recovery contract are defined in `docs/agent-ingest-contract.md` |
+| `MONITOR_AGENT_STORAGE_KEYRING_FILE` | unset | Required mode-`0600` AES-256-GCM keyring; see `docs/agent-ingest-contract.md` |
+| `MONITOR_AGENT_MAX_BATCH_BYTES` | `262144` | Maximum compressed Content-Length and inflated agent JSON body |
+| `MONITOR_AGENT_MAX_RECORDS_PER_BATCH` | `500` | Strict record count limit |
+| `MONITOR_AGENT_MAX_QUEUE_BYTES` | `33554432` | Encrypted durable ingest queue byte limit |
+| `MONITOR_AGENT_MAX_QUEUE_ENTRIES` | `256` | Encrypted durable ingest queue entry limit |
+| `MONITOR_AGENT_MAX_QUEUE_BYTES_PER_AGENT` | `8388608` | Per-agent encrypted queue byte isolation cap |
+| `MONITOR_AGENT_MAX_QUEUE_ENTRIES_PER_AGENT` | `64` | Per-agent encrypted queue entry isolation cap |
+| `MONITOR_AGENT_MAX_BATCH_RECEIPTS` | `4096` | Retained batch acknowledgement window cap |
+| `MONITOR_AGENT_MAX_BATCH_RECEIPTS_PER_AGENT` | `1024` | Per-agent acknowledgement isolation cap |
+| `MONITOR_AGENT_MAX_IDEMPOTENCY_RECORDS` | `100000` | Retained record-deduplication window cap |
+| `MONITOR_AGENT_MAX_IDEMPOTENCY_RECORDS_PER_AGENT` | `25000` | Per-agent record-deduplication isolation cap |
+| `MONITOR_AGENT_PRIORITY_RESERVE_PERCENT` | `20` | Queue capacity reserved for event batches |
+| `MONITOR_AGENT_MAX_CLOCK_SKEW_SECONDS` | `300` | Agent send/future-observation tolerance |
+| `MONITOR_AGENT_MAX_BACKFILL_AGE_SECONDS` | `604800` | Oldest admitted offline record |
+| `MONITOR_AGENT_QUEUE_RETENTION_SECONDS` | `604800` | Queue and idempotency retention |
+| `MONITOR_AGENT_MAX_ENROLLMENT_TTL_SECONDS` | `900` | Maximum one-use enrollment/rotation token lifetime |
+| `MONITOR_AGENT_CERTIFICATE_EXPIRY_WARNING_SECONDS` | `1209600` | Renewal-warning horizon returned to agents/admins |
+
+Central-agent control state uses fixed non-configurable memory guards: 4 MiB
+for the serialized UTF-8 state and 6 MiB for its AES-256-GCM envelope. Capacity
+is checked before encryption and returns `429 CONTROL_STATE_BACKPRESSURE`;
+ingest batch and queue limits above remain separate. Agent proxy authentication
+runs before body parsing, small control requests are capped at 8 KiB, and a
+fixed four-request global body gate bounds concurrent JSON/gzip memory. The
+gate permits only one incomplete body per verified certificate and closes it
+at a 15-second absolute deadline, so one enrolled agent cannot occupy every
+global permit with slow uploads.
 
 The repository Compose launcher automatically selects `docker-compose.sso.yml` or
 `docker-compose.local.yml` from the canonical mode. Common options are
 `MONITOR_IMAGE`, `MONITOR_PORT`, and `MONITOR_EXPORT_DIR`. SSO mode additionally
 accepts `MONITOR_EDGE_SECRET_PATH`; local mode accepts
 `MONITOR_AUTH_STATE_PATH`, `MONITOR_PASSWORD_PATH`, and
-`MONITOR_SESSION_SECRET_PATH`.
+`MONITOR_SESSION_SECRET_PATH`. The repository baseline Compose files do not
+enable central agent ingress or mount its separate secret/state/keyring.
 
 Collector variables and defaults are:
 
@@ -529,6 +598,13 @@ Collector variables and defaults are:
 | `MONITOR_MAX_INPUT_BYTES` | `1048576` per input read |
 | `MONITOR_KERNEL_MAX_INPUT_BYTES` | `8388608` per kernel-log read |
 | `MONITOR_RULE_PACK` | `/usr/local/lib/monitor-collector/rules/default-rules.v1.json` |
+| `MONITOR_LOG_SOURCES_CONFIG` | `/etc/monitor-collector/log-sources.json`; exact reviewed file/journald allowlist |
+| `MONITOR_LOG_SOURCES_REQUIRED` | `false`; missing optional config publishes no-data, while `true` fails the log subsystem closed |
+| `MONITOR_JOURNALCTL` | `/usr/bin/journalctl` |
+| `MONITOR_GENERIC_LOG_RETENTION_DAYS` | `30` |
+| `MONITOR_GENERIC_LOG_MAX_RECORDS` | `20000` |
+| `MONITOR_GENERIC_LOG_MAX_FILE_BYTES` | `16777216` |
+| `MONITOR_GENERIC_LOG_TOTAL_TIMEOUT` | `15` seconds across one collection cycle |
 
 `MONITOR_MOUNTINFO` and `MONITOR_MOUNT_ROOT` are normally unset and exist for
 fixture roots. The installed source of truth is
@@ -576,6 +652,11 @@ The default root is `/var/lib/monitor-export`:
   idempotent firing/resolution transitions. The seed pack defines all 82
   documented defaults; rules without a proven signal remain unsupported
   rather than appearing healthy.
+- `generic-logs.jsonl` and `generic-log-sources.json` contain only pre-parse
+  redacted, exact-schema generic records and per-source acquisition/drop state.
+  Their matching mode-`0600` cursor/quota state and pending transaction live
+  under `.state`; an unsafe config or persistence failure is an explicit
+  `generic-log-collection-error.json`, isolated from host snapshot publication.
 - `incidents.jsonl` is capped at 1,000 records, 16 MiB, and 30 days. A record is
   written only on incident entry, during at most five one-minute follow-ups,
   when another threshold joins the same window, and on recovery.
@@ -733,12 +814,21 @@ GET    /monitor/api/auth/session
 DELETE /monitor/api/auth/session
 POST   /monitor/api/auth/password
 GET    /monitor/api/dashboard?range=1h|24h|7d|30d
+GET    /monitor/api/generic-logs               # authenticated, safe-snapshot cache, 20 reads/min/IP
 GET    /monitor/api/infrastructure-ledger      # admin/chief-admin in SSO mode
 GET    /monitor/api/operations/auth-inventory  # admin/chief-admin, aggregate only
 GET    /monitor/api/system-updates              # authenticated, sanitized state
 POST   /monitor/api/system-updates/check        # canonical/legacy admin or canonical chief-admin
 POST   /monitor/api/system-updates/prepare      # canonical chief-admin, current plan only
 POST   /monitor/api/system-updates/apply        # canonical chief-admin, one-use confirmation
+GET    /monitor/api/agents                      # optional central path; SSO admin
+POST   /monitor/api/agents/enrollment-tokens    # optional central path; canonical chief-admin
+POST   /monitor/api/agents/:id/certificate-rotation-tokens # canonical chief-admin
+POST   /monitor/api/agents/:id/revoke           # canonical chief-admin
+POST   /monitor/api/agent/enroll                # enrollment token + trusted proxy mTLS metadata
+POST   /monitor/api/agent/heartbeat             # bound proxy-verified certificate
+POST   /monitor/api/agent/ingest                # bound certificate; bounded JSON/gzip batch
+POST   /monitor/api/agent/certificate-rotations # bound one-use token + new certificate
 ```
 
 ## Security boundaries

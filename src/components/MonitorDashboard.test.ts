@@ -82,4 +82,35 @@ describe('monitor overview composition', () => {
     expect(overviewComposition.indexOf('<RuleHealthSummary')).toBeLessThan(overviewComposition.indexOf('<SystemEmotionEngine'));
     expect(overviewComposition.indexOf('<SystemEmotionEngine')).toBeLessThan(overviewComposition.indexOf('<AdaptiveGrid'));
   });
+
+  it('routes the logs page directly to the generic log actions without telemetry-only controls', () => {
+    vi.stubGlobal('window', {
+      localStorage: { getItem: () => 'en', setItem: () => undefined },
+      location: { search: '?range=24h' },
+    });
+    vi.stubGlobal('navigator', { languages: ['en-US'] });
+    const viewer: SessionInfo = {
+      authenticated: true,
+      mode: 'local',
+      user: 'operator',
+      role: 'admin',
+      permissions: [],
+    };
+
+    const markup = renderToStaticMarkup(createElement(MonitorDashboard, {
+      page: 'logs',
+      navigationVersion: 0,
+      onNavigate: () => undefined,
+      onLogout: async () => undefined,
+      onPasswordChanged: () => undefined,
+      onUnauthorized: () => undefined,
+      viewer,
+    }));
+
+    expect(markup).toContain('Search generic logs');
+    expect(markup).toContain('aria-label="Generic log filters"');
+    expect(markup).not.toContain('Explore all events');
+    expect(markup).not.toContain('class="range-selector"');
+    expect(markup).not.toContain('Loading instruments');
+  });
 });
