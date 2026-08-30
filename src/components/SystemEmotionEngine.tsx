@@ -1,14 +1,10 @@
 import { useEffect, useRef, type CSSProperties } from 'react';
-import type { SystemEmotionAxisKey, SystemEmotionModel, SystemMood } from '../system-emotion';
-import type { DashboardPayload, MonitorLocale, MonitorPage } from '../types';
-import { formatDateTime, safeText } from '../utils';
-import { Icon } from './Icon';
+import type { SystemEmotionModel } from '../system-emotion';
+import type { MonitorLocale } from '../types';
 
 interface SystemEmotionEngineProps {
-  data: DashboardPayload | null;
   locale: MonitorLocale;
   model: SystemEmotionModel;
-  onNavigate: (page: MonitorPage) => void;
   paused?: boolean;
 }
 
@@ -71,52 +67,6 @@ export interface GranularWavePlan {
   waveBuckets: GranularWaveSeed[][];
   sprayBuckets: SprayGrainSeed[][];
   nucleusBuckets: NucleusGrainSeed[][];
-}
-
-const AXIS_LABELS: Record<SystemEmotionAxisKey, readonly [string, string]> = {
-  compute: ['연산', 'Compute'],
-  memory: ['메모리', 'Memory'],
-  thermal: ['열·전원', 'Thermal'],
-  network: ['네트워크', 'Network'],
-  storage: ['저장', 'Storage'],
-  services: ['서비스', 'Services'],
-  reliability: ['신뢰성', 'Reliability'],
-};
-
-const MOOD_COPY: Record<SystemMood, {
-  code: string;
-  title: readonly [string, string];
-  summary: readonly [string, string];
-}> = {
-  dormant: {
-    code: 'SIGNAL / LOW',
-    title: ['신호를 기다리는 중', 'Listening for signal'],
-    summary: ['관측 흐름이 끊겼거나 아직 첫 표본이 없습니다. 고요함을 정상으로 해석하지 않습니다.', 'The observation stream is delayed or has not started. Silence is not treated as health.'],
-  },
-  serene: {
-    code: 'STATE / SERENE',
-    title: ['고요한 정상 상태', 'Systems in quiet balance'],
-    summary: ['주요 계통이 서로 어긋나지 않고 낮은 진폭으로 흐르고 있습니다.', 'Primary systems are moving together with low amplitude and little friction.'],
-  },
-  watchful: {
-    code: 'STATE / WATCHFUL',
-    title: ['잔잔한 긴장', 'Quietly watchful'],
-    summary: ['즉시 장애는 아니지만 한 계통의 파형이 평상시보다 선명해졌습니다.', 'No immediate failure is evident, but one subsystem is speaking more loudly than usual.'],
-  },
-  strained: {
-    code: 'STATE / STRAINED',
-    title: ['흐름이 거칠어지는 중', 'Rising turbulence'],
-    summary: ['여러 신호가 겹치며 균형이 흐트러지고 있습니다. 지배 계통을 먼저 확인하세요.', 'Several signals are converging and balance is falling. Inspect the dominant subsystem first.'],
-  },
-  critical: {
-    code: 'STATE / CRITICAL',
-    title: ['즉시 확인할 파동', 'Critical disturbance'],
-    summary: ['위험 신호가 전체 흐름을 바꾸고 있습니다. 시각 효과보다 연결된 운영 근거를 우선하세요.', 'A danger signal is reshaping the whole field. Follow the linked operational evidence now.'],
-  },
-};
-
-function t(locale: MonitorLocale, pair: readonly [string, string]): string {
-  return locale === 'ko' ? pair[0] : pair[1];
 }
 
 function clamp(value: number, minimum = 0, maximum = 1): number {
@@ -305,21 +255,17 @@ interface WavePoint {
 
 function emotionGeometry(width: number, height: number, model: SystemEmotionModel): EmotionGeometry {
   const compact = width <= 640;
-  const horizon = compact
-    ? clamp(height * 0.12, 74, 96)
-    : clamp(height * 0.2, 94, 124);
-  const foreground = compact
-    ? Math.min(height * 0.34, horizon + 138)
-    : Math.min(height * 0.56, horizon + 178);
-  const fieldX = width * (compact ? 0.6 : 0.7);
-  const fieldY = lerp(horizon, foreground, compact ? 0.43 : 0.47);
+  const horizon = height * (compact ? 0.3 : 0.27);
+  const foreground = height * (compact ? 0.7 : 0.73);
+  const fieldX = width * (compact ? 0.56 : 0.6);
+  const fieldY = lerp(horizon, foreground, 0.48);
   return {
     width,
     height,
     compact,
     horizon,
     foreground,
-    waveStart: width * (compact ? -0.12 : 0.27),
+    waveStart: width * -0.08,
     waveEnd: width * 1.08,
     fieldX,
     fieldY,
@@ -634,11 +580,7 @@ export function emotionThemeStyle(model: SystemEmotionModel): CSSProperties {
   } as CSSProperties;
 }
 
-function moodMetric(value: number): string {
-  return `${Math.round(clamp(value) * 100).toString().padStart(2, '0')}%`;
-}
-
-export function SystemEmotionEngine({ data, locale, model, onNavigate, paused = false }: SystemEmotionEngineProps) {
+export function SystemEmotionEngine({ locale, model, paused = false }: SystemEmotionEngineProps) {
   const rootRef = useRef<HTMLElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const pointerRef = useRef<PointerField>({
@@ -650,11 +592,6 @@ export function SystemEmotionEngine({ data, locale, model, onNavigate, paused = 
     wakes: [],
   });
   const originRef = useRef<number | null>(null);
-  const copy = MOOD_COPY[model.mood];
-  const dominantLabel = model.dominantAxis
-    ? t(locale, AXIS_LABELS[model.dominantAxis])
-    : locale === 'ko' ? '없음' : 'None';
-
   useEffect(() => {
     const root = rootRef.current;
     const canvas = canvasRef.current;
@@ -773,9 +710,10 @@ export function SystemEmotionEngine({ data, locale, model, onNavigate, paused = 
   return (
     <section
       ref={rootRef}
-      className={`system-emotion-engine emotion-${model.mood}`}
+      className="system-emotion-engine"
       style={emotionThemeStyle(model)}
-      aria-labelledby="system-emotion-title"
+      role="img"
+      aria-label={locale === 'ko' ? '현재 시스템 상태의 입자 파동 시각화' : 'Particle-wave visualization of the current system state'}
       data-mood={model.mood}
     >
       <canvas
@@ -784,45 +722,6 @@ export function SystemEmotionEngine({ data, locale, model, onNavigate, paused = 
         aria-hidden="true"
         data-renderer="granular-particle-wave"
       />
-      <div className="system-emotion-grain" aria-hidden="true" />
-      <p className="sr-only" role="status" aria-live="polite" aria-atomic="true">
-        {t(locale, copy.title)}. {locale === 'ko' ? `지배 신호 ${dominantLabel}` : `Dominant signal ${dominantLabel}`}.
-      </p>
-      <header className="emotion-engine-header">
-        <span><i aria-hidden="true" />{locale === 'ko' ? '시스템 감응 · 입자파 합성' : 'SYSTEM AFFECT · PARTICLE WAVE'}</span>
-        <span className="emotion-engine-sample">{safeText(data?.host.hostname, 'HOST', 40)} · {formatDateTime(data?.latestObservedAt, locale)}</span>
-      </header>
-
-      <div className="emotion-engine-copy">
-        <span className="emotion-state-code">{copy.code}</span>
-        <h2 id="system-emotion-title">{t(locale, copy.title)}</h2>
-        <p>{t(locale, copy.summary)}</p>
-        {model.dominantPage ? (
-          <button type="button" onClick={() => onNavigate(model.dominantPage!)}>
-            <span>{locale === 'ko' ? `지배 신호 · ${dominantLabel}` : `Dominant signal · ${dominantLabel}`}</span>
-            <Icon name="chevron" size={16} />
-          </button>
-        ) : (
-          <span className="emotion-balanced-state">{locale === 'ko' ? '계통 균형 · 지배 신호 없음' : 'Systems balanced · no dominant signal'}</span>
-        )}
-      </div>
-
-      <div className="emotion-engine-readings" role="group" aria-label={locale === 'ko' ? '합성 상태 수치' : 'Synthesized state readings'}>
-        <div><span>{locale === 'ko' ? '균형도' : 'BALANCE'}</span><strong>{model.score.toString().padStart(2, '0')}</strong></div>
-        <div><span>{locale === 'ko' ? '활성' : 'ENERGY'}</span><strong>{moodMetric(model.energy)}</strong></div>
-        <div><span>{locale === 'ko' ? '난류' : 'TURBULENCE'}</span><strong>{moodMetric(model.turbulence)}</strong></div>
-        <div><span>{locale === 'ko' ? '결맞음' : 'COHERENCE'}</span><strong>{moodMetric(model.coherence)}</strong></div>
-      </div>
-
-      <div className="emotion-axis-field" role="group" aria-label={locale === 'ko' ? '계통별 신호 강도' : 'Subsystem signal intensity'}>
-        {model.axes.map((axis) => (
-          <div key={axis.key} className={axis.key === model.dominantAxis ? 'dominant' : ''}>
-            <span>{t(locale, AXIS_LABELS[axis.key])}</span>
-            <i aria-hidden="true"><b style={{ '--axis-level': axis.intensity.toFixed(3) } as CSSProperties} /></i>
-            <strong>{axis.observed ? Math.round(axis.intensity * 100).toString().padStart(2, '0') : '—'}</strong>
-          </div>
-        ))}
-      </div>
     </section>
   );
 }

@@ -426,10 +426,8 @@ export function MonitorDashboard({
 
           {normalizedPage === 'overview' && (
             <SystemEmotionEngine
-              data={assessedData ?? null}
               locale={locale}
               model={emotionModel}
-              onNavigate={(nextPage) => navigate(nextPage)}
               paused={passwordDialogOpen || helpOpen}
             />
           )}

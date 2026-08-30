@@ -5,23 +5,29 @@ import { deriveSystemEmotion } from '../system-emotion';
 import { createGranularWavePlan, SystemEmotionEngine } from './SystemEmotionEngine';
 
 describe('system emotion engine presentation', () => {
-  it('keeps the canvas decorative and exposes an actionable textual state', () => {
+  it('renders a labeled particle surface without operational overlays', () => {
     const model = deriveSystemEmotion({ data: null, stale: false, dangerCount: 0, cautionCount: 0 });
     const markup = renderToStaticMarkup(createElement(SystemEmotionEngine, {
-      data: null,
       locale: 'ko',
       model,
-      onNavigate: () => undefined,
     }));
 
+    expect(markup).toContain('role="img"');
+    expect(markup).toContain('aria-label="현재 시스템 상태의 입자 파동 시각화"');
     expect(markup).toContain('aria-hidden="true"');
-    expect(markup).toContain('신호를 기다리는 중');
-    expect(markup).toContain('지배 신호 · 신뢰성');
-    expect(markup).toContain('계통별 신호 강도');
     expect(markup).toContain('data-mood="dormant"');
     expect(markup).toContain('data-renderer="granular-particle-wave"');
-    expect(markup).toContain('시스템 감응 · 입자파 합성');
-    expect(markup.match(/role="group"/g)).toHaveLength(2);
+    expect(markup).not.toContain('<header');
+    expect(markup).not.toContain('<button');
+    expect(markup).not.toContain('system-emotion-grain');
+    expect(markup).not.toContain('emotion-engine-copy');
+    expect(markup).not.toContain('emotion-engine-readings');
+    expect(markup).not.toContain('emotion-axis-field');
+    expect(markup).not.toContain('시스템 감응');
+    expect(markup).not.toContain('STATE /');
+    expect(markup).not.toContain('즉시 확인할 파동');
+    expect(markup).not.toContain('위험 신호');
+    expect(markup).not.toContain('지배 신호');
   });
 
   it('builds a deterministic, dense particle sheet at desktop and compact sizes', () => {
