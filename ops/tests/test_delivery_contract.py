@@ -41,6 +41,13 @@ class DeliveryContractTests(unittest.TestCase):
         self.assertNotIn("testTimeout", workflow)
         production_stage = dockerfile.index(" AS production-dependencies")
         self.assertLess(dockerfile.index("npm run typecheck"), production_stage)
+        runtime_stage = dockerfile.index(" AS runtime")
+        self.assertGreater(
+            dockerfile.index("rm -rf /usr/local/lib/node_modules/npm"),
+            runtime_stage,
+        )
+        self.assertIn("/usr/local/bin/npm", dockerfile)
+        self.assertIn("/usr/local/bin/npx", dockerfile)
         self.assertIn("HEALTHCHECK", dockerfile)
         self.assertIn("/readyz", dockerfile)
 

@@ -46,6 +46,12 @@ ENV NODE_ENV=production \
 LABEL work.bonifacio.portfolio.branch=${PORTFOLIO_BRANCH} \
       work.bonifacio.portfolio.auth-mode=${PORTFOLIO_AUTH_MODE}
 
+# The production process invokes node directly. Do not ship npm/npx or their
+# transitive package-manager attack surface in the runtime image.
+RUN rm -rf /usr/local/lib/node_modules/npm \
+    /usr/local/bin/npm \
+    /usr/local/bin/npx
+
 RUN printf '%s\n%s\n' "$PORTFOLIO_BRANCH" "$PORTFOLIO_AUTH_MODE" \
       > /etc/portfolio-auth-build \
     && chmod 0444 /etc/portfolio-auth-build
