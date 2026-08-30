@@ -431,8 +431,20 @@ class QueueRecoveryTests(WorkerFixture):
     def run_queue(self, updater: worker_module.UpdateWorker, incoming: Path, processing: Path) -> None:
         worker_module.process_queue(
             worker=updater, store=self.store, incoming=incoming, processing=processing,
-            expected_request_uid=os.geteuid(), expected_peer_uid=1001,
+            expected_request_uid=os.geteuid(), expected_processing_uid=os.geteuid(),
+            expected_peer_uid=1001,
         )
+
+    def test_processing_directory_requires_configured_worker_owner(self) -> None:
+        incoming, processing = self.queue_directories()
+        with self.assertRaisesRegex(worker_module.WorkerError, "INTERNAL_ERROR"):
+            worker_module.process_queue(
+                worker=self.make_worker(FakeRunner()), store=self.store,
+                incoming=incoming, processing=processing,
+                expected_request_uid=os.geteuid(),
+                expected_processing_uid=os.geteuid() + 1,
+                expected_peer_uid=1001,
+            )
 
     def test_started_status_audit_failure_surfaces_and_recovers_without_apt(self) -> None:
         incoming, processing = self.queue_directories()
@@ -520,6 +532,44 @@ class QueueRecoveryTests(WorkerFixture):
         by_request = {row["requestId"]: row["result"] for row in audit if row["result"] != "started"}
         self.assertEqual(by_request[old_request["requestId"]], "interrupted")
         self.assertEqual(by_request[new_request["requestId"]], "succeeded")
+
+
+class MainSafetyTests(unittest.TestCase):
+    def test_production_entrypoint_pins_processing_owner_to_root(self) -> None:
+        values = worker_module.argparse.Namespace(
+            incoming=Path("/incoming"), processing=Path("/processing"),
+            plan=Path("/plan"), public_status=Path("/status"),
+            audit_log=Path("/audit"), lock=Path("/lock"),
+            request_user="monitor-updater", peer_uid=1001, public_group="cks",
+            initialize_only=False, verify_apt_transaction=False,
+        )
+        opened = mock.Mock(st_mode=stat.S_IFREG | 0o600, st_uid=0, st_nlink=1)
+        with mock.patch.object(worker_module, "parse_arguments", return_value=values), \
+                mock.patch.object(worker_module.os, "geteuid", return_value=0), \
+                mock.patch.object(
+                    worker_module.pwd, "getpwnam", return_value=mock.Mock(pw_uid=1234),
+                ), \
+                mock.patch.object(
+                    worker_module.grp, "getgrnam", return_value=mock.Mock(gr_gid=1234),
+                ), \
+                mock.patch.object(worker_module, "StateStore") as store_type, \
+                mock.patch.object(worker_module, "initialize_status"), \
+                mock.patch.object(worker_module.os, "open", return_value=42), \
+                mock.patch.object(worker_module.os, "fstat", return_value=opened), \
+                mock.patch.object(worker_module.os, "close"), \
+                mock.patch.object(worker_module.fcntl, "flock"), \
+                mock.patch.object(worker_module, "SubprocessRunner"), \
+                mock.patch.object(worker_module, "Preflight"), \
+                mock.patch.object(worker_module, "UpdateWorker") as worker_type, \
+                mock.patch.object(worker_module, "process_queue") as process_queue:
+            self.assertEqual(worker_module.main([]), 0)
+
+        process_queue.assert_called_once_with(
+            worker=worker_type.return_value, store=store_type.return_value,
+            incoming=values.incoming, processing=values.processing,
+            expected_request_uid=1234, expected_processing_uid=0,
+            expected_peer_uid=1001,
+        )
 
 
 class AdditionalUpdateActionTests(WorkerFixture):

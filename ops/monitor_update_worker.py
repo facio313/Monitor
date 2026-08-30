@@ -1686,10 +1686,11 @@ def process_queue(
     incoming: Path,
     processing: Path,
     expected_request_uid: int,
+    expected_processing_uid: int,
     expected_peer_uid: int,
 ) -> None:
     safe_directory(incoming, expected_request_uid, 0o700)
-    safe_directory(processing, 0, 0o700)
+    safe_directory(processing, expected_processing_uid, 0o700)
     initialize_status(store, worker.now())
     recovering_names = {
         path.name for path in processing.iterdir()
@@ -1783,7 +1784,8 @@ def main(arguments: list[str] | None = None) -> int:
         worker = UpdateWorker(runner=SubprocessRunner(), store=store, preflight=Preflight())
         process_queue(
             worker=worker, store=store, incoming=values.incoming, processing=values.processing,
-            expected_request_uid=request_uid, expected_peer_uid=values.peer_uid,
+            expected_request_uid=request_uid, expected_processing_uid=0,
+            expected_peer_uid=values.peer_uid,
         )
     finally:
         os.close(lock_descriptor)
