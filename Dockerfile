@@ -19,10 +19,13 @@ COPY server ./server
 COPY ops ./ops
 COPY scripts ./scripts
 
+# The workflow's native test gate keeps Vitest's strict default timeout. The
+# amd64 stage can run through QEMU on the ARM release runner, so bound its
+# parallelism and allow emulation overhead without weakening the native gate.
 RUN ./scripts/portfolio-auth-mode.sh check \
     && npm run test:portfolio-auth \
     && npm run typecheck \
-    && npm test \
+    && npm run test:raw -- --maxWorkers=2 --testTimeout=30000 \
     && npm run build
 
 FROM node:22.23.2-alpine@sha256:c610fcdfb1d5b4740dd70c284ed3cb16bb857e0f7166196e36a5501df7a3aa32 AS production-dependencies
