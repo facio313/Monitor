@@ -93,6 +93,7 @@ function incidents(count: number): PeakIncident[] {
 
 function payload(overrides: Partial<DashboardPayload>): DashboardPayload {
   return {
+    containerCollection: { status: 'fresh', observedAt: '2026-08-30T00:00:00Z' },
     containers: [],
     incidents: [],
     ...overrides,

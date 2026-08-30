@@ -49,6 +49,13 @@ specific password hash and signed cookie under the worktree so the application
 can be developed without the SSO stack. That state is a local development aid,
 not a second production identity system.
 
+The collector now gives this single-host file path stable random host/agent
+UUIDs, private machine binding, a reduced per-boot digest, and a sequenced
+heartbeat. This is continuity metadata for the local snapshot/API path, not a
+completed fleet agent. Central registration and enrollment, mTLS transport,
+bounded offline spool/ack/retry, central duplicate or out-of-order merge, and an
+administrator lifecycle workflow remain unimplemented.
+
 ## Branch authentication contract
 
 `scripts/portfolio-auth-mode.sh` is the only branch-to-authentication resolver.
@@ -92,12 +99,11 @@ The dashboard provides:
 - a Korean-first control-room view with an explicit English switch, large page
   and panel headings, persistent critical-state strip, and an in-product guide
   for load, throughput, PSI, stale data, and peak incidents;
-- a prominent system-affect field that synthesizes compute, memory, thermal,
-  network, storage, service, and reliability evidence into an accessible
-  textual state plus a decorative wave field. Danger/caution findings reshape
-  its color, energy, turbulence, and movement and link to the winning evidence;
-  the canvas pauses offscreen, in hidden tabs, and behind dialogs, honors
-  reduced-motion preferences, and uses a lower pixel ratio on coarse pointers;
+- an action-first overview whose persistent status, operational findings, and
+  rule summary share heartbeat, Docker collection, rule, compute, memory,
+  thermal, network, storage, service, and reliability evidence. Delayed or
+  failed collection and firing rules therefore affect the overall state; the
+  decorative overview canvas has been removed;
 - CPU, memory, temperature, 1/5/15-minute load, network, disk-I/O, filesystem,
   container, power, reliability, incident, and event views using area, line,
   composed, horizontal/stacked bar, histogram, and donut charts;
@@ -107,9 +113,11 @@ The dashboard provides:
   request/5xx/slow/latency interval;
 - `1h`, `24h`, `7d`, and `30d` ranges, with at most 360 chart points;
 - host, EXT5V supply/power/GPU, filesystem, and allow-listed `cks` container status;
-- host-reliability state and a fixed-message timeline for boot transitions,
-  collector heartbeat gaps, SSH listeners, the primary network link,
-  NVMe/RCU/OOM/filesystem signals, and NVMe runtime mitigation;
+- host-reliability state with stable local collector identity, sequenced
+  heartbeat status, expected cadence and explicit lifecycle, plus a
+  fixed-message timeline for boot transitions, collector gaps, SSH listeners,
+  the primary network link, NVMe/RCU/OOM/filesystem signals, and NVMe runtime
+  mitigation;
 - bounded peak-incident evidence with PSI, fixed executable classes,
   fixed-label `cks` workloads, and per-capture app request counts (not visitors);
 - recent semantic alerts and privilege outcomes without commands or arguments;
@@ -503,6 +511,8 @@ Collector variables and defaults are:
 | `MONITOR_CURL` | `/usr/bin/curl` |
 | `MONITOR_VCGENCMD` | `/usr/bin/vcgencmd` |
 | `MONITOR_COMMAND_TIMEOUT` | `2` seconds per command |
+| `MONITOR_EXPECTED_INTERVAL_SECONDS` | `60`; heartbeat cadence declaration, clamped to 10–86,400 seconds (does not reschedule the systemd timer) |
+| `MONITOR_AGENT_LIFECYCLE` | `active`; exact alternatives are `maintenance` and `inactive`, and this is host configuration rather than an admin workflow |
 | `MONITOR_RETENTION_DAYS` | `30` |
 | `MONITOR_MAX_LOG_RECORDS` | `5000` per event export |
 | `MONITOR_INCIDENT_RETENTION_DAYS` | `30` |
@@ -541,7 +551,8 @@ sudo systemctl restart monitor-collector.service
 
 The default root is `/var/lib/monitor-export`:
 
-- `current.json` contains `generatedAt`, `host`, `latest`, `disks`,
+- `current.json` is schema version 2 and contains exactly `schemaVersion`,
+  `generatedAt`, `identity`, `heartbeat`, `host`, `latest`, `disks`,
   `containers`, `containerCollection`, `currentTraffic`, `reliability`, and
   `system`. Container source status distinguishes fresh, bounded last-known,
   unavailable, and permission-denied observations. A current container row is
@@ -590,6 +601,34 @@ The default root is `/var/lib/monitor-export`:
   mode-`0600` durable cursor. Container IDs and CPU baselines stay only in the
   `cks` exporter's private runtime file and are never mounted into the root
   collector.
+
+`identity` publishes only random UUIDv4 `hostId`/`agentId`,
+`installationEpoch`, `identityGeneration`, `machineIdentityStatus`, and a
+nullable reduced `bootId`. The UUIDs survive normal collector and host restarts.
+The mode-`0600` `.state/collector-identity.json` additionally keeps sequence
+state and a domain-separated SHA-256 hash of a valid `/etc/machine-id`; neither
+the raw machine ID nor that hash is public. When both the retained and current
+hash exist and differ, the collector treats the state as a copied installation,
+creates new host/agent UUIDs, increments the generation, and resets sequence to
+1. `machineIdentityStatus=unavailable` means no valid binding has yet been
+established. A temporarily unreadable current machine ID does not discard a
+retained binding, but clone comparison requires both hashes. Invalid private
+state permissions, links, size, or schema fail closed.
+
+`heartbeat` publishes `sequence`, `observedAt`, `receivedAt`,
+`expectedIntervalSeconds`, `lifecycle`, and `transport=local-file`. The private
+sequence is advanced before the public snapshot, so publication failures create
+detectable gaps instead of number reuse. In this same-host path, received and
+observed times are equal; they are not evidence of network delivery. The API
+strictly validates both objects, maps legacy snapshots with neither object to
+`unknown`, and maps malformed partial contracts to `collection_error`. An
+active heartbeat is `delayed` after the greater of 90 seconds or two expected
+intervals, then `disconnected` after the greater of the configured application
+stale threshold or five intervals. Explicit `maintenance` and `inactive` values
+take precedence. The UI feeds these states, non-fresh `containerCollection`,
+and firing/recovering or failed rule evaluations into operational findings and
+the overall strip; unavailable/permission-denied Docker collection shows no
+healthy zero-service count, and last-known collection remains visibly stale.
 
 `host` contains hostname, OS, architecture, online logical-CPU count, and
 uptime. Top-level `system`
@@ -714,6 +753,12 @@ POST   /monitor/api/system-updates/apply        # canonical chief-admin, one-use
   nested schema. The web container also has no socket mount.
 - Export files are bounded, atomically replaced, and readable by the `cks`
   deployment boundary without becoming world-readable.
+- Stable collector UUIDs and sequence state are kept in an exact-schema,
+  owner-only mode-`0600` file. The raw machine ID and raw Linux boot UUID are
+  never exported; the public contract exposes only binding availability and a
+  domain-separated reduced boot digest. A verified machine-hash change rekeys a
+  copied identity. A retained binding survives a temporary read failure, but
+  clone comparison is possible only when both hashes are available.
 - The infrastructure ledger has a separate root-only append stream. A narrow
   writer validates exact fields, revision chains, source references, size,
   links, permissions, and credential-like content before atomically replacing
@@ -769,8 +814,10 @@ read-only `/var/lib/monitor-update-socket` host directory at
 dispatch. It builds and tests both SSO branches, but only `main` publishes
 `:latest` and requests a deployment. It:
 
-1. runs the Python collector tests;
-2. builds and tests the ARM64 image;
+1. runs the Python collector and branch/Compose contract tests;
+2. builds and tests one `linux/amd64` + `linux/arm64` manifest with provenance
+   and SBOM, verifies both platform entries, and scans each platform for critical
+   vulnerabilities;
 3. publishes the immutable SHA tag (and `:latest` only for `main`);
 4. on `main` only, connects with the repository `DEPLOY_KEY` secret and requests only
    `deploy monitor <40-character-sha>`.

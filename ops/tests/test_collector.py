@@ -2515,6 +2515,75 @@ class FilesystemTests(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(path.parent.stat().st_mode), 0o750)
             self.assertEqual(list(path.parent.glob(".current.json.*")), [])
 
+    def test_identity_is_stable_and_rekeys_a_copied_state_on_machine_change(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            etc = root / "etc"
+            proc = root / "proc"
+            (proc / "sys" / "kernel" / "random").mkdir(parents=True)
+            etc.mkdir()
+            machine_one = "1" * 32
+            machine_two = "2" * 32
+            boot_id = "11111111-1111-4111-8111-111111111111"
+            (etc / "machine-id").write_text(machine_one + "\n")
+            (proc / "sys" / "kernel" / "random" / "boot_id").write_text(boot_id + "\n")
+            config = collector.Config(
+                output_dir=root / "output",
+                runtime_dir=root / "run",
+                etc_root=etc,
+                proc_root=proc,
+            )
+            now = dt.datetime(2026, 8, 30, 0, 0, tzinfo=dt.timezone.utc)
+            first_identity, first_heartbeat = collector.prepare_identity(config, now)
+            second_identity, second_heartbeat = collector.prepare_identity(
+                config, now + dt.timedelta(minutes=1),
+            )
+            self.assertEqual(second_identity, first_identity)
+            self.assertEqual(first_heartbeat["sequence"], 1)
+            self.assertEqual(second_heartbeat["sequence"], 2)
+            self.assertEqual(first_identity["machineIdentityStatus"], "bound")
+            self.assertRegex(first_identity["bootId"], r"^[0-9a-f]{32}$")
+            self.assertNotEqual(first_identity["bootId"], boot_id.replace("-", ""))
+
+            (etc / "machine-id").write_text(machine_two + "\n")
+            third_identity, third_heartbeat = collector.prepare_identity(
+                config, now + dt.timedelta(minutes=2),
+            )
+            self.assertNotEqual(third_identity["hostId"], first_identity["hostId"])
+            self.assertNotEqual(third_identity["agentId"], first_identity["agentId"])
+            self.assertEqual(third_identity["identityGeneration"], 2)
+            self.assertEqual(third_heartbeat["sequence"], 1)
+            self.assertNotIn(machine_one, json.dumps(first_identity))
+            self.assertNotIn(machine_two, json.dumps(third_identity))
+            identity_path = config.output_dir / ".state" / "collector-identity.json"
+            self.assertEqual(stat.S_IMODE(identity_path.stat().st_mode), 0o600)
+
+    def test_identity_state_permissions_and_schema_fail_closed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            etc = root / "etc"
+            etc.mkdir()
+            (etc / "machine-id").write_text("3" * 32 + "\n")
+            config = collector.Config(
+                output_dir=root / "output",
+                runtime_dir=root / "run",
+                etc_root=etc,
+                proc_root=root / "proc",
+            )
+            now = dt.datetime(2026, 8, 30, tzinfo=dt.timezone.utc)
+            collector.prepare_identity(config, now)
+            identity_path = config.output_dir / ".state" / "collector-identity.json"
+            identity_path.chmod(0o640)
+            with self.assertRaisesRegex(collector.PendingJournalError, "file validation"):
+                collector.prepare_identity(config, now + dt.timedelta(minutes=1))
+
+            identity_path.unlink()
+            collector.atomic_write_json(identity_path, {"schemaVersion": 999}, 0o600)
+            with self.assertRaisesRegex(collector.PendingJournalError, "schema validation"):
+                collector.prepare_identity(config, now + dt.timedelta(minutes=1))
+
+            self.assertIsNone(collector.opaque_uuid("AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA"))
+
     def test_reliability_boot_gap_transitions_and_crash_replay(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -3119,9 +3188,34 @@ class FilesystemTests(unittest.TestCase):
                 third = collector.run(config, now + dt.timedelta(minutes=2))
 
             self.assertEqual(set(current), {
-                "generatedAt", "host", "latest", "disks", "containers",
+                "schemaVersion", "generatedAt", "identity", "heartbeat",
+                "host", "latest", "disks", "containers",
                 "containerCollection", "currentTraffic", "reliability", "system",
             })
+            self.assertEqual(current["schemaVersion"], collector.CURRENT_SCHEMA_VERSION)
+            self.assertEqual(set(current["identity"]), {
+                "hostId", "agentId", "installationEpoch", "identityGeneration",
+                "machineIdentityStatus", "bootId",
+            })
+            self.assertIsNotNone(collector.opaque_uuid(current["identity"]["hostId"]))
+            self.assertIsNotNone(collector.opaque_uuid(current["identity"]["agentId"]))
+            self.assertEqual(current["identity"]["identityGeneration"], 1)
+            self.assertEqual(current["identity"]["machineIdentityStatus"], "unavailable")
+            self.assertIsNone(current["identity"]["bootId"])
+            self.assertEqual(current["heartbeat"], {
+                "sequence": 1,
+                "observedAt": current["generatedAt"],
+                "receivedAt": current["generatedAt"],
+                "expectedIntervalSeconds": 60,
+                "lifecycle": "active",
+                "transport": "local-file",
+            })
+            self.assertEqual(second["identity"], current["identity"])
+            self.assertEqual(third["identity"], current["identity"])
+            self.assertEqual(second["heartbeat"]["sequence"], 2)
+            self.assertEqual(third["heartbeat"]["sequence"], 3)
+            identity_path = output / ".state" / "collector-identity.json"
+            self.assertEqual(stat.S_IMODE(identity_path.stat().st_mode), 0o600)
             self.assertEqual(current["containerCollection"], {
                 "status": "fresh", "observedAt": current["generatedAt"],
             })
@@ -3352,6 +3446,8 @@ class FilesystemTests(unittest.TestCase):
         self.assertEqual(config.package_root, Path("/"))
         self.assertEqual(config.kernel_max_input_bytes, 8_388_608)
         self.assertEqual(config.command_timeout, 2.0)
+        self.assertEqual(config.expected_interval_seconds, 60)
+        self.assertEqual(config.agent_lifecycle, "active")
         self.assertEqual(config.traffic_log, Path("/var/log/nginx/monitor-traffic.jsonl"))
         self.assertEqual(config.docker_sockets, {"cks": Path("/run/user/1001/docker.sock")})
         self.assertEqual(config.process_uids, {0, 1001})
@@ -3380,12 +3476,15 @@ class FilesystemTests(unittest.TestCase):
             "--disk-io-warn-bytes-per-second", "100",
             "--disk-io-recover-bytes-per-second", "200",
             "--traffic-request-warn", "300", "--traffic-request-recover", "500",
+            "--expected-interval-seconds", "1", "--agent-lifecycle", "maintenance",
         ])
         self.assertEqual(clamped.cpu_recover_percent, 80)
         self.assertEqual(clamped.memory_available_recover_percent, 20)
         self.assertEqual(clamped.load_recover, 4)
         self.assertEqual(clamped.disk_io_recover_bytes_per_second, 100)
         self.assertEqual(clamped.traffic_request_recover, 300)
+        self.assertEqual(clamped.expected_interval_seconds, 10)
+        self.assertEqual(clamped.agent_lifecycle, "maintenance")
         ops_root = Path(__file__).resolve().parents[1]
         unit = (ops_root / "systemd" / "monitor-collector.service").read_text()
         exporter_unit = (ops_root / "systemd" / "monitor-container-exporter.service").read_text()
@@ -3413,6 +3512,8 @@ class FilesystemTests(unittest.TestCase):
         self.assertIn("MemoryMax=192M", unit)
         self.assertIn("TasksMax=64", unit)
         self.assertIn("MONITOR_KERNEL_LOG=/var/log/kern.log", defaults)
+        self.assertIn("MONITOR_EXPECTED_INTERVAL_SECONDS=60", defaults)
+        self.assertIn("MONITOR_AGENT_LIFECYCLE=active", defaults)
         self.assertIn("MONITOR_KERNEL_MAX_INPUT_BYTES=8388608", defaults)
         self.assertIn("MONITOR_RULE_PACK=/usr/local/lib/monitor-collector/rules/default-rules.v1.json", defaults)
         self.assertIn("MONITOR_TRAFFIC_LOG=/var/log/nginx/monitor-traffic.jsonl", defaults)

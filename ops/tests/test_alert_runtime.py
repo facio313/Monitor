@@ -21,6 +21,9 @@ class AlertRuntimeTests(unittest.TestCase):
 
     def snapshot(self):
         return {
+            "identity": {
+                "hostId": "11111111-1111-4111-8111-111111111111",
+            },
             "host": {"hostname": "node-a", "logicalCpuCount": 4},
             "latest": {
                 "cpuPercent": 95,
@@ -65,12 +68,41 @@ class AlertRuntimeTests(unittest.TestCase):
     def test_current_signals_are_extracted_without_mount_path_leak(self):
         observations = observations_for_snapshot(self.pack, self.snapshot())
         self.assertEqual(observations["CpuUsageHigh"][0].value, 95)
+        self.assertEqual(
+            observations["CpuUsageHigh"][0].target,
+            "host/11111111-1111-4111-8111-111111111111",
+        )
         self.assertEqual(observations["LoadPerCoreHigh"][0].value, 2)
         self.assertEqual(observations["MemoryAvailableLow"][0].value, 8)
         self.assertTrue(observations["DiskUsageCritical"][0].target.startswith("filesystem/"))
         self.assertNotIn("private", observations["DiskUsageCritical"][0].target)
         self.assertEqual(observations["ContainerDown"][0].value, 1)
         self.assertEqual(observations["ContainerNoHealthcheck"][0].value, 0)
+
+    def test_host_alert_identity_survives_rename_and_legacy_snapshots_fall_back(self):
+        renamed = self.snapshot()
+        renamed["host"]["hostname"] = "renamed-node"
+        renamed_target = observations_for_snapshot(
+            self.pack, renamed,
+        )["CpuUsageHigh"][0].target
+        self.assertEqual(
+            renamed_target,
+            "host/11111111-1111-4111-8111-111111111111",
+        )
+
+        legacy = self.snapshot()
+        legacy.pop("identity")
+        legacy_target = observations_for_snapshot(
+            self.pack, legacy,
+        )["CpuUsageHigh"][0].target
+        self.assertEqual(legacy_target, "host/node-a")
+
+        malformed = self.snapshot()
+        malformed["identity"]["hostId"] = "not-a-valid-host-id"
+        malformed_target = observations_for_snapshot(
+            self.pack, malformed,
+        )["CpuUsageHigh"][0].target
+        self.assertEqual(malformed_target, "host/node-a")
 
     def test_container_lifecycle_and_limit_signals_use_authoritative_v2_fields(self):
         observations = observations_for_snapshot(self.pack, self.snapshot())

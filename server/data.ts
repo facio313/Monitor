@@ -63,6 +63,9 @@ const RULE_METRIC_PATTERN = /^[a-z][a-z0-9_.]{2,127}$/;
 const RULE_TARGET_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_.:/-]{0,191}$/;
 const RULE_LABEL_NAME_PATTERN = /^[a-z][a-z0-9_-]{0,31}$/;
 const RULE_LABEL_VALUE_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_.:/-]{0,95}$/;
+const OPAQUE_UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const OPAQUE_BOOT_ID_PATTERN = /^[0-9a-f]{32}$/;
+const CURRENT_SNAPSHOT_SCHEMA_VERSION = 2;
 const TRAFFIC_AGGREGATE_FIELDS = new Set([
   'app',
   'requestCount',
@@ -810,6 +813,135 @@ function normalizeHost(current: JsonRecord | null): DashboardResponse['host'] {
     architecture: cleanText(first(host, ['architecture', 'arch']), 32),
     logicalCpuCount: integer(first(host, ['logicalCpuCount']), 1, 4096),
     uptimeSeconds: finite(first(host, ['uptimeSeconds', 'uptime']), 0),
+  };
+}
+
+function unavailableAgent(
+  status: DashboardResponse['agent']['status'] = 'unknown',
+): DashboardResponse['agent'] {
+  return {
+    hostId: null,
+    agentId: null,
+    installationEpoch: null,
+    identityGeneration: null,
+    machineIdentityStatus: null,
+    bootId: null,
+    sequence: null,
+    observedAt: null,
+    receivedAt: null,
+    expectedIntervalSeconds: null,
+    lifecycle: null,
+    transport: null,
+    status,
+    ageSeconds: null,
+    clockSkewSeconds: null,
+  };
+}
+
+function normalizeAgent(
+  current: JsonRecord | null,
+  nowMs: number,
+  staleAfterMs: number,
+): DashboardResponse['agent'] {
+  if (!current) return unavailableAgent();
+  const hasIdentity = Object.prototype.hasOwnProperty.call(current, 'identity');
+  const hasHeartbeat = Object.prototype.hasOwnProperty.call(current, 'heartbeat');
+  if (!hasIdentity && !hasHeartbeat) return unavailableAgent();
+  if (own(current, 'schemaVersion') !== CURRENT_SNAPSHOT_SCHEMA_VERSION) {
+    return unavailableAgent('collection_error');
+  }
+  const identity = recordAt(current, 'identity');
+  const heartbeat = recordAt(current, 'heartbeat');
+  const identityFields = [
+    'hostId', 'agentId', 'installationEpoch', 'identityGeneration',
+    'machineIdentityStatus', 'bootId',
+  ] as const;
+  const heartbeatFields = [
+    'sequence', 'observedAt', 'receivedAt', 'expectedIntervalSeconds',
+    'lifecycle', 'transport',
+  ] as const;
+  if (
+    !identity
+    || !heartbeat
+    || !exactKeys(identity, identityFields)
+    || !exactKeys(heartbeat, heartbeatFields)
+  ) return unavailableAgent('collection_error');
+
+  const hostId = contractText(own(identity, 'hostId'), 36);
+  const agentId = contractText(own(identity, 'agentId'), 36);
+  const installationEpoch = contractTimestamp(own(identity, 'installationEpoch'), nowMs);
+  const identityGeneration = integer(own(identity, 'identityGeneration'), 1);
+  const machineIdentityStatus = own(identity, 'machineIdentityStatus');
+  const rawBootId = own(identity, 'bootId');
+  const bootId = rawBootId === null ? null : contractText(rawBootId, 32);
+  const sequence = integer(own(heartbeat, 'sequence'), 1);
+  const observedAt = contractTimestamp(own(heartbeat, 'observedAt'), nowMs);
+  const receivedAt = contractTimestamp(own(heartbeat, 'receivedAt'), nowMs);
+  const expectedIntervalSeconds = integer(own(heartbeat, 'expectedIntervalSeconds'), 10, 86_400);
+  const lifecycle = own(heartbeat, 'lifecycle');
+  const transport = own(heartbeat, 'transport');
+  const generatedAt = contractTimestamp(own(current, 'generatedAt'), nowMs);
+  if (
+    hostId === null
+    || !OPAQUE_UUID_PATTERN.test(hostId)
+    || agentId === null
+    || !OPAQUE_UUID_PATTERN.test(agentId)
+    || installationEpoch === null
+    || identityGeneration === null
+    || (machineIdentityStatus !== 'bound' && machineIdentityStatus !== 'unavailable')
+    || (bootId !== null && !OPAQUE_BOOT_ID_PATTERN.test(bootId))
+    || sequence === null
+    || observedAt === null
+    || receivedAt === null
+    || expectedIntervalSeconds === null
+    || generatedAt === null
+    || (lifecycle !== 'active' && lifecycle !== 'maintenance' && lifecycle !== 'inactive')
+    || transport !== 'local-file'
+  ) return unavailableAgent('collection_error');
+
+  const installationMs = new Date(installationEpoch).getTime();
+  const observedMs = new Date(observedAt).getTime();
+  const receivedMs = new Date(receivedAt).getTime();
+  const generatedMs = new Date(generatedAt).getTime();
+  if (
+    installationMs > observedMs
+    || receivedMs !== observedMs
+    || generatedMs !== observedMs
+  ) {
+    return unavailableAgent('collection_error');
+  }
+  const ageSeconds = Math.max(0, (nowMs - receivedMs) / 1_000);
+  const clockSkewSeconds = (receivedMs - observedMs) / 1_000;
+  const delayedAfterSeconds = Math.max(90, expectedIntervalSeconds * 2);
+  const disconnectedAfterSeconds = Math.max(
+    staleAfterMs / 1_000,
+    expectedIntervalSeconds * 5,
+  );
+  const status: DashboardResponse['agent']['status'] = lifecycle === 'maintenance'
+    ? 'maintenance'
+    : lifecycle === 'inactive'
+      ? 'inactive'
+      : ageSeconds > disconnectedAfterSeconds
+        ? 'disconnected'
+        : ageSeconds > delayedAfterSeconds
+          ? 'delayed'
+          : 'healthy';
+  return {
+    hostId,
+    agentId,
+    installationEpoch,
+    identityGeneration,
+    machineIdentityStatus,
+    bootId,
+    sequence,
+    observedAt,
+    receivedAt,
+    expectedIntervalSeconds,
+    lifecycle,
+    transport,
+    status,
+    ageSeconds: Math.round(ageSeconds * 1000) / 1000,
+    clockSkewSeconds,
   };
 }
 
@@ -2224,6 +2356,7 @@ export function readDashboard(
     range,
     stale: !Number.isFinite(latestTime) || nowMs - latestTime > staleAfterMs,
     latestObservedAt: observedLatest?.timestamp ?? null,
+    agent: normalizeAgent(current, nowMs, staleAfterMs),
     host: normalizeHost(current),
     reliability: normalizeReliability(current),
     system: normalizeSystem(current, nowMs),

@@ -27,6 +27,7 @@ import sys
 import tempfile
 import time
 import urllib.parse
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -112,6 +113,11 @@ MAX_SUPPLY_VOLTAGE_VOLTS = 10.0
 DEFAULT_KERNEL_MAX_INPUT_BYTES = 8_388_608
 MAX_KERNEL_BACKFILL_BYTES = 16_777_216
 COLLECTOR_VERSION = "1.0.0"
+CURRENT_SCHEMA_VERSION = 2
+IDENTITY_STATE_SCHEMA_VERSION = 1
+MAX_IDENTITY_STATE_BYTES = 4096
+MAX_HEARTBEAT_INTERVAL_SECONDS = 86_400
+AGENT_LIFECYCLES = frozenset({"active", "maintenance", "inactive"})
 DEFAULT_SOCKETS = {
     "cks": "/run/user/1001/docker.sock",
 }
@@ -288,6 +294,40 @@ def iso_event_timestamp(value: dt.datetime) -> str:
     normalized = value.astimezone(dt.timezone.utc)
     timespec = "microseconds" if normalized.microsecond else "seconds"
     return normalized.isoformat(timespec=timespec).replace("+00:00", "Z")
+
+
+def opaque_uuid(value: Any) -> str | None:
+    """Return one canonical random UUID without accepting alternate spellings."""
+    if not isinstance(value, str) or len(value) != 36:
+        return None
+    try:
+        parsed = uuid.UUID(value)
+    except (AttributeError, ValueError):
+        return None
+    canonical = str(parsed)
+    return canonical if canonical == value and parsed.version == 4 else None
+
+
+def machine_identity_hash(etc_root: Path) -> str | None:
+    """Bind private collector identity to machine-id without exporting it."""
+    value = read_text(etc_root / "machine-id", 256).strip().lower()
+    if re.fullmatch(r"[0-9a-f]{32}", value) is None or value == "0" * 32:
+        return None
+    return hashlib.sha256(b"monitor-machine-id-v1\0" + value.encode("ascii")).hexdigest()
+
+
+def public_boot_id(proc_root: Path) -> str | None:
+    """Expose only a namespace-bound digest of Linux's per-boot random UUID."""
+    value = read_text(proc_root / "sys" / "kernel" / "random" / "boot_id", 128).strip().lower()
+    try:
+        parsed = uuid.UUID(value)
+    except (AttributeError, ValueError):
+        return None
+    if str(parsed) != value:
+        return None
+    return hashlib.blake2s(
+        b"monitor-boot-id-v1\0" + value.encode("ascii"), digest_size=16,
+    ).hexdigest()
 
 
 def finite_number(value: Any, default: float | None = None) -> float | None:
@@ -545,6 +585,126 @@ def load_private_pending_json(path: Path, maximum_bytes: int) -> Any | None:
         return json.loads(payload.decode("utf-8"))
     except (UnicodeError, json.JSONDecodeError) as error:
         raise PendingJournalError("pending journal is not valid JSON") from error
+
+
+def normalized_identity_state(value: Any) -> dict[str, Any] | None:
+    """Validate the owner-only stable host/agent identity state."""
+    fields = {
+        "schemaVersion", "hostId", "agentId", "installationEpoch",
+        "identityGeneration", "machineIdHash", "sequence", "lastObservedAt",
+    }
+    if not isinstance(value, Mapping) or set(value) != fields:
+        return None
+    if value.get("schemaVersion") != IDENTITY_STATE_SCHEMA_VERSION:
+        return None
+    host_id = opaque_uuid(value.get("hostId"))
+    agent_id = opaque_uuid(value.get("agentId"))
+    installation = parse_iso_timestamp(value.get("installationEpoch"))
+    last_observed = parse_iso_timestamp(value.get("lastObservedAt"))
+    generation = value.get("identityGeneration")
+    sequence = value.get("sequence")
+    machine_hash = value.get("machineIdHash")
+    if (
+        host_id is None
+        or agent_id is None
+        or installation is None
+        or last_observed is None
+        or installation > last_observed
+        or isinstance(generation, bool)
+        or not isinstance(generation, int)
+        or not 1 <= generation <= MAX_SAFE_COUNTER
+        or isinstance(sequence, bool)
+        or not isinstance(sequence, int)
+        or not 1 <= sequence <= MAX_SAFE_COUNTER
+        or (
+            machine_hash is not None
+            and (
+                not isinstance(machine_hash, str)
+                or re.fullmatch(r"[0-9a-f]{64}", machine_hash) is None
+            )
+        )
+    ):
+        return None
+    return {
+        "schemaVersion": IDENTITY_STATE_SCHEMA_VERSION,
+        "hostId": host_id,
+        "agentId": agent_id,
+        "installationEpoch": iso_timestamp(installation),
+        "identityGeneration": generation,
+        "machineIdHash": machine_hash,
+        "sequence": sequence,
+        "lastObservedAt": iso_timestamp(last_observed),
+    }
+
+
+def prepare_identity(
+    config: "Config",
+    now: dt.datetime,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Advance a stable identity before publishing the matching heartbeat.
+
+    The state is committed first. A later publication failure therefore leaves
+    an observable sequence gap instead of reusing a sequence number.
+    """
+    path = config.output_dir / ".state" / "collector-identity.json"
+    raw = load_private_pending_json(path, MAX_IDENTITY_STATE_BYTES)
+    prior = normalized_identity_state(raw) if raw is not None else None
+    if raw is not None and prior is None:
+        raise PendingJournalError("collector identity failed schema validation")
+
+    now_text = iso_timestamp(now)
+    current_machine_hash = machine_identity_hash(config.etc_root)
+    machine_changed = bool(
+        prior
+        and prior["machineIdHash"] is not None
+        and current_machine_hash is not None
+        and prior["machineIdHash"] != current_machine_hash
+    )
+    if prior is None or machine_changed:
+        generation = 1 if prior is None else prior["identityGeneration"] + 1
+        if generation > MAX_SAFE_COUNTER:
+            raise OverflowError("collector identity generation exhausted")
+        state = {
+            "schemaVersion": IDENTITY_STATE_SCHEMA_VERSION,
+            "hostId": str(uuid.uuid4()),
+            "agentId": str(uuid.uuid4()),
+            "installationEpoch": now_text,
+            "identityGeneration": generation,
+            "machineIdHash": current_machine_hash,
+            "sequence": 1,
+            "lastObservedAt": now_text,
+        }
+    else:
+        if prior["sequence"] >= MAX_SAFE_COUNTER:
+            raise OverflowError("collector heartbeat sequence exhausted")
+        state = {
+            **prior,
+            "machineIdHash": prior["machineIdHash"] or current_machine_hash,
+            "sequence": prior["sequence"] + 1,
+            "lastObservedAt": now_text,
+        }
+    normalized = normalized_identity_state(state)
+    if normalized is None:
+        raise ValueError("collector identity did not satisfy the private contract")
+    atomic_write_json(path, normalized, 0o600)
+
+    identity = {
+        "hostId": normalized["hostId"],
+        "agentId": normalized["agentId"],
+        "installationEpoch": normalized["installationEpoch"],
+        "identityGeneration": normalized["identityGeneration"],
+        "machineIdentityStatus": "bound" if normalized["machineIdHash"] else "unavailable",
+        "bootId": public_boot_id(config.proc_root),
+    }
+    heartbeat = {
+        "sequence": normalized["sequence"],
+        "observedAt": now_text,
+        "receivedAt": now_text,
+        "expectedIntervalSeconds": config.expected_interval_seconds,
+        "lifecycle": config.agent_lifecycle,
+        "transport": "local-file",
+    }
+    return identity, heartbeat
 
 
 def append_json_line(path: Path, value: Mapping[str, Any], mode: int = 0o640) -> None:
@@ -5108,6 +5268,8 @@ class Config:
     curl: str = "/usr/bin/curl"
     vcgencmd: str = "/usr/bin/vcgencmd"
     command_timeout: float = 2.0
+    expected_interval_seconds: int = 60
+    agent_lifecycle: str = "active"
     retention_days: int = 30
     max_log_records: int = 5000
     incident_retention_days: int = 30
@@ -5166,6 +5328,16 @@ def config_from_environment(arguments: Sequence[str] | None = None) -> Config:
     parser.add_argument("--curl", default=env.get("MONITOR_CURL", "/usr/bin/curl"))
     parser.add_argument("--vcgencmd", default=env.get("MONITOR_VCGENCMD", "/usr/bin/vcgencmd"))
     parser.add_argument("--command-timeout", type=float, default=float(env.get("MONITOR_COMMAND_TIMEOUT", "2")))
+    parser.add_argument(
+        "--expected-interval-seconds",
+        type=int,
+        default=int(env.get("MONITOR_EXPECTED_INTERVAL_SECONDS", "60")),
+    )
+    parser.add_argument(
+        "--agent-lifecycle",
+        choices=sorted(AGENT_LIFECYCLES),
+        default=env.get("MONITOR_AGENT_LIFECYCLE", "active"),
+    )
     parser.add_argument("--retention-days", type=int, default=int(env.get("MONITOR_RETENTION_DAYS", "30")))
     parser.add_argument("--max-log-records", type=int, default=int(env.get("MONITOR_MAX_LOG_RECORDS", "5000")))
     parser.add_argument(
@@ -5246,6 +5418,10 @@ def config_from_environment(arguments: Sequence[str] | None = None) -> Config:
         primary_interface=safe_interface_name(values.primary_interface),
         curl=values.curl, vcgencmd=values.vcgencmd,
         command_timeout=max(0.1, min(10.0, values.command_timeout)),
+        expected_interval_seconds=max(
+            10, min(MAX_HEARTBEAT_INTERVAL_SECONDS, values.expected_interval_seconds)
+        ),
+        agent_lifecycle=values.agent_lifecycle,
         retention_days=max(1, min(366, values.retention_days)),
         max_log_records=max(10, min(100_000, values.max_log_records)),
         incident_retention_days=max(1, min(366, values.incident_retention_days)),
@@ -5642,8 +5818,12 @@ def run(config: Config, now: dt.datetime | None = None) -> dict[str, Any]:
             config, now, uptime_seconds, include_kernel_summary=True
         )
         system = collect_system(config, kernel_summary)
+        identity, heartbeat = prepare_identity(config, now)
         current = {
+            "schemaVersion": CURRENT_SCHEMA_VERSION,
             "generatedAt": now_text,
+            "identity": identity,
+            "heartbeat": heartbeat,
             "host": host,
             "latest": latest,
             "disks": collect_filesystems(read_text(config.mountinfo_path), config.mount_root),

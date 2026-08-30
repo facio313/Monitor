@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { SessionInfo } from '../api';
+import { agentHeartbeatLabel, containerCollectionLabel } from '../collection-status';
 import { chooseInitialLocale, localized, MONITOR_STALE_AFTER_MS, monitorPathForPage, monitorRangeFromSearch, monitorSnapshotIsStale, operationalAssessmentPresentation } from '../dashboard-model';
 import { useDashboard } from '../hooks/useDashboard';
 import { operationalFindings, operationalServiceState } from '../operational-health';
-import { deriveSystemEmotion } from '../system-emotion';
 import type { DashboardPayload, MonitorDetailPage, MonitorLocale, MonitorPage, TimeRange } from '../types';
 import { formatDateTime, safeText } from '../utils';
 import { AdaptiveGrid, type AdaptiveGridItem } from './AdaptiveGrid';
@@ -30,7 +30,6 @@ import { OperationalHeadroom } from './OperationalHeadroom';
 import { PasswordChangeDialog } from './PasswordChangeDialog';
 import { RuleHealthSummary } from './RuleHealthSummary';
 import { SystemMaintenance } from './SystemMaintenance';
-import { emotionThemeStyle, SystemEmotionEngine } from './SystemEmotionEngine';
 import { SystemUpdateControls } from './SystemUpdateControls';
 
 const LOCALE_STORAGE_KEY = 'monitor.locale.v2';
@@ -196,6 +195,7 @@ export function createOverviewDashboardItems(
       label: t(locale, '호스트 신뢰성', 'Host reliability'),
       layout: DEFAULT_LAYOUT.reliability,
       details: [
+        detail(locale, 'agent-heartbeat', '수집기 하트비트', 'Collector heartbeat'),
         detail(locale, 'ssh', 'SSH 접속 경로', 'SSH listeners'),
         detail(locale, 'network', '주 네트워크', 'Primary network'),
         detail(locale, 'nvme', 'NVMe 보호 설정', 'NVMe mitigation'),
@@ -294,14 +294,8 @@ export function MonitorDashboard({
     : counts.caution
       ? 'caution'
       : 'nominal';
-  const emotionModel = useMemo(() => deriveSystemEmotion({
-    data: assessedData ?? null,
-    stale: effectiveStale,
-    dangerCount: counts.danger,
-    cautionCount: counts.caution,
-    primaryFinding: findings[0] ?? null,
-  }), [assessedData, counts.caution, counts.danger, effectiveStale, findings]);
   const selectedRange = RANGES.find((item) => item.value === range)!;
+  const serviceCollectionNotCurrent = Boolean(data && data.containerCollection.status !== 'fresh');
   const storageSubject = viewer?.user ?? 'local';
   const centralAccount = viewer?.role === 'chief-admin'
     ? { href: '/sso/admin/', ko: 'SSO ADMIN', en: 'SSO ADMIN' }
@@ -381,7 +375,7 @@ export function MonitorDashboard({
   }, [data, locale, navigate, range]);
 
   return (
-    <div className="control-room" data-locale={locale} data-mood={emotionModel.mood} style={emotionThemeStyle(emotionModel)}>
+    <div className="control-room" data-locale={locale}>
       <a className="control-skip-link" href="#monitor-main">
         {t(locale, '본문으로 건너뛰기', 'Skip to main content')}
       </a>
@@ -430,9 +424,9 @@ export function MonitorDashboard({
 
           <section className={`system-strip strip-${overall}`} aria-label={t(locale, '항상 표시되는 핵심 운영 상태', 'Persistent operating status')}>
             <div className="system-state"><span>{overall === 'danger' ? '▲' : overall === 'caution' ? '●' : '✓'}</span><div><small>{t(locale, '전체 상태', 'OVERALL')}</small><strong>{overall === 'danger' ? t(locale, '확인 필요', 'CHECK SYSTEMS') : overall === 'caution' ? t(locale, '주의 관찰', 'CAUTION') : t(locale, '정상 운용', 'ALL NOMINAL')}</strong></div></div>
-            <div><small>{t(locale, '수집 상태', 'COLLECTOR')}</small><strong>{effectiveStale ? t(locale, '데이터 지연', 'STALE DATA') : data ? t(locale, '실시간', 'LIVE') : t(locale, '대기 중', 'WAITING')}</strong><span>{data?.latestObservedAt ? formatDateTime(data.latestObservedAt, locale) : '—'}</span></div>
+            <div><small>{t(locale, '수집 상태', 'COLLECTOR')}</small><strong>{data ? agentHeartbeatLabel(data.agent.status, locale, effectiveStale) : t(locale, '대기 중', 'WAITING')}</strong><span>{data?.latestObservedAt ? formatDateTime(data.latestObservedAt, locale) : '—'}</span></div>
             <div><small>{t(locale, '위험 / 주의', 'DANGER / CAUTION')}</small><strong><b className="strip-danger">{counts.danger}</b> / <b className="strip-caution">{counts.caution}</b></strong><span>{t(locale, '현재 판단 항목', 'assessed findings')}</span></div>
-            <div><small>{t(locale, '서비스 위험 / 주의', 'SERVICE DANGER / CAUTION')}</small><strong><b className="strip-danger">{serviceDangerCount}</b> / <b className="strip-caution">{serviceCautionCount}</b></strong><span>{t(locale, `총 ${data?.containers.length ?? 0}개`, `${data?.containers.length ?? 0} tracked`)}</span></div>
+            <div><small>{t(locale, '서비스 위험 / 주의', 'SERVICE DANGER / CAUTION')}</small><strong>{serviceCollectionNotCurrent ? '—' : <><b className="strip-danger">{serviceDangerCount}</b> / <b className="strip-caution">{serviceCautionCount}</b></>}</strong><span>{data ? `${containerCollectionLabel(data.containerCollection.status, locale)} · ${data.containers.length.toLocaleString()}` : '—'}</span></div>
             <div><small>{t(locale, '현재 분석 범위', 'ACTIVE RANGE')}</small><strong>{locale === 'ko' ? selectedRange.ko : selectedRange.en}</strong><span>{data ? t(locale, `차트 ${data.series.length} · 원본 ${data.telemetrySummary.sampleCount}`, `${data.series.length} chart · ${data.telemetrySummary.sampleCount} raw`) : '—'}</span></div>
             <div><small>{t(locale, '화면 갱신', 'DISPLAY UPDATE')}</small><strong>{lastUpdated ? formatDateTime(lastUpdated.toISOString(), locale) : '—'}</strong><span>{t(locale, '60초마다 자동 갱신', 'automatic every 60s')}</span></div>
           </section>
@@ -446,14 +440,6 @@ export function MonitorDashboard({
           )}
 
           {error && <div className="control-notice" role="alert"><Icon name="alert" size={19} /><div><strong>{t(locale, '원격 측정 갱신 실패', 'Telemetry refresh failed')}</strong><span>{safeText(error)} {data ? t(locale, '마지막 정상 화면을 유지합니다.', 'The last good snapshot remains visible.') : ''}</span></div><button type="button" onClick={() => void refresh()}>{t(locale, '재시도', 'Retry')}</button></div>}
-
-          {normalizedPage === 'overview' && (
-            <SystemEmotionEngine
-              locale={locale}
-              model={emotionModel}
-              paused={passwordDialogOpen || helpOpen}
-            />
-          )}
 
           {normalizedPage === 'infrastructure'
             ? <InfrastructureLedger locale={locale} onUnauthorized={onUnauthorized} />

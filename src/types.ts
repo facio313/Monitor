@@ -15,6 +15,33 @@ export type MonitorDetailPage =
 export type MonitorPage = 'overview' | 'details' | MonitorDetailPage;
 export type MonitorLocale = 'ko' | 'en';
 
+export type AgentHeartbeatStatus =
+  | 'healthy'
+  | 'delayed'
+  | 'disconnected'
+  | 'maintenance'
+  | 'inactive'
+  | 'unknown'
+  | 'collection_error';
+
+export interface AgentHeartbeatSummary {
+  hostId: string | null;
+  agentId: string | null;
+  installationEpoch: string | null;
+  identityGeneration: number | null;
+  machineIdentityStatus: 'bound' | 'unavailable' | null;
+  bootId: string | null;
+  sequence: number | null;
+  observedAt: string | null;
+  receivedAt: string | null;
+  expectedIntervalSeconds: number | null;
+  lifecycle: 'active' | 'maintenance' | 'inactive' | null;
+  transport: 'local-file' | null;
+  status: AgentHeartbeatStatus;
+  ageSeconds: number | null;
+  clockSkewSeconds: number | null;
+}
+
 export interface TelemetrySample {
   timestamp: string | null;
   cpuPercent: number | null;
@@ -54,6 +81,7 @@ export interface DashboardPayload {
   range: TimeRange;
   stale: boolean;
   latestObservedAt: string | null;
+  agent: AgentHeartbeatSummary;
   host: {
     hostname: string | null;
     os: string | null;
@@ -67,6 +95,10 @@ export interface DashboardPayload {
   telemetrySummary: TelemetrySummary;
   incidents: PeakIncident[];
   disks: DiskUsage[];
+  containerCollection: {
+    status: 'fresh' | 'last-known' | 'unavailable' | 'permission-denied';
+    observedAt: string | null;
+  };
   containers: ContainerStatus[];
   currentTraffic: IncidentTraffic[];
   alerts: AlertEvent[];

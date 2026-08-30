@@ -15,6 +15,9 @@ except ImportError:  # pragma: no cover - exercised by collector integration
 
 
 SAFE_TARGET = re.compile(r"[^a-zA-Z0-9_.:/-]+")
+OPAQUE_UUID = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}"
+)
 CONTAINER_RULES = frozenset({
     "ContainerDown", "ContainerRestartLoop", "ContainerOOMKilled", "ContainerUnhealthy",
     "ContainerCpuHigh", "ContainerCpuThrottlingHigh", "ContainerMemoryNearLimit",
@@ -82,11 +85,19 @@ def observations_for_snapshot(pack: RulePack, snapshot: Mapping[str, Any]) -> di
     healthy.  This is also the compatibility behavior for older snapshots.
     """
 
+    identity = _mapping(snapshot.get("identity"))
     host = _mapping(snapshot.get("host"))
     latest = _mapping(snapshot.get("latest"))
     system = _mapping(snapshot.get("system"))
     kernel = _mapping(system.get("kernel"))
-    host_target = _target("host", host.get("hostname"), "local")
+    host_id = identity.get("hostId")
+    if not isinstance(host_id, str) or OPAQUE_UUID.fullmatch(host_id) is None:
+        host_id = None
+    host_target = _target(
+        "host",
+        host_id or host.get("hostname"),
+        "local",
+    )
     result: dict[str, list[Observation]] = {
         rule.rule_id: [Observation(host_target, None, "unsupported")]
         for rule in pack.rules

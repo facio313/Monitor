@@ -22,17 +22,13 @@
   min-height: 100vh;
   color: var(--control-text);
   background:
-    radial-gradient(circle at 74% -10%, var(--emotion-primary-soft, rgb(50 130 120 / 12%)), transparent 34rem),
-    radial-gradient(circle at 12% 38%, var(--emotion-secondary-soft, transparent), transparent 42rem),
-    linear-gradient(180deg, color-mix(in srgb, var(--emotion-bg, #081210) 72%, #081210), var(--control-bg) 34rem);
+    radial-gradient(circle at 74% -10%, rgb(50 130 120 / 12%), transparent 34rem),
+    linear-gradient(180deg, #081210, var(--control-bg) 34rem);
   font-family: Inter, Pretendard, "Noto Sans KR", "Apple SD Gothic Neo", "Malgun Gothic", system-ui, sans-serif;
   font-size: 14px;
   line-height: 1.5;
   font-variant-numeric: tabular-nums;
 }
-.control-room[data-mood="critical"] .control-topbar,
-.control-room[data-mood="strained"] .control-topbar { border-bottom-color: color-mix(in srgb, var(--emotion-warning) 30%, var(--control-border)); }
-.control-room[data-mood="critical"] .control-rail { border-right-color: color-mix(in srgb, var(--emotion-warning) 24%, var(--control-border)); }
 
 .control-room button,
 .control-room input,
@@ -185,19 +181,6 @@
 .refresh-control { padding: 0 14px; display: flex; align-items: center; gap: 8px; font-weight: 750; cursor: pointer; }
 .refresh-control:disabled { opacity: .6; cursor: wait; }
 
-/* The affect engine is a secondary, pure particle surface. Authoritative
-   readings and actions remain in the operational panels that precede it. */
-.system-emotion-engine {
-  height: clamp(150px, 13vw, 200px);
-  margin: 0 0 18px;
-  display: block;
-  position: relative;
-  isolation: isolate;
-  overflow: hidden;
-  border-radius: 14px;
-  background: var(--emotion-bg, #07100f);
-}
-.system-emotion-canvas { width: 100%; height: 100%; display: block; position: absolute; inset: 0; pointer-events: none; }
 .system-strip {
   margin: 28px 0 18px;
   display: grid;
@@ -549,7 +532,14 @@
 .cockpit-check { min-width: 0; min-height: 72px; padding: 11px; display: flex; align-items: center; gap: 10px; border: 1px solid var(--control-border); border-radius: 8px; background: #091411; }
 .cockpit-check > span { width: 28px; height: 28px; display: grid; place-items: center; flex: 0 0 auto; border-radius: 7px; color: #07100f; background: var(--control-green); font-weight: 900; }
 .cockpit-check.check-danger > span { background: var(--control-red); }
+.cockpit-check.check-caution > span { color: #1b1402; background: var(--control-yellow); }
 .cockpit-check.check-unknown > span { background: var(--control-faint); }
+.collection-source-state { margin: 0 0 12px; padding: 10px 12px; display: flex; align-items: center; gap: 9px; border: 1px solid var(--control-border); border-radius: 7px; background: var(--control-panel-soft); }
+.collection-source-state > span { min-width: 0; display: grid; gap: 2px; }
+.collection-source-state strong { font-size: 12px; }
+.collection-source-state small { color: var(--control-muted); font-size: 10px; }
+.collection-source-state.source-caution { border-color: color-mix(in srgb, var(--control-yellow) 55%, var(--control-border)); }
+.collection-source-state.source-danger { border-color: color-mix(in srgb, var(--control-red) 60%, var(--control-border)); }
 .cockpit-check div { min-width: 0; display: grid; }
 .cockpit-check strong { font-size: 12px; }
 .cockpit-check small { color: var(--control-muted); font-size: 10px; }
@@ -973,7 +963,6 @@
   .control-footer { padding-left: clamp(18px, 2.5vw, 42px); }
   .detail-two-column { grid-template-columns: 1fr; }
   .detail-two-column > * { grid-column: auto !important; }
-  .system-emotion-engine { height: 180px; }
 }
 
 @media (max-width: 820px) {
@@ -1017,13 +1006,6 @@
   .update-package-list > div { grid-template-columns: minmax(130px, .8fr) minmax(180px, 1fr); }
   .update-package-list small { display: none; }
   .control-skeleton { grid-template-columns: 1fr; }
-}
-
-@media (max-width: 640px) {
-  .system-emotion-engine {
-    height: clamp(140px, 42vw, 180px);
-    margin-bottom: 16px;
-  }
 }
 
 @media (max-width: 560px) {

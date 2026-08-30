@@ -4,6 +4,7 @@ import { describe, expect, it } from 'vitest';
 import type { ContainerStatus, DashboardPayload, DiskUsage, SystemEventCount, SystemKernelStatus, SystemPcieStatus } from '../types';
 import {
   containerUtilizationChartRows,
+  ContainersWidget,
   ContainerStatusTable,
   CurrentTrafficWidget,
   currentBootReliabilitySignals,
@@ -60,6 +61,24 @@ function pcie(overrides: Partial<SystemPcieStatus> = {}): SystemPcieStatus {
 
 function reliabilityPayload(): DashboardPayload {
   return {
+    stale: false,
+    agent: {
+      hostId: '11111111-1111-4111-8111-111111111111',
+      agentId: '22222222-2222-4222-8222-222222222222',
+      installationEpoch: '2026-08-29T00:00:00Z',
+      identityGeneration: 1,
+      machineIdentityStatus: 'bound',
+      bootId: '0123456789abcdef0123456789abcdef',
+      sequence: 10,
+      observedAt: '2026-08-30T00:00:00Z',
+      receivedAt: '2026-08-30T00:00:00Z',
+      expectedIntervalSeconds: 60,
+      lifecycle: 'active',
+      transport: 'local-file',
+      status: 'healthy',
+      ageSeconds: 5,
+      clockSkewSeconds: 0,
+    },
     reliability: {
       sshListenersAvailable: true,
       networkLinkAvailable: true,
@@ -81,6 +100,7 @@ function reliabilityPayload(): DashboardPayload {
       memoryBytes: 128_000_000,
       memoryPercent: 2.5,
     }],
+    containerCollection: { status: 'fresh', observedAt: '2026-08-30T00:00:00Z' },
   } as unknown as DashboardPayload;
 }
 
@@ -100,6 +120,8 @@ describe('current-boot reliability presentation', () => {
     }));
 
     expect(compact).toContain('SSH 접속 경로');
+    expect(compact).toContain('수집기 하트비트');
+    expect(compact).toContain('실시간');
     expect(compact).toContain('주 네트워크');
     expect(compact).not.toContain('현재 부팅의 커널·장치 사건');
     expect(compact).not.toContain('reliability-signal-grid');
@@ -123,6 +145,27 @@ describe('current-boot reliability presentation', () => {
     expect(markup).toContain('monitor');
     expect(markup).toContain('running');
     expect(markup).toContain('상세');
+  });
+
+  it('never presents Docker collection failure as zero healthy services', () => {
+    const data = reliabilityPayload();
+    data.containerCollection = { status: 'permission-denied', observedAt: null };
+    data.containers = [];
+    const widget = renderToStaticMarkup(createElement(ContainersWidget, {
+      data,
+      locale: 'en',
+      onOpen: () => undefined,
+    }));
+    const table = renderToStaticMarkup(createElement(ContainerStatusTable, {
+      data,
+      locale: 'en',
+      grouped: true,
+    }));
+
+    expect(widget).toContain('Service collection denied');
+    expect(widget).toContain('This is not treated as zero services');
+    expect(table).toContain('Do not interpret this empty list as healthy');
+    expect(table).not.toContain('<table');
   });
 
   it('treats configured and negotiated Gen1 x1 as nominal even when the endpoint advertises more', () => {

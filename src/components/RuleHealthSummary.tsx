@@ -148,7 +148,7 @@ function evaluatorCopy(
     tone: 'firing',
     badge: t(locale, '확인 필요', 'ACTION'),
     title: t(locale, `${firingCount}개 규칙이 발화 중입니다`, firingCount === 1 ? '1 rule is firing' : `${firingCount} rules are firing`),
-    detail: t(locale, '규칙 엔진의 지속 조건을 충족한 항목만 표시합니다. 기존 화면 판단과 별도 신호입니다.', 'Only rules that met evaluator duration conditions are shown. This signal remains separate from the existing screen assessment.'),
+    detail: t(locale, '규칙 엔진의 지속 조건을 충족한 항목이며 전체 운영 상태에도 반영됩니다.', 'These rules met evaluator duration conditions and are included in the overall operating state.'),
   } as const;
   if (counts.recovering) return {
     tone: 'recovering',

@@ -39,7 +39,7 @@ describe('monitor overview composition', () => {
     });
   });
 
-  it('puts operating status before the secondary canvas and names mobile icon controls', () => {
+  it('puts operating status first and names mobile icon controls', () => {
     vi.stubGlobal('window', {
       localStorage: { getItem: () => 'en', setItem: () => undefined },
       location: { search: '' },
@@ -68,17 +68,16 @@ describe('monitor overview composition', () => {
     expect(markup).toContain('aria-label="Overview"');
     expect(markup).toContain('aria-label="Change password"');
     expect(markup).toContain('aria-label="Sign out"');
-    expect(markup.indexOf('class="system-strip')).toBeLessThan(markup.indexOf('class="system-emotion-engine"'));
+    expect(markup).toContain('class="system-strip');
   });
 
-  it('keeps the secondary canvas compact and restores the mobile traffic table as a scroller', () => {
+  it('keeps operational evidence above the dashboard and restores the mobile traffic table as a scroller', () => {
     const css = readFileSync(new URL('../monitor-dashboard.css', import.meta.url), 'utf8');
     const source = readFileSync(new URL('./MonitorDashboard.tsx', import.meta.url), 'utf8');
     const overviewComposition = source.slice(source.lastIndexOf('return (\n    <div className="control-room"'));
 
-    expect(css).toMatch(/\.system-emotion-engine\s*\{[^}]*height: clamp\(150px, 13vw, 200px\)/s);
     expect(css).toMatch(/\.current-traffic-table\.table-wrap\s*\{[^}]*display: block;[^}]*overflow-x: auto;/s);
     expect(overviewComposition.indexOf('<OperationalHealthOverview')).toBeLessThan(overviewComposition.indexOf('<RuleHealthSummary'));
-    expect(overviewComposition.indexOf('<RuleHealthSummary')).toBeLessThan(overviewComposition.indexOf('<SystemEmotionEngine'));
+    expect(overviewComposition.indexOf('<RuleHealthSummary')).toBeLessThan(overviewComposition.indexOf('<AdaptiveGrid'));
   });
 });

@@ -12,9 +12,25 @@ starts. Neither helper changes Docker or host configuration.
 
 The default output root is `/var/lib/monitor-export`:
 
-- `current.json`: atomically replaced snapshot with exactly the public keys
-  `generatedAt`, `host`, `latest`, `disks`, `containers`,
-  `containerCollection`, `currentTraffic`, `reliability`, and `system`.
+- `current.json`: atomically replaced schema-version-2 snapshot with exactly the
+  public keys `schemaVersion`, `generatedAt`, `identity`, `heartbeat`, `host`,
+  `latest`, `disks`, `containers`, `containerCollection`, `currentTraffic`,
+  `reliability`, and `system`.
+  `identity` contains only random UUIDv4 `hostId` and `agentId`, their
+  `installationEpoch`, an `identityGeneration`, `machineIdentityStatus`, and a
+  nullable 32-hex `bootId`. The IDs remain stable across ordinary collector and
+  host restarts. The raw Linux machine ID and boot UUID are never exported:
+  machine binding uses a domain-separated SHA-256 hash in the owner-only state,
+  and the public boot value is a separate domain-separated 128-bit BLAKE2s
+  digest that changes with the Linux boot ID.
+  `heartbeat` is exactly `sequence`, `observedAt`, `receivedAt`,
+  `expectedIntervalSeconds`, `lifecycle`, and `transport`. For the current
+  same-host path, `transport` is `local-file` and `receivedAt` equals
+  `observedAt`; it does not imply a network receipt. Sequence state is committed
+  before the matching snapshot, so a later publication failure leaves an
+  observable gap rather than reusing a number. The interval defaults to 60
+  seconds and is clamped to 10–86,400 seconds. Lifecycle is the operator-set
+  `active`, `maintenance`, or `inactive` value.
   `containerCollection` distinguishes a fresh Docker observation from a
   bounded last-known snapshot, source unavailability, or permission denial;
   stale workloads are never presented as current evidence.
@@ -48,7 +64,8 @@ The default output root is `/var/lib/monitor-export`:
   `reliability` contains only the calculated boot time, the prior collector
   heartbeat gap, expected SSH-listener availability, primary physical-link
   availability, and runtime NVMe power-management mitigation state. The boot
-  ID used to detect a restart stays in private collector state.
+  UUID used to detect a restart stays in private collector state; only the
+  reduced public `identity.bootId` digest described above leaves that state.
   `system` is a fixed, serial-free snapshot containing running/latest-installed
   kernel versions, bootloader channel/dates, NVMe model/firmware, collector
   version, configured/negotiated PCIe link properties, AER counters/status,
@@ -122,8 +139,38 @@ The default output root is `/var/lib/monitor-export`:
   working directory, open files, client address, user identity, URI/query,
   referrer, user agent, or cookie data.
 
+Stable collector identity lives at
+`.state/collector-identity.json` as an exact-schema, mode-`0600`, owner-only
+file. It contains the two public UUIDs, installation epoch, generation,
+sequence, last observation time, and only the domain-separated SHA-256 hash of
+a valid `/etc/machine-id`. When both the retained and current machine hashes are
+available and differ, the next run treats the state as a copied installation:
+it creates new host and agent UUIDs, increments `identityGeneration`, resets
+`sequence` to 1, and resets the installation epoch. `unavailable` means no valid
+binding has yet been established. A temporarily unreadable current machine ID
+does not discard a retained binding, but automatic clone comparison requires
+both hashes. Unsafe permissions, links, size, JSON, or schema fail closed
+instead of silently replacing an established identity.
+
+The Express reader independently validates the exact public identity and
+heartbeat shapes. For the only supported `local-file` transport,
+`generatedAt`, `observedAt`, and `receivedAt` must be identical. A legacy
+snapshot with neither identity nor heartbeat is `unknown`; a partial,
+extra-field, invalid, or mismatched contract is `collection_error`. Explicit
+`maintenance` and `inactive` lifecycle values take
+precedence. Otherwise an active heartbeat becomes `delayed` after the greater
+of 90 seconds or two expected intervals, and `disconnected` after the greater
+of the application stale threshold or five expected intervals. These are
+same-host display semantics, not proof that a remote server received a batch.
+
+This identity increment is deliberately local in scope. It does not implement
+central host registration or enrollment, mTLS, a bounded offline transmit
+spool with acknowledgement/retry, central duplicate/out-of-order merge, or an
+administrator lifecycle workflow. `MONITOR_AGENT_LIFECYCLE` is a reviewed host
+configuration value, not an admin API or UI.
+
 Durable server-watch, kernel, privilege, and request cursors live under the
-hidden output `.state` directory. Before changing alerts, power events,
+same hidden output `.state` directory. Before changing alerts, power events,
 privilege events, or their cursors, the collector stages only the new reduced
 rows, next cursors, limits, and each output's canonical base/final digest in the
 bounded mode-`0600` `.state/pending-sanitized-log-commit.json`. Replay compares
@@ -375,6 +422,13 @@ production unit also pins direct Docker sockets to empty, the exact reduced
 container input, the process UID set, and the request source on its command
 line. Edit other input/output or threshold values after installation, then run:
 
+- `MONITOR_EXPECTED_INTERVAL_SECONDS=60` declares the intended heartbeat
+  cadence and is clamped to 10–86,400 seconds; it does not change the systemd
+  timer by itself.
+- `MONITOR_AGENT_LIFECYCLE=active` may be changed only to `maintenance` or
+  `inactive`. This labels new heartbeats but does not stop collection, register
+  the change centrally, or provide an administrator approval/history workflow.
+
 ```sh
 sudo systemctl restart monitor-collector.service
 ```
@@ -481,7 +535,8 @@ Uninstall deliberately preserves `/var/lib/monitor-export`,
 `/etc/default/monitor-collector`, `/home/cks/.local/state/monitor-auth`, and
 `/home/cks/backups/monitor-auth`. Remove those separately only after deciding
 the retained telemetry, authentication recovery, and configuration value is no
-longer needed.
+longer needed. The retained export includes the private collector identity, so
+an ordinary reinstall keeps the same host/agent UUIDs and sequence continuity.
 
 The traffic uninstaller first enables the independent retention timer, then
 removes and reloads the Nginx request-log configuration and disables the

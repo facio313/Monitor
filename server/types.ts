@@ -2,6 +2,33 @@ export const DASHBOARD_RANGES = ['1h', '24h', '7d', '30d'] as const;
 
 export type DashboardRange = (typeof DASHBOARD_RANGES)[number];
 
+export type AgentHeartbeatStatus =
+  | 'healthy'
+  | 'delayed'
+  | 'disconnected'
+  | 'maintenance'
+  | 'inactive'
+  | 'unknown'
+  | 'collection_error';
+
+export interface AgentHeartbeatSummary {
+  hostId: string | null;
+  agentId: string | null;
+  installationEpoch: string | null;
+  identityGeneration: number | null;
+  machineIdentityStatus: 'bound' | 'unavailable' | null;
+  bootId: string | null;
+  sequence: number | null;
+  observedAt: string | null;
+  receivedAt: string | null;
+  expectedIntervalSeconds: number | null;
+  lifecycle: 'active' | 'maintenance' | 'inactive' | null;
+  transport: 'local-file' | null;
+  status: AgentHeartbeatStatus;
+  ageSeconds: number | null;
+  clockSkewSeconds: number | null;
+}
+
 export interface TelemetrySample {
   timestamp: string;
   cpuPercent: number | null;
@@ -209,6 +236,7 @@ export interface DashboardResponse {
   range: DashboardRange;
   stale: boolean;
   latestObservedAt: string | null;
+  agent: AgentHeartbeatSummary;
   host: {
     hostname: string | null;
     os: string | null;

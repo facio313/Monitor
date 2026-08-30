@@ -152,6 +152,7 @@ describe('collector to server contract', () => {
     writeFileSync(join(sysRoot, 'class', 'thermal', 'thermal_zone0', 'temp'), '45500\n');
     writeFileSync(join(sysRoot, 'class', 'hwmon', 'hwmon4', 'name'), 'rpi_volt\n');
     writeFileSync(join(sysRoot, 'class', 'hwmon', 'hwmon4', 'in0_lcrit_alarm'), '0\n');
+    writeFileSync(join(etcRoot, 'machine-id'), '0123456789abcdef0123456789abcdef\n');
     writeFileSync(join(etcRoot, 'os-release'), 'PRETTY_NAME="Contract Fixture Linux"\n');
     writeFileSync(join(etcRoot, 'default', 'rpi-eeprom-update'), 'FIRMWARE_RELEASE_STATUS="default"\n');
 
@@ -262,6 +263,22 @@ describe('collector to server contract', () => {
     const incidentPath = join(outputRoot, 'incidents.jsonl');
     const current = JSON.parse(readFileSync(currentPath, 'utf8')) as {
       generatedAt: string;
+      identity: {
+        hostId: string;
+        agentId: string;
+        installationEpoch: string;
+        identityGeneration: number;
+        machineIdentityStatus: 'bound' | 'unavailable';
+        bootId: string | null;
+      };
+      heartbeat: {
+        sequence: number;
+        observedAt: string;
+        receivedAt: string;
+        expectedIntervalSeconds: number;
+        lifecycle: 'active' | 'maintenance' | 'inactive';
+        transport: 'local-file';
+      };
       containerCollection: {
         status: 'fresh' | 'last-known' | 'unavailable' | 'permission-denied';
         observedAt: string | null;
@@ -321,6 +338,21 @@ describe('collector to server contract', () => {
     const dashboard = readDashboard(outputRoot, '1h', now, 120_000);
 
     expect(dashboard.latestObservedAt).toBe(new Date(current.generatedAt).toISOString());
+    expect(dashboard.agent).toEqual({
+      ...current.identity,
+      ...current.heartbeat,
+      installationEpoch: new Date(current.identity.installationEpoch).toISOString(),
+      observedAt: new Date(current.heartbeat.observedAt).toISOString(),
+      receivedAt: new Date(current.heartbeat.receivedAt).toISOString(),
+      status: 'healthy',
+      ageSeconds: 0,
+      clockSkewSeconds: 0,
+    });
+    expect(dashboard.agent.hostId).toMatch(/^[0-9a-f-]{36}$/);
+    expect(dashboard.agent.agentId).toMatch(/^[0-9a-f-]{36}$/);
+    expect(dashboard.agent.machineIdentityStatus).toBe('bound');
+    expect(dashboard.agent.bootId).toMatch(/^[0-9a-f]{32}$/);
+    expect(JSON.stringify(dashboard.agent)).not.toContain('0123456789abcdef0123456789abcdef');
     expect(Object.keys(dashboard.latest)).toEqual(LATEST_FIELDS);
     expect(dashboard.latest).toMatchObject({
       memoryPercent: 75,

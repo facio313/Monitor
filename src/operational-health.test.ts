@@ -62,6 +62,23 @@ function payload(): DashboardPayload {
     range: '24h',
     stale: false,
     latestObservedAt: '2026-08-30T00:00:00Z',
+    agent: {
+      hostId: '11111111-1111-4111-8111-111111111111',
+      agentId: '22222222-2222-4222-8222-222222222222',
+      installationEpoch: '2026-08-29T00:00:00Z',
+      identityGeneration: 1,
+      machineIdentityStatus: 'bound',
+      bootId: '0123456789abcdef0123456789abcdef',
+      sequence: 10,
+      observedAt: '2026-08-30T00:00:00Z',
+      receivedAt: '2026-08-30T00:00:00Z',
+      expectedIntervalSeconds: 60,
+      lifecycle: 'active',
+      transport: 'local-file',
+      status: 'healthy',
+      ageSeconds: 5,
+      clockSkewSeconds: 0,
+    },
     host: { hostname: 'host', os: 'Linux', architecture: 'arm64', logicalCpuCount: 4, uptimeSeconds: 3_600 },
     reliability: {
       bootStartedAt: '2026-08-29T00:00:00Z',
@@ -89,6 +106,7 @@ function payload(): DashboardPayload {
     },
     incidents: [],
     disks: [{ mount: '/', totalBytes: 100, usedBytes: 40, availableBytes: 60, usedPercent: 40, inodeUsedPercent: 10, readOnly: false }],
+    containerCollection: { status: 'fresh', observedAt: '2026-08-30T00:00:00Z' },
     containers: [],
     currentTraffic: [],
     alerts: [],
@@ -187,7 +205,7 @@ describe('operational health assessment', () => {
     expect(operationalFindings(payload())).toEqual([]);
   });
 
-  it('keeps evaluator rules separate from client heuristic findings', () => {
+  it('includes evaluator rules in the authoritative overall assessment', () => {
     const data = payload();
     data.ruleEvaluation = {
       schemaVersion: 1,
@@ -216,7 +234,48 @@ describe('operational health assessment', () => {
       },
     };
 
-    expect(operationalFindings(data)).toEqual([]);
+    expect(operationalFindings(data)).toEqual([
+      expect.objectContaining({
+        id: 'rule-evaluation',
+        level: 'caution',
+        scope: 'current',
+        count: 1,
+      }),
+    ]);
+
+    data.ruleEvaluation.states['CpuUsageHigh:host/node-a']!.severity = 'critical';
+    expect(operationalFindings(data)).toEqual([
+      expect.objectContaining({ id: 'rule-evaluation', level: 'danger' }),
+    ]);
+  });
+
+  it('distinguishes collector and service inventory failures from an empty nominal host', () => {
+    const disconnected = payload();
+    disconnected.agent.status = 'disconnected';
+    disconnected.agent.ageSeconds = 301;
+    expect(operationalFindings(disconnected)).toEqual([
+      expect.objectContaining({ id: 'agent-heartbeat', level: 'danger' }),
+    ]);
+
+    const denied = payload();
+    denied.containerCollection = { status: 'permission-denied', observedAt: null };
+    denied.containers = [];
+    expect(operationalFindings(denied)).toEqual([
+      expect.objectContaining({ id: 'service-collection', level: 'danger' }),
+    ]);
+
+    const lastKnown = payload();
+    lastKnown.containerCollection = {
+      status: 'last-known',
+      observedAt: '2026-08-29T23:59:00Z',
+    };
+    expect(operationalFindings(lastKnown)).toEqual([
+      expect.objectContaining({
+        id: 'service-collection',
+        level: 'caution',
+        scope: 'last-known',
+      }),
+    ]);
   });
 
   it('separates currently stale telemetry from a recovered historical collection gap', () => {
@@ -353,6 +412,28 @@ describe('operational health assessment', () => {
       scope: 'current',
       count: 2,
       evidence: ['위험 0개 · 주의 2개', '0 danger · 2 caution'],
+    });
+  });
+
+  it('never promotes a last-known failed service to a current danger signal', () => {
+    const data = payload();
+    data.containerCollection = {
+      status: 'last-known',
+      observedAt: '2026-08-29T23:58:00Z',
+    };
+    data.containers = [
+      { name: 'old-failure', owner: null, state: 'exited', health: 'unhealthy', cpuPercent: 0, memoryBytes: 0, memoryPercent: 0 },
+    ];
+
+    const findings = operationalFindings(data);
+    expect(findings.find((finding) => finding.id === 'service-collection')).toMatchObject({
+      level: 'caution',
+      scope: 'last-known',
+    });
+    expect(findings.find((finding) => finding.id === 'service-fault')).toMatchObject({
+      level: 'caution',
+      scope: 'last-known',
+      lastObservedAt: '2026-08-29T23:58:00Z',
     });
   });
 

@@ -7,6 +7,9 @@ export type LocalizedText = readonly [korean: string, english: string];
 
 export type OperationalFindingId =
   | 'collection-stale'
+  | 'agent-heartbeat'
+  | 'service-collection'
+  | 'rule-evaluation'
   | 'collection-gap'
   | 'service-fault'
   | 'resource-pressure'
@@ -61,6 +64,57 @@ const DEFINITIONS: Record<OperationalFindingId, OperationalFindingDefinition> = 
       ['Monitor 수집 타이머와 마지막 실행 결과를 확인합니다.', 'Check the Monitor collector timer and its most recent run result.'],
       ['수집 로그의 권한·디스크 공간·입력 파일 오류를 확인합니다.', 'Inspect collection logs for permission, disk-space, or input-file errors.'],
       ['수집이 복구된 뒤 새 생성 시각이 계속 증가하는지 확인합니다.', 'After recovery, verify that the generated timestamp keeps advancing.'],
+    ],
+  },
+  'agent-heartbeat': {
+    id: 'agent-heartbeat',
+    page: 'reliability',
+    priority: 1,
+    title: ['수집기 연결 상태 확인', 'Collector heartbeat needs review'],
+    summary: ['수집기 하트비트가 지연·중단됐거나 명시적으로 비활성 상태입니다.', 'The collector heartbeat is delayed, disconnected, or explicitly inactive.'],
+    problem: ['수집기 연결 상태가 정상이 아니면 화면의 수치와 사건 기록이 현재 호스트 상태를 빠뜨릴 수 있습니다.', 'When the collector connection is not healthy, displayed readings and incident records can miss the current host state.'],
+    symptoms: [
+      ['하트비트 순번 또는 관측 시각이 증가하지 않거나 수집 상태가 지연·중단·오류로 표시됩니다.', 'The heartbeat sequence or observation time stops advancing, or collection shows delayed, disconnected, or error.'],
+      ['유지보수·비활성 상태라면 새 원격 측정이 의도적으로 멈출 수 있습니다.', 'Maintenance or inactive lifecycle can intentionally stop new telemetry.'],
+    ],
+    resolutions: [
+      ['수집 타이머와 마지막 실행 결과, 출력 디렉터리 권한을 확인합니다.', 'Check the collector timer, its last result, and output-directory permissions.'],
+      ['호스트 ID·에이전트 ID가 예상 설치와 일치하고 하트비트 순번이 계속 증가하는지 확인합니다.', 'Confirm the host and agent IDs match the expected installation and that the heartbeat sequence advances.'],
+      ['계획된 유지보수가 아니라면 수집기를 복구한 뒤 새 표본과 규칙 평가가 함께 갱신되는지 확인합니다.', 'If this is not planned maintenance, restore the collector and verify both samples and rule evaluation refresh.'],
+    ],
+  },
+  'service-collection': {
+    id: 'service-collection',
+    page: 'containers',
+    priority: 2,
+    title: ['서비스 수집 상태 확인', 'Service collection needs review'],
+    summary: ['컨테이너 목록이 비어 있는 것이 아니라 Docker 관측이 오래됐거나 실패했을 수 있습니다.', 'An empty service list may mean Docker observation is stale or failed, not that no services exist.'],
+    problem: ['수집 실패를 0개 정상 서비스로 해석하면 실제 중단·재시작·비정상 상태를 놓칠 수 있습니다.', 'Treating collection failure as zero healthy services can hide real outages, restarts, or unhealthy states.'],
+    symptoms: [
+      ['서비스 수집이 마지막 상태·권한 부족·수집 불가로 표시됩니다.', 'Service collection reports last-known, permission denied, or unavailable.'],
+      ['서비스 개수가 갑자기 0으로 보이지만 Docker 자체 상태는 확인되지 않습니다.', 'The service count suddenly appears as zero while Docker itself is unverified.'],
+    ],
+    resolutions: [
+      ['Docker 소켓 접근 권한과 제한된 수집 프록시 상태를 확인합니다.', 'Check Docker socket access and the restricted collection proxy.'],
+      ['마지막 관측 시각과 다음 수집에서 fresh 상태로 회복되는지 확인합니다.', 'Check the last observation time and whether the next collection returns to fresh.'],
+      ['수집이 복구될 때까지 마지막 상태를 현재 상태로 단정하지 않습니다.', 'Do not present last-known service state as current until collection recovers.'],
+    ],
+  },
+  'rule-evaluation': {
+    id: 'rule-evaluation',
+    page: 'reliability',
+    priority: 2,
+    title: ['지속 규칙 평가 확인', 'Rule evaluation needs review'],
+    summary: ['발화·회복 중인 규칙 또는 규칙 평가 범위 오류가 있습니다.', 'Rules are firing or recovering, or evaluator coverage has an error.'],
+    problem: ['지속 조건을 충족한 규칙과 평가기 장애가 전체 상태에서 빠지면 정상으로 오인할 수 있습니다.', 'If persistent rule signals or evaluator failures are omitted from overall state, the system can be mistaken for nominal.'],
+    symptoms: [
+      ['규칙 카드가 firing·recovering·collection error·permission denied 상태를 표시합니다.', 'Rule cards report firing, recovering, collection error, or permission denied.'],
+      ['전체 상태와 규칙 평가 상태가 서로 다르게 보일 수 있습니다.', 'Overall status and rule-evaluator status can otherwise disagree.'],
+    ],
+    resolutions: [
+      ['발화 규칙의 대상·관측값·열린 시각과 안전 확인 절차를 검토합니다.', 'Review each firing rule target, value, opened time, and safe runbook.'],
+      ['평가 오류라면 규칙 팩과 평가 출력 파일의 권한·스키마·최신성을 확인합니다.', 'For evaluator errors, check rule-pack and output-file permissions, schema, and freshness.'],
+      ['복구 표본 수를 충족해 resolved 전이가 기록되는지 확인합니다.', 'Verify recovery samples complete and a resolved transition is recorded.'],
     ],
   },
   'collection-gap': {
@@ -462,17 +516,95 @@ export function operationalFindings(data: DashboardPayload): OperationalFinding[
     ));
   }
 
+  const agent = data.agent;
+  if (agent && agent.status !== 'healthy') {
+    const agentDanger = agent.status === 'disconnected' || agent.status === 'collection_error';
+    const age = typeof agent.ageSeconds === 'number' && Number.isFinite(agent.ageSeconds)
+      ? `${Math.round(agent.ageSeconds)}초`
+      : '관측 시각 없음';
+    const ageEn = typeof agent.ageSeconds === 'number' && Number.isFinite(agent.ageSeconds)
+      ? `${Math.round(agent.ageSeconds)}s old`
+      : 'observation time unavailable';
+    findings.push(finding(
+      'agent-heartbeat',
+      agentDanger ? 'danger' : 'caution',
+      'current',
+      [
+        `상태 ${agent.status} · ${age}${agent.sequence == null ? '' : ` · 순번 ${agent.sequence.toLocaleString()}`}`,
+        `status ${agent.status} · ${ageEn}${agent.sequence == null ? '' : ` · sequence ${agent.sequence.toLocaleString()}`}`,
+      ],
+      1,
+      agent.receivedAt ?? data.generatedAt,
+    ));
+  }
+
+  const serviceCollection = data.containerCollection;
+  if (serviceCollection && serviceCollection.status !== 'fresh') {
+    const denied = serviceCollection.status === 'permission-denied';
+    const unavailable = serviceCollection.status === 'unavailable';
+    findings.push(finding(
+      'service-collection',
+      denied || unavailable ? 'danger' : 'caution',
+      serviceCollection.status === 'last-known' ? 'last-known' : 'current',
+      [
+        `Docker 관측 ${serviceCollection.status}${serviceCollection.observedAt ? ` · 마지막 ${serviceCollection.observedAt}` : ''}`,
+        `Docker observation ${serviceCollection.status}${serviceCollection.observedAt ? ` · last ${serviceCollection.observedAt}` : ''}`,
+      ],
+      null,
+      serviceCollection.observedAt ?? data.generatedAt,
+    ));
+  }
+
+  const ruleStates = Object.values(data.ruleEvaluation.states);
+  const activeRules = ruleStates.filter((state) => state.phase === 'firing' || state.phase === 'recovering');
+  const ruleCoverageFailures = ruleStates.filter((state) => (
+    state.phase === 'collection_error'
+    || state.phase === 'permission_denied'
+    || state.phase === 'no_data'
+  ));
+  if (activeRules.length) {
+    const firing = activeRules.filter((state) => state.phase === 'firing');
+    const recovering = activeRules.length - firing.length;
+    const lastKnown = data.stale || data.ruleEvaluation.status === 'last-known';
+    const critical = firing.filter((state) => state.severity === 'critical').length;
+    findings.push(finding(
+      'rule-evaluation',
+      !lastKnown && critical > 0 ? 'danger' : 'caution',
+      lastKnown ? 'last-known' : 'current',
+      [
+        `발화 ${firing.length.toLocaleString()} · 회복 확인 ${recovering.toLocaleString()}${critical ? ` · 심각 ${critical.toLocaleString()}` : ''}`,
+        `${firing.length.toLocaleString()} firing · ${recovering.toLocaleString()} recovering${critical ? ` · ${critical.toLocaleString()} critical` : ''}`,
+      ],
+      activeRules.length,
+      latestTimestamp(activeRules.map((state) => state.lastEvaluatedAt)),
+    ));
+  } else if (data.ruleEvaluation.status !== 'ok' || ruleCoverageFailures.length) {
+    const evaluatorError = data.ruleEvaluation.status === 'collection_error';
+    findings.push(finding(
+      'rule-evaluation',
+      evaluatorError ? 'danger' : 'caution',
+      data.ruleEvaluation.status === 'last-known' ? 'last-known' : 'current',
+      [
+        `평가 상태 ${data.ruleEvaluation.status} · 범위 오류 ${ruleCoverageFailures.length.toLocaleString()}`,
+        `evaluation ${data.ruleEvaluation.status} · ${ruleCoverageFailures.length.toLocaleString()} coverage failures`,
+      ],
+      ruleCoverageFailures.length || null,
+      data.ruleEvaluation.evaluatedAt ?? data.generatedAt,
+    ));
+  }
+
   const serviceStates = data.containers.map(operationalServiceState);
   const serviceDangerCount = serviceStates.filter((state) => state === 'danger').length;
   const serviceCautionCount = serviceStates.filter((state) => state === 'caution').length;
   if (serviceDangerCount || serviceCautionCount) {
+    const serviceEvidenceCurrent = data.containerCollection?.status === 'fresh';
     findings.push(finding(
       'service-fault',
-      serviceDangerCount ? 'danger' : 'caution',
-      snapshotScope,
+      serviceEvidenceCurrent && serviceDangerCount ? 'danger' : 'caution',
+      serviceEvidenceCurrent ? snapshotScope : 'last-known',
       [`위험 ${serviceDangerCount.toLocaleString()}개 · 주의 ${serviceCautionCount.toLocaleString()}개`, `${serviceDangerCount.toLocaleString()} danger · ${serviceCautionCount.toLocaleString()} caution`],
       serviceDangerCount + serviceCautionCount,
-      snapshotObservedAt,
+      serviceEvidenceCurrent ? snapshotObservedAt : data.containerCollection?.observedAt ?? snapshotObservedAt,
     ));
   }
 

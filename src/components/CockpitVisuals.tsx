@@ -19,6 +19,12 @@ import {
   YAxis,
 } from 'recharts';
 import {
+  agentHeartbeatDetail,
+  agentHeartbeatTone,
+  containerCollectionLabel,
+  containerCollectionTone,
+} from '../collection-status';
+import {
   eventBuckets,
   localized,
   operationalAssessmentPresentation,
@@ -558,10 +564,15 @@ export function ContainersWidget({ data, locale, onOpen }: Omit<VisualProps, 'ra
   const memoryVisible = detailVisible('memory');
   const chart = containerUtilizationChartRows(data.containers);
   const nominal = data.containers.filter((container) => containerTone(container) === 'ok').length;
+  const collection: DashboardPayload['containerCollection'] = data.containerCollection
+    ?? { status: 'unavailable', observedAt: null };
+  const collectionTone = containerCollectionTone(collection.status);
+  const currentUnavailable = collectionTone === 'danger';
   return (
-    <CockpitPanel title={t(locale, '서비스와 컨테이너', 'Services and containers')} description={t(locale, '현재 상태와 상대 자원 사용량', 'Current health and relative resource usage')} icon="server" badge={`${nominal}/${data.containers.length}`} detailPage="containers" onOpen={onOpen} locale={locale}>
+    <CockpitPanel title={t(locale, '서비스와 컨테이너', 'Services and containers')} description={t(locale, '현재 상태와 상대 자원 사용량', 'Current health and relative resource usage')} icon="server" badge={currentUnavailable ? t(locale, '수집 불가', 'UNAVAILABLE') : `${nominal}/${data.containers.length}`} detailPage="containers" onOpen={onOpen} locale={locale}>
+      {collectionTone !== 'ok' && <div className={`collection-source-state source-${collectionTone}`} role={currentUnavailable ? 'alert' : 'status'}><Icon name={currentUnavailable ? 'alert' : 'info'} size={16} /><span><strong>{containerCollectionLabel(collection.status, locale)}</strong><small>{collection.observedAt ? formatDateTime(collection.observedAt, locale) : t(locale, '현재 Docker 관측 시각 없음', 'No current Docker observation time')}</small></span></div>}
       <div className="cockpit-chart container-chart">
-        {!cpuVisible && !memoryVisible ? <SelectionEmpty locale={locale} /> : !chart.length ? <ChartEmpty locale={locale} /> : (
+        {!cpuVisible && !memoryVisible ? <SelectionEmpty locale={locale} /> : currentUnavailable ? <div className="detail-positive-empty">{t(locale, '서비스가 0개인 것으로 판단하지 않습니다. Docker 수집을 복구한 뒤 현재 목록을 확인하세요.', 'This is not treated as zero services. Restore Docker collection before using the current inventory.')}</div> : !chart.length ? <ChartEmpty locale={locale} /> : (
           <ResponsiveContainer width="100%" height="100%">
             <BarChart data={chart} layout="vertical" margin={{ top: 5, right: 12, left: 10, bottom: 0 }}>
               <CartesianGrid stroke={CHART_COLORS.grid} strokeDasharray="3 5" horizontal={false} />
@@ -629,19 +640,25 @@ export function ReliabilityWidget({ data, locale, onOpen, detailed = false }: Om
     : value
       ? available
       : unavailable;
+  const stateTone = (value: boolean | null): 'ok' | 'danger' | 'unknown' => value === true
+    ? 'ok'
+    : value === false
+      ? 'danger'
+      : 'unknown';
   const checks = [
-    { id: 'ssh', label: t(locale, 'SSH 접속 경로', 'SSH listeners'), value: summary.sshListenersAvailable, detail: stateDetail(summary.sshListenersAvailable, t(locale, '수신 포트 없음', 'No listener detected'), t(locale, '접속 경로 확인', 'Listener available')) },
-    { id: 'network', label: t(locale, '주 네트워크', 'Primary network'), value: summary.networkLinkAvailable, detail: stateDetail(summary.networkLinkAvailable, t(locale, '연결 끊김', 'Link unavailable'), t(locale, '연결 유지', 'Link available')) },
-    { id: 'nvme', label: t(locale, 'NVMe 보호 설정', 'NVMe mitigation'), value: summary.nvmeMitigationActive, detail: stateDetail(summary.nvmeMitigationActive, t(locale, '보호 설정 불완전', 'Mitigation incomplete'), t(locale, '보호 설정 적용', 'Mitigation active')) },
-    { id: 'collector-gap', label: t(locale, '수집 지연', 'Collector gap'), value: summary.collectorGapSeconds == null ? null : summary.collectorGapSeconds < 120, detail: summary.collectorGapSeconds == null ? t(locale, '보고 없음', 'Not reported') : `${Math.round(summary.collectorGapSeconds)}s` },
+    { id: 'agent-heartbeat', label: t(locale, '수집기 하트비트', 'Collector heartbeat'), tone: agentHeartbeatTone(data.agent.status, data.stale), detail: agentHeartbeatDetail(data.agent, locale) },
+    { id: 'ssh', label: t(locale, 'SSH 접속 경로', 'SSH listeners'), tone: stateTone(summary.sshListenersAvailable), detail: stateDetail(summary.sshListenersAvailable, t(locale, '수신 포트 없음', 'No listener detected'), t(locale, '접속 경로 확인', 'Listener available')) },
+    { id: 'network', label: t(locale, '주 네트워크', 'Primary network'), tone: stateTone(summary.networkLinkAvailable), detail: stateDetail(summary.networkLinkAvailable, t(locale, '연결 끊김', 'Link unavailable'), t(locale, '연결 유지', 'Link available')) },
+    { id: 'nvme', label: t(locale, 'NVMe 보호 설정', 'NVMe mitigation'), tone: stateTone(summary.nvmeMitigationActive), detail: stateDetail(summary.nvmeMitigationActive, t(locale, '보호 설정 불완전', 'Mitigation incomplete'), t(locale, '보호 설정 적용', 'Mitigation active')) },
+    { id: 'collector-gap', label: t(locale, '수집 간격', 'Collector interval'), tone: summary.collectorGapSeconds == null ? 'unknown' as const : summary.collectorGapSeconds < 120 ? 'ok' as const : 'caution' as const, detail: summary.collectorGapSeconds == null ? t(locale, '보고 없음', 'Not reported') : `${Math.round(summary.collectorGapSeconds)}s` },
   ].filter((check) => detailVisible(check.id));
   const lastBootVisible = detailVisible('last-boot');
   return (
     <CockpitPanel title={t(locale, '호스트 신뢰성', 'Host reliability')} description={t(locale, '연결·수집·저장장치 보호 상태', 'Connectivity, collection, and storage safeguards')} icon="shield" badge={`${data.reliabilityEvents.length}`} detailPage="reliability" onOpen={onOpen} locale={locale}>
       <div className="cockpit-check-grid">
         {checks.map((check) => (
-          <div key={check.label} className={`cockpit-check check-${check.value === true ? 'ok' : check.value === false ? 'danger' : 'unknown'}`}>
-            <span>{check.value === true ? '✓' : check.value === false ? '▲' : '?'}</span>
+          <div key={check.label} className={`cockpit-check check-${check.tone}`}>
+            <span>{check.tone === 'ok' ? '✓' : check.tone === 'danger' ? '▲' : check.tone === 'caution' ? '!' : '?'}</span>
             <div><strong>{check.label}</strong><small>{check.detail}</small></div>
           </div>
         ))}
@@ -655,6 +672,7 @@ export function ReliabilityWidget({ data, locale, onOpen, detailed = false }: Om
         <ReliabilitySignalGrid kernel={kernel} pcie={pcie} locale={locale} />
       </>}
       {lastBootVisible && <p className="cockpit-footnote">{t(locale, '최근 부팅', 'Last boot')} · {formatDateTime(summary.bootStartedAt, locale)}</p>}
+      {detailed && <p className="cockpit-footnote">{t(locale, '수집기', 'Collector')} · {data.agent.agentId ? safeText(data.agent.agentId.slice(0, 8), '—', 8) : '—'} · gen {data.agent.identityGeneration ?? '—'} · seq {data.agent.sequence ?? '—'}</p>}
     </CockpitPanel>
   );
 }
@@ -1006,9 +1024,14 @@ export function ContainerStatusTable({ data, locale, onOpen, grouped = false }: 
     resetKey: `${grouped ? 'grouped' : 'table'}\u001e${containerSignature}`,
   });
   const containers = paginateItems(data.containers, pagination);
+  const collection: DashboardPayload['containerCollection'] = data.containerCollection
+    ?? { status: 'unavailable', observedAt: null };
+  const collectionTone = containerCollectionTone(collection.status);
+  const currentUnavailable = collectionTone === 'danger';
   return (
     <CockpitPanel title={t(locale, '전체 서비스 상태표', 'Full service status board')} description={t(locale, '서비스별 현재 상태·CPU·메모리·소유 계정', 'Current state, CPU, memory, and owner by service')} icon="server" badge={`${data.containers.length}`} detailPage={onOpen ? 'containers' : undefined} onOpen={onOpen} locale={locale}>
-      {grouped ? <ContainerList containers={data.containers} paginationOptions={{ pageSize: 6, locale }} /> : (
+      {collectionTone !== 'ok' && <div className={`collection-source-state source-${collectionTone}`} role={currentUnavailable ? 'alert' : 'status'}><Icon name={currentUnavailable ? 'alert' : 'info'} size={16} /><span><strong>{containerCollectionLabel(collection.status, locale)}</strong><small>{collection.observedAt ? formatDateTime(collection.observedAt, locale) : t(locale, '현재 Docker 관측 시각 없음', 'No current Docker observation time')}</small></span></div>}
+      {currentUnavailable ? <div className="detail-positive-empty">{t(locale, '현재 서비스 목록을 확인할 수 없습니다. 빈 목록을 정상 상태로 해석하지 마세요.', 'The current service inventory is unavailable. Do not interpret this empty list as healthy.')}</div> : grouped ? <ContainerList containers={data.containers} paginationOptions={{ pageSize: 6, locale }} /> : (
         <>
           <div className="cockpit-table-wrap">
             <table className="cockpit-table">
