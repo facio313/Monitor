@@ -136,11 +136,11 @@ const DEFINITIONS: Record<OperationalFindingId, OperationalFindingDefinition> = 
     page: 'power',
     priority: 3,
     title: ['전원 품질 또는 제한 감지', 'Power-quality or throttling condition'],
-    summary: ['저전압 또는 성능 제한 증거가 감지되었습니다.', 'Undervoltage or performance-throttling evidence was detected.'],
-    problem: ['관측 당시 공급 전압이 불안정했거나 장치가 전원·온도 보호를 위해 성능을 제한한 증거가 있습니다.', 'The observation contains evidence of an unstable supply or device throttling for power or thermal protection.'],
+    summary: ['저전압·제한 플래그 또는 전원 이벤트가 감지되었습니다.', 'An undervoltage or throttle flag, or a power event, was detected.'],
+    problem: ['권위 있는 플래그나 이벤트에 전원 불안정 또는 전원·온도 보호에 따른 성능 제한 증거가 있습니다.', 'Authoritative flags or events contain evidence of supply instability or power/thermal protection throttling.'],
     symptoms: [
       ['성능 저하, USB·저장장치 연결 불안정 또는 예기치 않은 재부팅이 나타날 수 있습니다.', 'Performance drops, USB or storage instability, or unexpected reboots may occur.'],
-      ['전압 그래프가 기준 아래로 내려가거나 throttle 플래그가 기록됩니다.', 'The voltage chart falls below its reference or throttle flags are recorded.'],
+      ['throttle 플래그나 전원 이벤트가 기록되며, 전압 그래프는 당시 상황을 해석하는 보조 근거로 사용합니다.', 'Throttle flags or power events are recorded; the voltage chart is supporting context for that evidence.'],
     ],
     resolutions: [
       ['정격 전원 어댑터, 케이블, 커넥터와 전압 추세를 확인합니다.', 'Check the rated power supply, cable, connectors, and voltage trend.'],
@@ -545,23 +545,21 @@ export function operationalFindings(data: DashboardPayload): OperationalFinding[
     ? Math.max(0, Math.trunc(data.latest.throttledFlags))
     : 0;
   const currentThrottle = (flags & 0x0f) !== 0;
-  const historicalThrottle = flags !== 0 || data.powerSummary.underVoltageSampleCount > 0 || data.powerSummary.throttledSampleCount > 0;
-  const lowVoltage = typeof voltage === 'number' && Number.isFinite(voltage) && voltage < 4.75;
-  if (currentThrottle || historicalThrottle || lowVoltage) {
-    const powerEventTimes = data.powerEvents
-      .filter((event) => {
-        const severity = event.severity.toLowerCase();
-        const kind = (event.kind ?? '').toLowerCase();
-        const status = (event.status ?? '').toLowerCase();
-        return /(warning|critical|error)/.test(severity)
-          && status !== 'recovered'
-          && /(power|voltage|host)/.test(kind);
-      })
-      .map((event) => event.timestamp);
+  const historicalThrottle = flags !== 0
+    || data.powerSummary.underVoltageSampleCount > 0
+    || data.powerSummary.throttledSampleCount > 0;
+  const powerEvents = data.powerEvents.filter((event) => {
+    const severity = event.severity.toLowerCase();
+    const kind = (event.kind ?? '').toLowerCase();
+    const status = (event.status ?? '').toLowerCase();
+    return /(warning|critical|error)/.test(severity)
+      && status !== 'recovered'
+      && /(power|voltage|host)/.test(kind);
+  });
+  if (currentThrottle || historicalThrottle || powerEvents.length) {
+    const powerEventTimes = powerEvents.map((event) => event.timestamp);
     const powerSampleTimes = data.series
       .filter((sample) => (
-        typeof sample.supplyVoltageVolts === 'number' && sample.supplyVoltageVolts < 4.75
-      ) || (
         typeof sample.throttledFlags === 'number' && (sample.throttledFlags & 0x0f) !== 0
       ))
       .map((sample) => sample.timestamp);
@@ -569,11 +567,12 @@ export function operationalFindings(data: DashboardPayload): OperationalFinding[
     const hasRangeAnomaly = rangeAnomalyAt !== null
       || data.powerSummary.underVoltageSampleCount > 0
       || data.powerSummary.throttledSampleCount > 0;
-    const powerScope: OperationalFindingScope = currentThrottle || lowVoltage
+    const powerScope: OperationalFindingScope = currentThrottle
       ? snapshotScope
       : hasRangeAnomaly
         ? 'range'
         : bootScope;
+    const criticalPowerEventCount = powerEvents.filter((event) => /critical|error/.test(event.severity.toLowerCase())).length;
     const powerEvidenceKo = [
       (powerScope === 'current' || powerScope === 'last-known') && typeof voltage === 'number' && Number.isFinite(voltage)
         ? `${powerScope === 'current' ? '현재' : '마지막 표본'} ${voltage.toFixed(3)}V`
@@ -581,6 +580,7 @@ export function operationalFindings(data: DashboardPayload): OperationalFinding[
       flags ? `throttled 플래그 0x${flags.toString(16)}${currentThrottle ? (powerScope === 'current' ? ' (현재 제한 포함)' : ' (마지막 표본의 제한 비트)') : ' (과거 이력 비트)'}` : null,
       data.powerSummary.underVoltageSampleCount ? `저전압 표본 ${data.powerSummary.underVoltageSampleCount.toLocaleString()}건` : null,
       data.powerSummary.throttledSampleCount ? `제한 표본 ${data.powerSummary.throttledSampleCount.toLocaleString()}건` : null,
+      powerEvents.length ? `전원 이벤트 ${powerEvents.length.toLocaleString()}건${criticalPowerEventCount ? ` (위험 ${criticalPowerEventCount.toLocaleString()}건)` : ''}` : null,
     ].filter((value): value is string => Boolean(value));
     const powerEvidenceEn = [
       (powerScope === 'current' || powerScope === 'last-known') && typeof voltage === 'number' && Number.isFinite(voltage)
@@ -589,13 +589,14 @@ export function operationalFindings(data: DashboardPayload): OperationalFinding[
       flags ? `throttled flags 0x${flags.toString(16)}${currentThrottle ? (powerScope === 'current' ? ' (includes current state)' : ' (set in the last sample)') : ' (historic bits)'}` : null,
       data.powerSummary.underVoltageSampleCount ? `${data.powerSummary.underVoltageSampleCount.toLocaleString()} undervoltage samples` : null,
       data.powerSummary.throttledSampleCount ? `${data.powerSummary.throttledSampleCount.toLocaleString()} throttled samples` : null,
+      powerEvents.length ? `${powerEvents.length.toLocaleString()} power ${powerEvents.length === 1 ? 'event' : 'events'}${criticalPowerEventCount ? ` (${criticalPowerEventCount.toLocaleString()} critical)` : ''}` : null,
     ].filter((value): value is string => Boolean(value));
     findings.push(finding(
       'power-quality',
-      currentThrottle || (typeof voltage === 'number' && voltage < 4.63) ? 'danger' : 'caution',
+      currentThrottle || criticalPowerEventCount ? 'danger' : 'caution',
       powerScope,
-      [powerEvidenceKo.join(' · ') || `throttled 0x${flags.toString(16)}`, powerEvidenceEn.join(' · ') || `throttled 0x${flags.toString(16)}`],
-      Math.max(data.powerSummary.underVoltageSampleCount + data.powerSummary.throttledSampleCount, flags ? 1 : 0),
+      [powerEvidenceKo.join(' · '), powerEvidenceEn.join(' · ')],
+      Math.max(data.powerSummary.underVoltageSampleCount + data.powerSummary.throttledSampleCount, flags ? 1 : 0, powerEvents.length),
       powerScope === 'current' || powerScope === 'last-known' ? snapshotObservedAt : powerScope === 'range' ? rangeAnomalyAt : null,
     ));
   }

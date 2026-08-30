@@ -32,6 +32,9 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 
+DEFAULT_RULE_PACK_PATH = Path(__file__).resolve().parent / "rules" / "default-rules.v1.json"
+
+
 POWER_SAMPLE_FIELDS = (
     "timestamp",
     "cpuPercent",
@@ -120,6 +123,27 @@ MAX_PROCESS_STATE_ENTRIES = 8_192
 MAX_PROCESS_GROUPS = 20
 MAX_INCIDENT_CONTAINERS = 64
 MAX_CONTAINER_CPU_PERCENT = 1024.0
+MAX_CONTAINER_CPU_LIMIT_CORES = 1024.0
+MAX_CONTAINER_MEMORY_LIMIT_BYTES = MAX_SAFE_COUNTER
+MAX_CONTAINER_PID_LIMIT = MAX_SAFE_COUNTER
+MAX_DOCKER_LIST_RESPONSE_BYTES = 1 * 1024 * 1024
+MAX_DOCKER_DETAIL_RESPONSE_BYTES = 256 * 1024
+MAX_DOCKER_INSPECT_REQUESTS = 30
+MAX_DOCKER_STATS_REQUESTS = 30
+MAX_DOCKER_DETAIL_WORKERS = 6
+MAX_DOCKER_COLLECTION_SECONDS = 20.0
+LEGACY_CONTAINER_FIELDS = (
+    "name", "owner", "state", "health", "cpuPercent", "memoryBytes", "memoryPercent",
+)
+CONTAINER_FIELDS = (
+    "name", "project", "owner", "state", "health", "healthcheckConfigured",
+    "cpuPercent", "memoryBytes", "memoryPercent", "memoryLimitBytes", "cpuLimitCores",
+    "pidLimit", "restartCount", "restartCountDelta", "oomKilled", "startedAt", "finishedAt",
+)
+CONTAINER_STATES = frozenset({
+    "created", "running", "paused", "restarting", "removing", "exited", "dead", "unknown",
+})
+CONTAINER_HEALTH_STATES = frozenset({"healthy", "unhealthy", "starting", "none", "unknown"})
 ALLOWED_PROCESS_UIDS = frozenset({0, 1001})
 MAX_TRAFFIC_APPS = 16
 ALLOWED_TRAFFIC_APPS = frozenset({
@@ -139,6 +163,9 @@ MAX_PENDING_RELIABILITY_COMMIT_BYTES = 8 * 1024 * 1024
 MAX_SANITIZED_LOG_RECORD_BYTES = 4096
 MAX_CONTAINER_INPUT_BYTES = 1 * 1024 * 1024
 MAX_CONTAINER_INPUT_AGE_SECONDS = 180
+CONTAINER_COLLECTION_STATUSES = frozenset({
+    "fresh", "last-known", "unavailable", "permission-denied",
+})
 ALLOWED_COMPOSE_SERVICES = {
     ("bonifacio", "bonifacio"): "bonifacio",
     ("bonifacio", "bonifacioSso"): "sso",
@@ -165,6 +192,10 @@ ALLOWED_COMPOSE_PROJECTS = tuple(sorted({
     project for project, _service in ALLOWED_COMPOSE_SERVICES
 }))
 CURRENT_CONTAINER_NAMES = frozenset(ALLOWED_COMPOSE_SERVICES.values())
+CURRENT_CONTAINER_PROJECTS = {
+    public_name: project
+    for (project, _service), public_name in ALLOWED_COMPOSE_SERVICES.items()
+}
 LEGACY_CONTAINER_SERVICE_NAMES = frozenset({
     "bonifacio-web",
     "bonifacio-sso",
@@ -192,6 +223,12 @@ VIRTUAL_FILESYSTEMS = {
     "overlay", "proc", "pstore", "ramfs", "securityfs", "sysfs", "tmpfs",
     "tracefs",
 }
+
+
+class ContainerSourceUnavailable(RuntimeError):
+    """The bounded Docker source could not provide a complete observation."""
+
+
 LEGACY_KERNEL_EVENT_SUMMARY_KEYS = (
     "warning",
     "oops",
@@ -1551,34 +1588,73 @@ def collect_gpu(vcgencmd: str, timeout: float, sys_root: Path | None = None) -> 
     return result
 
 
+def docker_response_byte_limit(request_path: str) -> int:
+    """Return the fixed response budget without trusting Docker-provided metadata."""
+    if re.fullmatch(
+        r"/v1\.41/containers/[a-fA-F0-9]{12,64}/"
+        r"(?:json|stats\?stream=false&one-shot=true)",
+        request_path,
+    ):
+        return MAX_DOCKER_DETAIL_RESPONSE_BYTES
+    return MAX_DOCKER_LIST_RESPONSE_BYTES
+
+
 def docker_get(socket_path: Path, request_path: str, curl: str, timeout: float) -> Any:
-    if not socket_path.is_socket():
+    try:
+        socket_metadata = socket_path.stat()
+    except PermissionError:
+        raise
+    except OSError:
         return None
+    if not stat.S_ISSOCK(socket_metadata.st_mode):
+        return None
+    response_limit = docker_response_byte_limit(request_path)
     try:
         completed = subprocess.run(
             [curl, "--silent", "--show-error", "--fail", "--max-time", str(timeout),
+             "--max-filesize", str(response_limit),
              "--unix-socket", str(socket_path), "http://localhost" + request_path],
-            capture_output=True, text=True, timeout=timeout + 0.5, check=False,
+            capture_output=True, timeout=timeout + 0.5, check=False,
         )
+    except PermissionError:
+        raise
     except (OSError, subprocess.SubprocessError):
         return None
-    if completed.returncode != 0 or len(completed.stdout) > 8_388_608:
+    stdout = (
+        completed.stdout
+        if isinstance(completed.stdout, bytes)
+        else str(completed.stdout).encode("utf-8", errors="replace")
+    )
+    stderr = (
+        completed.stderr
+        if isinstance(completed.stderr, bytes)
+        else str(completed.stderr).encode("utf-8", errors="replace")
+    )
+    if completed.returncode != 0:
+        bounded_error = stderr[:256].lower()
+        if b"permission denied" in bounded_error or b"403" in bounded_error:
+            raise PermissionError("container telemetry source denied access")
+        return None
+    if len(stdout) > response_limit:
         return None
     try:
-        return json.loads(completed.stdout)
-    except json.JSONDecodeError:
+        return json.loads(stdout)
+    except (UnicodeError, json.JSONDecodeError):
         return None
 
 
 def docker_cpu_state(stats: Mapping[str, Any]) -> dict[str, int] | None:
     cpu = stats.get("cpu_stats") if isinstance(stats.get("cpu_stats"), dict) else {}
     cpu_usage = cpu.get("cpu_usage") if isinstance(cpu.get("cpu_usage"), dict) else {}
-    cpu_total = finite_number(cpu_usage.get("total_usage"))
-    system_total = finite_number(cpu.get("system_cpu_usage"))
-    if cpu_total is None or system_total is None or cpu_total < 0 or system_total < 0:
+    cpu_total = bounded_integer(cpu_usage.get("total_usage"), 0, (1 << 63) - 1)
+    system_total = bounded_integer(cpu.get("system_cpu_usage"), 0, (1 << 63) - 1)
+    if cpu_total is None or system_total is None:
         return None
-    online = int(finite_number(cpu.get("online_cpus"), 0) or len(cpu_usage.get("percpu_usage", [])) or 1)
-    return {"cpuTotal": int(cpu_total), "systemTotal": int(system_total), "onlineCpus": max(1, online)}
+    online = bounded_integer(cpu.get("online_cpus"), 1, 4096)
+    if online is None:
+        per_cpu = cpu_usage.get("percpu_usage")
+        online = len(per_cpu) if isinstance(per_cpu, list) and 1 <= len(per_cpu) <= 4096 else 1
+    return {"cpuTotal": cpu_total, "systemTotal": system_total, "onlineCpus": online}
 
 
 def docker_cpu_percent(current: Mapping[str, Any] | None, previous: Any) -> float | None:
@@ -1618,19 +1694,290 @@ def safe_container_name(raw: Mapping[str, Any], expected_project: str | None = N
     return ALLOWED_COMPOSE_SERVICES.get((project, service))
 
 
+def validated_container_inspect(
+    value: Any,
+    requested_id: str,
+    public_name: str,
+) -> Mapping[str, Any] | None:
+    """Bind an inspect response to the admitted ID and exact Compose pair."""
+    if not isinstance(value, Mapping):
+        return None
+    inspected_id = value.get("Id")
+    if (
+        not isinstance(inspected_id, str)
+        or re.fullmatch(r"[a-fA-F0-9]{12,64}", inspected_id) is None
+        or not (
+            inspected_id.lower() == requested_id.lower()
+            or (
+                len(requested_id) >= 12
+                and len(inspected_id) > len(requested_id)
+                and inspected_id.lower().startswith(requested_id.lower())
+            )
+        )
+    ):
+        return None
+    config = value.get("Config")
+    labels = config.get("Labels") if isinstance(config, Mapping) else None
+    if not isinstance(labels, Mapping):
+        return None
+    project = labels.get("com.docker.compose.project")
+    service = labels.get("com.docker.compose.service")
+    if (
+        not isinstance(project, str)
+        or not isinstance(service, str)
+        or ALLOWED_COMPOSE_SERVICES.get((project, service)) != public_name
+        or CURRENT_CONTAINER_PROJECTS.get(public_name) != project
+    ):
+        return None
+    return value
+
+
+def reduce_container_inspect(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Discard inspect secrets immediately, retaining only fixed lifecycle inputs."""
+    reduced: dict[str, Any] = {}
+    restart_count = value.get("RestartCount")
+    reduced["RestartCount"] = (
+        restart_count if isinstance(restart_count, (int, bool)) else True
+    )
+
+    raw_state = value.get("State") if isinstance(value.get("State"), Mapping) else {}
+    state: dict[str, Any] = {
+        "OOMKilled": (
+            raw_state.get("OOMKilled")
+            if isinstance(raw_state.get("OOMKilled"), bool)
+            else None
+        ),
+        "StartedAt": (
+            raw_state.get("StartedAt")
+            if isinstance(raw_state.get("StartedAt"), str) and len(raw_state["StartedAt"]) <= 64
+            else None
+        ),
+        "FinishedAt": (
+            raw_state.get("FinishedAt")
+            if isinstance(raw_state.get("FinishedAt"), str) and len(raw_state["FinishedAt"]) <= 64
+            else None
+        ),
+    }
+    raw_health = raw_state.get("Health") if isinstance(raw_state.get("Health"), Mapping) else None
+    if raw_health is not None:
+        health_status = raw_health.get("Status")
+        state["Health"] = {
+            "Status": (
+                health_status.lower()
+                if isinstance(health_status, str)
+                and health_status.lower() in {"healthy", "unhealthy", "starting"}
+                else None
+            )
+        }
+    reduced["State"] = state
+
+    raw_config = value.get("Config") if isinstance(value.get("Config"), Mapping) else {}
+    config: dict[str, Any] = {}
+    if "Healthcheck" in raw_config:
+        raw_healthcheck = raw_config.get("Healthcheck")
+        if raw_healthcheck is None or raw_healthcheck == {}:
+            config["Healthcheck"] = raw_healthcheck
+        elif isinstance(raw_healthcheck, Mapping):
+            raw_test = raw_healthcheck.get("Test")
+            if isinstance(raw_test, list) and not raw_test:
+                config["Healthcheck"] = {"Test": []}
+            elif (
+                isinstance(raw_test, list)
+                and len(raw_test) <= 32
+                and all(isinstance(item, str) and len(item) <= 4096 for item in raw_test)
+                and raw_test[0].upper() in {"CMD", "CMD-SHELL", "NONE"}
+                and (raw_test[0].upper() != "NONE" or len(raw_test) == 1)
+            ):
+                # The command body can contain secrets. Retain only the
+                # validated schema marker needed by the public health contract.
+                config["Healthcheck"] = {"Test": [raw_test[0].upper()]}
+            else:
+                config["Healthcheck"] = {"Test": ["INVALID"]}
+        else:
+            config["Healthcheck"] = "INVALID"
+    reduced["Config"] = config
+
+    raw_host = value.get("HostConfig") if isinstance(value.get("HostConfig"), Mapping) else None
+    if raw_host is not None:
+        host: dict[str, Any] = {}
+        for field_name in ("Memory", "NanoCpus", "CpuQuota", "CpuPeriod", "PidsLimit"):
+            if field_name not in raw_host:
+                continue
+            candidate = raw_host.get(field_name)
+            host[field_name] = (
+                candidate
+                if candidate is None or isinstance(candidate, (int, bool))
+                else True
+            )
+        reduced["HostConfig"] = host
+    return reduced
+
+
+def reduce_container_stats(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Discard all stats fields except validated CPU counters and memory usage."""
+    reduced: dict[str, Any] = {}
+    cpu_state = docker_cpu_state(value)
+    if cpu_state is not None:
+        reduced["cpu_stats"] = {
+            "cpu_usage": {"total_usage": cpu_state["cpuTotal"]},
+            "system_cpu_usage": cpu_state["systemTotal"],
+            "online_cpus": cpu_state["onlineCpus"],
+        }
+    raw_memory = value.get("memory_stats") if isinstance(value.get("memory_stats"), Mapping) else {}
+    usage = bounded_integer(raw_memory.get("usage"), 0, MAX_CONTAINER_MEMORY_LIMIT_BYTES)
+    limit = bounded_integer(raw_memory.get("limit"), 0, MAX_CONTAINER_MEMORY_LIMIT_BYTES)
+    if usage is not None or limit is not None:
+        reduced["memory_stats"] = {"usage": usage, "limit": limit}
+    return reduced
+
+
+def bounded_integer(value: Any, minimum: int, maximum: int) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if minimum <= value <= maximum else None
+
+
+def docker_container_timestamp(
+    value: Any, not_after: dt.datetime | None = None,
+) -> str | None:
+    parsed = parse_iso_timestamp(value)
+    maximum = not_after or (dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=60))
+    if (
+        parsed is None
+        or parsed <= dt.datetime(1970, 1, 1, tzinfo=dt.timezone.utc)
+        or parsed > maximum
+    ):
+        return None
+    return iso_event_timestamp(parsed)
+
+
+def docker_health_details(inspect: Mapping[str, Any] | None) -> tuple[str | None, bool | None]:
+    if not isinstance(inspect, Mapping):
+        return None, None
+    config = inspect.get("Config") if isinstance(inspect.get("Config"), Mapping) else None
+    if config is None:
+        return None, None
+    healthcheck = config.get("Healthcheck")
+    if healthcheck is None or healthcheck == {}:
+        return "none", False
+    if not isinstance(healthcheck, Mapping):
+        return None, None
+    test = healthcheck.get("Test")
+    if not isinstance(test, list) or len(test) > 32 or not all(
+        isinstance(item, str) and len(item) <= 4096 for item in test
+    ):
+        return None, None
+    if not test or test[0].upper() == "NONE":
+        return "none", False
+    if test[0].upper() not in {"CMD", "CMD-SHELL"}:
+        return None, None
+
+    state = inspect.get("State") if isinstance(inspect.get("State"), Mapping) else None
+    if state is not None and isinstance(state.get("Health"), Mapping):
+        status = state["Health"].get("Status")
+        if isinstance(status, str) and status.lower() in {"healthy", "unhealthy", "starting"}:
+            return status.lower(), True
+    return None, True
+
+
+def docker_resource_limits(
+    inspect: Mapping[str, Any] | None,
+) -> tuple[int | None, float | None, int | None]:
+    if not isinstance(inspect, Mapping) or not isinstance(inspect.get("HostConfig"), Mapping):
+        return None, None, None
+    host_config = inspect["HostConfig"]
+
+    memory_limit: int | None = None
+    if "Memory" in host_config:
+        memory_limit = bounded_integer(
+            host_config.get("Memory"), 0, MAX_CONTAINER_MEMORY_LIMIT_BYTES
+        )
+
+    cpu_limit: float | None = None
+    nano_cpus_present = "NanoCpus" in host_config
+    quota_present = "CpuQuota" in host_config
+    nano_cpus = (
+        bounded_integer(host_config.get("NanoCpus"), 0, MAX_SAFE_COUNTER)
+        if nano_cpus_present else None
+    )
+    quota = (
+        bounded_integer(host_config.get("CpuQuota"), -1, MAX_SAFE_COUNTER)
+        if quota_present else None
+    )
+    period = (
+        bounded_integer(host_config.get("CpuPeriod"), 0, MAX_SAFE_COUNTER)
+        if "CpuPeriod" in host_config else None
+    )
+    candidate_cpu_limit: float | None = None
+    if nano_cpus_present and nano_cpus is None:
+        candidate_cpu_limit = None
+    elif nano_cpus is not None and nano_cpus > 0:
+        # NanoCpus is Docker's preferred effective CPU limit. Once it is a
+        # valid positive value, stale or malformed quota fields are irrelevant.
+        candidate_cpu_limit = nano_cpus / 1_000_000_000
+    elif quota_present:
+        if quota is None:
+            candidate_cpu_limit = None
+        elif quota > 0:
+            candidate_cpu_limit = quota / period if period is not None and period > 0 else None
+        elif quota in {-1, 0}:
+            candidate_cpu_limit = 0.0
+    elif nano_cpus == 0:
+        candidate_cpu_limit = 0.0
+    if (
+        candidate_cpu_limit is not None
+        and math.isfinite(candidate_cpu_limit)
+        and 0 <= candidate_cpu_limit <= MAX_CONTAINER_CPU_LIMIT_CORES
+    ):
+        cpu_limit = round(candidate_cpu_limit, 6)
+
+    pid_limit: int | None = None
+    if "PidsLimit" in host_config:
+        raw_pid_limit = host_config.get("PidsLimit")
+        if raw_pid_limit is None:
+            pid_limit = 0
+        else:
+            parsed_pid_limit = bounded_integer(raw_pid_limit, -1, MAX_CONTAINER_PID_LIMIT)
+            if parsed_pid_limit is not None:
+                pid_limit = max(0, parsed_pid_limit)
+    return memory_limit, cpu_limit, pid_limit
+
+
+def normalize_private_container_state(value: Any) -> dict[str, int]:
+    """Admit only bounded CPU and restart counters from the owner-only state file."""
+    if not isinstance(value, Mapping):
+        return {}
+    result: dict[str, int] = {}
+    cpu_total = bounded_integer(value.get("cpuTotal"), 0, (1 << 63) - 1)
+    system_total = bounded_integer(value.get("systemTotal"), 0, (1 << 63) - 1)
+    online_cpus = bounded_integer(value.get("onlineCpus"), 1, 4096)
+    if cpu_total is not None and system_total is not None and online_cpus is not None:
+        result.update({
+            "cpuTotal": cpu_total,
+            "systemTotal": system_total,
+            "onlineCpus": online_cpus,
+        })
+    restart_count = bounded_integer(value.get("restartCount"), 0, MAX_SAFE_COUNTER)
+    if restart_count is not None:
+        result["restartCount"] = restart_count
+    return result
+
+
 def container_from_api(
     raw: Mapping[str, Any], owner: str, stats: Mapping[str, Any] | None,
-    previous_cpu: Any = None, public_name: str | None = None,
+    previous_state: Any = None, public_name: str | None = None,
+    inspect: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     name = safe_container_name(raw)
     if name is None:
         raise ValueError("container is outside the Compose service allowlist")
     if public_name is not None and public_name != name:
         raise ValueError("container Compose labels changed after admission")
-    state = bounded_text(raw.get("State", "unknown"), 24).lower()
-    status = str(raw.get("Status", ""))
-    health_match = re.search(r"\((healthy|unhealthy|starting)\)", status, re.IGNORECASE)
-    health = health_match.group(1).lower() if health_match else ("none" if state != "running" else "unknown")
+    project = CURRENT_CONTAINER_PROJECTS[name]
+    raw_state = raw.get("State")
+    state = raw_state.lower() if isinstance(raw_state, str) and raw_state.lower() in CONTAINER_STATES else "unknown"
+    health, healthcheck_configured = docker_health_details(inspect)
+
     memory_bytes: int | None = None
     memory_percent: float | None = None
     cpu_percent: float | None = None
@@ -1638,22 +1985,68 @@ def container_from_api(
         memory = stats.get("memory_stats") if isinstance(stats.get("memory_stats"), dict) else {}
         raw_memory_bytes = finite_number(memory.get("usage"))
         raw_memory_limit = finite_number(memory.get("limit"))
-        memory_bytes = int(raw_memory_bytes) if raw_memory_bytes is not None and raw_memory_bytes >= 0 else None
-        memory_limit = int(raw_memory_limit) if raw_memory_limit is not None and raw_memory_limit > 0 else None
-        memory_percent = (
-            round(min(100.0, 100.0 * memory_bytes / memory_limit), 2)
-            if memory_bytes is not None and memory_limit is not None
+        memory_bytes = (
+            int(raw_memory_bytes)
+            if raw_memory_bytes is not None and 0 <= raw_memory_bytes <= MAX_CONTAINER_MEMORY_LIMIT_BYTES
             else None
         )
-        cpu_percent = docker_cpu_percent(docker_cpu_state(stats), previous_cpu)
+        effective_memory_limit = (
+            int(raw_memory_limit)
+            if raw_memory_limit is not None and 0 < raw_memory_limit <= MAX_CONTAINER_MEMORY_LIMIT_BYTES
+            else None
+        )
+        memory_percent = (
+            round(min(100.0, 100.0 * memory_bytes / effective_memory_limit), 2)
+            if memory_bytes is not None and effective_memory_limit is not None
+            else None
+        )
+        cpu_percent = docker_cpu_percent(docker_cpu_state(stats), previous_state)
+
+    restart_count = (
+        bounded_integer(inspect.get("RestartCount"), 0, MAX_SAFE_COUNTER)
+        if isinstance(inspect, Mapping) else None
+    )
+    normalized_previous = normalize_private_container_state(previous_state)
+    previous_restart_count = normalized_previous.get("restartCount")
+    restart_delta = (
+        restart_count - previous_restart_count
+        if restart_count is not None
+        and previous_restart_count is not None
+        and restart_count >= previous_restart_count
+        else None
+    )
+    inspect_state = (
+        inspect.get("State")
+        if isinstance(inspect, Mapping) and isinstance(inspect.get("State"), Mapping)
+        else None
+    )
+    oom_killed = (
+        inspect_state.get("OOMKilled")
+        if inspect_state is not None and isinstance(inspect_state.get("OOMKilled"), bool)
+        else None
+    )
+    started_at = docker_container_timestamp(inspect_state.get("StartedAt")) if inspect_state else None
+    finished_at = docker_container_timestamp(inspect_state.get("FinishedAt")) if inspect_state else None
+    memory_limit, cpu_limit, pid_limit = docker_resource_limits(inspect)
+
     return {
         "name": name,
+        "project": project,
         "owner": "cks" if owner == "cks" else "unknown",
         "state": state,
         "health": health,
+        "healthcheckConfigured": healthcheck_configured,
         "cpuPercent": cpu_percent,
         "memoryBytes": memory_bytes,
         "memoryPercent": memory_percent,
+        "memoryLimitBytes": memory_limit,
+        "cpuLimitCores": cpu_limit,
+        "pidLimit": pid_limit,
+        "restartCount": restart_count,
+        "restartCountDelta": restart_delta,
+        "oomKilled": oom_killed,
+        "startedAt": started_at,
+        "finishedAt": finished_at,
     }
 
 
@@ -1661,20 +2054,90 @@ def collect_containers(
     sockets: Mapping[str, Path], curl: str, timeout: float, previous_cpu: Any = None
 ) -> tuple[list[dict[str, Any]], dict[str, dict[str, int]]]:
     sockets = {"cks": sockets["cks"]} if isinstance(sockets.get("cks"), Path) else {}
+    if not sockets:
+        raise ContainerSourceUnavailable("cks container telemetry source unavailable")
     containers: list[dict[str, Any]] = []
-    deadline = _monotonic() + 20.0
+    deadline = _monotonic() + MAX_DOCKER_COLLECTION_SECONDS
     entries: list[tuple[str, Path, Mapping[str, Any], str]] = []
     seen_container_ids: set[str] = set()
-    # Every list request is constrained to one reviewed Compose project. An
-    # unavailable query fails the whole export so callers retain the last
-    # complete reduced snapshot instead of publishing a partial count.
+    # Every list request is constrained to one reviewed Compose project. Run
+    # those independent bounded queries concurrently so the 11-project allowlist
+    # cannot multiply the per-request timeout past the exporter service budget.
     for owner, socket_path in sockets.items():
+        list_remaining = max(0.0, deadline - _monotonic())
+        if list_remaining < 0.25:
+            raise ContainerSourceUnavailable("cks container telemetry source deadline exceeded")
+        request_timeout = min(timeout, list_remaining)
+        lists_by_project: dict[str, Any] = {}
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(MAX_DOCKER_DETAIL_WORKERS, len(ALLOWED_COMPOSE_PROJECTS)),
+            thread_name_prefix="docker-list",
+        ) as executor:
+            list_futures = {
+                executor.submit(
+                    docker_get,
+                    socket_path,
+                    compose_project_list_path(project),
+                    curl,
+                    request_timeout,
+                ): project
+                for project in ALLOWED_COMPOSE_PROJECTS
+            }
+            done, pending = concurrent.futures.wait(list_futures, timeout=list_remaining)
+            for future in pending:
+                future.cancel()
+            if pending:
+                raise ContainerSourceUnavailable("cks container telemetry source deadline exceeded")
+            for future in done:
+                project = list_futures[future]
+                try:
+                    response = future.result()
+                except PermissionError:
+                    raise
+                except Exception:
+                    response = None
+                if not isinstance(response, list):
+                    lists_by_project[project] = None
+                    continue
+                if len(response) > 200:
+                    raise RuntimeError("cks container telemetry project response exceeded its limit")
+                reduced_list: list[dict[str, Any]] = []
+                for raw in response:
+                    if not isinstance(raw, dict):
+                        raise RuntimeError("cks container telemetry project response is malformed")
+                    public_name = safe_container_name(raw, project)
+                    if public_name is None:
+                        continue
+                    container_id = raw.get("Id")
+                    if not isinstance(container_id, str) or re.fullmatch(
+                        r"[a-fA-F0-9]{12,64}", container_id
+                    ) is None:
+                        raise RuntimeError("cks container telemetry workload has an invalid ID")
+                    labels = raw.get("Labels")
+                    service = labels.get("com.docker.compose.service") if isinstance(labels, Mapping) else None
+                    reduced_list.append({
+                        "Id": container_id,
+                        "Labels": {
+                            "com.docker.compose.project": project,
+                            "com.docker.compose.service": service,
+                        },
+                        "State": raw.get("State") if isinstance(raw.get("State"), str) else "unknown",
+                    })
+                lists_by_project[project] = reduced_list
+            # Drop Future-held raw Docker responses (including labels, image,
+            # command and mounts) before scheduling inspect/stats requests.
+            done.clear()
+            list_futures.clear()
+            future = None
+            response = None
+            raw = None
+
+        # An unavailable query fails the whole export so callers retain the last
+        # complete reduced snapshot instead of publishing a partial count.
         for project in ALLOWED_COMPOSE_PROJECTS:
-            raw_list = docker_get(socket_path, compose_project_list_path(project), curl, timeout)
+            raw_list = lists_by_project.get(project)
             if not isinstance(raw_list, list):
-                raise RuntimeError("cks container telemetry source unavailable")
-            if len(raw_list) > 200:
-                raise RuntimeError("cks container telemetry project response exceeded its limit")
+                raise ContainerSourceUnavailable("cks container telemetry source unavailable")
             for raw in raw_list:
                 if not isinstance(raw, dict):
                     raise RuntimeError("cks container telemetry project response is malformed")
@@ -1694,87 +2157,288 @@ def collect_containers(
     previous_state = previous_cpu if isinstance(previous_cpu, Mapping) else {}
     listed_keys: list[str] = []
     stats_candidates: list[tuple[int, Path, str, str]] = []
+    inspect_candidates: list[tuple[int, Path, str, str]] = []
     for index, (owner, socket_path, raw, _public_name) in enumerate(entries):
         container_id = str(raw.get("Id", ""))
         state_key = f"{owner}:{container_id}"
         if re.fullmatch(r"[A-Za-z0-9_.-]{1,32}:[a-fA-F0-9]{12,64}", state_key):
             listed_keys.append(state_key)
+            if len(inspect_candidates) < MAX_DOCKER_INSPECT_REQUESTS:
+                inspect_candidates.append((index, socket_path, container_id, state_key))
         if (
             raw.get("State") == "running"
             and re.fullmatch(r"[a-fA-F0-9]{12,64}", container_id)
-            and len(stats_candidates) < 30
+            and len(stats_candidates) < MAX_DOCKER_STATS_REQUESTS
         ):
             stats_candidates.append((index, socket_path, container_id, state_key))
 
     stats_by_index: dict[int, Mapping[str, Any]] = {}
+    inspect_by_index: dict[int, Mapping[str, Any]] = {}
     remaining = max(0.0, deadline - _monotonic())
-    if stats_candidates and remaining > 0:
-        worker_count = min(6, len(stats_candidates))
+    detail_request_count = len(inspect_candidates) + len(stats_candidates)
+    if detail_request_count and remaining >= 0.25:
+        detail_timeout = min(timeout, remaining)
+        worker_count = min(MAX_DOCKER_DETAIL_WORKERS, detail_request_count)
         with concurrent.futures.ThreadPoolExecutor(
-            max_workers=worker_count, thread_name_prefix="docker-stats"
+            max_workers=worker_count, thread_name_prefix="docker-detail"
         ) as executor:
-            futures = {
-                executor.submit(
+            futures: dict[concurrent.futures.Future[Any], tuple[str, int]] = {}
+            # Submit inspect first: lifecycle/health/limit truth has priority over
+            # optional point-in-time stats when the shared deadline is nearly spent.
+            for index, socket_path, container_id, _state_key in inspect_candidates:
+                future = executor.submit(
+                    docker_get,
+                    socket_path,
+                    f"/v1.41/containers/{container_id}/json",
+                    curl,
+                    detail_timeout,
+                )
+                futures[future] = ("inspect", index)
+            for index, socket_path, container_id, _state_key in stats_candidates:
+                future = executor.submit(
                     docker_get,
                     socket_path,
                     f"/v1.41/containers/{container_id}/stats?stream=false&one-shot=true",
                     curl,
-                    timeout,
-                ): index
-                for index, socket_path, container_id, _state_key in stats_candidates
-            }
+                    detail_timeout,
+                )
+                futures[future] = ("stats", index)
             done, pending = concurrent.futures.wait(futures, timeout=remaining)
             for future in pending:
                 future.cancel()
             for future in done:
                 try:
-                    stats = future.result()
+                    response = future.result()
                 except Exception:
                     continue
-                if isinstance(stats, dict):
-                    stats_by_index[futures[future]] = stats
+                if not isinstance(response, dict):
+                    continue
+                kind, index = futures[future]
+                if kind == "inspect":
+                    _owner, _socket_path, raw, public_name = entries[index]
+                    requested_id = str(raw.get("Id", ""))
+                    validated = validated_container_inspect(
+                        response, requested_id, public_name
+                    )
+                    if validated is not None:
+                        inspect_by_index[index] = reduce_container_inspect(validated)
+                else:
+                    stats_by_index[index] = reduce_container_stats(response)
+            done.clear()
+            futures.clear()
+            future = None
+            response = None
 
     next_cpu_state: dict[str, dict[str, int]] = {}
-    # Retain prior counters only for containers still listed, and hard-cap the
-    # protected internal state even if all three daemons return 200 entries.
-    for state_key in listed_keys[:600]:
-        prior_value = previous_state.get(state_key)
-        if isinstance(prior_value, Mapping):
-            try:
-                next_cpu_state[state_key] = {
-                    "cpuTotal": int(prior_value["cpuTotal"]),
-                    "systemTotal": int(prior_value["systemTotal"]),
-                    "onlineCpus": max(1, int(prior_value["onlineCpus"])),
-                }
-            except (KeyError, TypeError, ValueError):
-                pass
+    # Retain only validated private counters for containers still listed. This
+    # lets a temporary inspect/stats miss bridge to the next observation without
+    # admitting arbitrary state-file keys or exposing the raw-ID map publicly.
+    for state_key in listed_keys[:200]:
+        normalized_prior = normalize_private_container_state(previous_state.get(state_key))
+        if normalized_prior:
+            next_cpu_state[state_key] = normalized_prior
 
-    retained_keys = set(listed_keys[:600])
+    retained_keys = set(listed_keys[:200])
     for index, (owner, _socket_path, raw, public_name) in enumerate(entries):
         stats = stats_by_index.get(index)
         container_id = str(raw.get("Id", ""))
+        inspect = inspect_by_index.get(index)
         state_key = f"{owner}:{container_id}"
         current_cpu = docker_cpu_state(stats) if isinstance(stats, Mapping) else None
-        containers.append(container_from_api(
+        reduced = container_from_api(
             raw, owner, stats if isinstance(stats, dict) else None,
-            previous_state.get(state_key), public_name,
-        ))
-        if current_cpu is not None and state_key in retained_keys:
-            next_cpu_state[state_key] = current_cpu
+            previous_state.get(state_key), public_name, inspect,
+        )
+        containers.append(reduced)
+        if state_key in retained_keys:
+            next_entry = dict(next_cpu_state.get(state_key, {}))
+            if current_cpu is not None:
+                next_entry.update(current_cpu)
+            if isinstance(reduced.get("restartCount"), int):
+                next_entry["restartCount"] = reduced["restartCount"]
+            if next_entry:
+                next_cpu_state[state_key] = next_entry
     return sorted(containers, key=lambda item: (item["owner"], item["name"])), next_cpu_state
 
 
-def load_container_snapshot(path: Path, now: dt.datetime) -> list[dict[str, Any]]:
+def normalize_container_values(
+    values: Any,
+    not_after: dt.datetime | None = None,
+) -> list[dict[str, Any]]:
+    """Reduce legacy or current rows to the exact bounded public contract."""
+    if not isinstance(values, list) or len(values) > 200:
+        raise ValueError("container telemetry snapshot has an invalid workload list")
+
+    result: list[dict[str, Any]] = []
+    for value in values:
+        if not isinstance(value, dict):
+            raise ValueError("container telemetry workload has unexpected fields")
+        fields = set(value)
+        legacy = fields == set(LEGACY_CONTAINER_FIELDS)
+        if not legacy and fields != set(CONTAINER_FIELDS):
+            raise ValueError("container telemetry workload has unexpected fields")
+        name = value.get("name")
+        state = value.get("state")
+        source_health = value.get("health")
+        if (
+            name not in SAFE_CONTAINER_NAMES
+            or value.get("owner") != "cks"
+            or state not in CONTAINER_STATES
+            or (source_health is not None and source_health not in CONTAINER_HEALTH_STATES)
+        ):
+            raise ValueError("container telemetry workload is outside the allowlist")
+        # Legacy health was inferred from ``docker ps`` presentation text. Keep
+        # the row as last-known evidence, but do not upgrade that inference into
+        # the new authoritative inspect-backed health contract.
+        health = None if legacy else source_health
+        # A seven-field snapshot predates authoritative Compose provenance.
+        # Overlapping app/service names make project inference ambiguous, so
+        # migrate it as unknown and preserve that null in subsequent last-known
+        # v2 snapshots. Fresh observations always carry the fixed allowlist value.
+        project = None if legacy else value.get("project")
+        expected_project = CURRENT_CONTAINER_PROJECTS.get(str(name))
+        if (
+            (project is not None and project != expected_project)
+            or (project is not None and project not in ALLOWED_COMPOSE_PROJECTS)
+        ):
+            raise ValueError("container telemetry workload has an invalid Compose project")
+
+        cpu_percent = normalized_bounded_number(value.get("cpuPercent"), 0, MAX_CONTAINER_CPU_PERCENT)
+        memory_bytes = normalized_bounded_number(
+            value.get("memoryBytes"), 0, MAX_CONTAINER_MEMORY_LIMIT_BYTES
+        )
+        memory_percent = normalized_bounded_number(value.get("memoryPercent"), 0, 100)
+        for source, normalized in (
+            (value.get("cpuPercent"), cpu_percent),
+            (value.get("memoryBytes"), memory_bytes),
+            (value.get("memoryPercent"), memory_percent),
+        ):
+            if source is not None and normalized is None:
+                raise ValueError("container telemetry workload has an invalid metric")
+        if memory_bytes is not None and (
+            isinstance(value.get("memoryBytes"), bool) or not isinstance(value.get("memoryBytes"), int)
+        ):
+            raise ValueError("container telemetry workload has an invalid memory byte count")
+
+        healthcheck_configured = None if legacy else value.get("healthcheckConfigured")
+        oom_killed = None if legacy else value.get("oomKilled")
+        if healthcheck_configured is not None and not isinstance(healthcheck_configured, bool):
+            raise ValueError("container telemetry workload has an invalid healthcheck state")
+        if oom_killed is not None and not isinstance(oom_killed, bool):
+            raise ValueError("container telemetry workload has an invalid OOM state")
+        if healthcheck_configured is False and health != "none":
+            raise ValueError("container telemetry workload has inconsistent health fields")
+        if healthcheck_configured is True and health in {"none", "unknown"}:
+            raise ValueError("container telemetry workload has inconsistent health fields")
+        if healthcheck_configured is None and health is not None:
+            raise ValueError("container telemetry workload has unverified health")
+
+        restart_count = None if legacy else value.get("restartCount")
+        restart_delta = None if legacy else value.get("restartCountDelta")
+        memory_limit = None if legacy else value.get("memoryLimitBytes")
+        pid_limit = None if legacy else value.get("pidLimit")
+        for field_name, candidate, maximum in (
+            ("restart count", restart_count, MAX_SAFE_COUNTER),
+            ("restart delta", restart_delta, MAX_SAFE_COUNTER),
+            ("memory limit", memory_limit, MAX_CONTAINER_MEMORY_LIMIT_BYTES),
+            ("PID limit", pid_limit, MAX_CONTAINER_PID_LIMIT),
+        ):
+            if candidate is not None and bounded_integer(candidate, 0, maximum) is None:
+                raise ValueError(f"container telemetry workload has an invalid {field_name}")
+        if restart_delta is not None and (restart_count is None or restart_delta > restart_count):
+            raise ValueError("container telemetry workload has an inconsistent restart delta")
+
+        cpu_limit_source = None if legacy else value.get("cpuLimitCores")
+        cpu_limit = normalized_bounded_number(
+            cpu_limit_source, 0, MAX_CONTAINER_CPU_LIMIT_CORES
+        )
+        if cpu_limit_source is not None and cpu_limit is None:
+            raise ValueError("container telemetry workload has an invalid CPU limit")
+        if cpu_limit is not None:
+            cpu_limit = round(float(cpu_limit), 6)
+
+        normalized_times: dict[str, str | None] = {}
+        for field_name in ("startedAt", "finishedAt"):
+            source = None if legacy else value.get(field_name)
+            parsed = parse_iso_timestamp(source) if source is not None else None
+            if source is not None and (
+                parsed is None
+                or parsed <= dt.datetime(1970, 1, 1, tzinfo=dt.timezone.utc)
+                or (not_after is not None and parsed > not_after)
+            ):
+                raise ValueError("container telemetry workload has an invalid lifecycle timestamp")
+            normalized_times[field_name] = iso_event_timestamp(parsed) if parsed is not None else None
+        normalized = {
+            "name": name,
+            "project": project,
+            "owner": "cks",
+            "state": state,
+            "health": health,
+            "healthcheckConfigured": healthcheck_configured,
+            "cpuPercent": cpu_percent,
+            "memoryBytes": memory_bytes,
+            "memoryPercent": memory_percent,
+            "memoryLimitBytes": memory_limit,
+            "cpuLimitCores": cpu_limit,
+            "pidLimit": pid_limit,
+            "restartCount": restart_count,
+            "restartCountDelta": restart_delta,
+            "oomKilled": oom_killed,
+            "startedAt": normalized_times["startedAt"],
+            "finishedAt": normalized_times["finishedAt"],
+        }
+        assert tuple(normalized) == CONTAINER_FIELDS
+        result.append(normalized)
+    return sorted(result, key=lambda item: item["name"])
+
+
+def normalize_container_collection(
+    value: Any,
+    generated: dt.datetime,
+    now: dt.datetime,
+) -> dict[str, str | None]:
+    if not isinstance(value, Mapping) or set(value) != {"status", "observedAt"}:
+        raise ValueError("container telemetry snapshot has invalid collection status")
+    status = value.get("status")
+    if status not in CONTAINER_COLLECTION_STATUSES:
+        raise ValueError("container telemetry snapshot has invalid collection status")
+    observed = parse_iso_timestamp(value.get("observedAt"))
+    if value.get("observedAt") is not None and observed is None:
+        raise ValueError("container telemetry snapshot has invalid observation timestamp")
+    if observed is not None and observed > now + dt.timedelta(seconds=60):
+        raise ValueError("container telemetry snapshot has a future observation timestamp")
+    if status in {"fresh", "last-known"} and observed is None:
+        raise ValueError("container telemetry snapshot is missing its observation timestamp")
+    if status == "unavailable" and observed is not None:
+        raise ValueError("unavailable container telemetry cannot have an observation timestamp")
+    if status == "fresh" and observed != generated:
+        raise ValueError("fresh container telemetry timestamps do not match")
+    if status == "fresh" and (now - generated).total_seconds() > MAX_CONTAINER_INPUT_AGE_SECONDS:
+        status = "last-known"
+    return {
+        "status": str(status),
+        "observedAt": iso_timestamp(observed) if observed is not None else None,
+    }
+
+
+def load_container_snapshot_state(
+    path: Path,
+    now: dt.datetime,
+    expected_uid: int | None = 1001,
+    expected_gid: int | None = 1001,
+) -> tuple[list[dict[str, Any]], dict[str, str | None]]:
     """Validate the unprivileged export before admitting it to root-owned output."""
     try:
         metadata = path.lstat()
+    except PermissionError:
+        raise
     except OSError as error:
         raise RuntimeError("container telemetry snapshot unavailable") from error
     def valid_metadata(value: os.stat_result) -> bool:
         return (
             stat.S_ISREG(value.st_mode)
-            and value.st_uid == 1001
-            and value.st_gid == 1001
+            and (expected_uid is None or value.st_uid == expected_uid)
+            and (expected_gid is None or value.st_gid == expected_gid)
             and value.st_nlink == 1
             and stat.S_IMODE(value.st_mode) == 0o640
             and 0 < value.st_size <= MAX_CONTAINER_INPUT_BYTES
@@ -1801,57 +2465,125 @@ def load_container_snapshot(path: Path, now: dt.datetime) -> list[dict[str, Any]
         raw = json.loads(payload.decode("utf-8"))
     except (UnicodeError, json.JSONDecodeError) as error:
         raise ValueError("container telemetry snapshot is invalid JSON") from error
-    if not isinstance(raw, dict) or set(raw) != {"generatedAt", "containers"}:
+    if not isinstance(raw, dict) or set(raw) not in (
+        {"generatedAt", "containers"},
+        {"generatedAt", "containerCollection", "containers"},
+    ):
         raise ValueError("container telemetry snapshot has unexpected fields")
     generated = parse_iso_timestamp(raw.get("generatedAt"))
-    if generated is None or not -60 <= (now - generated).total_seconds() <= MAX_CONTAINER_INPUT_AGE_SECONDS:
-        raise ValueError("container telemetry snapshot is stale")
-    values = raw.get("containers")
-    if not isinstance(values, list) or len(values) > 200:
-        raise ValueError("container telemetry snapshot has an invalid workload list")
+    if generated is None or generated > now + dt.timedelta(seconds=60):
+        raise ValueError("container telemetry snapshot has an invalid generation timestamp")
+    containers = normalize_container_values(
+        raw.get("containers"), generated + dt.timedelta(seconds=60)
+    )
+    if "containerCollection" in raw:
+        collection = normalize_container_collection(raw["containerCollection"], generated, now)
+    else:
+        collection = {
+            "status": (
+                "fresh"
+                if (now - generated).total_seconds() <= MAX_CONTAINER_INPUT_AGE_SECONDS
+                else "last-known"
+            ),
+            "observedAt": iso_timestamp(generated),
+        }
+    if collection["status"] == "unavailable" and containers:
+        raise ValueError("unavailable container telemetry cannot contain workloads")
+    if collection["observedAt"] is None and containers:
+        raise ValueError("container telemetry workloads require an observation timestamp")
+    return containers, collection
 
-    result: list[dict[str, Any]] = []
-    allowed_states = {"created", "running", "paused", "restarting", "removing", "exited", "dead", "unknown"}
-    allowed_health = {"healthy", "unhealthy", "starting", "none", "unknown"}
-    for value in values:
-        if not isinstance(value, dict) or set(value) != {
-            "name", "owner", "state", "health", "cpuPercent", "memoryBytes", "memoryPercent",
-        }:
-            raise ValueError("container telemetry workload has unexpected fields")
-        name = value.get("name")
-        state = value.get("state")
-        health = value.get("health")
-        if (
-            name not in SAFE_CONTAINER_NAMES
-            or value.get("owner") != "cks"
-            or state not in allowed_states
-            or health not in allowed_health
-        ):
-            raise ValueError("container telemetry workload is outside the allowlist")
-        cpu_percent = normalized_bounded_number(value.get("cpuPercent"), 0, MAX_CONTAINER_CPU_PERCENT)
-        memory_bytes = normalized_bounded_number(value.get("memoryBytes"), 0, 1 << 63)
-        memory_percent = normalized_bounded_number(value.get("memoryPercent"), 0, 100)
-        for source, normalized in (
-            (value.get("cpuPercent"), cpu_percent),
-            (value.get("memoryBytes"), memory_bytes),
-            (value.get("memoryPercent"), memory_percent),
-        ):
-            if source is not None and normalized is None:
-                raise ValueError("container telemetry workload has an invalid metric")
-        if memory_bytes is not None and (
-            isinstance(value.get("memoryBytes"), bool) or not isinstance(value.get("memoryBytes"), int)
-        ):
-            raise ValueError("container telemetry workload has an invalid memory byte count")
-        result.append({
-            "name": name,
-            "owner": "cks",
-            "state": state,
-            "health": health,
-            "cpuPercent": cpu_percent,
-            "memoryBytes": memory_bytes,
-            "memoryPercent": memory_percent,
-        })
-    return sorted(result, key=lambda item: item["name"])
+
+def load_container_snapshot(path: Path, now: dt.datetime) -> list[dict[str, Any]]:
+    """Backward-compatible list-only view of the reduced container snapshot."""
+    return load_container_snapshot_state(path, now)[0]
+
+
+def previous_container_observation(
+    output_dir: Path,
+    now: dt.datetime,
+) -> tuple[list[dict[str, Any]], str | None]:
+    """Recover only a previously admitted bounded observation from current.json."""
+    current = load_json(output_dir / "current.json")
+    try:
+        containers = normalize_container_values(
+            current.get("containers"), now + dt.timedelta(seconds=60)
+        )
+    except ValueError:
+        return [], None
+
+    raw_collection = current.get("containerCollection")
+    if raw_collection is not None:
+        if not isinstance(raw_collection, Mapping) or set(raw_collection) != {"status", "observedAt"}:
+            return [], None
+        status = raw_collection.get("status")
+        observed = parse_iso_timestamp(raw_collection.get("observedAt"))
+        if status not in CONTAINER_COLLECTION_STATUSES:
+            return [], None
+        if status in {"fresh", "last-known"} and observed is None:
+            return [], None
+        if status == "unavailable" and observed is not None:
+            return [], None
+        if observed is not None and observed <= now + dt.timedelta(seconds=60):
+            return containers, iso_timestamp(observed)
+        return [], None
+
+    # Legacy current.json files had no collection status. Their collector
+    # timestamp is the only bounded evidence that the list was observed.
+    observed = parse_iso_timestamp(current.get("generatedAt"))
+    if observed is None and isinstance(current.get("latest"), Mapping):
+        observed = parse_iso_timestamp(current["latest"].get("timestamp"))
+    if observed is None or observed > now + dt.timedelta(seconds=60):
+        return [], None
+    return containers, iso_timestamp(observed)
+
+
+def collect_container_telemetry(
+    config: "Config",
+    prior: Mapping[str, Any],
+    now: dt.datetime,
+) -> tuple[list[dict[str, Any]], dict[str, str | None], dict[str, dict[str, int]]]:
+    """Collect containers without allowing a Docker-side failure to block the host sample."""
+    previous_containers, previous_observed_at = previous_container_observation(
+        config.output_dir, now
+    )
+    try:
+        if config.container_input is not None:
+            containers, collection = load_container_snapshot_state(config.container_input, now)
+            container_cpu_state: dict[str, dict[str, int]] = {}
+        else:
+            containers, container_cpu_state = collect_containers(
+                config.docker_sockets,
+                config.curl,
+                config.command_timeout,
+                prior.get("containers"),
+            )
+            collection = {"status": "fresh", "observedAt": iso_timestamp(now)}
+    except PermissionError:
+        return (
+            previous_containers if previous_observed_at is not None else [],
+            {"status": "permission-denied", "observedAt": previous_observed_at},
+            {},
+        )
+    except (ContainerSourceUnavailable, RuntimeError, ValueError, OSError):
+        return (
+            previous_containers if previous_observed_at is not None else [],
+            {
+                "status": "last-known" if previous_observed_at is not None else "unavailable",
+                "observedAt": previous_observed_at,
+            },
+            {},
+        )
+
+    # An exporter may have no retained state after a runtime-directory reset,
+    # while current.json still contains a previously admitted observation.
+    if collection["status"] in {"unavailable", "permission-denied"} and previous_observed_at is not None:
+        if not containers:
+            containers = previous_containers
+        collection["observedAt"] = collection["observedAt"] or previous_observed_at
+        if collection["status"] == "unavailable":
+            collection["status"] = "last-known"
+    return containers, collection, container_cpu_state
 
 
 TIMESTAMP_RE = re.compile(r"^(\d{4}-\d\d-\d\d[T ][0-9:.+-]+(?:Z)?)")
@@ -3405,10 +4137,18 @@ def incident_transition(
             "pressure": dict(pressure),
             "processes": [dict(value) for value in processes],
             "containers": [
-                dict(value) for value in sorted(
+                {
+                    field_name: (
+                        "unknown"
+                        if field_name == "health" and value.get(field_name) is None
+                        else value.get(field_name)
+                    )
+                    for field_name in LEGACY_CONTAINER_FIELDS
+                }
+                for value in sorted(
                     containers,
                     key=lambda value: (
-                        0 if str(value.get("health", "")).lower() not in {"healthy", "none"} else 1,
+                        0 if value.get("health") not in {"healthy", "none"} else 1,
                         -float(finite_number(value.get("cpuPercent"), 0.0) or 0.0),
                         -int(finite_number(value.get("memoryBytes"), 0.0) or 0),
                         str(value.get("name", "")),
@@ -4375,7 +5115,7 @@ class Config:
     incident_follow_up_samples: int = 5
     cpu_warn_percent: float = 85.0
     cpu_recover_percent: float = 75.0
-    cpu_warn_samples: int = 1
+    cpu_warn_samples: int = 2
     memory_available_warn_percent: float = 20.0
     memory_available_recover_percent: float = 25.0
     temperature_warn_c: float = 75.0
@@ -4389,6 +5129,7 @@ class Config:
     traffic_slow_seconds: float = 1.0
     max_input_bytes: int = 1_048_576
     kernel_max_input_bytes: int = DEFAULT_KERNEL_MAX_INPUT_BYTES
+    rule_pack: Path = DEFAULT_RULE_PACK_PATH
 
     @property
     def mountinfo_path(self) -> Path:
@@ -4444,7 +5185,7 @@ def config_from_environment(arguments: Sequence[str] | None = None) -> Config:
     )
     parser.add_argument("--cpu-warn-percent", type=float, default=float(env.get("MONITOR_CPU_WARN_PERCENT", "85")))
     parser.add_argument("--cpu-recover-percent", type=float, default=float(env.get("MONITOR_CPU_RECOVER_PERCENT", "75")))
-    parser.add_argument("--cpu-warn-samples", type=int, default=int(env.get("MONITOR_CPU_WARN_SAMPLES", "1")))
+    parser.add_argument("--cpu-warn-samples", type=int, default=int(env.get("MONITOR_CPU_WARN_SAMPLES", "2")))
     parser.add_argument(
         "--memory-available-warn-percent",
         type=float,
@@ -4477,6 +5218,10 @@ def config_from_environment(arguments: Sequence[str] | None = None) -> Config:
         "--kernel-max-input-bytes",
         type=int,
         default=int(env.get("MONITOR_KERNEL_MAX_INPUT_BYTES", str(DEFAULT_KERNEL_MAX_INPUT_BYTES))),
+    )
+    parser.add_argument(
+        "--rule-pack",
+        default=env.get("MONITOR_RULE_PACK", str(DEFAULT_RULE_PACK_PATH)),
     )
     values = parser.parse_args(arguments)
     cpu_warn = max(0.0, min(100.0, values.cpu_warn_percent))
@@ -4526,6 +5271,7 @@ def config_from_environment(arguments: Sequence[str] | None = None) -> Config:
         traffic_slow_seconds=max(0.001, min(MAX_TRAFFIC_REQUEST_SECONDS, values.traffic_slow_seconds)),
         max_input_bytes=max(4096, min(16_777_216, values.max_input_bytes)),
         kernel_max_input_bytes=max(65_536, min(16_777_216, values.kernel_max_input_bytes)),
+        rule_pack=Path(values.rule_pack),
     )
 
 
@@ -4746,6 +5492,40 @@ def collect_reliability(
     return (summary, kernel_summary) if include_kernel_summary else summary
 
 
+def publish_rule_evaluation(
+    config: Config,
+    snapshot: Mapping[str, Any],
+    now: dt.datetime,
+) -> dict[str, Any]:
+    """Evaluate rules without allowing this optional subsystem to stop collection."""
+    failure = {
+        "schemaVersion": 1,
+        "status": "collection_error",
+        "rulePackVersion": None,
+        "evaluatedAt": iso_timestamp(now),
+        "summary": {},
+        "states": {},
+    }
+    try:
+        from alert_store import evaluate_and_persist
+
+        return evaluate_and_persist(
+            snapshot,
+            now,
+            config.rule_pack,
+            config.output_dir,
+            config.max_log_records,
+        )
+    except Exception:
+        # Missing/corrupt alert modules are an explicit rule-evaluation error,
+        # not a reason to discard independently collected host telemetry.
+        try:
+            atomic_write_json(config.output_dir / "rule-evaluation.json", failure)
+        except Exception:
+            pass
+        return failure
+
+
 def run(config: Config, now: dt.datetime | None = None) -> dict[str, Any]:
     now = now or utc_now()
     now_text = iso_timestamp(now)
@@ -4851,13 +5631,9 @@ def run(config: Config, now: dt.datetime | None = None) -> dict[str, Any]:
             "logicalCpuCount": parse_logical_cpu_count(proc_stat),
             "uptimeSeconds": uptime_seconds,
         }
-        if config.container_input is not None:
-            containers = load_container_snapshot(config.container_input, now)
-            container_cpu_state: dict[str, dict[str, int]] = {}
-        else:
-            containers, container_cpu_state = collect_containers(
-                config.docker_sockets, config.curl, config.command_timeout, prior.get("containers")
-            )
+        containers, container_collection, container_cpu_state = collect_container_telemetry(
+            config, prior, now
+        )
         processes, process_cpu_state = collect_processes(
             config.proc_root, prior.get("processes"), host_cpu_delta, config.process_uids
         )
@@ -4872,6 +5648,7 @@ def run(config: Config, now: dt.datetime | None = None) -> dict[str, Any]:
             "latest": latest,
             "disks": collect_filesystems(read_text(config.mountinfo_path), config.mount_root),
             "containers": containers,
+            "containerCollection": container_collection,
             "currentTraffic": traffic,
             "reliability": reliability,
             "system": system,
@@ -4912,6 +5689,7 @@ def run(config: Config, now: dt.datetime | None = None) -> dict[str, Any]:
             "processes": process_cpu_state,
             "incident": incident_state,
         }, 0o600)
+        publish_rule_evaluation(config, current, now)
         return current
 
 

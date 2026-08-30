@@ -107,6 +107,51 @@ function sumObserved(values: Array<number | null | undefined>): number | null {
   return observed.length ? observed.reduce((total, value) => total + value, 0) : null;
 }
 
+function isObservedNumber(value: number | null | undefined): value is number {
+  return typeof value === 'number' && Number.isFinite(value);
+}
+
+export function highestObservedDiskUsage(disks: DashboardPayload['disks']): number | null {
+  const observed = disks
+    .map((disk) => disk.usedPercent)
+    .filter(isObservedNumber);
+  return observed.length ? Math.max(...observed) : null;
+}
+
+export function storageCapacityChartRows(disks: DashboardPayload['disks']) {
+  return disks
+    .filter((disk) => isObservedNumber(disk.usedPercent))
+    .map((disk) => ({
+      name: safeText(disk.mount, 'volume', 24),
+      used: disk.usedPercent as number,
+    }));
+}
+
+function compareObservedDescending(
+  left: number | null | undefined,
+  right: number | null | undefined,
+): number {
+  if (isObservedNumber(left) && isObservedNumber(right)) return right - left;
+  if (isObservedNumber(left)) return -1;
+  if (isObservedNumber(right)) return 1;
+  return 0;
+}
+
+export function containerUtilizationChartRows(containers: ContainerStatus[]) {
+  return containers
+    .filter((container) => isObservedNumber(container.cpuPercent) || isObservedNumber(container.memoryPercent))
+    .sort((left, right) => (
+      compareObservedDescending(left.cpuPercent, right.cpuPercent)
+      || compareObservedDescending(left.memoryPercent, right.memoryPercent)
+    ))
+    .slice(0, 10)
+    .map((container) => ({
+      name: safeText(container.name, 'container', 24),
+      cpu: isObservedNumber(container.cpuPercent) ? container.cpuPercent : null,
+      memory: isObservedNumber(container.memoryPercent) ? container.memoryPercent : null,
+    }));
+}
+
 function eventRate(value: number | null | undefined): string {
   if (typeof value !== 'number' || !Number.isFinite(value)) return '—';
   const digits = value >= 10 ? 1 : value >= 0.1 ? 2 : 3;
@@ -202,9 +247,7 @@ export function VitalSignsWidget({ data, locale, onOpen }: Omit<VisualProps, 'ra
   const latest = data.latest;
   const running = data.containers.filter((container) => safeText(container.state, '').toLowerCase() === 'running').length;
   const unhealthy = data.containers.filter((container) => /unhealthy|dead|exited/i.test(`${container.health} ${container.state}`)).length;
-  const highestDisk = data.disks.length
-    ? data.disks.reduce((maximum, disk) => Math.max(maximum, disk.usedPercent ?? 0), 0)
-    : null;
+  const highestDisk = highestObservedDiskUsage(data.disks);
   const diskIo = latest?.diskReadBytesPerSecond == null && latest?.diskWriteBytesPerSecond == null
     ? null
     : (latest?.diskReadBytesPerSecond ?? 0) + (latest?.diskWriteBytesPerSecond ?? 0);
@@ -268,7 +311,7 @@ export function VitalSignsWidget({ data, locale, onOpen }: Omit<VisualProps, 'ra
       title={t(locale, '핵심 계기', 'Primary instruments')}
       description={t(locale, '현재 판단에 필요한 호스트 핵심 수치', 'Host readings needed for immediate decisions')}
       icon="activity"
-      badge={t(locale, '실시간', 'LIVE')}
+      badge={data.stale ? t(locale, '지연', 'STALE') : t(locale, '실시간', 'LIVE')}
       detailPage="resources"
       onOpen={onOpen}
       locale={locale}
@@ -309,8 +352,8 @@ export function ResourceWidget({ data, range, locale, onOpen }: VisualProps) {
               <Tooltip contentStyle={TOOLTIP_STYLE} labelFormatter={(_label, payload) => payload?.[0]?.payload?.fullTime ?? _label} formatter={(value: any, name: any) => [formatPercent(Number(value), 1), name]} />
               <Legend />
               <ReferenceLine y={75} stroke={CHART_COLORS.orange} strokeDasharray="4 4" />
-              {cpuVisible && <Area type="monotone" dataKey="cpuPercent" name="CPU" stroke={CHART_COLORS.cyan} fill="url(#v2CpuFill)" strokeWidth={2} connectNulls />}
-              {memoryVisible && <Area type="monotone" dataKey="memoryPercent" name={t(locale, '메모리', 'Memory')} stroke={CHART_COLORS.violet} fill="url(#v2MemoryFill)" strokeWidth={2} connectNulls />}
+              {cpuVisible && <Area type="monotone" dataKey="cpuPercent" name="CPU" stroke={CHART_COLORS.cyan} fill="url(#v2CpuFill)" strokeWidth={2} />}
+              {memoryVisible && <Area type="monotone" dataKey="memoryPercent" name={t(locale, '메모리', 'Memory')} stroke={CHART_COLORS.violet} fill="url(#v2MemoryFill)" strokeWidth={2} />}
             </AreaChart>
           </ResponsiveContainer>
         )}
@@ -342,10 +385,10 @@ export function LoadWidget({ data, range, locale, onOpen }: VisualProps) {
               <YAxis yAxisId="temp" orientation="right" stroke={CHART_COLORS.axis} tickFormatter={(value) => `${value}°`} tickLine={false} axisLine={false} width={42} />
               <Tooltip contentStyle={TOOLTIP_STYLE} labelFormatter={(_label, payload) => payload?.[0]?.payload?.fullTime ?? _label} />
               <Legend />
-              {loadVisible && <Line yAxisId="load" type="monotone" dataKey="load1" name={t(locale, '부하 1분', 'Load 1m')} stroke={CHART_COLORS.green} strokeWidth={2.2} dot={false} connectNulls />}
-              {loadVisible && <Line yAxisId="load" type="monotone" dataKey="load5" name={t(locale, '부하 5분', 'Load 5m')} stroke={CHART_COLORS.cyan} strokeWidth={1.6} dot={false} connectNulls />}
-              {loadVisible && <Line yAxisId="load" type="monotone" dataKey="load15" name={t(locale, '부하 15분', 'Load 15m')} stroke={CHART_COLORS.violet} strokeWidth={1.4} dot={false} connectNulls />}
-              {temperatureVisible && <Line yAxisId="temp" type="monotone" dataKey="temperatureC" name={t(locale, '온도 °C', 'Temperature °C')} stroke={CHART_COLORS.orange} strokeWidth={1.8} strokeDasharray="5 3" dot={false} connectNulls />}
+              {loadVisible && <Line yAxisId="load" type="monotone" dataKey="load1" name={t(locale, '부하 1분', 'Load 1m')} stroke={CHART_COLORS.green} strokeWidth={2.2} dot={false} />}
+              {loadVisible && <Line yAxisId="load" type="monotone" dataKey="load5" name={t(locale, '부하 5분', 'Load 5m')} stroke={CHART_COLORS.cyan} strokeWidth={1.6} dot={false} />}
+              {loadVisible && <Line yAxisId="load" type="monotone" dataKey="load15" name={t(locale, '부하 15분', 'Load 15m')} stroke={CHART_COLORS.violet} strokeWidth={1.4} dot={false} />}
+              {temperatureVisible && <Line yAxisId="temp" type="monotone" dataKey="temperatureC" name={t(locale, '온도 °C', 'Temperature °C')} stroke={CHART_COLORS.orange} strokeWidth={1.8} strokeDasharray="5 3" dot={false} />}
             </ComposedChart>
           </ResponsiveContainer>
         )}
@@ -388,8 +431,8 @@ export function NetworkWidget({ data, range, locale, onOpen }: VisualProps) {
               <YAxis stroke={CHART_COLORS.axis} tickFormatter={(value) => formatRate(Number(value)).replace('/s', '')} tickLine={false} axisLine={false} width={58} />
               <Tooltip contentStyle={TOOLTIP_STYLE} formatter={(value: any, name: any) => [formatRate(Number(value)), name]} />
               <Legend />
-              {receiveVisible && <Area type="monotone" dataKey="networkRxBytesPerSecond" name={t(locale, '수신', 'Receive')} stroke={CHART_COLORS.cyan} fill="url(#networkRxFill)" strokeWidth={2} connectNulls />}
-              {transmitVisible && <Area type="monotone" dataKey="networkTxBytesPerSecond" name={t(locale, '송신', 'Transmit')} stroke={CHART_COLORS.violet} fill="url(#networkTxFill)" strokeWidth={2} connectNulls />}
+              {receiveVisible && <Area type="monotone" dataKey="networkRxBytesPerSecond" name={t(locale, '수신', 'Receive')} stroke={CHART_COLORS.cyan} fill="url(#networkRxFill)" strokeWidth={2} />}
+              {transmitVisible && <Area type="monotone" dataKey="networkTxBytesPerSecond" name={t(locale, '송신', 'Transmit')} stroke={CHART_COLORS.violet} fill="url(#networkTxFill)" strokeWidth={2} />}
             </AreaChart>
           </ResponsiveContainer>
         )}
@@ -446,7 +489,7 @@ export function StorageWidget({ data, range, locale, onOpen }: VisualProps) {
   const writeVisible = detailVisible('write');
   const ioVisible = readVisible || writeVisible;
   const series = useMemo(() => chartSeries(data, range, locale), [data, range, locale]);
-  const diskBars = data.disks.map((disk) => ({ name: safeText(disk.mount, 'volume', 24), used: disk.usedPercent ?? 0 }));
+  const diskBars = storageCapacityChartRows(data.disks);
   const reportedAvailable = data.disks.filter((disk) => typeof disk.availableBytes === 'number');
   const minimumAvailable = reportedAvailable.length
     ? Math.min(...reportedAvailable.map((disk) => disk.availableBytes ?? Number.POSITIVE_INFINITY))
@@ -513,11 +556,7 @@ export function ContainersWidget({ data, locale, onOpen }: Omit<VisualProps, 'ra
   const detailVisible = useAdaptiveGridDetailVisibility();
   const cpuVisible = detailVisible('cpu');
   const memoryVisible = detailVisible('memory');
-  const chart = data.containers.slice().sort((left, right) => (right.cpuPercent ?? 0) - (left.cpuPercent ?? 0)).slice(0, 10).map((container) => ({
-    name: safeText(container.name, 'container', 24),
-    cpu: container.cpuPercent ?? 0,
-    memory: container.memoryPercent ?? 0,
-  }));
+  const chart = containerUtilizationChartRows(data.containers);
   const nominal = data.containers.filter((container) => containerTone(container) === 'ok').length;
   return (
     <CockpitPanel title={t(locale, '서비스와 컨테이너', 'Services and containers')} description={t(locale, '현재 상태와 상대 자원 사용량', 'Current health and relative resource usage')} icon="server" badge={`${nominal}/${data.containers.length}`} detailPage="containers" onOpen={onOpen} locale={locale}>
@@ -571,7 +610,7 @@ export function PowerWidget({ data, range, locale, onOpen }: VisualProps) {
               <YAxis domain={['dataMin - 0.05', 'dataMax + 0.05']} stroke={CHART_COLORS.axis} tickFormatter={(value) => `${Number(value).toFixed(2)}V`} tickLine={false} axisLine={false} width={55} />
               <Tooltip contentStyle={TOOLTIP_STYLE} formatter={(value: any) => voltage(Number(value))} />
               <ReferenceLine y={4.75} stroke={CHART_COLORS.orange} strokeDasharray="4 4" label={{ value: '4.75V', fill: CHART_COLORS.orange, fontSize: 10 }} />
-              <Line type="monotone" dataKey="supplyVoltageVolts" name={t(locale, '공급 전압', 'Supply voltage')} stroke={CHART_COLORS.cyan} strokeWidth={2.2} dot={false} connectNulls />
+              <Line type="monotone" dataKey="supplyVoltageVolts" name={t(locale, '공급 전압', 'Supply voltage')} stroke={CHART_COLORS.cyan} strokeWidth={2.2} dot={false} />
             </LineChart>
           </ResponsiveContainer>
         )}

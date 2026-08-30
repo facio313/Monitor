@@ -21,6 +21,7 @@ COPY scripts ./scripts
 
 RUN ./scripts/portfolio-auth-mode.sh check \
     && npm run test:portfolio-auth \
+    && npm run typecheck \
     && npm test \
     && npm run build
 

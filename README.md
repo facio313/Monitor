@@ -509,7 +509,7 @@ Collector variables and defaults are:
 | `MONITOR_MAX_INCIDENT_RECORDS` | `1000` |
 | `MONITOR_INCIDENT_FOLLOW_UP_SAMPLES` | `5` |
 | `MONITOR_CPU_WARN_PERCENT`, `MONITOR_CPU_RECOVER_PERCENT` | `85`, `75` |
-| `MONITOR_CPU_WARN_SAMPLES` | `1` one-minute sample |
+| `MONITOR_CPU_WARN_SAMPLES` | `2` consecutive one-minute samples |
 | `MONITOR_MEMORY_AVAILABLE_WARN_PERCENT`, `MONITOR_MEMORY_AVAILABLE_RECOVER_PERCENT` | `20`, `25` |
 | `MONITOR_TEMPERATURE_WARN_C`, `MONITOR_TEMPERATURE_RECOVER_C` | `75`, `72` |
 | `MONITOR_LOAD_WARN`, `MONITOR_LOAD_RECOVER` | `4`, `2` |
@@ -518,6 +518,7 @@ Collector variables and defaults are:
 | `MONITOR_TRAFFIC_SLOW_SECONDS` | `1` |
 | `MONITOR_MAX_INPUT_BYTES` | `1048576` per input read |
 | `MONITOR_KERNEL_MAX_INPUT_BYTES` | `8388608` per kernel-log read |
+| `MONITOR_RULE_PACK` | `/usr/local/lib/monitor-collector/rules/default-rules.v1.json` |
 
 `MONITOR_MOUNTINFO` and `MONITOR_MOUNT_ROOT` are normally unset and exist for
 fixture roots. The installed source of truth is
@@ -541,7 +542,16 @@ sudo systemctl restart monitor-collector.service
 The default root is `/var/lib/monitor-export`:
 
 - `current.json` contains `generatedAt`, `host`, `latest`, `disks`,
-  `containers`, `currentTraffic`, `reliability`, and `system`.
+  `containers`, `containerCollection`, `currentTraffic`, `reliability`, and
+  `system`. Container source status distinguishes fresh, bounded last-known,
+  unavailable, and permission-denied observations. A current container row is
+  the fixed 17-field reduced lifecycle contract: safe name/project/owner,
+  state and authoritative health support, CPU/memory usage, configured
+  memory/CPU/PID limits, restart total and interval delta, OOM state, and
+  start/finish timestamps. Missing inspect evidence remains `null`; raw IDs,
+  images, commands, environment, and mounts are never published. Legacy
+  seven-field rows are read with the new fields unknown, and incident evidence
+  intentionally remains the smaller seven-field projection.
 - `history/YYYY-MM-DD.jsonl` contains one reduced telemetry sample per line.
   Each day is capped at 2,000 rows and the default calendar retention is 30
   days.
@@ -549,6 +559,12 @@ The default root is `/var/lib/monitor-export`:
   records. Every `power.jsonl` record has exactly `timestamp`, `severity`,
   `kind`, `status`, and a fixed semantic `message`; it never contains the raw
   kernel line.
+- `rule-evaluation.json` contains the latest versioned fixed-schema rule
+  evaluation, including explicit unsupported, no-data, permission, and
+  collection-error phases. `rule-alerts.jsonl` keeps at most 5,000
+  idempotent firing/resolution transitions. The seed pack defines all 82
+  documented defaults; rules without a proven signal remain unsupported
+  rather than appearing healthy.
 - `incidents.jsonl` is capped at 1,000 records, 16 MiB, and 30 days. A record is
   written only on incident entry, during at most five one-minute follow-ups,
   when another threshold joins the same window, and on recovery.
@@ -635,8 +651,9 @@ list requests are restricted to explicitly reviewed Compose projects, and
 only exact reviewed project/service pairs become fixed, distinct workload
 labels. Previous app-level labels and the generic `cks-workload` value remain
 readable in retained history but are never emitted for a new observation. Each admitted workload is
-reduced to that label, owner, state, health, CPU percentage, and memory
-bytes/percentage. The Blog Compose services `blogWeb` and `blogServer` are
+reduced to that label/project, owner, state, authoritative health support,
+CPU/memory usage, configured limits, restart/OOM state, and lifecycle
+timestamps. The Blog Compose services `blogWeb` and `blogServer` are
 published only as `blog-frontend` and `blog-backend`; the default dashboard
 order keeps them together, frontend before backend, among the alphabetically
 ordered non-core apps. Incident process evidence is grouped into fixed executable
@@ -652,7 +669,8 @@ mount, or a raw log line.
 The API validates and bounds the files again, rejects malformed, out-of-range,
 or future data, and marks a response stale when no recent sample exists. It
 returns at most 360 chart samples and 500 each of incidents, alerts, power
-events, and privilege events. Chart downsampling retains the first/last sample,
+events, privilege events, and rule transitions. Rule evaluation and rule
+transitions remain separate from legacy semantic alerts. Chart downsampling retains the first/last sample,
 power-state/flag transitions, and global minima/maxima for CPU, memory,
 temperature, 1/5/15-minute load, voltage, network receive/transmit, and disk
 read/write rates. `telemetrySummary` is calculated from every valid sample

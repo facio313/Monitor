@@ -179,6 +179,11 @@ describe('authentication', () => {
     await request(app).get('/healthz').expect(200, { status: 'ok' });
     await request(app).get('/readyz').expect(503, { status: 'not_ready' });
     writeFileSync(join(directory, 'current.json'), JSON.stringify({
+      latest: { timestamp: '2026-08-19T11:54:59Z', cpuPercent: 1 },
+    }));
+    await request(app).get('/readyz').expect(503, { status: 'not_ready' });
+    await request(app).get('/healthz').expect(200, { status: 'ok' });
+    writeFileSync(join(directory, 'current.json'), JSON.stringify({
       latest: { timestamp: '2026-08-19T12:00:00Z', cpuPercent: 1 },
     }));
     await request(app).get('/readyz').expect(200, { status: 'ready' });
@@ -936,6 +941,7 @@ describe('dashboard ingestion', () => {
       'multtara-frontend',
     ];
     writeFileSync(join(directory, 'current.json'), JSON.stringify({
+      generatedAt: new Date(NOW).toISOString(),
       containers: names.map((name) => ({
         name,
         owner: 'cks',
@@ -952,6 +958,25 @@ describe('dashboard ingestion', () => {
       .expect(200);
 
     expect(response.body.containers.map((container: { name: string }) => container.name)).toEqual(names);
+    expect(response.body.containerCollection).toEqual({
+      status: 'last-known',
+      observedAt: new Date(NOW).toISOString(),
+    });
+    expect(response.body.containers.every((container: { health: unknown }) => container.health === null)).toBe(true);
+
+    writeFileSync(join(directory, 'current.json'), JSON.stringify({
+      generatedAt: new Date(NOW).toISOString(),
+      containerCollection: { status: 'unavailable', observedAt: null },
+      containers: names.map((name) => ({
+        name, owner: 'cks', state: 'running', health: 'healthy',
+      })),
+    }));
+    const contradictory = await request(app)
+      .get('/monitor/api/dashboard?range=1h')
+      .set('Cookie', cookie)
+      .expect(200);
+    expect(contradictory.body.containerCollection).toEqual({ status: 'unavailable', observedAt: null });
+    expect(contradictory.body.containers).toEqual([]);
   });
 
   it('whitelists fields, redacts secrets, and never returns raw privilege commands', async () => {
@@ -1091,13 +1116,13 @@ describe('dashboard ingestion', () => {
     });
     expect(response.body.containers).toHaveLength(3);
     expect(response.body.containers[0]).toMatchObject({
-      name: 'cks-workload', owner: 'cks', state: 'running', health: 'healthy', cpuPercent: 250,
+      name: 'cks-workload', owner: 'cks', state: 'running', health: null, cpuPercent: 250,
     });
     expect(response.body.containers[1]).toMatchObject({
-      name: 'feelmyrythm-web', owner: 'cks', state: 'running', health: 'healthy', cpuPercent: 12.5,
+      name: 'feelmyrythm-web', owner: 'cks', state: 'running', health: null, cpuPercent: 12.5,
     });
     expect(response.body.containers[2]).toMatchObject({
-      name: 'pilgrimage', owner: 'cks', state: 'exited', health: 'none', cpuPercent: null,
+      name: 'pilgrimage', owner: 'cks', state: 'exited', health: null, cpuPercent: null,
     });
     expect(response.body.currentTraffic).toEqual([]);
     expect(response.body.alerts[0]).toMatchObject({ kind: null, status: null });

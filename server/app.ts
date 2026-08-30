@@ -126,7 +126,7 @@ export function createApp(options: AppOptions = {}) {
   });
 
   app.get('/readyz', (_request, response) => {
-    if (!telemetryIsReady(config.dataDir)) {
+    if (!telemetryIsReady(config.dataDir, now(), config.staleAfterMs)) {
       response.status(503).json({ status: 'not_ready' });
       return;
     }

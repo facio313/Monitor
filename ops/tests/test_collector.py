@@ -1,6 +1,7 @@
 import datetime as dt
 import json
 import os
+import socket
 import stat
 import sys
 import tempfile
@@ -371,14 +372,65 @@ class ParsingTests(unittest.TestCase):
             "precpu_stats": {"cpu_usage": {"total_usage": 0}, "system_cpu_usage": 0},
             "memory_stats": {"usage": 25, "limit": 100},
         }
-        prior = {"cpuTotal": 100, "systemTotal": 1000, "onlineCpus": 2}
-        reduced = collector.container_from_api(raw, "cks", stats, prior)
-        self.assertEqual(set(reduced), {
-            "name", "owner", "state", "health", "cpuPercent", "memoryBytes", "memoryPercent"
-        })
+        inspect = {
+            "Id": raw["Id"],
+            "Name": "/private-name",
+            "Image": "sha256:secret-image-digest",
+            "RestartCount": 5,
+            "State": {
+                "Status": "running",
+                "OOMKilled": True,
+                "StartedAt": "2026-08-23T01:02:03.123456789Z",
+                "FinishedAt": "0001-01-01T00:00:00Z",
+                "Health": {"Status": "unhealthy", "Log": [{"Output": "token=secret"}]},
+            },
+            "Config": {
+                "Healthcheck": {"Test": ["CMD-SHELL", "curl -H 'token: secret' localhost"]},
+                "Env": ["TOKEN=secret"],
+            },
+            "HostConfig": {
+                "Memory": 0,
+                "NanoCpus": 1_500_000_000,
+                "CpuQuota": 0,
+                "CpuPeriod": 0,
+                "PidsLimit": None,
+                "Binds": ["/private/secret:/data"],
+            },
+            "Mounts": [{"Source": "/private/secret"}],
+        }
+        prior = {
+            "cpuTotal": 100, "systemTotal": 1000, "onlineCpus": 2,
+            "restartCount": 2,
+        }
+        reduced = collector.container_from_api(raw, "cks", stats, prior, inspect=inspect)
+        self.assertEqual(tuple(reduced), collector.CONTAINER_FIELDS)
         self.assertEqual(reduced["name"], "monitor")
-        self.assertEqual(reduced["health"], "healthy")
+        self.assertEqual(reduced["project"], "monitor")
+        self.assertEqual(reduced["health"], "unhealthy")
+        self.assertTrue(reduced["healthcheckConfigured"])
         self.assertEqual(reduced["cpuPercent"], 20.0)
+        self.assertEqual(reduced["memoryPercent"], 25.0)
+        self.assertEqual(reduced["restartCount"], 5)
+        self.assertEqual(reduced["restartCountDelta"], 3)
+        self.assertTrue(reduced["oomKilled"])
+        self.assertEqual(reduced["startedAt"], "2026-08-23T01:02:03.123456Z")
+        self.assertIsNone(reduced["finishedAt"])
+        self.assertEqual(reduced["memoryLimitBytes"], 0)
+        self.assertEqual(reduced["cpuLimitCores"], 1.5)
+        self.assertEqual(reduced["pidLimit"], 0)
+        future_inspect = {
+            **inspect,
+            "State": {
+                **inspect["State"],
+                "StartedAt": "2099-01-01T00:00:00Z",
+                "FinishedAt": "2099-01-01T00:01:00Z",
+            },
+        }
+        future_reduced = collector.container_from_api(
+            raw, "cks", None, prior, inspect=future_inspect
+        )
+        self.assertIsNone(future_reduced["startedAt"])
+        self.assertIsNone(future_reduced["finishedAt"])
         multi_core_stats = {
             **stats,
             "cpu_stats": {
@@ -388,7 +440,9 @@ class ParsingTests(unittest.TestCase):
             },
         }
         self.assertEqual(
-            collector.container_from_api(raw, "cks", multi_core_stats, prior)["cpuPercent"],
+            collector.container_from_api(
+                raw, "cks", multi_core_stats, prior, inspect=inspect
+            )["cpuPercent"],
             160.0,
         )
         self.assertEqual(
@@ -405,13 +459,255 @@ class ParsingTests(unittest.TestCase):
                 "online_cpus": 2,
             },
         }
-        self.assertEqual(collector.container_from_api(raw, "cks", idle_stats, prior)["cpuPercent"], 0.0)
+        self.assertEqual(
+            collector.container_from_api(raw, "cks", idle_stats, prior, inspect=inspect)["cpuPercent"],
+            0.0,
+        )
         self.assertNotIn("secret", json.dumps(reduced))
         unavailable = collector.container_from_api(raw, "cks", None)
         self.assertIsNone(unavailable["cpuPercent"])
         self.assertIsNone(unavailable["memoryBytes"])
+        self.assertIsNone(unavailable["health"])
+        self.assertIsNone(unavailable["healthcheckConfigured"])
+        self.assertIsNone(unavailable["restartCount"])
+        self.assertIsNone(unavailable["memoryLimitBytes"])
+        self.assertEqual(unavailable["project"], "monitor")
+
+        unlimited = collector.container_from_api(raw, "cks", None, inspect={
+            "RestartCount": 0,
+            "State": {
+                "OOMKilled": False,
+                "StartedAt": "2026-08-23T01:02:03Z",
+                "FinishedAt": "2026-08-23T01:03:03Z",
+            },
+            "Config": {},
+            "HostConfig": {
+                "Memory": 0, "NanoCpus": 0, "CpuQuota": 0,
+                "CpuPeriod": 100_000, "PidsLimit": -1,
+            },
+        })
+        self.assertEqual(unlimited["health"], "none")
+        self.assertFalse(unlimited["healthcheckConfigured"])
+        self.assertFalse(unlimited["oomKilled"])
+        self.assertEqual(unlimited["memoryLimitBytes"], 0)
+        self.assertEqual(unlimited["cpuLimitCores"], 0.0)
+        self.assertEqual(unlimited["pidLimit"], 0)
+        self.assertEqual(unlimited["restartCount"], 0)
+        self.assertIsNone(unlimited["restartCountDelta"])
+
+        decreased = collector.container_from_api(raw, "cks", None, {"restartCount": 2}, inspect={
+            "RestartCount": 1,
+            "State": {
+                "StartedAt": "2026-08-23T02:00:00Z",
+                "FinishedAt": "2026-08-23T01:00:00Z",
+            },
+            "Config": {},
+            "HostConfig": {},
+        })
+        self.assertEqual(decreased["restartCount"], 1)
+        self.assertIsNone(decreased["restartCountDelta"])
+        self.assertEqual(decreased["startedAt"], "2026-08-23T02:00:00Z")
+        self.assertEqual(decreased["finishedAt"], "2026-08-23T01:00:00Z")
         with self.assertRaisesRegex(ValueError, "outside the Compose service allowlist"):
             collector.container_from_api({**raw, "Names": [], "Labels": {}}, "cks", None)
+
+    def test_docker_response_and_detail_request_budgets_are_fixed(self):
+        container_id = "a" * 64
+        self.assertEqual(
+            collector.docker_response_byte_limit(f"/v1.41/containers/{container_id}/json"),
+            collector.MAX_DOCKER_DETAIL_RESPONSE_BYTES,
+        )
+        self.assertEqual(
+            collector.docker_response_byte_limit(
+                f"/v1.41/containers/{container_id}/stats?stream=false&one-shot=true"
+            ),
+            collector.MAX_DOCKER_DETAIL_RESPONSE_BYTES,
+        )
+        self.assertEqual(
+            collector.docker_response_byte_limit(
+                collector.compose_project_list_path("monitor")
+            ),
+            collector.MAX_DOCKER_LIST_RESPONSE_BYTES,
+        )
+        self.assertEqual(collector.MAX_DOCKER_INSPECT_REQUESTS, 30)
+        self.assertEqual(collector.MAX_DOCKER_STATS_REQUESTS, 30)
+        self.assertEqual(collector.MAX_DOCKER_DETAIL_WORKERS, 6)
+
+    def test_inspect_identity_health_and_limit_contracts_fail_closed(self):
+        container_id = "a" * 64
+        base = {
+            "Id": container_id,
+            "Config": {"Labels": {
+                "com.docker.compose.project": "monitor",
+                "com.docker.compose.service": "monitor",
+            }},
+            "State": {},
+            "HostConfig": {},
+        }
+        self.assertIs(collector.validated_container_inspect(base, container_id, "monitor"), base)
+        self.assertIsNone(collector.validated_container_inspect(
+            {**base, "Id": "b" * 64}, container_id, "monitor"
+        ))
+        self.assertIsNone(collector.validated_container_inspect({
+            **base,
+            "Config": {"Labels": {
+                "com.docker.compose.project": "private-project",
+                "com.docker.compose.service": "monitor",
+            }},
+        }, container_id, "monitor"))
+
+        health_cases = (
+            (None, (None, None)),
+            ({"Config": {}}, ("none", False)),
+            ({"Config": {"Healthcheck": {"Test": ["NONE"]}}}, ("none", False)),
+            ({"Config": {"Healthcheck": {"Test": ["CMD", "true"]}}}, (None, True)),
+            ({
+                "Config": {"Healthcheck": {"Test": ["CMD-SHELL", "true"]}},
+                "State": {"Health": {"Status": "healthy"}},
+            }, ("healthy", True)),
+            ({
+                "Config": {},
+                "State": {"Health": {"Status": "healthy"}},
+            }, ("none", False)),
+            ({
+                "Config": {"Healthcheck": {"Test": ["NONE"]}},
+                "State": {"Health": {"Status": "healthy"}},
+            }, ("none", False)),
+            ({
+                "Config": {"Healthcheck": {"Test": ["BOGUS"]}},
+                "State": {"Health": {"Status": "healthy"}},
+            }, (None, None)),
+            ({"Config": {"Healthcheck": {"Test": ["BOGUS", "secret"]}}}, (None, None)),
+        )
+        for inspect, expected in health_cases:
+            with self.subTest(expected=expected):
+                self.assertEqual(collector.docker_health_details(inspect), expected)
+
+        for malformed_test in (
+            ["CMD", {"secret": True}],
+            ["CMD", "x" * 4097],
+            ["CMD", *("x" for _ in range(32))],
+            ["NONE", "unexpected"],
+        ):
+            reduced = collector.reduce_container_inspect({
+                "Config": {"Healthcheck": {"Test": malformed_test}},
+                "State": {"Health": {"Status": "healthy"}},
+            })
+            with self.subTest(malformed_test=malformed_test[:1]):
+                self.assertEqual(collector.docker_health_details(reduced), (None, None))
+
+        for raw_healthcheck in ({}, {"Test": []}, {"Test": ["NONE"]}):
+            reduced = collector.reduce_container_inspect({
+                "Config": {"Healthcheck": raw_healthcheck},
+                "State": {"Health": {"Status": "healthy"}},
+            })
+            with self.subTest(raw_healthcheck=raw_healthcheck):
+                self.assertEqual(collector.docker_health_details(reduced), ("none", False))
+
+        self.assertEqual(
+            collector.docker_resource_limits({"HostConfig": {
+                "Memory": 0, "NanoCpus": 0, "CpuQuota": 50_000,
+                "CpuPeriod": 100_000, "PidsLimit": None,
+            }}),
+            (0, 0.5, 0),
+        )
+        self.assertEqual(
+            collector.docker_resource_limits({"HostConfig": {
+                "Memory": True, "NanoCpus": 0, "CpuQuota": 50_000,
+                "CpuPeriod": 0, "PidsLimit": "64",
+            }}),
+            (None, None, None),
+        )
+        self.assertEqual(
+            collector.docker_resource_limits({"HostConfig": {
+                "Memory": 0, "NanoCpus": 500_000_000,
+                "CpuQuota": "malformed", "CpuPeriod": "malformed",
+                "PidsLimit": -1,
+            }}),
+            (0, 0.5, 0),
+        )
+
+    def test_mismatched_inspect_is_redacted_and_does_not_rebase_restart_state(self):
+        container_id = "a" * 64
+        raw = {
+            "Id": container_id,
+            "Labels": {
+                "com.docker.compose.project": "monitor",
+                "com.docker.compose.service": "monitor",
+            },
+            "State": "running",
+            "Status": "Up (healthy)",
+        }
+        prior = {f"cks:{container_id}": {
+            "cpuTotal": 100, "systemTotal": 1000, "onlineCpus": 2,
+            "restartCount": 9,
+        }}
+
+        def fake_get(_socket, path, _curl, _timeout):
+            project = docker_list_project(path)
+            if project is not None:
+                return [raw] if project == "monitor" else []
+            if path.endswith("/json"):
+                return {
+                    "Id": "b" * 64,
+                    "RestartCount": 99,
+                    "State": {"OOMKilled": True, "Health": {"Status": "unhealthy"}},
+                    "Config": {
+                        "Labels": raw["Labels"],
+                        "Env": ["TOKEN=secret"],
+                    },
+                    "HostConfig": {"Memory": 123},
+                }
+            return {
+                "cpu_stats": {
+                    "cpu_usage": {"total_usage": 200},
+                    "system_cpu_usage": 2000,
+                    "online_cpus": 2,
+                },
+                "memory_stats": {"usage": 25, "limit": 100},
+            }
+
+        with mock.patch.object(collector, "docker_get", side_effect=fake_get):
+            containers, next_state = collector.collect_containers(
+                {"cks": Path("/cks.sock")}, "/curl", 2, prior
+            )
+        self.assertEqual(len(containers), 1)
+        self.assertIsNone(containers[0]["health"])
+        self.assertIsNone(containers[0]["restartCount"])
+        self.assertIsNone(containers[0]["oomKilled"])
+        self.assertIsNone(containers[0]["memoryLimitBytes"])
+        self.assertEqual(next_state[f"cks:{container_id}"]["restartCount"], 9)
+        self.assertNotIn("secret", json.dumps([containers, next_state]))
+
+    def test_docker_transport_rejects_oversize_and_invalid_utf8(self):
+        container_id = "a" * 64
+        request_path = f"/v1.41/containers/{container_id}/json"
+        with tempfile.TemporaryDirectory() as temporary:
+            socket_path = Path(temporary) / "docker.sock"
+            connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            connection.bind(str(socket_path))
+            try:
+                completed = mock.Mock(returncode=0, stdout=b"{}", stderr=b"")
+                with mock.patch.object(collector.subprocess, "run", return_value=completed) as run:
+                    self.assertEqual(
+                        collector.docker_get(socket_path, request_path, "/curl", 2), {}
+                    )
+                arguments = run.call_args.args[0]
+                self.assertIn("--max-filesize", arguments)
+                self.assertIn(str(collector.MAX_DOCKER_DETAIL_RESPONSE_BYTES), arguments)
+
+                completed.stdout = b"x" * (collector.MAX_DOCKER_DETAIL_RESPONSE_BYTES + 1)
+                with mock.patch.object(collector.subprocess, "run", return_value=completed):
+                    self.assertIsNone(
+                        collector.docker_get(socket_path, request_path, "/curl", 2)
+                    )
+                completed.stdout = b"\xff"
+                with mock.patch.object(collector.subprocess, "run", return_value=completed):
+                    self.assertIsNone(
+                        collector.docker_get(socket_path, request_path, "/curl", 2)
+                    )
+            finally:
+                connection.close()
 
     def test_compose_pairs_have_distinct_fixed_names_and_filtered_list_paths(self):
         expected_pairs = {
@@ -455,6 +751,7 @@ class ParsingTests(unittest.TestCase):
             ("pongdang-multtara", "db"), collector.ALLOWED_COMPOSE_SERVICES
         )
         paths = []
+        inspect_paths = []
         stats_paths = []
         ids_by_pair = {
             pair: f"{index + 1:064x}"
@@ -464,7 +761,10 @@ class ParsingTests(unittest.TestCase):
         def fake_get(_socket, path, _curl, _timeout):
             project = docker_list_project(path)
             if project is None:
-                stats_paths.append(path)
+                if path.endswith("/json"):
+                    inspect_paths.append(path)
+                else:
+                    stats_paths.append(path)
                 return {}
             self.assertIn(project, collector.ALLOWED_COMPOSE_PROJECTS)
             paths.append(path)
@@ -530,17 +830,34 @@ class ParsingTests(unittest.TestCase):
         self.assertEqual(len(containers), len(collector.ALLOWED_COMPOSE_SERVICES))
         self.assertNotIn("cks-workload", {item["name"] for item in containers})
         self.assertEqual(cpu_state, {})
+        self.assertEqual(len(inspect_paths), len(collector.ALLOWED_COMPOSE_SERVICES))
+        self.assertTrue(all(path.endswith("/json") for path in inspect_paths))
         self.assertEqual(stats_paths, [])
         self.assertTrue(all(item["state"] == "exited" for item in containers))
+        self.assertEqual(
+            {item["project"] for item in containers},
+            set(collector.ALLOWED_COMPOSE_PROJECTS),
+        )
 
     def test_reduced_container_input_requires_fresh_cks_owned_fixed_schema(self):
         now = dt.datetime(2026, 8, 23, 3, 0, tzinfo=dt.timezone.utc)
         document = {
             "generatedAt": collector.iso_timestamp(now),
+            "containerCollection": {
+                "status": "fresh", "observedAt": collector.iso_timestamp(now),
+            },
             "containers": [{
                 "name": "monitor", "owner": "cks", "state": "running", "health": "healthy",
                 "cpuPercent": 250.0, "memoryBytes": 123, "memoryPercent": 1.5,
             }],
+        }
+        normalized_container = {
+            "name": "monitor", "project": None, "owner": "cks",
+            "state": "running", "health": None, "healthcheckConfigured": None,
+            "cpuPercent": 250.0, "memoryBytes": 123, "memoryPercent": 1.5,
+            "memoryLimitBytes": None, "cpuLimitCores": None, "pidLimit": None,
+            "restartCount": None, "restartCountDelta": None, "oomKilled": None,
+            "startedAt": None, "finishedAt": None,
         }
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "containers.json"
@@ -567,7 +884,38 @@ class ParsingTests(unittest.TestCase):
 
             with mock.patch.object(Path, "lstat", owned_by_cks), \
                  mock.patch.object(collector.os, "fstat", opened_by_cks):
-                self.assertEqual(collector.load_container_snapshot(path, now), document["containers"])
+                self.assertEqual(collector.load_container_snapshot(path, now), [normalized_container])
+                containers, collection = collector.load_container_snapshot_state(path, now)
+                self.assertEqual(containers, [normalized_container])
+                self.assertEqual(collection, document["containerCollection"])
+                migrated_v2 = {
+                    **document,
+                    "containers": [normalized_container],
+                }
+                path.write_text(json.dumps(migrated_v2), encoding="utf-8")
+                self.assertEqual(
+                    collector.load_container_snapshot(path, now),
+                    [normalized_container],
+                )
+                legacy_schema = {
+                    "generatedAt": collector.iso_timestamp(now),
+                    "containers": document["containers"],
+                }
+                path.write_text(json.dumps(legacy_schema), encoding="utf-8")
+                self.assertEqual(
+                    collector.load_container_snapshot_state(path, now)[1],
+                    {"status": "fresh", "observedAt": collector.iso_timestamp(now)},
+                )
+                stale_observed = now - dt.timedelta(minutes=4)
+                stale_legacy = {
+                    "generatedAt": collector.iso_timestamp(stale_observed),
+                    "containers": document["containers"],
+                }
+                path.write_text(json.dumps(stale_legacy), encoding="utf-8")
+                self.assertEqual(
+                    collector.load_container_snapshot_state(path, now)[1],
+                    {"status": "last-known", "observedAt": collector.iso_timestamp(stale_observed)},
+                )
                 for legacy_name in sorted(collector.LEGACY_CONTAINER_NAMES):
                     legacy_document = {
                         **document,
@@ -577,16 +925,37 @@ class ParsingTests(unittest.TestCase):
                         }],
                     }
                     path.write_text(json.dumps(legacy_document), encoding="utf-8")
+                    loaded = collector.load_container_snapshot(path, now)
+                    self.assertEqual(tuple(loaded[0]), collector.CONTAINER_FIELDS)
+                    self.assertEqual(loaded[0]["name"], legacy_name)
                     self.assertEqual(
-                        collector.load_container_snapshot(path, now),
-                        legacy_document["containers"],
+                        loaded[0]["project"],
+                        None,
                     )
+                    self.assertIsNone(loaded[0]["health"])
+                    self.assertIsNone(loaded[0]["restartCount"])
                 path.write_text(json.dumps({
                     **document,
                     "containers": [{**document["containers"][0], "name": "alice@example.test"}],
                 }), encoding="utf-8")
                 with self.assertRaisesRegex(ValueError, "outside the allowlist"):
                     collector.load_container_snapshot(path, now)
+
+                for invalid_row in (
+                    {**normalized_container, "project": "private-project"},
+                    {**normalized_container, "restartCount": True},
+                    {**normalized_container, "restartCount": 2, "restartCountDelta": 3},
+                    {**normalized_container, "oomKilled": "true"},
+                    {**normalized_container, "memoryLimitBytes": -1},
+                    {**normalized_container, "cpuLimitCores": float("inf")},
+                    {**normalized_container, "pidLimit": "100"},
+                    {**normalized_container, "startedAt": "not-a-date"},
+                ):
+                    path.write_text(json.dumps({
+                        **document, "containers": [invalid_row],
+                    }), encoding="utf-8")
+                    with self.assertRaises(ValueError):
+                        collector.load_container_snapshot(path, now)
 
             path.chmod(0o660)
             with mock.patch.object(Path, "lstat", owned_by_cks), \
@@ -608,23 +977,55 @@ class ParsingTests(unittest.TestCase):
             "Mounts": [{"Source": "/private/secret"}],
         } for value in range(2)]
         lock = threading.Lock()
-        active = peak = stats_calls = 0
+        active = peak = stats_calls = inspect_calls = 0
         sample = [0]
         stats_paths = []
+        inspect_paths = []
 
         def fake_get(socket_path, path, _curl, request_timeout):
-            nonlocal active, peak, stats_calls
+            nonlocal active, peak, stats_calls, inspect_calls
             self.assertEqual(request_timeout, 2)
             if "containers/json" in path:
                 return cks_raw if socket_path == Path("/cks.sock") else secondary_raw
             with lock:
                 active += 1
-                stats_calls += 1
                 peak = max(peak, active)
-                stats_paths.append(path)
             wall_time.sleep(0.02)
             with lock:
                 active -= 1
+            if path.endswith("/json"):
+                with lock:
+                    inspect_calls += 1
+                    inspect_paths.append(path)
+                container_id = path.split("/")[3]
+                return {
+                    "Id": container_id,
+                    "RestartCount": 5 + sample[0] * 2,
+                    "State": {
+                        "OOMKilled": False,
+                        "StartedAt": "2026-08-23T01:00:00Z",
+                        "FinishedAt": "0001-01-01T00:00:00Z",
+                        "Health": {"Status": "healthy", "Log": [{"Output": "secret"}]},
+                    },
+                    "Config": {
+                        "Healthcheck": {"Test": ["CMD", "secret-health-command"]},
+                        "Env": ["TOKEN=secret"],
+                        "Labels": {
+                            "com.docker.compose.project": "monitor",
+                            "com.docker.compose.service": "monitor",
+                            "private.secret": "token",
+                        },
+                    },
+                    "HostConfig": {
+                        "Memory": 100, "NanoCpus": 500_000_000,
+                        "CpuQuota": 0, "CpuPeriod": 0, "PidsLimit": 64,
+                        "Binds": ["/private/secret:/data"],
+                    },
+                    "Mounts": [{"Source": "/private/secret"}],
+                }
+            with lock:
+                stats_calls += 1
+                stats_paths.append(path)
             return {
                 "cpu_stats": {
                     "cpu_usage": {"total_usage": 200 + sample[0] * 100},
@@ -646,15 +1047,27 @@ class ParsingTests(unittest.TestCase):
         self.assertEqual(len(first), 12)
         self.assertEqual(len(second), 12)
         self.assertEqual(stats_calls, 24)
+        self.assertEqual(inspect_calls, 24)
         self.assertGreater(peak, 1)
         self.assertLessEqual(peak, 6)
         self.assertTrue(all(item["cpuPercent"] is None for item in first))
         self.assertTrue(all(item["memoryBytes"] == 25 for item in first))
         self.assertTrue(all(item["cpuPercent"] == 20.0 for item in second))
+        self.assertTrue(all(item["restartCount"] == 5 for item in first))
+        self.assertTrue(all(item["restartCountDelta"] is None for item in first))
+        self.assertTrue(all(item["restartCount"] == 7 for item in second))
+        self.assertTrue(all(item["restartCountDelta"] == 2 for item in second))
+        self.assertTrue(all(item["health"] == "healthy" for item in second))
+        self.assertTrue(all(item["healthcheckConfigured"] is True for item in second))
+        self.assertTrue(all(item["memoryLimitBytes"] == 100 for item in second))
+        self.assertTrue(all(item["cpuLimitCores"] == 0.5 for item in second))
+        self.assertTrue(all(item["pidLimit"] == 64 for item in second))
         self.assertEqual(len(cpu_state), 12)
         self.assertEqual(len(next_cpu_state), 12)
+        self.assertTrue(all(value["restartCount"] == 7 for value in next_cpu_state.values()))
         self.assertTrue(all(item["owner"] == "cks" for item in first))
         self.assertTrue(all("stream=false&one-shot=true" in path for path in stats_paths))
+        self.assertTrue(all(path.endswith("/json") for path in inspect_paths))
         serialized = json.dumps([first, second]).lower()
         self.assertNotIn("secret", serialized)
         self.assertNotIn("token", serialized)
@@ -675,7 +1088,7 @@ class ParsingTests(unittest.TestCase):
             calls.append(path)
             return raw if "containers/json" in path else {}
 
-        with mock.patch.object(collector, "_monotonic", side_effect=[0.0, 21.0]), \
+        with mock.patch.object(collector, "_monotonic", side_effect=[0.0, 0.0, 21.0]), \
              mock.patch.object(collector, "docker_get", side_effect=fake_get):
             result, cpu_state = collector.collect_containers(
                 {"cks": Path("/cks.sock"), "secondary": Path("/secondary.sock")}, "/curl", 2
@@ -688,6 +1101,27 @@ class ParsingTests(unittest.TestCase):
         self.assertEqual(len([path for path in calls if "/stats?" in path]), 0)
         self.assertTrue(all(item["cpuPercent"] is None for item in result))
         self.assertEqual(cpu_state, {})
+
+    def test_docker_list_queries_respect_global_deadline(self):
+        calls = 0
+        lock = threading.Lock()
+
+        def slow_get(_socket, _path, _curl, _timeout):
+            nonlocal calls
+            with lock:
+                calls += 1
+            wall_time.sleep(0.03)
+            return []
+
+        started = wall_time.monotonic()
+        with mock.patch.object(collector, "MAX_DOCKER_COLLECTION_SECONDS", 0.05), \
+             mock.patch.object(collector, "docker_get", side_effect=slow_get):
+            with self.assertRaisesRegex(collector.ContainerSourceUnavailable, "deadline"):
+                collector.collect_containers({"cks": Path("/cks.sock")}, "/curl", 2)
+        elapsed = wall_time.monotonic() - started
+
+        self.assertLess(elapsed, 0.25)
+        self.assertLessEqual(calls, len(collector.ALLOWED_COMPOSE_PROJECTS))
 
     def test_docker_cpu_state_is_capped_and_pruned_to_listed_containers(self):
         sockets = {owner: Path(f"/{owner}.sock") for owner in ("cks", "secondary", "tertiary")}
@@ -709,11 +1143,28 @@ class ParsingTests(unittest.TestCase):
         }
         prior["cks:" + "f" * 64] = {"cpuTotal": 1, "systemTotal": 1, "onlineCpus": 1}
         stats_calls = 0
+        inspect_calls = 0
 
         def fake_get(socket_path, path, _curl, _timeout):
-            nonlocal stats_calls
+            nonlocal stats_calls, inspect_calls
             if "containers/json" in path:
                 return raw_by_owner[socket_path.stem]
+            if path.endswith("/json"):
+                inspect_calls += 1
+                container_id = path.split("/")[3]
+                return {
+                    "Id": container_id,
+                    "RestartCount": 1,
+                    "State": {"OOMKilled": False},
+                    "Config": {"Labels": {
+                        "com.docker.compose.project": "monitor",
+                        "com.docker.compose.service": "monitor",
+                    }},
+                    "HostConfig": {
+                        "Memory": 0, "NanoCpus": 0, "CpuQuota": 0,
+                        "CpuPeriod": 100_000, "PidsLimit": 0,
+                    },
+                }
             stats_calls += 1
             return {
                 "cpu_stats": {
@@ -726,7 +1177,16 @@ class ParsingTests(unittest.TestCase):
             containers, next_state = collector.collect_containers(sockets, "/curl", 2, prior)
         self.assertEqual(len(containers), 200)
         self.assertEqual(stats_calls, 30)
+        self.assertEqual(inspect_calls, 30)
         self.assertEqual(len(next_state), 200)
+        self.assertEqual(
+            sum("restartCount" in value for value in next_state.values()),
+            collector.MAX_DOCKER_INSPECT_REQUESTS,
+        )
+        self.assertEqual(
+            sum(item["restartCount"] is None for item in containers),
+            200 - collector.MAX_DOCKER_INSPECT_REQUESTS,
+        )
         self.assertNotIn("cks:" + "f" * 64, next_state)
 
         with mock.patch.object(collector, "docker_get", return_value=[]):
@@ -1165,8 +1625,14 @@ class IncidentTests(unittest.TestCase):
         )
         self.assertIsNone(first)
         self.assertEqual(state["cpuStreak"], 1)
+        missing, state = collector.incident_transition(
+            config, start + dt.timedelta(minutes=1), incident_metrics(cpuPercent=None),
+            empty_pressure(), [], [], [], state,
+        )
+        self.assertIsNone(missing)
+        self.assertEqual(state["cpuStreak"], 1)
         active, state = collector.incident_transition(
-            config, start + dt.timedelta(minutes=1), incident_metrics(cpuPercent=90),
+            config, start + dt.timedelta(minutes=2), incident_metrics(cpuPercent=90),
             empty_pressure(), [], [], [], state,
         )
         self.assertEqual(active["phase"], "active")
@@ -1177,17 +1643,17 @@ class IncidentTests(unittest.TestCase):
         self.assertIsNotNone(collector.existing_incident_record(active))
 
         follow_up, state = collector.incident_transition(
-            config, start + dt.timedelta(minutes=2), incident_metrics(cpuPercent=80),
+            config, start + dt.timedelta(minutes=3), incident_metrics(cpuPercent=80),
             empty_pressure(), [], [], [], state,
         )
         self.assertEqual(follow_up["phase"], "follow-up")
         suppressed, state = collector.incident_transition(
-            config, start + dt.timedelta(minutes=3), incident_metrics(cpuPercent=80),
+            config, start + dt.timedelta(minutes=4), incident_metrics(cpuPercent=80),
             empty_pressure(), [], [], [], state,
         )
         self.assertIsNone(suppressed)
         recovered, state = collector.incident_transition(
-            config, start + dt.timedelta(minutes=4), incident_metrics(cpuPercent=74),
+            config, start + dt.timedelta(minutes=5), incident_metrics(cpuPercent=74),
             empty_pressure(), [], [], [], state,
         )
         self.assertEqual(recovered["phase"], "recovered")
@@ -1247,7 +1713,7 @@ class IncidentTests(unittest.TestCase):
         self.assertEqual(state["activeReasons"], [])
 
     def test_unknown_metrics_preserve_active_reasons_without_opening_new_ones(self):
-        config = collector.Config(docker_sockets={}, traffic_log=None)
+        config = collector.Config(docker_sockets={}, traffic_log=None, cpu_warn_samples=1)
         start = dt.datetime(2026, 8, 23, 2, 30, tzinfo=dt.timezone.utc)
         traffic = [{
             "app": "monitor", "requestCount": 300, "status2xx": 300, "status3xx": 0,
@@ -1292,7 +1758,7 @@ class IncidentTests(unittest.TestCase):
         self.assertEqual(new_state["activeReasons"], [])
 
     def test_incident_validation_rejects_foreign_owner_and_malformed_nested_data(self):
-        config = collector.Config(docker_sockets={}, traffic_log=None)
+        config = collector.Config(docker_sockets={}, traffic_log=None, cpu_warn_samples=1)
         now = dt.datetime(2026, 8, 23, 3, 0, tzinfo=dt.timezone.utc)
         container = {
             "name": "web", "owner": "cks", "state": "running", "health": "healthy",
@@ -1324,7 +1790,7 @@ class IncidentTests(unittest.TestCase):
         self.assertIsNone(collector.existing_incident_record(unexpected))
 
     def test_incident_container_snapshot_is_safe_prioritized_and_line_bounded(self):
-        config = collector.Config(docker_sockets={}, traffic_log=None)
+        config = collector.Config(docker_sockets={}, traffic_log=None, cpu_warn_samples=1)
         now = dt.datetime(2026, 8, 23, 3, 30, tzinfo=dt.timezone.utc)
         containers = [{
             "name": f"service-{index}", "owner": "cks", "state": "running", "health": "healthy",
@@ -1348,6 +1814,7 @@ class IncidentTests(unittest.TestCase):
             config = collector.Config(
                 output_dir=root / "out", runtime_dir=root / "run", docker_sockets={},
                 traffic_log=None, max_incident_records=3, incident_retention_days=1,
+                cpu_warn_samples=1,
             )
             start = dt.datetime(2026, 8, 23, 4, 0, tzinfo=dt.timezone.utc)
             records = []
@@ -1397,7 +1864,7 @@ class IncidentTests(unittest.TestCase):
                 root = Path(temporary)
                 config = collector.Config(
                     output_dir=root / "out", runtime_dir=root / "run",
-                    docker_sockets={}, traffic_log=None,
+                    docker_sockets={}, traffic_log=None, cpu_warn_samples=1,
                 )
                 record, lifecycle = collector.incident_transition(
                     config, now, incident_metrics(cpuPercent=90), empty_pressure(), [], [], [], {}
@@ -1470,7 +1937,7 @@ class IncidentTests(unittest.TestCase):
             root = Path(temporary)
             config = collector.Config(
                 output_dir=root / "out", runtime_dir=root / "run",
-                docker_sockets={}, traffic_log=None,
+                docker_sockets={}, traffic_log=None, cpu_warn_samples=1,
             )
             now = dt.datetime(2026, 8, 23, 4, 40, tzinfo=dt.timezone.utc)
             record, lifecycle = collector.incident_transition(
@@ -1501,7 +1968,7 @@ class IncidentTests(unittest.TestCase):
             root = Path(temporary)
             config = collector.Config(
                 output_dir=root / "out", runtime_dir=root / "run",
-                docker_sockets={}, traffic_log=None,
+                docker_sockets={}, traffic_log=None, cpu_warn_samples=1,
             )
             now = dt.datetime(2026, 8, 23, 4, 45, tzinfo=dt.timezone.utc)
             record, lifecycle = collector.incident_transition(
@@ -1534,7 +2001,7 @@ class IncidentTests(unittest.TestCase):
             root = Path(temporary)
             config = collector.Config(
                 output_dir=root / "out", runtime_dir=root / "run",
-                docker_sockets={}, traffic_log=None,
+                docker_sockets={}, traffic_log=None, cpu_warn_samples=1,
             )
             record, lifecycle = collector.incident_transition(
                 config,
@@ -2600,9 +3067,12 @@ class FilesystemTests(unittest.TestCase):
             (history_dir / "2026-08-19.jsonl").write_text(json.dumps(legacy_sample) + "\n")
             container_id = "b" * 64
             docker_sample = [0]
+            docker_available = [True]
 
             def fake_docker(_socket, path, _curl, _timeout):
                 if "containers/json" in path:
+                    if not docker_available[0]:
+                        return None
                     return [{
                         "Id": container_id, "Names": ["/fixture"], "State": "running",
                         "Labels": {
@@ -2637,7 +3107,7 @@ class FilesystemTests(unittest.TestCase):
             }
             with mock.patch.object(collector, "collect_gpu", return_value=gpu), \
                  mock.patch.object(collector, "docker_get", side_effect=fake_docker), \
-                 mock.patch.object(collector.time, "monotonic", side_effect=[100.0, 160.0]):
+                 mock.patch.object(collector.time, "monotonic", side_effect=[100.0, 160.0, 220.0]):
                 current = collector.run(config, now)
                 first_delta_state = json.loads((runtime / "delta-state.json").read_text())
                 docker_sample[0] = 1
@@ -2645,11 +3115,26 @@ class FilesystemTests(unittest.TestCase):
                     "eth0: 700 0 7 9 0 0 0 0 800 0 8 10 0 0 0 0\n"
                 )
                 second = collector.run(config, now + dt.timedelta(minutes=1))
+                docker_available[0] = False
+                third = collector.run(config, now + dt.timedelta(minutes=2))
 
             self.assertEqual(set(current), {
-                "generatedAt", "host", "latest", "disks", "containers", "currentTraffic",
-                "reliability", "system",
+                "generatedAt", "host", "latest", "disks", "containers",
+                "containerCollection", "currentTraffic", "reliability", "system",
             })
+            self.assertEqual(current["containerCollection"], {
+                "status": "fresh", "observedAt": current["generatedAt"],
+            })
+            self.assertEqual(second["containerCollection"], {
+                "status": "fresh", "observedAt": second["generatedAt"],
+            })
+            self.assertEqual(third["containerCollection"], {
+                "status": "last-known", "observedAt": second["generatedAt"],
+            })
+            self.assertEqual(third["containers"], second["containers"])
+            self.assertEqual(third["latest"]["timestamp"], collector.iso_timestamp(
+                now + dt.timedelta(minutes=2)
+            ))
             self.assertEqual(current["currentTraffic"], [])
             self.assertEqual(set(current["host"]), {
                 "hostname", "os", "architecture", "logicalCpuCount", "uptimeSeconds",
@@ -2698,6 +3183,15 @@ class FilesystemTests(unittest.TestCase):
             self.assertEqual(stat.S_IMODE((runtime / "delta-state.json").stat().st_mode), 0o600)
             self.assertNotIn(container_id, (output / "current.json").read_text())
             self.assertNotIn("secret", (output / "current.json").read_text())
+            rule_evaluation = json.loads((output / "rule-evaluation.json").read_text())
+            self.assertEqual(rule_evaluation["status"], "ok")
+            self.assertEqual(rule_evaluation["rulePackVersion"], "2026.08.30.1")
+            self.assertEqual(
+                {state["ruleId"] for state in rule_evaluation["states"].values()},
+                {rule["id"] for rule in json.loads(collector.DEFAULT_RULE_PACK_PATH.read_text())["rules"]},
+            )
+            self.assertEqual(stat.S_IMODE((output / ".state" / "rule-state.json").stat().st_mode), 0o600)
+            self.assertEqual(stat.S_IMODE((output / "rule-alerts.jsonl").stat().st_mode), 0o640)
             self.assertEqual(len((output / "alerts.jsonl").read_text().splitlines()), 1)
             alert = json.loads((output / "alerts.jsonl").read_text().splitlines()[0])
             self.assertEqual(set(alert), {"timestamp", "severity", "kind", "status", "message"})
@@ -2710,13 +3204,19 @@ class FilesystemTests(unittest.TestCase):
                 json.loads(line)
                 for line in (output / "history" / "2026-08-19.jsonl").read_text().splitlines()
             ]
-            self.assertEqual(len(history), 3)
+            self.assertEqual(len(history), 4)
             self.assertTrue(all(tuple(sample) == collector.SAMPLE_FIELDS for sample in history))
-            self.assertEqual([sample["supplyVoltageVolts"] for sample in history], [None, 4.87, 4.87])
-            self.assertEqual([sample["throttledFlags"] for sample in history], [None, 0x50000, 0x50000])
+            self.assertEqual(
+                [sample["supplyVoltageVolts"] for sample in history],
+                [None, 4.87, 4.87, 4.87],
+            )
+            self.assertEqual(
+                [sample["throttledFlags"] for sample in history],
+                [None, 0x50000, 0x50000, 0x50000],
+            )
             self.assertEqual(
                 [sample["networkRxErrorsPerSecond"] for sample in history],
-                [None, None, 0.1],
+                [None, None, 0.1, 0.0],
             )
             self.assertTrue((runtime / "delta-state.json").is_file())
 
@@ -2859,7 +3359,8 @@ class FilesystemTests(unittest.TestCase):
         self.assertEqual(config.primary_interface, "eth0")
         self.assertEqual(config.incident_retention_days, 30)
         self.assertEqual(config.max_incident_records, 1000)
-        self.assertEqual(config.cpu_warn_samples, 1)
+        self.assertEqual(config.cpu_warn_samples, 2)
+        self.assertEqual(config.rule_pack, collector.DEFAULT_RULE_PACK_PATH)
         self.assertEqual(config.memory_available_warn_percent, 20)
         self.assertEqual(config.memory_available_recover_percent, 25)
         self.assertEqual(config.load_warn, 4)
@@ -2898,7 +3399,9 @@ class FilesystemTests(unittest.TestCase):
         self.assertIn("MONITOR_PACKAGE_ROOT=/", defaults)
         self.assertIn("TemporaryFileSystem=/run:ro", unit)
         self.assertIn("BindPaths=/run/monitor-collector", unit)
-        self.assertIn("BindReadOnlyPaths=/run/monitor-container-exporter/containers.json", unit)
+        self.assertIn("Wants=monitor-container-exporter.service", unit)
+        self.assertNotIn("Requires=monitor-container-exporter.service", unit)
+        self.assertIn("BindReadOnlyPaths=-/run/monitor-container-exporter/containers.json", unit)
         self.assertNotIn("/run/user/1001/docker.sock", unit)
         self.assertIn("User=cks", exporter_unit)
         self.assertNotIn("ProtectHome=", exporter_unit)
@@ -2911,17 +3414,21 @@ class FilesystemTests(unittest.TestCase):
         self.assertIn("TasksMax=64", unit)
         self.assertIn("MONITOR_KERNEL_LOG=/var/log/kern.log", defaults)
         self.assertIn("MONITOR_KERNEL_MAX_INPUT_BYTES=8388608", defaults)
+        self.assertIn("MONITOR_RULE_PACK=/usr/local/lib/monitor-collector/rules/default-rules.v1.json", defaults)
         self.assertIn("MONITOR_TRAFFIC_LOG=/var/log/nginx/monitor-traffic.jsonl", defaults)
         self.assertIn("MONITOR_DOCKER_SOCKETS=\n", defaults)
         self.assertIn("MONITOR_CONTAINER_INPUT=/run/monitor-container-exporter/containers.json", defaults)
         self.assertIn("MONITOR_PROCESS_UIDS=0,1001", defaults)
         self.assertIn("MONITOR_SSH_PORTS=22,22022", defaults)
         self.assertIn("MONITOR_PRIMARY_INTERFACE=eth0", defaults)
-        self.assertIn("MONITOR_CPU_WARN_SAMPLES=1", defaults)
+        self.assertIn("MONITOR_CPU_WARN_SAMPLES=2", defaults)
         self.assertIn("-o root -g cks -m 0750 /var/lib/monitor-export", installer)
         self.assertIn('had_default=false', installer)
         self.assertIn('restore_file "$backup_dir/monitor-collector.default" "$default_target" "$had_default"', installer)
         self.assertIn('install -m 0640 "$script_dir/monitor-collector.default" "$default_target"', installer)
+        self.assertIn('install -m 0644 "$script_dir/alert_store.py" "$alert_store_target"', installer)
+        self.assertIn('install -m 0644 "$script_dir/rules/default-rules.v1.json" "$rule_target"', installer)
+        self.assertIn('restore_file "$backup_dir/default-rules.v1.json" "$rule_target" "$had_rule"', installer)
         self.assertIn('if [ "$transaction_started" = true ] && [ "$committed" != true ]', installer)
         self.assertLess(
             installer.index('cp -p "$default_target" "$backup_dir/monitor-collector.default"'),

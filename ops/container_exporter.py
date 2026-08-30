@@ -54,16 +54,67 @@ def run(arguments: Sequence[str] | None = None) -> None:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
 
         prior = collector.load_json(state_path)
-        containers, next_cpu_state = collector.collect_containers(
-            {"cks": socket_path}, values.curl, values.timeout, prior.get("containers")
-        )
+        previous_containers: list[dict[str, object]] = []
+        previous_observed_at: str | None = None
+        try:
+            previous_containers, previous_collection = collector.load_container_snapshot_state(
+                output_path,
+                dt.datetime.now(dt.timezone.utc),
+                expected_uid=EXPECTED_UID,
+                expected_gid=EXPECTED_UID,
+            )
+            previous_observed_at = previous_collection["observedAt"]
+        except (OSError, RuntimeError, ValueError):
+            pass
+
+        try:
+            containers, next_cpu_state = collector.collect_containers(
+                {"cks": socket_path}, values.curl, values.timeout, prior.get("containers")
+            )
+        except PermissionError:
+            generated_at = collector.iso_timestamp(dt.datetime.now(dt.timezone.utc))
+            collector.atomic_write_json(
+                output_path,
+                {
+                    "generatedAt": generated_at,
+                    "containerCollection": {
+                        "status": "permission-denied",
+                        "observedAt": previous_observed_at,
+                    },
+                    "containers": previous_containers if previous_observed_at is not None else [],
+                },
+                0o640,
+            )
+            return
+        except (collector.ContainerSourceUnavailable, RuntimeError):
+            generated_at = collector.iso_timestamp(dt.datetime.now(dt.timezone.utc))
+            collector.atomic_write_json(
+                output_path,
+                {
+                    "generatedAt": generated_at,
+                    "containerCollection": {
+                        "status": "last-known" if previous_observed_at is not None else "unavailable",
+                        "observedAt": previous_observed_at,
+                    },
+                    "containers": previous_containers if previous_observed_at is not None else [],
+                },
+                0o640,
+            )
+            return
         if any(value.get("owner") != "cks" for value in containers):
             raise ValueError("unexpected container owner")
 
         generated_at = collector.iso_timestamp(dt.datetime.now(dt.timezone.utc))
         collector.atomic_write_json(
             output_path,
-            {"generatedAt": generated_at, "containers": containers},
+            {
+                "generatedAt": generated_at,
+                "containerCollection": {
+                    "status": "fresh",
+                    "observedAt": generated_at,
+                },
+                "containers": containers,
+            },
             0o640,
         )
         collector.atomic_write_json(

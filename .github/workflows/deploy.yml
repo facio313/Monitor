@@ -21,7 +21,7 @@ env:
 
 jobs:
   build-and-deploy:
-    name: Test and build ARM64 image; deploy main
+    name: Test and build multi-architecture image; deploy main
     runs-on: ubuntu-24.04-arm
     # The restricted host may spend up to 20 minutes waiting for the shared
     # fleet deploy lock. Leave enough time for image publication, cutover, and
@@ -31,6 +31,32 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 2
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22.23.2
+          cache: npm
+
+      - name: Install and validate application dependencies
+        run: |
+          npm ci
+          npm run typecheck
+          npm run test:raw -- --reporter=dot
+          npm audit --audit-level=critical
+
+      - name: Validate source hygiene and script syntax
+        run: |
+          git diff-tree --check HEAD^ HEAD
+          git ls-files -z '*.sh' | xargs -0 --no-run-if-empty bash -n
+          python3 -m py_compile \
+            ops/collector.py \
+            ops/container_exporter.py \
+            ops/alert_engine.py \
+            ops/alert_runtime.py \
+            ops/alert_store.py
 
       - name: Resolve branch authentication contract
         id: auth
@@ -70,22 +96,72 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ github.token }}
 
+      - name: Set up multi-architecture emulation
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
-      - name: Build, test, and publish ARM64 image
+      - name: Build, test, and publish multi-architecture image
+        id: image
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
-          platforms: linux/arm64
+          platforms: linux/amd64,linux/arm64
           push: true
           pull: true
+          provenance: mode=max
+          sbom: true
           tags: ${{ steps.auth.outputs.tags }}
           build-args: |
             PORTFOLIO_BRANCH=${{ steps.auth.outputs.branch }}
             PORTFOLIO_AUTH_MODE=${{ steps.auth.outputs.mode }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Verify published platform manifest
+        run: |
+          docker buildx imagetools inspect "$IMAGE_NAME:$GITHUB_SHA" --raw | node -e '
+            let input = "";
+            process.stdin.setEncoding("utf8");
+            process.stdin.on("data", (chunk) => { input += chunk; });
+            process.stdin.on("end", () => {
+              const index = JSON.parse(input);
+              const platforms = new Set((index.manifests || [])
+                .map((entry) => `${entry.platform?.os || ""}/${entry.platform?.architecture || ""}`));
+              for (const expected of ["linux/amd64", "linux/arm64"]) {
+                if (!platforms.has(expected)) {
+                  throw new Error(`published manifest is missing ${expected}`);
+                }
+              }
+            });
+          '
+
+      - name: Scan arm64 production image for critical vulnerabilities
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        env:
+          TRIVY_IMAGE_SRC: remote
+          TRIVY_PLATFORM: linux/arm64
+        with:
+          image-ref: ${{ env.IMAGE_NAME }}:${{ github.sha }}
+          format: table
+          exit-code: "1"
+          ignore-unfixed: true
+          severity: CRITICAL
+          vuln-type: os,library
+
+      - name: Scan amd64 production image for critical vulnerabilities
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        env:
+          TRIVY_IMAGE_SRC: remote
+          TRIVY_PLATFORM: linux/amd64
+        with:
+          image-ref: ${{ env.IMAGE_NAME }}:${{ github.sha }}
+          format: table
+          exit-code: "1"
+          ignore-unfixed: true
+          severity: CRITICAL
+          vuln-type: os,library
 
       - name: Request restricted server deployment
         if: github.ref_name == 'main'

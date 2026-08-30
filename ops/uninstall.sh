@@ -15,7 +15,12 @@ rm -f \
     /etc/systemd/system/monitor-collector.timer
 rm -f \
     /usr/local/lib/monitor-collector/collector.py \
-    /usr/local/lib/monitor-collector/container_exporter.py
+    /usr/local/lib/monitor-collector/container_exporter.py \
+    /usr/local/lib/monitor-collector/alert_engine.py \
+    /usr/local/lib/monitor-collector/alert_runtime.py \
+    /usr/local/lib/monitor-collector/alert_store.py \
+    /usr/local/lib/monitor-collector/rules/default-rules.v1.json
+rmdir /usr/local/lib/monitor-collector/rules 2>/dev/null || true
 rmdir /usr/local/lib/monitor-collector 2>/dev/null || true
 rm -f /usr/local/share/doc/monitor-collector/README.md
 rmdir /usr/local/share/doc/monitor-collector 2>/dev/null || true

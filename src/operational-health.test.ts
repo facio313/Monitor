@@ -92,6 +92,15 @@ function payload(): DashboardPayload {
     containers: [],
     currentTraffic: [],
     alerts: [],
+    ruleEvaluation: {
+      schemaVersion: 1,
+      status: 'ok',
+      rulePackVersion: 'test',
+      evaluatedAt: '2026-08-30T00:00:00Z',
+      summary: {},
+      states: {},
+    },
+    ruleAlerts: { status: 'ok', events: [] },
     privilegeEvents: [],
     powerEvents: [],
     reliabilityEvents: [],
@@ -176,6 +185,38 @@ function incident(observedAt: string): PeakIncident {
 describe('operational health assessment', () => {
   it('stays quiet for a nominal current state and current boot', () => {
     expect(operationalFindings(payload())).toEqual([]);
+  });
+
+  it('keeps evaluator rules separate from client heuristic findings', () => {
+    const data = payload();
+    data.ruleEvaluation = {
+      schemaVersion: 1,
+      status: 'ok',
+      rulePackVersion: 'test',
+      evaluatedAt: '2026-08-30T00:00:00Z',
+      summary: { firing: 1 },
+      states: {
+        'CpuUsageHigh:host/node-a': {
+          ruleId: 'CpuUsageHigh',
+          target: 'host/node-a',
+          metric: 'host.cpu.percent',
+          severity: 'warning',
+          description: 'Evaluator-owned rule.',
+          runbook: 'Inspect evaluator evidence.',
+          phase: 'firing',
+          breachSamples: 5,
+          recoverySamples: 0,
+          missingSamples: 0,
+          openedAt: '2026-08-29T23:55:00Z',
+          changedAt: '2026-08-30T00:00:00Z',
+          lastEvaluatedAt: '2026-08-30T00:00:00Z',
+          lastValue: 95,
+          observationStatus: 'ok',
+        },
+      },
+    };
+
+    expect(operationalFindings(data)).toEqual([]);
   });
 
   it('separates currently stale telemetry from a recovered historical collection gap', () => {
@@ -452,11 +493,42 @@ describe('operational health assessment', () => {
     });
   });
 
-  it('uses the actual selected-range power anomaly time without presenting the latest normal voltage as faulty', () => {
+  it('does not classify a voltage reading without an authoritative flag or event', () => {
+    const data = payload();
+    data.latest = latest({ supplyVoltageVolts: 4.4, throttledFlags: 0 });
+    data.series = [latest({ timestamp: '2026-08-29T22:00:00Z', supplyVoltageVolts: 4.3, throttledFlags: 0 })];
+    data.powerSummary.minSupplyVoltageVolts = 4.3;
+    data.powerSummary.averageSupplyVoltageVolts = 4.4;
+
+    expect(operationalFindings(data).find((finding) => finding.id === 'power-quality')).toBeUndefined();
+  });
+
+  it('uses authoritative power events for severity even when no throttle flag is available', () => {
+    const data = payload();
+    data.powerEvents = [{
+      timestamp: '2026-08-29T22:00:00Z',
+      severity: 'critical',
+      kind: 'power',
+      status: 'active',
+      message: 'authoritative power fault',
+      supplyVoltageVolts: 4.5,
+      throttledFlags: null,
+    }];
+
+    expect(operationalFindings(data).find((finding) => finding.id === 'power-quality')).toMatchObject({
+      level: 'danger',
+      scope: 'range',
+      count: 1,
+      lastObservedAt: '2026-08-29T22:00:00Z',
+      evidence: [expect.stringContaining('전원 이벤트 1건'), expect.stringContaining('1 power event')],
+    });
+  });
+
+  it('uses the actual selected-range power-flag time without presenting the latest normal voltage as faulty', () => {
     const data = payload();
     data.series = [
-      latest({ timestamp: '2026-08-29T22:00:00Z', supplyVoltageVolts: 4.7 }),
-      latest({ timestamp: '2026-08-30T00:00:00Z', supplyVoltageVolts: 5.1 }),
+      latest({ timestamp: '2026-08-29T22:00:00Z', supplyVoltageVolts: 4.7, throttledFlags: 1 }),
+      latest({ timestamp: '2026-08-30T00:00:00Z', supplyVoltageVolts: 5.1, throttledFlags: 0 }),
     ];
     data.powerSummary.underVoltageSampleCount = 1;
 

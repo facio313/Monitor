@@ -23,6 +23,10 @@ script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
 collector_target=/usr/local/lib/monitor-collector/collector.py
 exporter_target=/usr/local/lib/monitor-collector/container_exporter.py
+alert_engine_target=/usr/local/lib/monitor-collector/alert_engine.py
+alert_runtime_target=/usr/local/lib/monitor-collector/alert_runtime.py
+alert_store_target=/usr/local/lib/monitor-collector/alert_store.py
+rule_target=/usr/local/lib/monitor-collector/rules/default-rules.v1.json
 documentation_target=/usr/local/share/doc/monitor-collector/README.md
 collector_service_target=/etc/systemd/system/monitor-collector.service
 exporter_service_target=/etc/systemd/system/monitor-container-exporter.service
@@ -32,6 +36,10 @@ default_target=/etc/default/monitor-collector
 for source in \
     "$script_dir/collector.py" \
     "$script_dir/container_exporter.py" \
+    "$script_dir/alert_engine.py" \
+    "$script_dir/alert_runtime.py" \
+    "$script_dir/alert_store.py" \
+    "$script_dir/rules/default-rules.v1.json" \
     "$script_dir/README.md" \
     "$script_dir/systemd/monitor-collector.service" \
     "$script_dir/systemd/monitor-container-exporter.service" \
@@ -47,6 +55,11 @@ done
 backup_dir=$(mktemp -d /tmp/monitor-collector-install.XXXXXX)
 had_collector=false
 had_exporter=false
+had_alert_engine=false
+had_alert_runtime=false
+had_alert_store=false
+had_rule=false
+had_rule_directory=false
 had_documentation=false
 had_collector_service=false
 had_exporter_service=false
@@ -78,6 +91,13 @@ finish() {
         systemctl stop monitor-collector.timer monitor-collector.service monitor-container-exporter.service >/dev/null 2>&1 || true
         restore_file "$backup_dir/collector.py" "$collector_target" "$had_collector" || rollback_failed=true
         restore_file "$backup_dir/container_exporter.py" "$exporter_target" "$had_exporter" || rollback_failed=true
+        restore_file "$backup_dir/alert_engine.py" "$alert_engine_target" "$had_alert_engine" || rollback_failed=true
+        restore_file "$backup_dir/alert_runtime.py" "$alert_runtime_target" "$had_alert_runtime" || rollback_failed=true
+        restore_file "$backup_dir/alert_store.py" "$alert_store_target" "$had_alert_store" || rollback_failed=true
+        restore_file "$backup_dir/default-rules.v1.json" "$rule_target" "$had_rule" || rollback_failed=true
+        if [ "$had_rule_directory" != true ]; then
+            rmdir /usr/local/lib/monitor-collector/rules 2>/dev/null || true
+        fi
         restore_file "$backup_dir/README.md" "$documentation_target" "$had_documentation" || rollback_failed=true
         restore_file "$backup_dir/monitor-collector.service" "$collector_service_target" "$had_collector_service" || rollback_failed=true
         restore_file "$backup_dir/monitor-container-exporter.service" "$exporter_service_target" "$had_exporter_service" || rollback_failed=true
@@ -97,6 +117,10 @@ finish() {
     rm -f \
         "$backup_dir/collector.py" \
         "$backup_dir/container_exporter.py" \
+        "$backup_dir/alert_engine.py" \
+        "$backup_dir/alert_runtime.py" \
+        "$backup_dir/alert_store.py" \
+        "$backup_dir/default-rules.v1.json" \
         "$backup_dir/README.md" \
         "$backup_dir/monitor-collector.service" \
         "$backup_dir/monitor-container-exporter.service" \
@@ -112,9 +136,24 @@ finish() {
 trap finish EXIT
 trap 'exit 1' HUP INT TERM
 
+for directory in \
+    /usr/local/lib/monitor-collector \
+    /usr/local/lib/monitor-collector/rules \
+    /usr/local/share/doc/monitor-collector
+do
+    if [ -L "$directory" ] || { [ -e "$directory" ] && [ ! -d "$directory" ]; }; then
+        echo "refusing to use an unsafe collector installation directory: $directory" >&2
+        exit 1
+    fi
+done
+
 for target in \
     "$collector_target" \
     "$exporter_target" \
+    "$alert_engine_target" \
+    "$alert_runtime_target" \
+    "$alert_store_target" \
+    "$rule_target" \
     "$documentation_target" \
     "$collector_service_target" \
     "$exporter_service_target" \
@@ -144,6 +183,11 @@ fi
 
 if [ -e "$collector_target" ]; then cp -p "$collector_target" "$backup_dir/collector.py"; had_collector=true; fi
 if [ -e "$exporter_target" ]; then cp -p "$exporter_target" "$backup_dir/container_exporter.py"; had_exporter=true; fi
+if [ -e "$alert_engine_target" ]; then cp -p "$alert_engine_target" "$backup_dir/alert_engine.py"; had_alert_engine=true; fi
+if [ -e "$alert_runtime_target" ]; then cp -p "$alert_runtime_target" "$backup_dir/alert_runtime.py"; had_alert_runtime=true; fi
+if [ -e "$alert_store_target" ]; then cp -p "$alert_store_target" "$backup_dir/alert_store.py"; had_alert_store=true; fi
+if [ -e "$rule_target" ]; then cp -p "$rule_target" "$backup_dir/default-rules.v1.json"; had_rule=true; fi
+if [ -d /usr/local/lib/monitor-collector/rules ]; then had_rule_directory=true; fi
 if [ -e "$documentation_target" ]; then cp -p "$documentation_target" "$backup_dir/README.md"; had_documentation=true; fi
 if [ -e "$collector_service_target" ]; then cp -p "$collector_service_target" "$backup_dir/monitor-collector.service"; had_collector_service=true; fi
 if [ -e "$exporter_service_target" ]; then cp -p "$exporter_service_target" "$backup_dir/monitor-container-exporter.service"; had_exporter_service=true; fi
@@ -163,6 +207,11 @@ done
 install -d -m 0755 /usr/local/lib/monitor-collector
 install -m 0755 "$script_dir/collector.py" "$collector_target"
 install -m 0755 "$script_dir/container_exporter.py" "$exporter_target"
+install -m 0644 "$script_dir/alert_engine.py" "$alert_engine_target"
+install -m 0644 "$script_dir/alert_runtime.py" "$alert_runtime_target"
+install -m 0644 "$script_dir/alert_store.py" "$alert_store_target"
+install -d -m 0755 /usr/local/lib/monitor-collector/rules
+install -m 0644 "$script_dir/rules/default-rules.v1.json" "$rule_target"
 install -d -m 0755 /usr/local/share/doc/monitor-collector
 install -m 0644 "$script_dir/README.md" "$documentation_target"
 install -m 0644 "$script_dir/systemd/monitor-collector.service" "$collector_service_target"

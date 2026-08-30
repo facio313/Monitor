@@ -262,10 +262,15 @@ describe('collector to server contract', () => {
     const incidentPath = join(outputRoot, 'incidents.jsonl');
     const current = JSON.parse(readFileSync(currentPath, 'utf8')) as {
       generatedAt: string;
+      containerCollection: {
+        status: 'fresh' | 'last-known' | 'unavailable' | 'permission-denied';
+        observedAt: string | null;
+      };
       containers: unknown[];
       currentTraffic: unknown[];
       latest: Record<string, unknown>;
     };
+    expect(current.containerCollection).toEqual({ status: 'unavailable', observedAt: null });
     const expectedTraffic = [{
       app: 'blog', requestCount: 1, status2xx: 1, status3xx: 0, status4xx: 0,
       status5xx: 0, slowCount: 0, avgResponseMs: 400, maxResponseMs: 400,
@@ -289,7 +294,21 @@ describe('collector to server contract', () => {
       memoryBytes: 262_144,
       memoryPercent: 12.5,
     };
-    current.containers = [multiCoreContainer];
+    const currentContainer = {
+      ...multiCoreContainer,
+      project: 'monitor',
+      healthcheckConfigured: true,
+      memoryLimitBytes: 2_097_152,
+      cpuLimitCores: 4,
+      pidLimit: 128,
+      restartCount: 2,
+      restartCountDelta: 0,
+      oomKilled: false,
+      startedAt: '2026-08-30T11:00:00Z',
+      finishedAt: null,
+    };
+    current.containers = [currentContainer];
+    current.containerCollection = { status: 'fresh', observedAt: current.generatedAt };
     writeFileSync(currentPath, `${JSON.stringify(current)}\n`);
     const incident = JSON.parse(readFileSync(incidentPath, 'utf8').trim()) as {
       containers: unknown[];
@@ -376,7 +395,25 @@ describe('collector to server contract', () => {
       expect.objectContaining({ kind: 'rcu-stall', status: 'expedited', severity: 'warning' }),
       expect.objectContaining({ kind: 'pcie-aer', status: 'correctable' }),
     ]));
-    expect(dashboard.containers).toEqual([multiCoreContainer]);
+    expect(dashboard.containers).toEqual([{
+      ...currentContainer,
+      startedAt: '2026-08-30T11:00:00.000Z',
+    }]);
+    expect(dashboard.containerCollection).toEqual({
+      status: 'fresh',
+      observedAt: new Date(current.generatedAt).toISOString(),
+    });
+    expect(dashboard.ruleEvaluation.status).toBe('ok');
+    expect(dashboard.ruleEvaluation.rulePackVersion).toBe('2026.08.30.1');
+    expect(Object.keys(dashboard.ruleEvaluation.states).length).toBeGreaterThanOrEqual(82);
+    expect(Object.values(dashboard.ruleEvaluation.states).some(
+      (state) => state.ruleId === 'CpuUsageHigh' && state.metric === 'host.cpu.percent',
+    )).toBe(true);
+    expect(Object.values(dashboard.ruleEvaluation.summary).reduce(
+      (total, count) => total + (count ?? 0),
+      0,
+    )).toBe(Object.keys(dashboard.ruleEvaluation.states).length);
+    expect(dashboard.ruleAlerts).toEqual({ status: 'ok', events: [] });
     expect(dashboard.currentTraffic).toEqual(expectedTraffic);
     expect(dashboard.powerSummary).toEqual({
       sampleCount: 1,

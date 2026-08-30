@@ -150,6 +150,60 @@ export interface SystemSnapshot {
   };
 }
 
+export type RuleEvaluationPhase =
+  | 'inactive'
+  | 'pending'
+  | 'firing'
+  | 'recovering'
+  | 'no_data'
+  | 'unsupported'
+  | 'permission_denied'
+  | 'collection_error';
+
+export type RuleObservationStatus =
+  | 'ok'
+  | 'no_data'
+  | 'stale'
+  | 'collection_error'
+  | 'permission_denied'
+  | 'unsupported';
+
+export interface RuleEvaluationState {
+  ruleId: string;
+  target: string;
+  metric: string;
+  severity: 'info' | 'warning' | 'critical';
+  description: string;
+  runbook: string;
+  phase: RuleEvaluationPhase;
+  breachSamples: number;
+  recoverySamples: number;
+  missingSamples: number;
+  openedAt: string | null;
+  changedAt: string;
+  lastEvaluatedAt: string;
+  lastValue: number | null;
+  observationStatus: RuleObservationStatus;
+}
+
+export interface RuleAlertEvent {
+  schemaVersion: 1;
+  rulePackVersion: string;
+  idempotencyKey: string;
+  ruleId: string;
+  target: string;
+  transition: 'firing' | 'resolved';
+  severity: 'info' | 'warning' | 'critical';
+  notificationState: 'ready' | 'suppressed' | 'silenced';
+  observedAt: string;
+  openedAt: string;
+  value: number | null;
+  status: RuleObservationStatus;
+  labels: Record<string, string>;
+  description: string;
+  runbook: string;
+}
+
 export interface DashboardResponse {
   generatedAt: string;
   range: DashboardRange;
@@ -205,14 +259,28 @@ export interface DashboardResponse {
     inodeUsedPercent: number | null;
     readOnly: boolean | null;
   }>;
+  containerCollection: {
+    status: 'fresh' | 'last-known' | 'unavailable' | 'permission-denied';
+    observedAt: string | null;
+  };
   containers: Array<{
     name: string;
+    project: string | null;
     owner: string | null;
     state: string | null;
     health: string | null;
+    healthcheckConfigured: boolean | null;
     cpuPercent: number | null;
     memoryBytes: number | null;
     memoryPercent: number | null;
+    memoryLimitBytes: number | null;
+    cpuLimitCores: number | null;
+    pidLimit: number | null;
+    restartCount: number | null;
+    restartCountDelta: number | null;
+    oomKilled: boolean | null;
+    startedAt: string | null;
+    finishedAt: string | null;
   }>;
   currentTraffic: TrafficAggregate[];
   alerts: Array<{
@@ -222,6 +290,18 @@ export interface DashboardResponse {
     status: string | null;
     message: string;
   }>;
+  ruleEvaluation: {
+    schemaVersion: 1;
+    status: 'ok' | 'last-known' | 'collection_error' | 'unavailable';
+    rulePackVersion: string | null;
+    evaluatedAt: string | null;
+    summary: Partial<Record<RuleEvaluationPhase, number>>;
+    states: Record<string, RuleEvaluationState>;
+  };
+  ruleAlerts: {
+    status: 'ok' | 'collection_error' | 'unavailable';
+    events: RuleAlertEvent[];
+  };
   powerEvents: Array<{
     timestamp: string;
     severity: 'info' | 'warning' | 'critical';

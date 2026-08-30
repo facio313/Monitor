@@ -24,6 +24,9 @@ describe('system emotion engine presentation', () => {
     expect(markup).not.toContain('emotion-engine-readings');
     expect(markup).not.toContain('emotion-axis-field');
     expect(markup).not.toContain('시스템 감응');
+    expect(markup).not.toContain('Ubuntu');
+    expect(markup).not.toContain('CRITICAL');
+    expect(markup).not.toContain('<time');
     expect(markup).not.toContain('STATE /');
     expect(markup).not.toContain('즉시 확인할 파동');
     expect(markup).not.toContain('위험 신호');

@@ -1,6 +1,14 @@
-import { describe, expect, it } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { createElement } from 'react';
+import { renderToStaticMarkup } from 'react-dom/server';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import type { SessionInfo } from '../api';
 import type { DashboardPayload } from '../types';
-import { createOverviewDashboardItems } from './MonitorDashboard';
+import { createOverviewDashboardItems, MonitorDashboard } from './MonitorDashboard';
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
 
 describe('monitor overview composition', () => {
   it('keeps every established chart widget in the home dashboard', () => {
@@ -29,5 +37,48 @@ describe('monitor overview composition', () => {
       minH: 4,
       maxH: 8,
     });
+  });
+
+  it('puts operating status before the secondary canvas and names mobile icon controls', () => {
+    vi.stubGlobal('window', {
+      localStorage: { getItem: () => 'en', setItem: () => undefined },
+      location: { search: '' },
+    });
+    vi.stubGlobal('navigator', { languages: ['en-US'] });
+    const viewer: SessionInfo = {
+      authenticated: true,
+      mode: 'local',
+      user: 'operator',
+      role: 'admin',
+      permissions: [],
+    };
+
+    const markup = renderToStaticMarkup(createElement(MonitorDashboard, {
+      page: 'overview',
+      navigationVersion: 0,
+      onNavigate: () => undefined,
+      onLogout: async () => undefined,
+      onPasswordChanged: () => undefined,
+      onUnauthorized: () => undefined,
+      viewer,
+    }));
+
+    expect(markup).toContain('class="control-skip-link" href="#monitor-main"');
+    expect(markup).toContain('<main id="monitor-main" class="control-main" tabindex="-1">');
+    expect(markup).toContain('aria-label="Overview"');
+    expect(markup).toContain('aria-label="Change password"');
+    expect(markup).toContain('aria-label="Sign out"');
+    expect(markup.indexOf('class="system-strip')).toBeLessThan(markup.indexOf('class="system-emotion-engine"'));
+  });
+
+  it('keeps the secondary canvas compact and restores the mobile traffic table as a scroller', () => {
+    const css = readFileSync(new URL('../monitor-dashboard.css', import.meta.url), 'utf8');
+    const source = readFileSync(new URL('./MonitorDashboard.tsx', import.meta.url), 'utf8');
+    const overviewComposition = source.slice(source.lastIndexOf('return (\n    <div className="control-room"'));
+
+    expect(css).toMatch(/\.system-emotion-engine\s*\{[^}]*height: clamp\(150px, 13vw, 200px\)/s);
+    expect(css).toMatch(/\.current-traffic-table\.table-wrap\s*\{[^}]*display: block;[^}]*overflow-x: auto;/s);
+    expect(overviewComposition.indexOf('<OperationalHealthOverview')).toBeLessThan(overviewComposition.indexOf('<RuleHealthSummary'));
+    expect(overviewComposition.indexOf('<RuleHealthSummary')).toBeLessThan(overviewComposition.indexOf('<SystemEmotionEngine'));
   });
 });

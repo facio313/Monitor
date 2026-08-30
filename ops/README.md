@@ -13,8 +13,11 @@ starts. Neither helper changes Docker or host configuration.
 The default output root is `/var/lib/monitor-export`:
 
 - `current.json`: atomically replaced snapshot with exactly the public keys
-  `generatedAt`, `host`, `latest`, `disks`, `containers`, `currentTraffic`,
-  `reliability`, and `system`.
+  `generatedAt`, `host`, `latest`, `disks`, `containers`,
+  `containerCollection`, `currentTraffic`, `reliability`, and `system`.
+  `containerCollection` distinguishes a fresh Docker observation from a
+  bounded last-known snapshot, source unavailability, or permission denial;
+  stale workloads are never presented as current evidence.
   `host` includes the online logical-CPU count derived from aggregate
   `/proc/stat`. `latest` includes memory and swap byte totals/usage, swap
   percentage, all three load averages, current CPU/memory/I/O PSI `some` and
@@ -28,6 +31,17 @@ The default output root is `/var/lib/monitor-export`:
   Each disk is exactly `mount`, `totalBytes`, `usedBytes`, `availableBytes`,
   `usedPercent`, `inodeUsedPercent`, and `readOnly`. Inode usage is aggregate;
   filenames and inode identities are never collected.
+  Each current `containers` row is the exact 17-field reduced contract:
+  `name`, `project`, `owner`, `state`, `health`,
+  `healthcheckConfigured`, `cpuPercent`, `memoryBytes`, `memoryPercent`,
+  `memoryLimitBytes`, `cpuLimitCores`, `pidLimit`, `restartCount`,
+  `restartCountDelta`, `oomKilled`, `startedAt`, and `finishedAt`.
+  Health, restart/OOM state, lifecycle timestamps, and configured limits come
+  from an identity-bound Docker inspect response; an unavailable detail stays
+  `null` and is never inferred from presentation text. Container IDs remain
+  private. Retained seven-field snapshots are promoted with unverified
+  lifecycle fields set to `null`, while incident evidence deliberately keeps
+  its smaller seven-field projection.
   Each `currentTraffic` entry is exactly `app`, `requestCount`, `status2xx`,
   `status3xx`, `status4xx`, `status5xx`, `slowCount`, `avgResponseMs`, and
   `maxResponseMs`; at most 16 allow-listed app groups are emitted.
@@ -62,6 +76,17 @@ The default output root is `/var/lib/monitor-export`:
   also emitted here. A transition message includes the validated flags and, when
   available, the validated supply-voltage observation; voltage changes alone
   never create an alert.
+- `rule-evaluation.json`: the latest exact-schema evaluation of the versioned
+  default rule pack. It publishes every rule as `inactive`, `pending`,
+  `firing`, `recovering`, `no_data`, `unsupported`, `permission_denied`, or
+  `collection_error`; an unimplemented signal can therefore never look
+  healthy. The installed pack defines all 82 documented defaults, while only
+  signals proven by the current reduced snapshot are evaluated as data.
+- `rule-alerts.jsonl`: at most 5,000 opening/resolution transitions from that
+  evaluator. Each row has a deterministic SHA-256 idempotency key, rule and
+  bounded target IDs, severity, delivery disposition, timestamps, normalized
+  value/status, bounded labels, fixed description, and runbook. Raw samples,
+  mount paths, commands, and log lines are never copied.
 - `power.jsonl`: at most 5,000 fixed-message kernel power/storage events with
   exactly `timestamp`, `severity`, `kind`, `status`, and `message`. Only kernel
   `Undervoltage detected!`, `Voltage normalised`, NVMe controller-reset, and
@@ -128,6 +153,17 @@ events-before-state invariant through a separate bounded mode-`0600`
 rewrite but before private state publication is replayed by digest without
 duplicating the event batch.
 
+Rule transitions use the same event-before-state invariant with deterministic
+transition identities. The evaluator first atomically publishes any changed
+bounded public event log, then its private mode-`0600` state, and finally the public
+evaluation. If collection stops between those writes, replay from the prior
+state produces the same identity and retains the first durable row. A rule-pack
+or evaluator failure writes only an explicit `collection_error` evaluation;
+it does not stop the independently collected host snapshot or history.
+The transition log is not rewritten when it is unchanged, and private state
+stores only counters/timestamps rather than duplicating public descriptions and
+runbooks, limiting steady-state writes on small systems.
+
 Short-lived host-rate and hashed process counters live in
 `/run/monitor-collector/delta-state.json`; each run atomically replaces that
 mode-`0600` file rather than appending it. PID/start-time material never leaves
@@ -165,8 +201,10 @@ without loading an unbounded historical log. The command-line/environment
 value is clamped to at most 16 MiB. The ordinary event/privilege input bound
 remains separately controlled by `MONITOR_MAX_INPUT_BYTES`.
 
-The unprivileged Docker helper reduces each workload immediately to `name`,
-`owner`, `state`, `health`, `cpuPercent`, `memoryBytes`, and `memoryPercent`.
+The unprivileged Docker helper reduces each workload immediately to the fixed
+17-field current contract documented above. It never exports a container ID,
+raw image reference, command, environment, mount, network address, or Docker
+inspect document.
 Each Docker list request is filtered to one explicitly reviewed Compose
 project. A result is admitted only when its returned project/service labels
 match one exact pair in the fixed map, and it receives that pair's distinct

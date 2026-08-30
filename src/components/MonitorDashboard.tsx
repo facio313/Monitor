@@ -28,6 +28,7 @@ import { InfrastructureLedger } from './InfrastructureLedger';
 import { OperationalGuidance, OperationalHealthOverview } from './OperationalHealth';
 import { OperationalHeadroom } from './OperationalHeadroom';
 import { PasswordChangeDialog } from './PasswordChangeDialog';
+import { RuleHealthSummary } from './RuleHealthSummary';
 import { SystemMaintenance } from './SystemMaintenance';
 import { emotionThemeStyle, SystemEmotionEngine } from './SystemEmotionEngine';
 import { SystemUpdateControls } from './SystemUpdateControls';
@@ -381,6 +382,9 @@ export function MonitorDashboard({
 
   return (
     <div className="control-room" data-locale={locale} data-mood={emotionModel.mood} style={emotionThemeStyle(emotionModel)}>
+      <a className="control-skip-link" href="#monitor-main">
+        {t(locale, '본문으로 건너뛰기', 'Skip to main content')}
+      </a>
       <header className="control-topbar" inert={passwordDialogOpen || helpOpen || undefined}>
         <div className="control-brand-group">
           <div className="control-brand"><span><Icon name="activity" size={21} /></span><div><strong>MONITOR</strong><small>{t(locale, '비공개 호스트 관제', 'Private host control')}</small></div></div>
@@ -393,8 +397,8 @@ export function MonitorDashboard({
             <button type="button" aria-pressed={locale === 'en'} onClick={() => setLocale('en')}>EN</button>
           </div>
           <button className="control-icon-button" type="button" onClick={() => setHelpOpen(true)} aria-label={t(locale, '용어 설명 열기', 'Open terminology guide')}><Icon name="info" size={18} /><span>{t(locale, '용어', 'Terms')}</span></button>
-          {!ssoEnabled && <button className="control-icon-button" type="button" onClick={() => setPasswordDialogOpen(true)}><Icon name="lock" size={17} /><span>{t(locale, '암호', 'Password')}</span></button>}
-          <button className="control-icon-button" type="button" onClick={handleLogout} disabled={loggingOut}><Icon name="logout" size={18} /><span>{loggingOut ? t(locale, '종료 중', 'Signing out') : t(locale, '로그아웃', 'Sign out')}</span></button>
+          {!ssoEnabled && <button className="control-icon-button" type="button" onClick={() => setPasswordDialogOpen(true)} aria-label={t(locale, '암호 변경', 'Change password')}><Icon name="lock" size={17} /><span>{t(locale, '암호', 'Password')}</span></button>}
+          <button className="control-icon-button" type="button" onClick={handleLogout} disabled={loggingOut} aria-label={loggingOut ? t(locale, '로그아웃 중', 'Signing out') : t(locale, '로그아웃', 'Sign out')}><Icon name="logout" size={18} /><span>{loggingOut ? t(locale, '종료 중', 'Signing out') : t(locale, '로그아웃', 'Sign out')}</span></button>
         </div>
       </header>
 
@@ -405,13 +409,13 @@ export function MonitorDashboard({
             {NAVIGATION.map((item) => {
               if (item.page === 'infrastructure' && ssoEnabled && !viewer?.permissions.includes('infrastructure-ledger:read')) return null;
               const active = normalizedPage === item.page;
-              return <a key={item.page} href={`${monitorPathForPage(item.page)}?range=${encodeURIComponent(range)}`} className={active ? 'active' : ''} aria-current={active ? 'page' : undefined} onClick={(event) => { if (event.button || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return; event.preventDefault(); navigate(item.page); }}><Icon name={item.icon} size={18} /><span><strong>{locale === 'ko' ? item.ko : item.en}</strong><small>{locale === 'ko' ? item.koHint : item.enHint}</small></span></a>;
+              return <a key={item.page} href={`${monitorPathForPage(item.page)}?range=${encodeURIComponent(range)}`} className={active ? 'active' : ''} aria-label={locale === 'ko' ? item.ko : item.en} aria-current={active ? 'page' : undefined} onClick={(event) => { if (event.button || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return; event.preventDefault(); navigate(item.page); }}><Icon name={item.icon} size={18} /><span><strong>{locale === 'ko' ? item.ko : item.en}</strong><small>{locale === 'ko' ? item.koHint : item.enHint}</small></span></a>;
             })}
           </nav>
           <div className="rail-identity"><span>{t(locale, '접속 계정', 'SIGNED IN')}</span><strong>{safeText(viewer?.user, t(locale, '로컬 운영자', 'Local operator'), 64)}</strong><small>{viewer?.role ?? (ssoEnabled ? 'user' : 'local')}</small></div>
         </aside>
 
-        <main className="control-main">
+        <main id="monitor-main" className="control-main" tabIndex={-1}>
           <section className="control-heading" aria-labelledby="control-title">
             <div>
               <span className="control-eyebrow">{heading.eyebrow}</span>
@@ -423,14 +427,6 @@ export function MonitorDashboard({
               <button className="refresh-control" type="button" onClick={() => void refresh()} disabled={refreshing}><Icon name="refresh" size={18} className={refreshing ? 'spin' : ''} /><span>{refreshing ? t(locale, '갱신 중', 'Refreshing') : t(locale, '지금 갱신', 'Refresh now')}</span></button></>}
             </div>
           </section>
-
-          {normalizedPage === 'overview' && (
-            <SystemEmotionEngine
-              locale={locale}
-              model={emotionModel}
-              paused={passwordDialogOpen || helpOpen}
-            />
-          )}
 
           <section className={`system-strip strip-${overall}`} aria-label={t(locale, '항상 표시되는 핵심 운영 상태', 'Persistent operating status')}>
             <div className="system-state"><span>{overall === 'danger' ? '▲' : overall === 'caution' ? '●' : '✓'}</span><div><small>{t(locale, '전체 상태', 'OVERALL')}</small><strong>{overall === 'danger' ? t(locale, '확인 필요', 'CHECK SYSTEMS') : overall === 'caution' ? t(locale, '주의 관찰', 'CAUTION') : t(locale, '정상 운용', 'ALL NOMINAL')}</strong></div></div>
@@ -445,7 +441,19 @@ export function MonitorDashboard({
             <OperationalHealthOverview findings={findings} locale={locale} range={range} onNavigate={onNavigate} />
           )}
 
+          {data && assessmentPresentation === 'overview' && (
+            <RuleHealthSummary evaluation={data.ruleEvaluation} alerts={data.ruleAlerts} locale={locale} stale={effectiveStale} />
+          )}
+
           {error && <div className="control-notice" role="alert"><Icon name="alert" size={19} /><div><strong>{t(locale, '원격 측정 갱신 실패', 'Telemetry refresh failed')}</strong><span>{safeText(error)} {data ? t(locale, '마지막 정상 화면을 유지합니다.', 'The last good snapshot remains visible.') : ''}</span></div><button type="button" onClick={() => void refresh()}>{t(locale, '재시도', 'Retry')}</button></div>}
+
+          {normalizedPage === 'overview' && (
+            <SystemEmotionEngine
+              locale={locale}
+              model={emotionModel}
+              paused={passwordDialogOpen || helpOpen}
+            />
+          )}
 
           {normalizedPage === 'infrastructure'
             ? <InfrastructureLedger locale={locale} onUnauthorized={onUnauthorized} />

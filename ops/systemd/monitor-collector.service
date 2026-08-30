@@ -1,7 +1,7 @@
 [Unit]
 Description=Host telemetry collector for Monitor
 Documentation=file:/usr/local/share/doc/monitor-collector/README.md
-Requires=monitor-container-exporter.service
+Wants=monitor-container-exporter.service
 After=local-fs.target monitor-container-exporter.service
 
 [Service]
@@ -25,7 +25,7 @@ ProtectHome=read-only
 InaccessiblePaths=/home /root
 TemporaryFileSystem=/run:ro
 BindPaths=/run/monitor-collector
-BindReadOnlyPaths=/run/monitor-container-exporter/containers.json
+BindReadOnlyPaths=-/run/monitor-container-exporter/containers.json
 PrivateTmp=true
 PrivateDevices=true
 BindPaths=-/dev/vcio

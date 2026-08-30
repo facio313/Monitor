@@ -51,7 +51,13 @@ describe('system snapshot contract', () => {
   it('keeps legacy snapshots readable with explicit unknown and zero defaults', () => {
     const directory = dataDirectory();
     writeCurrent(directory);
-    const system = readDashboard(directory, '1h', NOW, 300_000).system;
+    const dashboard = readDashboard(directory, '1h', NOW, 300_000);
+    const system = dashboard.system;
+
+    expect(dashboard.containerCollection).toEqual({
+      status: 'last-known',
+      observedAt: '2026-08-27T11:59:30.000Z',
+    });
 
     expect(system.versions).toEqual({
       kernelRunning: null,

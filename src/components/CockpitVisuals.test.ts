@@ -1,15 +1,18 @@
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it } from 'vitest';
-import type { DashboardPayload, SystemEventCount, SystemKernelStatus, SystemPcieStatus } from '../types';
+import type { ContainerStatus, DashboardPayload, DiskUsage, SystemEventCount, SystemKernelStatus, SystemPcieStatus } from '../types';
 import {
+  containerUtilizationChartRows,
   ContainerStatusTable,
   CurrentTrafficWidget,
   currentBootReliabilitySignals,
+  highestObservedDiskUsage,
   PcieStatusPanel,
   pcieLinkTone,
   ReliabilitySignalGrid,
   ReliabilityWidget,
+  storageCapacityChartRows,
 } from './CockpitVisuals';
 
 function event(count = 0, lastEventAt: string | null = null): SystemEventCount {
@@ -250,5 +253,35 @@ describe('current traffic presentation', () => {
     expect(markup).not.toContain('app-02');
     expect(markup).toContain('1–8 of 10 apps');
     expect(markup).toContain('Client addresses, paths, queries, and headers are not collected');
+  });
+});
+
+describe('missing telemetry presentation', () => {
+  it('does not turn unreported disk usage into a zero-percent vital or capacity bar', () => {
+    const disks: DiskUsage[] = [
+      { mount: '/unknown', totalBytes: null, usedBytes: null, availableBytes: null, usedPercent: null, inodeUsedPercent: null, readOnly: null },
+      { mount: '/empty', totalBytes: 100, usedBytes: 0, availableBytes: 100, usedPercent: 0, inodeUsedPercent: 0, readOnly: false },
+      { mount: '/busy', totalBytes: 100, usedBytes: 82, availableBytes: 18, usedPercent: 82, inodeUsedPercent: 20, readOnly: false },
+    ];
+
+    expect(highestObservedDiskUsage([disks[0]])).toBeNull();
+    expect(highestObservedDiskUsage(disks)).toBe(82);
+    expect(storageCapacityChartRows(disks)).toEqual([
+      { name: '/empty', used: 0 },
+      { name: '/busy', used: 82 },
+    ]);
+  });
+
+  it('omits containers with no utilization readings and preserves partial readings as gaps', () => {
+    const containers: ContainerStatus[] = [
+      { name: 'unreported', owner: null, state: 'running', health: 'healthy', cpuPercent: null, memoryBytes: null, memoryPercent: null },
+      { name: 'cpu-only', owner: null, state: 'running', health: 'healthy', cpuPercent: 4, memoryBytes: null, memoryPercent: null },
+      { name: 'memory-only', owner: null, state: 'running', health: 'healthy', cpuPercent: null, memoryBytes: 700, memoryPercent: 70 },
+    ];
+
+    expect(containerUtilizationChartRows(containers)).toEqual([
+      { name: 'cpu-only', cpu: 4, memory: null },
+      { name: 'memory-only', cpu: null, memory: 70 },
+    ]);
   });
 });

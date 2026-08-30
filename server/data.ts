@@ -2,6 +2,7 @@ import {
   closeSync,
   constants,
   fstatSync,
+  lstatSync,
   openSync,
   readFileSync,
   realpathSync,
@@ -11,11 +12,21 @@ import type {
   DashboardRange,
   DashboardResponse,
   IncidentReason,
+  RuleAlertEvent,
+  RuleEvaluationPhase,
+  RuleEvaluationState,
+  RuleObservationStatus,
   TelemetrySample,
 } from './types.js';
 
 const MAX_CURRENT_BYTES = 1024 * 1024;
 const MAX_EVENT_FILE_BYTES = 4 * 1024 * 1024;
+const MAX_RULE_EVALUATION_BYTES = 8 * 1024 * 1024;
+const MAX_RULE_ALERT_FILE_BYTES = 32 * 1024 * 1024;
+const MAX_RULE_ALERT_LINE_BYTES = 8192;
+const MAX_RULE_STATES = 8192;
+const MAX_RULE_ALERT_RECORDS = 5000;
+const MAX_RULE_ALERTS = 500;
 const MAX_INCIDENT_FILE_BYTES = 16 * 1024 * 1024;
 const MAX_HISTORY_FILE_BYTES = 8 * 1024 * 1024;
 const MAX_JSONL_LINES = 50_000;
@@ -36,6 +47,22 @@ const MAX_INCIDENT_COUNT = 1_000_000_000;
 const MAX_RELIABILITY_DURATION_SECONDS = 366 * 24 * 60 * 60;
 const MAX_CONTAINER_CPU_PERCENT = 1024;
 const MAX_TELEMETRY_RATE = 1_000_000_000_000;
+const RULE_PHASES = new Set<RuleEvaluationPhase>([
+  'inactive', 'pending', 'firing', 'recovering', 'no_data', 'unsupported',
+  'permission_denied', 'collection_error',
+]);
+const RULE_OBSERVATION_STATUSES = new Set<RuleObservationStatus>([
+  'ok', 'no_data', 'stale', 'collection_error', 'permission_denied', 'unsupported',
+]);
+const RULE_SEVERITIES = new Set<RuleEvaluationState['severity']>([
+  'info', 'warning', 'critical',
+]);
+const RULE_ID_PATTERN = /^[A-Z][A-Za-z0-9]{2,63}$/;
+const RULE_PACK_VERSION_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/;
+const RULE_METRIC_PATTERN = /^[a-z][a-z0-9_.]{2,127}$/;
+const RULE_TARGET_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_.:/-]{0,191}$/;
+const RULE_LABEL_NAME_PATTERN = /^[a-z][a-z0-9_-]{0,31}$/;
+const RULE_LABEL_VALUE_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_.:/-]{0,95}$/;
 const TRAFFIC_AGGREGATE_FIELDS = new Set([
   'app',
   'requestCount',
@@ -91,6 +118,28 @@ const FIXED_CONTAINER_SERVICE_NAMES = [
   'react',
   'vue',
 ] as const;
+const CURRENT_CONTAINER_PROJECTS: Readonly<Record<string, string>> = {
+  bonifacio: 'bonifacio',
+  sso: 'bonifacio',
+  'sso-redis': 'bonifacio',
+  'blog-frontend': 'blog',
+  'blog-backend': 'blog',
+  'cks-database': 'cks-database',
+  monitor: 'monitor',
+  'feelmyrythm-frontend': 'feelmyrythm',
+  'feelmyrythm-backend': 'feelmyrythm',
+  'feelmyrythm-redis': 'feelmyrythm',
+  'multtara-backend': 'pongdang-multtara',
+  'multtara-collector': 'pongdang-multtara',
+  'multtara-frontend': 'pongdang-multtara',
+  'pilgrimage-frontend': 'pilgrimage',
+  'pilgrimage-backend': 'pilgrimage',
+  'pilgrimage-redis': 'pilgrimage',
+  'ddit-finalproject': 'ddit-finalproject',
+  dukkeobi: 'dukkeobi',
+  react: 'react',
+  vue: 'vue',
+};
 const LEGACY_CONTAINER_SERVICE_NAMES = [
   'bonifacio-web',
   'bonifacio-sso',
@@ -173,6 +222,11 @@ function isRecord(value: unknown): value is JsonRecord {
 
 function own(record: JsonRecord | undefined, key: string): unknown {
   return record && Object.prototype.hasOwnProperty.call(record, key) ? record[key] : undefined;
+}
+
+function exactKeys(record: JsonRecord, expected: readonly string[]): boolean {
+  const actual = Object.keys(record);
+  return actual.length === expected.length && expected.every((key) => Object.prototype.hasOwnProperty.call(record, key));
 }
 
 function recordAt(record: JsonRecord | undefined, ...keys: string[]): JsonRecord | undefined {
@@ -527,6 +581,82 @@ function readBounded(root: string, path: string, maximumBytes: number): string |
   }
 }
 
+type StrictFileRead =
+  | { status: 'ok'; content: string }
+  | { status: 'unavailable' | 'collection_error'; content: null };
+
+function strictFileFailure(error: unknown): StrictFileRead {
+  return (error as NodeJS.ErrnoException | undefined)?.code === 'ENOENT'
+    ? { status: 'unavailable', content: null }
+    : { status: 'collection_error', content: null };
+}
+
+function readStrictBounded(root: string, path: string, maximumBytes: number): StrictFileRead {
+  let realRoot: string;
+  try {
+    realRoot = realpathSync(root);
+  } catch (error) {
+    return strictFileFailure(error);
+  }
+
+  let metadata: ReturnType<typeof lstatSync>;
+  try {
+    metadata = lstatSync(path);
+  } catch (error) {
+    return strictFileFailure(error);
+  }
+  if (
+    !metadata.isFile()
+    || metadata.isSymbolicLink()
+    || metadata.nlink !== 1
+    || metadata.size > maximumBytes
+  ) {
+    return { status: 'collection_error', content: null };
+  }
+
+  let realPath: string;
+  try {
+    realPath = realpathSync(path);
+  } catch (error) {
+    return strictFileFailure(error);
+  }
+  if (!isInside(realRoot, realPath)) {
+    return { status: 'collection_error', content: null };
+  }
+
+  let descriptor: number | undefined;
+  try {
+    descriptor = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+    const opened = fstatSync(descriptor);
+    if (
+      !opened.isFile()
+      || opened.nlink !== 1
+      || opened.dev !== metadata.dev
+      || opened.ino !== metadata.ino
+      || opened.size !== metadata.size
+      || opened.size > maximumBytes
+    ) {
+      return { status: 'collection_error', content: null };
+    }
+    const payload = readFileSync(descriptor);
+    if (payload.length !== opened.size || payload.length > maximumBytes) {
+      return { status: 'collection_error', content: null };
+    }
+    try {
+      return {
+        status: 'ok',
+        content: new TextDecoder('utf-8', { fatal: true }).decode(payload),
+      };
+    } catch {
+      return { status: 'collection_error', content: null };
+    }
+  } catch {
+    return { status: 'collection_error', content: null };
+  } finally {
+    if (descriptor !== undefined) closeSync(descriptor);
+  }
+}
+
 function parseObjectFile(root: string, path: string, maximumBytes: number): JsonRecord | null {
   const content = readBounded(root, path, maximumBytes);
   if (content === null) return null;
@@ -538,11 +668,18 @@ function parseObjectFile(root: string, path: string, maximumBytes: number): Json
   }
 }
 
-export function telemetryIsReady(dataDirectory: string): boolean {
+export function telemetryIsReady(
+  dataDirectory: string,
+  nowMs = Date.now(),
+  staleAfterMs = 5 * 60 * 1_000,
+): boolean {
   const root = resolve(dataDirectory);
   const current = parseObjectFile(root, join(root, 'current.json'), MAX_CURRENT_BYTES);
   const currentPayload = recordAt(current ?? undefined, 'latest') ?? current;
-  return normalizeSample(currentPayload) !== null;
+  const sample = normalizeSample(currentPayload);
+  if (!sample) return false;
+  const observedAt = new Date(sample.timestamp).getTime();
+  return observedAt <= nowMs + 60_000 && nowMs - observedAt <= staleAfterMs;
 }
 
 function parseJsonLines(root: string, path: string, maximumBytes: number): JsonRecord[] {
@@ -826,26 +963,581 @@ function normalizeDisks(current: JsonRecord | null): DashboardResponse['disks'] 
   });
 }
 
-function normalizeContainerList(input: unknown, maximum = 256): DashboardResponse['containers'] {
+const CONTAINER_V2_FIELDS = [
+  'name', 'project', 'owner', 'state', 'health', 'healthcheckConfigured',
+  'cpuPercent', 'memoryBytes', 'memoryPercent', 'memoryLimitBytes', 'cpuLimitCores',
+  'pidLimit', 'restartCount', 'restartCountDelta', 'oomKilled', 'startedAt', 'finishedAt',
+] as const;
+const CONTAINER_V2_ONLY_FIELDS = [
+  'project', 'healthcheckConfigured', 'memoryLimitBytes', 'cpuLimitCores', 'pidLimit',
+  'restartCount', 'restartCountDelta', 'oomKilled', 'startedAt', 'finishedAt',
+] as const;
+
+function containerLifecycleTimestamp(value: unknown, nowMs: number): string | null | undefined {
+  if (value === null) return null;
+  if (typeof value !== 'string') return undefined;
+  const normalized = isoTimestamp(value);
+  if (normalized === null) return undefined;
+  const time = new Date(normalized).getTime();
+  return time > 0 && time <= nowMs + 60_000 ? normalized : undefined;
+}
+
+function normalizeContainerList(
+  input: unknown,
+  nowMs: number,
+  allowMigratedLegacy: boolean,
+  maximum = 256,
+): DashboardResponse['containers'] {
   if (!Array.isArray(input)) return [];
   return input.slice(0, maximum).flatMap((value) => {
     if (!isRecord(value)) return [];
     if (own(value, 'owner') !== 'cks') return [];
+    const v2 = CONTAINER_V2_ONLY_FIELDS.some((field) => Object.prototype.hasOwnProperty.call(value, field));
+    if (v2 && !CONTAINER_V2_FIELDS.every((field) => Object.prototype.hasOwnProperty.call(value, field))) {
+      return [];
+    }
+    const rawName = cleanText(own(value, 'name'), 128)?.toLowerCase() ?? null;
     const name = safeContainerName(first(value, ['name']));
+    const expectedProject = rawName === null ? undefined : CURRENT_CONTAINER_PROJECTS[rawName];
+    const project = v2 ? own(value, 'project') : null;
+    const migratedV2 = v2
+      && project === null
+      && own(value, 'health') === null
+      && CONTAINER_V2_ONLY_FIELDS
+        .filter((field) => field !== 'project')
+        .every((field) => own(value, field) === null);
+    if (
+      (!v2 && !allowMigratedLegacy)
+      || (v2 && (
+        name !== rawName
+        || expectedProject === undefined
+        || (project !== expectedProject && !(allowMigratedLegacy && migratedV2))
+      ))
+    ) {
+      return [];
+    }
+    const rawHealth = own(value, 'health');
+    const rawState = own(value, 'state');
+    const health = !v2 || rawHealth === null
+      ? null
+      : safeContainerHealth(first(value, ['health', 'healthStatus']));
+    const healthcheckConfigured = v2 ? own(value, 'healthcheckConfigured') : null;
+    const oomKilled = v2 ? own(value, 'oomKilled') : null;
+    const memoryBytes = v2
+      ? (own(value, 'memoryBytes') === null ? null : integer(own(value, 'memoryBytes')))
+      : finite(first(value, ['memoryBytes', 'memoryUsageBytes']));
+    const memoryLimitBytes = v2
+      ? (own(value, 'memoryLimitBytes') === null ? null : integer(own(value, 'memoryLimitBytes')))
+      : null;
+    const cpuLimitCores = v2
+      ? (own(value, 'cpuLimitCores') === null ? null : finite(own(value, 'cpuLimitCores'), 0, 1024))
+      : null;
+    const pidLimit = v2
+      ? (own(value, 'pidLimit') === null ? null : integer(own(value, 'pidLimit')))
+      : null;
+    const restartCount = v2
+      ? (own(value, 'restartCount') === null ? null : integer(own(value, 'restartCount')))
+      : null;
+    const restartCountDelta = v2
+      ? (own(value, 'restartCountDelta') === null ? null : integer(own(value, 'restartCountDelta')))
+      : null;
+    const startedAt = v2 ? containerLifecycleTimestamp(own(value, 'startedAt'), nowMs) : null;
+    const finishedAt = v2 ? containerLifecycleTimestamp(own(value, 'finishedAt'), nowMs) : null;
+    const cpuPercent = containerCpuPercent(first(value, ['cpuPercent', 'cpu']));
+    const memoryPercent = percent(first(value, ['memoryPercent']));
+    if (v2 && (
+      (healthcheckConfigured !== null && typeof healthcheckConfigured !== 'boolean')
+      || (oomKilled !== null && typeof oomKilled !== 'boolean')
+      || (own(value, 'memoryBytes') !== null && memoryBytes === null)
+      || (own(value, 'memoryLimitBytes') !== null && memoryLimitBytes === null)
+      || (own(value, 'cpuLimitCores') !== null && cpuLimitCores === null)
+      || (own(value, 'pidLimit') !== null && pidLimit === null)
+      || (own(value, 'restartCount') !== null && restartCount === null)
+      || (own(value, 'restartCountDelta') !== null && restartCountDelta === null)
+      || (restartCountDelta !== null && (restartCount === null || restartCountDelta > restartCount))
+      || startedAt === undefined
+      || finishedAt === undefined
+      || typeof rawState !== 'string'
+      || safeContainerState(rawState) !== rawState
+      || (rawHealth !== null && (typeof rawHealth !== 'string' || health !== rawHealth))
+      || (own(value, 'cpuPercent') !== null && cpuPercent === null)
+      || (own(value, 'memoryPercent') !== null && memoryPercent === null)
+      || (healthcheckConfigured === false && health !== 'none')
+      || (healthcheckConfigured === true && !['healthy', 'unhealthy', 'starting'].includes(health ?? ''))
+      || (healthcheckConfigured === null && health !== null)
+    )) return [];
     return [{
       name,
+      project: typeof project === 'string' ? project : null,
       owner: 'cks',
       state: safeContainerState(first(value, ['state', 'status'])),
-      health: safeContainerHealth(first(value, ['health', 'healthStatus'])),
-      cpuPercent: containerCpuPercent(first(value, ['cpuPercent', 'cpu'])),
-      memoryBytes: finite(first(value, ['memoryBytes', 'memoryUsageBytes'])),
-      memoryPercent: percent(first(value, ['memoryPercent'])),
+      health,
+      healthcheckConfigured: typeof healthcheckConfigured === 'boolean' ? healthcheckConfigured : null,
+      cpuPercent,
+      memoryBytes,
+      memoryPercent,
+      memoryLimitBytes,
+      cpuLimitCores,
+      pidLimit,
+      restartCount,
+      restartCountDelta,
+      oomKilled: typeof oomKilled === 'boolean' ? oomKilled : null,
+      startedAt: startedAt ?? null,
+      finishedAt: finishedAt ?? null,
     }];
   });
 }
 
-function normalizeContainers(current: JsonRecord | null): DashboardResponse['containers'] {
-  return normalizeContainerList(current ? first(current, ['containers']) : undefined);
+function normalizeContainers(
+  current: JsonRecord,
+  nowMs: number,
+  allowMigratedLegacy: boolean,
+): DashboardResponse['containers'] {
+  return normalizeContainerList(
+    first(current, ['containers']),
+    nowMs,
+    allowMigratedLegacy,
+  );
+}
+
+const CONTAINER_COLLECTION_STATUSES = new Set<DashboardResponse['containerCollection']['status']>([
+  'fresh',
+  'last-known',
+  'unavailable',
+  'permission-denied',
+]);
+
+function unavailableContainerCollection(): DashboardResponse['containerCollection'] {
+  return { status: 'unavailable', observedAt: null };
+}
+
+function normalizeContainerTelemetry(
+  current: JsonRecord | null,
+  nowMs: number,
+  staleAfterMs: number,
+): Pick<DashboardResponse, 'containerCollection' | 'containers'> {
+  if (!current) {
+    return { containerCollection: unavailableContainerCollection(), containers: [] };
+  }
+
+  const rawCollection = own(current, 'containerCollection');
+  if (rawCollection === undefined) {
+    const containers = normalizeContainers(current, nowMs, true);
+    const latest = recordAt(current, 'latest');
+    const observedAt = isoTimestamp(
+      first(latest, ['timestamp']) ?? first(current, ['generatedAt']),
+    );
+    if (!observedAt) {
+      // Pre-status snapshots sometimes contained only the reduced list. Never
+      // claim current or last-known evidence without an observation time.
+      return { containerCollection: unavailableContainerCollection(), containers: [] };
+    }
+    const observedMs = new Date(observedAt).getTime();
+    if (observedMs > nowMs + 60_000) {
+      return { containerCollection: unavailableContainerCollection(), containers: [] };
+    }
+    return {
+      containerCollection: {
+        status: 'last-known',
+        observedAt,
+      },
+      containers,
+    };
+  }
+
+  if (!isRecord(rawCollection)) {
+    return { containerCollection: unavailableContainerCollection(), containers: [] };
+  }
+  const keys = Object.keys(rawCollection);
+  const rawStatus = own(rawCollection, 'status');
+  const rawObservedAt = own(rawCollection, 'observedAt');
+  const observedAt = rawObservedAt === null ? null : isoTimestamp(rawObservedAt);
+  if (
+    keys.length !== 2
+    || !keys.includes('status')
+    || !keys.includes('observedAt')
+    || typeof rawStatus !== 'string'
+    || !CONTAINER_COLLECTION_STATUSES.has(rawStatus as DashboardResponse['containerCollection']['status'])
+    || (rawObservedAt !== null && observedAt === null)
+  ) {
+    return { containerCollection: unavailableContainerCollection(), containers: [] };
+  }
+  let status = rawStatus as DashboardResponse['containerCollection']['status'];
+  if (
+    status === 'fresh'
+    && observedAt !== null
+    && nowMs - new Date(observedAt).getTime() > staleAfterMs
+  ) {
+    status = 'last-known';
+  }
+  const containers = normalizeContainers(current, nowMs, status !== 'fresh');
+  if (
+    ((status === 'fresh' || status === 'last-known') && observedAt === null)
+    || (status === 'unavailable' && observedAt !== null)
+    || (observedAt !== null && new Date(observedAt).getTime() > nowMs + 60_000)
+    || (observedAt === null && containers.length > 0)
+  ) {
+    return { containerCollection: unavailableContainerCollection(), containers: [] };
+  }
+  return { containerCollection: { status, observedAt }, containers };
+}
+
+function contractText(value: unknown, maximumLength: number): string | null {
+  if (typeof value !== 'string' || value.length < 1 || value.length > maximumLength) return null;
+  const normalized = value
+    .replace(/[\u0000-\u001f\u007f]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return normalized === value ? value : null;
+}
+
+function contractTimestamp(value: unknown, nowMs: number): string | null {
+  if (typeof value !== 'string') return null;
+  const timestamp = isoTimestamp(value);
+  return timestamp !== null && new Date(timestamp).getTime() <= nowMs + 60_000
+    ? timestamp
+    : null;
+}
+
+function signedRuleValue(value: unknown): number | null {
+  return typeof value === 'number'
+    && Number.isFinite(value)
+    ? value
+    : null;
+}
+
+function unavailableRuleEvaluation(
+  status: 'unavailable' | 'collection_error',
+): DashboardResponse['ruleEvaluation'] {
+  return {
+    schemaVersion: 1,
+    status,
+    rulePackVersion: null,
+    evaluatedAt: null,
+    summary: {},
+    states: {},
+  };
+}
+
+const RULE_STATE_FIELDS = [
+  'ruleId',
+  'target',
+  'metric',
+  'severity',
+  'description',
+  'runbook',
+  'phase',
+  'breachSamples',
+  'recoverySamples',
+  'missingSamples',
+  'openedAt',
+  'changedAt',
+  'lastEvaluatedAt',
+  'lastValue',
+  'observationStatus',
+] as const;
+
+function normalizeRuleState(
+  key: string,
+  value: unknown,
+  evaluatedAt: string,
+  nowMs: number,
+): RuleEvaluationState | null {
+  if (!isRecord(value) || !exactKeys(value, RULE_STATE_FIELDS)) return null;
+  const ruleId = own(value, 'ruleId');
+  const target = own(value, 'target');
+  const metric = own(value, 'metric');
+  const severity = own(value, 'severity');
+  const description = contractText(own(value, 'description'), 500);
+  const runbook = contractText(own(value, 'runbook'), 500);
+  const phase = own(value, 'phase');
+  const observationStatus = own(value, 'observationStatus');
+  if (
+    typeof ruleId !== 'string'
+    || !RULE_ID_PATTERN.test(ruleId)
+    || typeof target !== 'string'
+    || !RULE_TARGET_PATTERN.test(target)
+    || key !== `${ruleId}:${target}`
+    || typeof metric !== 'string'
+    || !RULE_METRIC_PATTERN.test(metric)
+    || typeof severity !== 'string'
+    || !RULE_SEVERITIES.has(severity as RuleEvaluationState['severity'])
+    || description === null
+    || runbook === null
+    || typeof phase !== 'string'
+    || !RULE_PHASES.has(phase as RuleEvaluationPhase)
+    || typeof observationStatus !== 'string'
+    || !RULE_OBSERVATION_STATUSES.has(observationStatus as RuleObservationStatus)
+  ) return null;
+
+  const breachSamples = integer(own(value, 'breachSamples'), 0, 10_000);
+  const recoverySamples = integer(own(value, 'recoverySamples'), 0, 10_000);
+  const missingSamples = integer(own(value, 'missingSamples'), 0, 10_000);
+  const openedAtValue = own(value, 'openedAt');
+  const openedAt = openedAtValue === null ? null : contractTimestamp(openedAtValue, nowMs);
+  const changedAt = contractTimestamp(own(value, 'changedAt'), nowMs);
+  const lastEvaluatedAt = contractTimestamp(own(value, 'lastEvaluatedAt'), nowMs);
+  const rawLastValue = own(value, 'lastValue');
+  const lastValue = rawLastValue === null ? null : signedRuleValue(rawLastValue);
+  const evaluatedMs = new Date(evaluatedAt).getTime();
+  if (
+    breachSamples === null
+    || recoverySamples === null
+    || missingSamples === null
+    || (openedAtValue !== null && openedAt === null)
+    || changedAt === null
+    || lastEvaluatedAt !== evaluatedAt
+    || new Date(changedAt).getTime() > evaluatedMs
+    || (openedAt !== null && new Date(openedAt).getTime() > evaluatedMs)
+    || ((phase === 'firing' || phase === 'recovering') && openedAt === null)
+    || ((phase !== 'firing' && phase !== 'recovering') && openedAt !== null)
+    || (rawLastValue !== null && lastValue === null)
+    || (observationStatus !== 'ok' && lastValue !== null)
+  ) return null;
+
+  return {
+    ruleId,
+    target,
+    metric,
+    severity: severity as RuleEvaluationState['severity'],
+    description,
+    runbook,
+    phase: phase as RuleEvaluationPhase,
+    breachSamples,
+    recoverySamples,
+    missingSamples,
+    openedAt,
+    changedAt,
+    lastEvaluatedAt,
+    lastValue,
+    observationStatus: observationStatus as RuleObservationStatus,
+  };
+}
+
+function readRuleEvaluation(
+  root: string,
+  nowMs: number,
+  staleAfterMs: number,
+): DashboardResponse['ruleEvaluation'] {
+  const file = readStrictBounded(
+    root,
+    join(root, 'rule-evaluation.json'),
+    MAX_RULE_EVALUATION_BYTES,
+  );
+  if (file.status !== 'ok') return unavailableRuleEvaluation(file.status);
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(file.content);
+  } catch {
+    return unavailableRuleEvaluation('collection_error');
+  }
+  const topFields = [
+    'schemaVersion', 'status', 'rulePackVersion', 'evaluatedAt', 'summary', 'states',
+  ] as const;
+  if (!isRecord(parsed) || !exactKeys(parsed, topFields) || own(parsed, 'schemaVersion') !== 1) {
+    return unavailableRuleEvaluation('collection_error');
+  }
+  const status = own(parsed, 'status');
+  const evaluatedAt = contractTimestamp(own(parsed, 'evaluatedAt'), nowMs);
+  const rawSummary = own(parsed, 'summary');
+  const rawStates = own(parsed, 'states');
+  if (
+    (status !== 'ok' && status !== 'collection_error')
+    || evaluatedAt === null
+    || !isRecord(rawSummary)
+    || !isRecord(rawStates)
+  ) return unavailableRuleEvaluation('collection_error');
+
+  if (status === 'collection_error') {
+    if (
+      own(parsed, 'rulePackVersion') !== null
+      || Object.keys(rawSummary).length !== 0
+      || Object.keys(rawStates).length !== 0
+    ) return unavailableRuleEvaluation('collection_error');
+    return {
+      schemaVersion: 1,
+      status,
+      rulePackVersion: null,
+      evaluatedAt,
+      summary: {},
+      states: {},
+    };
+  }
+
+  const rawVersion = own(parsed, 'rulePackVersion');
+  const rulePackVersion = contractText(rawVersion, 64);
+  if (
+    rulePackVersion === null
+    || !RULE_PACK_VERSION_PATTERN.test(rulePackVersion)
+    || Object.keys(rawStates).length === 0
+  ) return unavailableRuleEvaluation('collection_error');
+
+  const stateEntries = Object.entries(rawStates);
+  if (stateEntries.length > MAX_RULE_STATES) {
+    return unavailableRuleEvaluation('collection_error');
+  }
+  const states: Record<string, RuleEvaluationState> = {};
+  const phaseCounts: Partial<Record<RuleEvaluationPhase, number>> = {};
+  for (const [key, rawState] of stateEntries) {
+    const state = normalizeRuleState(key, rawState, evaluatedAt, nowMs);
+    if (!state) return unavailableRuleEvaluation('collection_error');
+    states[key] = state;
+    phaseCounts[state.phase] = (phaseCounts[state.phase] ?? 0) + 1;
+  }
+
+  const summary: Partial<Record<RuleEvaluationPhase, number>> = {};
+  for (const [phase, rawCount] of Object.entries(rawSummary)) {
+    if (!RULE_PHASES.has(phase as RuleEvaluationPhase)) {
+      return unavailableRuleEvaluation('collection_error');
+    }
+    const count = integer(rawCount, 1, MAX_RULE_STATES);
+    if (count === null) return unavailableRuleEvaluation('collection_error');
+    summary[phase as RuleEvaluationPhase] = count;
+  }
+  const countedPhases = Object.keys(phaseCounts) as RuleEvaluationPhase[];
+  if (
+    Object.keys(summary).length !== countedPhases.length
+    || countedPhases.some((phase) => summary[phase] !== phaseCounts[phase])
+  ) return unavailableRuleEvaluation('collection_error');
+
+  return {
+    schemaVersion: 1,
+    status: nowMs - new Date(evaluatedAt).getTime() > staleAfterMs ? 'last-known' : status,
+    rulePackVersion,
+    evaluatedAt,
+    summary,
+    states,
+  };
+}
+
+const RULE_ALERT_FIELDS = [
+  'schemaVersion',
+  'rulePackVersion',
+  'idempotencyKey',
+  'ruleId',
+  'target',
+  'transition',
+  'severity',
+  'notificationState',
+  'observedAt',
+  'openedAt',
+  'value',
+  'status',
+  'labels',
+  'description',
+  'runbook',
+] as const;
+
+function normalizeRuleAlert(value: unknown, nowMs: number): RuleAlertEvent | null {
+  if (!isRecord(value) || !exactKeys(value, RULE_ALERT_FIELDS) || own(value, 'schemaVersion') !== 1) {
+    return null;
+  }
+  const rulePackVersion = own(value, 'rulePackVersion');
+  const idempotencyKey = own(value, 'idempotencyKey');
+  const ruleId = own(value, 'ruleId');
+  const target = own(value, 'target');
+  const transition = own(value, 'transition');
+  const severity = own(value, 'severity');
+  const notificationState = own(value, 'notificationState');
+  const observedAt = contractTimestamp(own(value, 'observedAt'), nowMs);
+  const openedAt = contractTimestamp(own(value, 'openedAt'), nowMs);
+  const rawValue = own(value, 'value');
+  const normalizedValue = rawValue === null ? null : signedRuleValue(rawValue);
+  const status = own(value, 'status');
+  const rawLabels = own(value, 'labels');
+  const description = contractText(own(value, 'description'), 500);
+  const runbook = contractText(own(value, 'runbook'), 500);
+  if (
+    typeof rulePackVersion !== 'string'
+    || !RULE_PACK_VERSION_PATTERN.test(rulePackVersion)
+    || typeof idempotencyKey !== 'string'
+    || !/^[a-f0-9]{64}$/.test(idempotencyKey)
+    || typeof ruleId !== 'string'
+    || !RULE_ID_PATTERN.test(ruleId)
+    || typeof target !== 'string'
+    || !RULE_TARGET_PATTERN.test(target)
+    || (transition !== 'firing' && transition !== 'resolved')
+    || typeof severity !== 'string'
+    || !RULE_SEVERITIES.has(severity as RuleAlertEvent['severity'])
+    || (notificationState !== 'ready' && notificationState !== 'suppressed' && notificationState !== 'silenced')
+    || observedAt === null
+    || openedAt === null
+    || new Date(openedAt).getTime() > new Date(observedAt).getTime()
+    || (rawValue !== null && normalizedValue === null)
+    || typeof status !== 'string'
+    || !RULE_OBSERVATION_STATUSES.has(status as RuleObservationStatus)
+    || (status !== 'ok' && normalizedValue !== null)
+    || !isRecord(rawLabels)
+    || Object.keys(rawLabels).length > 16
+    || description === null
+    || runbook === null
+  ) return null;
+
+  const labels: Record<string, string> = {};
+  for (const [key, labelValue] of Object.entries(rawLabels)) {
+    if (
+      !RULE_LABEL_NAME_PATTERN.test(key)
+      || typeof labelValue !== 'string'
+      || !RULE_LABEL_VALUE_PATTERN.test(labelValue)
+    ) return null;
+    labels[key] = labelValue;
+  }
+  return {
+    schemaVersion: 1,
+    rulePackVersion,
+    idempotencyKey,
+    ruleId,
+    target,
+    transition,
+    severity: severity as RuleAlertEvent['severity'],
+    notificationState,
+    observedAt,
+    openedAt,
+    value: normalizedValue,
+    status: status as RuleObservationStatus,
+    labels,
+    description,
+    runbook,
+  };
+}
+
+function readRuleAlerts(
+  root: string,
+  cutoff: number,
+  nowMs: number,
+): DashboardResponse['ruleAlerts'] {
+  const file = readStrictBounded(root, join(root, 'rule-alerts.jsonl'), MAX_RULE_ALERT_FILE_BYTES);
+  if (file.status !== 'ok') return { status: file.status, events: [] };
+  if (file.content.length === 0) return { status: 'ok', events: [] };
+
+  const lines = file.content.split('\n');
+  if (lines.at(-1) === '') lines.pop();
+  if (lines.length > MAX_RULE_ALERT_RECORDS || lines.some((line) => line.length === 0)) {
+    return { status: 'collection_error', events: [] };
+  }
+  const events: RuleAlertEvent[] = [];
+  const identities = new Set<string>();
+  for (const line of lines) {
+    if (Buffer.byteLength(line) > MAX_RULE_ALERT_LINE_BYTES) {
+      return { status: 'collection_error', events: [] };
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(line);
+    } catch {
+      return { status: 'collection_error', events: [] };
+    }
+    const event = normalizeRuleAlert(parsed, nowMs);
+    if (!event || identities.has(event.idempotencyKey)) {
+      return { status: 'collection_error', events: [] };
+    }
+    identities.add(event.idempotencyKey);
+    const observedMs = new Date(event.observedAt).getTime();
+    if (observedMs >= cutoff) events.push(event);
+  }
+  events.sort((left, right) => right.observedAt.localeCompare(left.observedAt));
+  return { status: 'ok', events: events.slice(0, MAX_RULE_ALERTS) };
 }
 
 function normalizeAlert(
@@ -1518,7 +2210,10 @@ export function readDashboard(
   const observedLatest = currentSample ?? samples.at(-1) ?? null;
   const latestTime = observedLatest ? new Date(observedLatest.timestamp).getTime() : Number.NaN;
   const latest = observedLatest ?? emptySample(new Date(nowMs).toISOString());
+  const containerTelemetry = normalizeContainerTelemetry(current, nowMs, staleAfterMs);
   const alerts = parseJsonLines(root, join(root, 'alerts.jsonl'), MAX_EVENT_FILE_BYTES);
+  const ruleEvaluation = readRuleEvaluation(root, nowMs, staleAfterMs);
+  const ruleAlerts = readRuleAlerts(root, cutoff, nowMs);
   const power = parseJsonLines(root, join(root, 'power.jsonl'), MAX_EVENT_FILE_BYTES);
   const reliability = parseJsonLines(root, join(root, 'reliability.jsonl'), MAX_EVENT_FILE_BYTES);
   const privilege = parseJsonLines(root, join(root, 'privilege.jsonl'), MAX_EVENT_FILE_BYTES);
@@ -1537,9 +2232,12 @@ export function readDashboard(
     telemetrySummary: summarizeTelemetry(samples),
     powerSummary: summarizePower(samples),
     disks: normalizeDisks(current),
-    containers: normalizeContainers(current),
+    containerCollection: containerTelemetry.containerCollection,
+    containers: containerTelemetry.containers,
     currentTraffic: normalizeCurrentTraffic(current),
     alerts: normalizeAlerts(alerts, cutoff, nowMs),
+    ruleEvaluation,
+    ruleAlerts,
     powerEvents: normalizePowerEvents(power, alerts, samples, cutoff, nowMs),
     reliabilityEvents: normalizeReliabilityEvents(reliability, power, cutoff, nowMs),
     privilegeEvents: normalizePrivilege(privilege, cutoff, nowMs),
@@ -1550,8 +2248,21 @@ export function readDashboard(
 export const dataLimits = {
   maximumSeriesPoints: MAX_SERIES_POINTS,
   maximumEvents: MAX_EVENTS,
+  maximumRuleStates: MAX_RULE_STATES,
+  maximumRuleAlerts: MAX_RULE_ALERTS,
+  maximumRuleEvaluationBytes: MAX_RULE_EVALUATION_BYTES,
+  maximumRuleAlertFileBytes: MAX_RULE_ALERT_FILE_BYTES,
   maximumIncidents: MAX_INCIDENTS,
   maximumIncidentFileBytes: MAX_INCIDENT_FILE_BYTES,
   acceptedHistoryFilePattern: /^\d{4}-\d{2}-\d{2}\.jsonl$/,
-  fixedFiles: ['current.json', 'alerts.jsonl', 'power.jsonl', 'reliability.jsonl', 'privilege.jsonl', 'incidents.jsonl'].map((path) => basename(path)),
+  fixedFiles: [
+    'current.json',
+    'alerts.jsonl',
+    'rule-evaluation.json',
+    'rule-alerts.jsonl',
+    'power.jsonl',
+    'reliability.jsonl',
+    'privilege.jsonl',
+    'incidents.jsonl',
+  ].map((path) => basename(path)),
 } as const;
