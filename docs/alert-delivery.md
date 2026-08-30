@@ -66,8 +66,9 @@ row fails permanently without retrying.
   idle timeouts are not treated as a session bound. Configuration requires the
   lease to exceed the enforced deadline by five seconds and rejects combinations
   that cannot fit the 300-second lease ceiling. A non-main-thread invocation,
-  unsupported platform, custom `SIGALRM` handler, or pre-existing real-time
-  timer performs no network I/O and returns fixed retryable
+  unsupported platform, blocked `SIGALRM`, unavailable signal-mask inspection,
+  custom `SIGALRM` handler, or pre-existing real-time timer performs no network
+  I/O and returns fixed retryable
   `deadline_unavailable`; expiry returns `delivery_deadline_exceeded`.
 - A full queue rejects a new item unless it has higher alert priority than the
   oldest lowest-priority pending/retry row. Every rejection or eviction is

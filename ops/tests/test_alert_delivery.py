@@ -691,6 +691,52 @@ class AlertDeliveryTests(unittest.TestCase):
             self.assertLess(elapsed, 1.5)
             self.assertLess(elapsed, config.queue.lease_seconds)
 
+    def test_adapter_deadline_cleans_up_when_descheduled_during_timer_arm(self):
+        class RecordingAdapter:
+            def __init__(self):
+                self.calls = 0
+
+            def send(self, _channel, _task, _payload, _secret):
+                self.calls += 1
+                return alert_delivery.DeliveryResult.success(204)
+
+        with tempfile.TemporaryDirectory() as directory:
+            value = config_value(lease_seconds=6)
+            value["channels"][0]["timeoutSeconds"] = 0.25
+            outbox, config = self.outbox(Path(directory), value)
+            alert_delivery.enqueue_test_delivery(
+                outbox, config, "ops-webhook", "deadline-arm-race",
+                "Deadline arm race", NOW,
+            )
+            task = outbox.claim_due(NOW, "worker-a", 1)[0]
+            adapter = RecordingAdapter()
+            original_handler = signal.getsignal(signal.SIGALRM)
+            real_setitimer = signal.setitimer
+
+            def delayed_setitimer(which, seconds, interval=0.0):
+                result = real_setitimer(which, seconds, interval)
+                if seconds > 0:
+                    wall_time.sleep(1.0)
+                return result
+
+            with mock.patch.object(
+                alert_delivery.signal, "setitimer", side_effect=delayed_setitimer,
+            ):
+                result = alert_delivery.dispatch_task(
+                    config,
+                    task,
+                    secret_resolver=lambda _ref: "https://example.test/private",
+                    adapters={"webhook": adapter},
+                )
+
+            self.assertEqual(
+                result,
+                alert_delivery.DeliveryResult.retryable("delivery_deadline_exceeded"),
+            )
+            self.assertEqual(adapter.calls, 0)
+            self.assertEqual(signal.getsignal(signal.SIGALRM), original_handler)
+            self.assertEqual(signal.getitimer(signal.ITIMER_REAL), (0.0, 0.0))
+
     def test_adapter_deadline_fails_closed_without_stealing_alarm_or_off_main_thread(self):
         class RecordingAdapter:
             def __init__(self):
@@ -742,6 +788,63 @@ class AlertDeliveryTests(unittest.TestCase):
             self.assertEqual(threaded_results, [
                 alert_delivery.DeliveryResult.retryable("deadline_unavailable"),
             ])
+            self.assertEqual(adapter.calls, 0)
+
+            original_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+            try:
+                signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGALRM})
+                blocked_mask_before = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+                blocked_alarm = alert_delivery.dispatch_task(
+                    config,
+                    task,
+                    secret_resolver=lambda _ref: "https://example.test/private",
+                    adapters={"webhook": adapter},
+                )
+                blocked_mask_after = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+            finally:
+                signal.pthread_sigmask(signal.SIG_SETMASK, original_mask)
+            self.assertEqual(
+                blocked_alarm,
+                alert_delivery.DeliveryResult.retryable("deadline_unavailable"),
+            )
+            self.assertIn(signal.SIGALRM, blocked_mask_before)
+            self.assertEqual(blocked_mask_after, blocked_mask_before)
+            self.assertEqual(adapter.calls, 0)
+
+            with mock.patch.object(
+                alert_delivery.signal,
+                "pthread_sigmask",
+                side_effect=PermissionError("injected mask query denial"),
+            ):
+                denied_mask_query = alert_delivery.dispatch_task(
+                    config,
+                    task,
+                    secret_resolver=lambda _ref: "https://example.test/private",
+                    adapters={"webhook": adapter},
+                )
+            self.assertEqual(
+                denied_mask_query,
+                alert_delivery.DeliveryResult.retryable("deadline_unavailable"),
+            )
+            self.assertEqual(adapter.calls, 0)
+
+            original_handler = signal.getsignal(signal.SIGALRM)
+            with mock.patch.object(
+                alert_delivery.signal,
+                "setitimer",
+                side_effect=PermissionError("injected timer denial"),
+            ):
+                denied_timer = alert_delivery.dispatch_task(
+                    config,
+                    task,
+                    secret_resolver=lambda _ref: "https://example.test/private",
+                    adapters={"webhook": adapter},
+                )
+            self.assertEqual(
+                denied_timer,
+                alert_delivery.DeliveryResult.retryable("deadline_unavailable"),
+            )
+            self.assertEqual(signal.getsignal(signal.SIGALRM), original_handler)
             self.assertEqual(adapter.calls, 0)
 
     def test_smtp_partial_recipient_refusals_are_never_full_success(self):

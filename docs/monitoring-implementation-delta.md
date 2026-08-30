@@ -135,7 +135,7 @@ transition 생성이나 enqueue 성공을 수신자 exactly-once 성공으로 �
 notification outbox/worker, central admission과 agent transport를 함께 포함한
 전체 회귀를 다시 실행했다.
 
-- Python: `python3 -m unittest discover -s ops/tests -p 'test_*.py'` — 320/320
+- Python: `python3 -m unittest discover -s ops/tests -p 'test_*.py'` — 321/321
 - TypeScript/Vitest: 30 files, 250/250
 - client/server TypeScript typecheck — 통과
 - Vite client와 server production build — 통과

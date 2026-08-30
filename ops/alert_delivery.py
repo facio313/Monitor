@@ -1588,13 +1588,21 @@ def _call_with_delivery_deadline(
         or not hasattr(signal, "ITIMER_REAL")
         or not hasattr(signal, "getitimer")
         or not hasattr(signal, "setitimer")
+        or not hasattr(signal, "pthread_sigmask")
+        or not hasattr(signal, "SIG_BLOCK")
     ):
         return unavailable
 
     try:
+        # Query the calling thread's mask without changing it. A blocked
+        # SIGALRM would leave a blocking transport free to outlive its lease;
+        # fail closed before resolving credentials or starting network I/O.
+        current_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+        if signal.SIGALRM in current_mask:
+            return unavailable
         previous_handler = signal.getsignal(signal.SIGALRM)
         previous_timer = signal.getitimer(signal.ITIMER_REAL)
-    except (AttributeError, OSError, RuntimeError, ValueError):
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
         return unavailable
     # Replacing another component's alarm would either disable its safety
     # boundary or make restoration imprecise.  This worker therefore owns
@@ -1606,42 +1614,67 @@ def _call_with_delivery_deadline(
     ):
         return unavailable
 
-    handler_installed = False
-    try:
-        signal.signal(signal.SIGALRM, _raise_delivery_deadline)
-        handler_installed = True
-        signal.setitimer(signal.ITIMER_REAL, deadline_seconds, 0.0)
-    except (AttributeError, OSError, RuntimeError, ValueError):
-        if handler_installed:
-            try:
-                signal.setitimer(signal.ITIMER_REAL, 0.0, 0.0)
-            finally:
-                signal.signal(signal.SIGALRM, previous_handler)
-        return unavailable
-
     started_at = time.monotonic()
     result: DeliveryResult | None = None
     operation_error: BaseException | None = None
     expired = False
+    setup_failed = False
+    cleanup_failed = False
+    handler_installed = False
     try:
-        result = operation()
-    except _DeliveryDeadlineExpired:
-        expired = True
-    except BaseException as error:
-        operation_error = error
-    finally:
-        # Ignore a pending alarm before disarming it, then restore the exact
-        # default handler.  If it arrives while changing the handler, record
-        # the expiry and retry once the one-shot signal has been consumed.
-        while True:
+        try:
+            signal.signal(signal.SIGALRM, _raise_delivery_deadline)
+            handler_installed = True
+            # The arm itself and every subsequent instruction are inside this
+            # outer protected region. A deschedule immediately after the
+            # syscall therefore cannot bypass cleanup or leak our handler.
+            signal.setitimer(signal.ITIMER_REAL, deadline_seconds, 0.0)
             try:
-                signal.signal(signal.SIGALRM, signal.SIG_IGN)
-                break
+                result = operation()
             except _DeliveryDeadlineExpired:
                 expired = True
-        signal.setitimer(signal.ITIMER_REAL, 0.0, 0.0)
-        signal.signal(signal.SIGALRM, previous_handler)
+            except BaseException as error:
+                operation_error = error
+        except _DeliveryDeadlineExpired:
+            expired = True
+        except (AttributeError, OSError, RuntimeError, ValueError):
+            setup_failed = True
+    finally:
+        if handler_installed:
+            # Ignore a pending alarm before disarming it, then restore the
+            # exact default handler. If it arrives while changing the handler,
+            # record the expiry and retry after the one-shot signal is spent.
+            while True:
+                try:
+                    signal.signal(signal.SIGALRM, signal.SIG_IGN)
+                    break
+                except _DeliveryDeadlineExpired:
+                    expired = True
+                except (AttributeError, OSError, RuntimeError, ValueError):
+                    cleanup_failed = True
+                    break
+            try:
+                while True:
+                    try:
+                        signal.setitimer(signal.ITIMER_REAL, 0.0, 0.0)
+                        break
+                    except _DeliveryDeadlineExpired:
+                        expired = True
+            except (AttributeError, OSError, RuntimeError, ValueError):
+                cleanup_failed = True
+            finally:
+                # Restore the caller's handler even if cancellation itself is
+                # rejected. In the normal Linux worker, a successful arm and
+                # rejected cancel cannot occur under the same seccomp policy;
+                # this path primarily guarantees deterministic fail-closed
+                # behavior for setup faults and embedded callers.
+                try:
+                    signal.signal(signal.SIGALRM, previous_handler)
+                except (AttributeError, OSError, RuntimeError, ValueError):
+                    cleanup_failed = True
 
+    if setup_failed or cleanup_failed:
+        return unavailable
     if expired or time.monotonic() - started_at >= deadline_seconds:
         return DeliveryResult.retryable("delivery_deadline_exceeded")
     if operation_error is not None:

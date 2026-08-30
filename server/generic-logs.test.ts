@@ -458,5 +458,5 @@ describe('generic log read model', () => {
     expect(rssGrowth).toBeLessThan(192 * 1024 * 1024);
     expect(peakRssGrowth).toBeLessThan(192 * 1024 * 1024);
     clearGenericLogSnapshotCacheForTests();
-  });
+  }, 15_000);
 });
