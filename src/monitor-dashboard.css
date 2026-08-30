@@ -216,14 +216,14 @@
   position: absolute;
   inset: -30%;
   z-index: 1;
-  opacity: .18;
+  opacity: .065;
   pointer-events: none;
   mix-blend-mode: soft-light;
   background-image:
     repeating-radial-gradient(circle at 31% 27%, rgb(255 255 255 / 16%) 0 .6px, transparent .7px 3px),
     repeating-linear-gradient(119deg, transparent 0 7px, rgb(255 255 255 / 2%) 8px 9px);
   background-size: 7px 7px, 19px 19px;
-  animation: emotion-grain-drift 19s steps(9) infinite;
+  animation: emotion-grain-drift 28s steps(9) infinite;
 }
 .system-emotion-engine[data-animation-paused="true"]::after,
 .system-emotion-engine[data-animation-paused="true"] .system-emotion-grain { animation-play-state: paused; }
@@ -1227,6 +1227,7 @@
 
 @media (pointer: coarse) {
   .emotion-engine-copy button, .emotion-engine-readings { backdrop-filter: none; }
+  .system-emotion-grain { opacity: .035; animation: none; }
 }
 
 @media (prefers-reduced-motion: reduce) {
