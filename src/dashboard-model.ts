@@ -8,6 +8,7 @@ import type {
   PrivilegeEvent,
   ReliabilityEvent,
   TelemetrySample,
+  TimeRange,
 } from './types';
 
 export const DETAIL_PAGES: readonly MonitorDetailPage[] = [
@@ -16,6 +17,8 @@ export const DETAIL_PAGES: readonly MonitorDetailPage[] = [
   'storage',
   'containers',
   'reliability',
+  'maintenance',
+  'infrastructure',
   'power',
   'incidents',
   'logs',
@@ -35,6 +38,37 @@ export function monitorPathForPage(page: MonitorPage): string {
   if (page === 'overview') return '/monitor/';
   if (page === 'details') return '/monitor/details/resources';
   return `/monitor/details/${page}`;
+}
+
+export type OperationalAssessmentPresentation = 'overview' | 'details' | 'hidden';
+
+export function operationalAssessmentPresentation(page: MonitorPage): OperationalAssessmentPresentation {
+  if (page === 'overview') return 'overview';
+  if (page === 'reliability') return 'details';
+  return 'hidden';
+}
+
+const TIME_RANGE_SET = new Set<TimeRange>(['1h', '24h', '7d', '30d']);
+export const MONITOR_STALE_AFTER_MS = 5 * 60_000;
+
+export function monitorRangeFromSearch(search: string): TimeRange {
+  try {
+    const value = new URLSearchParams(search).get('range');
+    return value && TIME_RANGE_SET.has(value as TimeRange) ? value as TimeRange : '24h';
+  } catch {
+    return '24h';
+  }
+}
+
+export function monitorSnapshotIsStale(
+  reportedStale: boolean,
+  lastSuccessfulAtMs: number,
+  nowMs: number,
+  staleAfterMs = MONITOR_STALE_AFTER_MS,
+): boolean {
+  if (reportedStale) return true;
+  if (!Number.isFinite(lastSuccessfulAtMs) || !Number.isFinite(nowMs)) return true;
+  return nowMs - lastSuccessfulAtMs > staleAfterMs;
 }
 
 export function chooseInitialLocale(stored: string | null, browserLanguages: readonly string[]): MonitorLocale {
@@ -132,9 +166,17 @@ export interface OperationalLogEntry {
 }
 
 function normalizedSeverity(value: unknown, status: unknown): OperationalLogSeverity {
-  const text = `${typeof value === 'string' ? value : ''} ${typeof status === 'string' ? status : ''}`.toLowerCase();
-  if (/(critical|error|failure|failed|denied|unhealthy|down)/.test(text)) return 'critical';
-  if (/(warning|warn|active|degraded|stale|unknown)/.test(text)) return 'warning';
+  const severity = typeof value === 'string' ? value.toLowerCase() : '';
+  if (/(critical|error|failure|failed|denied)/.test(severity)) return 'critical';
+  if (/(warning|warn|caution|degraded)/.test(severity)) return 'warning';
+  if (/(info|informational|advisory|success|ok)/.test(severity)) return 'info';
+
+  // Status is only a fallback for legacy events without a canonical severity.
+  // Treating every `active` status as a warning incorrectly promoted nominal
+  // records such as `nvme-mitigation:active / info`.
+  const state = typeof status === 'string' ? status.toLowerCase() : '';
+  if (/(critical|error|failure|failed|denied|unhealthy|down)/.test(state)) return 'critical';
+  if (/(warning|warn|active|degraded|stale|unknown|incomplete)/.test(state)) return 'warning';
   return 'info';
 }
 
@@ -232,6 +274,7 @@ export function relatedLogs(entries: OperationalLogEntry[], page: MonitorPage): 
   if (page === 'logs' || page === 'overview' || page === 'details') return entries;
   const categories: Partial<Record<MonitorDetailPage, OperationalLogCategory[]>> = {
     reliability: ['reliability', 'alert'],
+    maintenance: ['reliability', 'power', 'privilege'],
     power: ['power', 'alert'],
     resources: ['alert', 'reliability'],
     network: ['alert', 'reliability'],

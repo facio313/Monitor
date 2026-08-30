@@ -12,6 +12,7 @@ import {
 } from './auth.js';
 import { loadConfig, type ConfigOverrides } from './config.js';
 import { readDashboard, telemetryIsReady } from './data.js';
+import { readInfrastructureLedger } from './infrastructure-ledger.js';
 import { inventoryLegacyAuth } from './legacy-auth.js';
 import { PasswordStore, PasswordStoreBusyError } from './password-store.js';
 import {
@@ -19,11 +20,23 @@ import {
   ssoRoleAtLeast,
   trustedSsoIdentity,
 } from './sso.js';
+import {
+  readSystemUpdateStatus,
+  safeUpdateActor,
+  sendUpdateGatewayRequest,
+  UpdateGatewayError,
+  updateGatewayIsAvailable,
+  UpdateNonceStore,
+  type UpdateGatewayRequest,
+  type UpdateGatewayResponse,
+} from './system-updates.js';
 import { DASHBOARD_RANGES, type DashboardRange } from './types.js';
 
 export interface AppOptions extends ConfigOverrides {
   now?: () => number;
   publicDir?: string;
+  updateGateway?: (request: UpdateGatewayRequest) => Promise<UpdateGatewayResponse>;
+  updateGatewayAvailable?: () => boolean;
 }
 
 function apiError(response: Response, status: number, code: string, message: string): void {
@@ -44,6 +57,30 @@ function mutationIsSameOrigin(request: Request, allowedOrigins: string[]): boole
   }
 }
 
+function criticalMutationIsSameOrigin(request: Request, allowedOrigins: string[]): boolean {
+  const origin = request.get('origin');
+  const contentType = request.get('content-type')?.split(';', 1)[0]?.trim().toLowerCase();
+  return request.get('sec-fetch-site') === 'same-origin'
+    && typeof origin === 'string'
+    && allowedOrigins.includes(origin)
+    && contentType === 'application/json';
+}
+
+function exactBody(value: unknown, keys: readonly string[]): Record<string, unknown> | null {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return null;
+  const body = value as Record<string, unknown>;
+  const actual = Object.keys(body).sort();
+  const expected = [...keys].sort();
+  return actual.length === expected.length
+    && actual.every((key, index) => key === expected[index])
+    ? body
+    : null;
+}
+
+function validPlanId(value: unknown): value is string {
+  return typeof value === 'string' && /^[a-f0-9]{64}$/u.test(value);
+}
+
 export function createApp(options: AppOptions = {}) {
   const config = loadConfig(options);
   const localAuth = config.ssoEnabled ? null : {
@@ -52,6 +89,14 @@ export function createApp(options: AppOptions = {}) {
     sessionTtlMs: config.sessionTtlMs,
   };
   const now = options.now ?? Date.now;
+  const updateGateway = options.updateGateway
+    ?? ((gatewayRequest: UpdateGatewayRequest) => sendUpdateGatewayRequest(
+      config.updateSocketPath,
+      gatewayRequest,
+    ));
+  const gatewayAvailable = options.updateGatewayAvailable
+    ?? (() => updateGatewayIsAvailable(config.updateSocketPath));
+  const updateNonces = new UpdateNonceStore(now);
   const publicDirectory = resolve(options.publicDir ?? join(process.cwd(), 'dist', 'public'));
   const indexFile = join(publicDirectory, 'index.html');
   const app = express();
@@ -122,6 +167,16 @@ export function createApp(options: AppOptions = {}) {
     },
   });
 
+  const updateActionLimiter = rateLimit({
+    windowMs: 15 * 60 * 1_000,
+    limit: 8,
+    standardHeaders: 'draft-8',
+    legacyHeaders: false,
+    handler: (_request, response) => {
+      apiError(response, 429, 'RATE_LIMITED', 'Too many update requests');
+    },
+  });
+
   app.post('/monitor/api/auth/login', loginLimiter, async (request, response) => {
     if (config.ssoEnabled) {
       apiError(response, 403, 'SSO_REQUIRED', 'Sign in through the portfolio single sign-on portal');
@@ -161,7 +216,9 @@ export function createApp(options: AppOptions = {}) {
         user: identity?.subject ?? null,
         groups: identity?.groups ?? [],
         role: identity?.role ?? null,
-        permissions: identity ? permissionsForRole(identity.role) : [],
+        permissions: identity
+          ? permissionsForRole(identity.role, !identity.legacyAdminCompatibility)
+          : [],
       });
       return;
     }
@@ -251,6 +308,213 @@ export function createApp(options: AppOptions = {}) {
       now(),
       config.staleAfterMs,
     ));
+  });
+
+  app.get('/monitor/api/system-updates', (request, response) => {
+    if (config.ssoEnabled) {
+      const identity = trustedSsoIdentity(request, config.edgeSecret);
+      if (!identity) {
+        apiError(response, 401, 'AUTH_REQUIRED', 'Authentication required');
+        return;
+      }
+      const available = gatewayAvailable();
+      const actorAccepted = safeUpdateActor(identity.subject);
+      response.status(200).json({
+        status: readSystemUpdateStatus(config.dataDir),
+        capabilities: {
+          gatewayAvailable: available,
+          canCheck: available && actorAccepted && ssoRoleAtLeast(identity, 'admin'),
+          canApply: available
+            && actorAccepted
+            && !identity.legacyAdminCompatibility
+            && ssoRoleAtLeast(identity, 'chief-admin'),
+        },
+      });
+      return;
+    }
+    const session = verifySession(
+      request,
+      localAuth!.sessionSecret,
+      localAuth!.passwordStore.sessionEpoch,
+      now(),
+    );
+    if (!session) {
+      apiError(response, 401, 'AUTH_REQUIRED', 'Authentication required');
+      return;
+    }
+    response.status(200).json({
+      status: readSystemUpdateStatus(config.dataDir),
+      capabilities: { gatewayAvailable: false, canCheck: false, canApply: false },
+    });
+  });
+
+  app.get('/monitor/api/infrastructure-ledger', (request, response) => {
+    if (config.ssoEnabled) {
+      const identity = trustedSsoIdentity(request, config.edgeSecret);
+      if (!identity) {
+        apiError(response, 401, 'AUTH_REQUIRED', 'Authentication required');
+        return;
+      }
+      if (!ssoRoleAtLeast(identity, 'admin')) {
+        apiError(response, 403, 'ROLE_REQUIRED', 'Admin role required');
+        return;
+      }
+    } else {
+      const session = verifySession(
+        request,
+        localAuth!.sessionSecret,
+        localAuth!.passwordStore.sessionEpoch,
+        now(),
+      );
+      if (!session) {
+        apiError(response, 401, 'AUTH_REQUIRED', 'Authentication required');
+        return;
+      }
+    }
+
+    const ledger = readInfrastructureLedger(config.dataDir, now());
+    if (!ledger) {
+      apiError(response, 503, 'LEDGER_UNAVAILABLE', 'Infrastructure ledger is unavailable');
+      return;
+    }
+    response.status(200).json(ledger);
+  });
+
+  function requireCriticalUpdateIdentity(request: Request, response: Response, minimum: 'admin' | 'chief-admin') {
+    if (!config.ssoEnabled) {
+      apiError(response, 404, 'NOT_FOUND', 'Not found');
+      return null;
+    }
+    const identity = trustedSsoIdentity(request, config.edgeSecret);
+    if (!identity) {
+      apiError(response, 401, 'AUTH_REQUIRED', 'Authentication required');
+      return null;
+    }
+    if (!ssoRoleAtLeast(identity, minimum)) {
+      apiError(response, 403, 'ROLE_REQUIRED', `${minimum === 'admin' ? 'Admin' : 'Chief admin'} role required`);
+      return null;
+    }
+    if (minimum === 'chief-admin' && identity.legacyAdminCompatibility) {
+      apiError(response, 403, 'CANONICAL_ROLE_REQUIRED', 'Canonical chief admin role required');
+      return null;
+    }
+    if (!criticalMutationIsSameOrigin(request, config.allowedOrigins)) {
+      apiError(response, 403, 'ORIGIN_REJECTED', 'Same-origin JSON request required');
+      return null;
+    }
+    if (!safeUpdateActor(identity.subject)) {
+      apiError(response, 403, 'IDENTITY_REJECTED', 'Update identity rejected');
+      return null;
+    }
+    return identity;
+  }
+
+  function rejectGateway(response: Response, result: Extract<UpdateGatewayResponse, { accepted: false }>): void {
+    const statuses: Record<string, number> = {
+      BUSY: 409,
+      QUEUE_FULL: 409,
+      INVALID_PLAN: 409,
+      INVALID_REQUEST: 400,
+      INVALID_ACTION: 400,
+      INVALID_ACTOR: 400,
+      PEER_REJECTED: 403,
+      INTERNAL_ERROR: 503,
+    };
+    const status = statuses[result.code] ?? 503;
+    apiError(response, status, result.code in statuses ? result.code : 'UPDATE_UNAVAILABLE', 'Update request rejected');
+  }
+
+  async function queueUpdate(
+    response: Response,
+    request: UpdateGatewayRequest,
+  ): Promise<void> {
+    if (!gatewayAvailable()) {
+      apiError(response, 503, 'UPDATE_UNAVAILABLE', 'Update service unavailable');
+      return;
+    }
+    try {
+      const result = await updateGateway(request);
+      if (!result.accepted) {
+        rejectGateway(response, result);
+        return;
+      }
+      response.status(202).json(result);
+    } catch (error) {
+      if (error instanceof UpdateGatewayError) {
+        apiError(response, 503, 'UPDATE_UNAVAILABLE', 'Update service unavailable');
+        return;
+      }
+      apiError(response, 503, 'UPDATE_UNAVAILABLE', 'Update service unavailable');
+    }
+  }
+
+  app.post('/monitor/api/system-updates/check', updateActionLimiter, async (request, response) => {
+    const identity = requireCriticalUpdateIdentity(request, response, 'admin');
+    if (!identity) return;
+    if (!exactBody(request.body, [])) {
+      apiError(response, 400, 'INVALID_REQUEST', 'Request body must be an empty JSON object');
+      return;
+    }
+    await queueUpdate(response, {
+      schemaVersion: 1,
+      action: 'check',
+      actor: identity.subject,
+      planId: null,
+    });
+  });
+
+  app.post('/monitor/api/system-updates/prepare', updateActionLimiter, (request, response) => {
+    const identity = requireCriticalUpdateIdentity(request, response, 'chief-admin');
+    if (!identity) return;
+    const body = exactBody(request.body, ['planId']);
+    if (!body || !validPlanId(body.planId)) {
+      apiError(response, 400, 'INVALID_PLAN', 'A valid update plan is required');
+      return;
+    }
+    const status = readSystemUpdateStatus(config.dataDir);
+    if (
+      !status
+      || status.state !== 'available'
+      || status.planId !== body.planId
+      || status.planExpiresAt === null
+      || Date.parse(status.planExpiresAt) <= now()
+    ) {
+      apiError(response, 409, 'PLAN_STALE', 'Update plan is no longer available');
+      return;
+    }
+    const authorization = updateNonces.issue(identity.subject, body.planId);
+    response.status(200).json({ planId: body.planId, ...authorization });
+  });
+
+  app.post('/monitor/api/system-updates/apply', updateActionLimiter, async (request, response) => {
+    const identity = requireCriticalUpdateIdentity(request, response, 'chief-admin');
+    if (!identity) return;
+    const body = exactBody(request.body, ['planId', 'nonce']);
+    if (!body || !validPlanId(body.planId) || typeof body.nonce !== 'string') {
+      apiError(response, 400, 'INVALID_REQUEST', 'Valid plan and confirmation token required');
+      return;
+    }
+    const status = readSystemUpdateStatus(config.dataDir);
+    if (
+      !status
+      || status.state !== 'available'
+      || status.planId !== body.planId
+      || status.planExpiresAt === null
+      || Date.parse(status.planExpiresAt) <= now()
+    ) {
+      apiError(response, 409, 'PLAN_STALE', 'Update plan is no longer available');
+      return;
+    }
+    if (!updateNonces.consume(body.nonce, identity.subject, body.planId)) {
+      apiError(response, 409, 'CONFIRMATION_REQUIRED', 'Fresh confirmation required');
+      return;
+    }
+    await queueUpdate(response, {
+      schemaVersion: 1,
+      action: 'apply-safe',
+      actor: identity.subject,
+      planId: body.planId,
+    });
   });
 
   app.get('/monitor/api/operations/auth-inventory', (request, response) => {

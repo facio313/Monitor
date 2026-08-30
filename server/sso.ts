@@ -34,6 +34,7 @@ export interface TrustedSsoIdentity {
   groups: string[];
   grants: SsoGrant[];
   role: SsoRole;
+  legacyAdminCompatibility: boolean;
 }
 
 function safeEqual(left: string, right: string): boolean {
@@ -124,17 +125,28 @@ export function trustedSsoIdentity(
   if (!edgeSecret || !suppliedEdgeSecret || !safeEqual(suppliedEdgeSecret, edgeSecret)) return null;
   const subject = safeIdentityHeader(request.get('remote-user'), 255);
   const email = safeIdentityHeader(request.get('remote-email'), 320);
-  const parsedGroups = parseSsoGroups(request.get('remote-groups'));
+  const rawGroups = request.get('remote-groups');
+  const parsedGroups = parseSsoGroups(rawGroups);
   if (!subject || !email || !parsedGroups) return null;
-  return { subject, email, ...parsedGroups };
+  return {
+    subject,
+    email,
+    ...parsedGroups,
+    legacyAdminCompatibility: rawGroups === 'user,developer,admin',
+  };
 }
 
 export function ssoRoleAtLeast(identity: TrustedSsoIdentity, minimumRole: SsoRole): boolean {
   return ROLE_RANK[identity.role] >= ROLE_RANK[minimumRole];
 }
 
-export function permissionsForRole(role: SsoRole): string[] {
+export function permissionsForRole(role: SsoRole, allowSystemApply = true): string[] {
   const permissions = ['dashboard:read'];
-  if (ROLE_RANK[role] >= ROLE_RANK.admin) permissions.push('auth-inventory:read');
+  if (ROLE_RANK[role] >= ROLE_RANK.admin) {
+    permissions.push('auth-inventory:read', 'infrastructure-ledger:read', 'system-updates:check');
+  }
+  if (allowSystemApply && ROLE_RANK[role] >= ROLE_RANK['chief-admin']) {
+    permissions.push('system-updates:apply');
+  }
   return permissions;
 }

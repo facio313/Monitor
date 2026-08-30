@@ -7,6 +7,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type CSSProperties,
   type ReactNode,
 } from 'react';
 import type {
@@ -22,6 +23,8 @@ export const ADAPTIVE_GRID_SCHEMA_VERSION = 1 as const;
 export const ADAPTIVE_GRID_DETAILS_SCHEMA_VERSION = 1 as const;
 export const ADAPTIVE_GRID_BASE_COLUMNS = 12;
 export const ADAPTIVE_GRID_MAX_ROWS = 256;
+export const ADAPTIVE_GRID_TABLET_MAX_WIDTH = 1024;
+export const ADAPTIVE_GRID_PHONE_MAX_WIDTH = 640;
 
 const ADAPTIVE_GRID_MAX_WIDGET_HEIGHT = 64;
 const ADAPTIVE_GRID_MAX_JSON_LENGTH = 64 * 1024;
@@ -66,6 +69,14 @@ export interface AdaptiveGridLayoutItem {
   y: number;
   w: number;
   h: number;
+}
+
+export type AdaptiveGridViewportMode = 'desktop' | 'tablet' | 'phone';
+
+export interface AdaptiveGridCompactPlacement {
+  id: string;
+  order: number;
+  tabletSpan: 1 | 2;
 }
 
 export type AdaptiveGridLocale = 'ko' | 'en';
@@ -163,6 +174,7 @@ interface AdaptiveGridStrings {
   unavailable: string;
   saveFailed: string;
   invalidLayout: string;
+  compactEditingCancelled: string;
   changed: string;
   detailShown: (label: string) => string;
   detailHidden: (label: string) => string;
@@ -225,6 +237,7 @@ const STRINGS: Record<AdaptiveGridLocale, AdaptiveGridStrings> = {
     unavailable: 'Layout editing is not ready yet.',
     saveFailed: 'The layout could not be saved in this browser.',
     invalidLayout: 'The visible layout is invalid. Cancel or reset before saving.',
+    compactEditingCancelled: 'Layout changes were cancelled for the compact view.',
     changed: 'Layout changed. Save to keep it.',
     detailShown: (label) => `${label} is now shown. Save to keep it.`,
     detailHidden: (label) => `${label} is now hidden. Save to keep it.`,
@@ -274,6 +287,7 @@ const STRINGS: Record<AdaptiveGridLocale, AdaptiveGridStrings> = {
     unavailable: '아직 배치 편집을 사용할 수 없습니다.',
     saveFailed: '이 브라우저에 배치를 저장하지 못했습니다.',
     invalidLayout: '현재 배치를 검증하지 못했습니다. 저장하기 전에 취소하거나 초기화하세요.',
+    compactEditingCancelled: '작은 화면으로 전환되어 배치 변경을 취소했습니다.',
     changed: '배치가 변경되었습니다. 저장하면 유지됩니다.',
     detailShown: (label) => `${label} 항목을 표시합니다. 저장하면 유지됩니다.`,
     detailHidden: (label) => `${label} 항목을 숨깁니다. 저장하면 유지됩니다.`,
@@ -294,6 +308,60 @@ export function useAdaptiveGridDetailVisibility(): (detailId: string) => boolean
     if (!context) return true;
     return !context.hiddenDetailTokens.has(detailToken(context.widgetId, detailId));
   }, [context]);
+}
+
+export function getAdaptiveGridViewportMode(width: number): AdaptiveGridViewportMode {
+  if (!Number.isFinite(width) || width < 0) {
+    throw new RangeError('Adaptive-grid viewport width must be a finite, non-negative number.');
+  }
+  if (width <= ADAPTIVE_GRID_PHONE_MAX_WIDTH) return 'phone';
+  if (width <= ADAPTIVE_GRID_TABLET_MAX_WIDTH) return 'tablet';
+  return 'desktop';
+}
+
+export function getAdaptiveGridCompactPlacements(
+  layout: readonly Pick<AdaptiveGridLayoutItem, 'id' | 'x' | 'y' | 'w'>[],
+): AdaptiveGridCompactPlacement[] {
+  const orderedIndexes = layout
+    .map((entry, index) => ({ entry, index }))
+    .sort((left, right) => (
+      left.entry.y - right.entry.y
+      || left.entry.x - right.entry.x
+      || left.index - right.index
+    ));
+  const orderByIndex = new Map(
+    orderedIndexes.map(({ index }, order) => [index, order]),
+  );
+
+  return layout.map((entry, index) => ({
+    id: entry.id,
+    order: orderByIndex.get(index) ?? index,
+    // A canonical widget wider than half of the 12-column canvas is a
+    // feature/summary panel and should keep visual priority in the 2-column flow.
+    tabletSpan: entry.w > ADAPTIVE_GRID_BASE_COLUMNS / 2 ? 2 : 1,
+  }));
+}
+
+function currentAdaptiveGridViewportMode(): AdaptiveGridViewportMode {
+  if (typeof window === 'undefined') return 'desktop';
+  return Number.isFinite(window.innerWidth) && window.innerWidth >= 0
+    ? getAdaptiveGridViewportMode(window.innerWidth)
+    : 'desktop';
+}
+
+function listenForMediaQueryChange(
+  media: MediaQueryList,
+  listener: (event: MediaQueryListEvent) => void,
+): () => void {
+  if (typeof media.addEventListener === 'function') {
+    media.addEventListener('change', listener);
+    return () => media.removeEventListener('change', listener);
+  }
+  if (typeof media.addListener === 'function') {
+    media.addListener(listener);
+    return () => media.removeListener(listener);
+  }
+  return () => undefined;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -962,6 +1030,9 @@ export function AdaptiveGrid({
   const [ready, setReady] = useState(false);
   const [canUndo, setCanUndo] = useState(false);
   const [announcement, setAnnouncement] = useState<Announcement>({ sequence: 0, text: '' });
+  const [viewportMode, setViewportMode] = useState<AdaptiveGridViewportMode>(
+    currentAdaptiveGridViewportMode,
+  );
 
   itemsRef.current = items;
   stringsRef.current = strings;
@@ -970,6 +1041,9 @@ export function AdaptiveGrid({
   onDetailVisibilityChangeRef.current = onDetailVisibilityChange;
 
   const layoutById = new Map(renderLayout.map((entry) => [entry.id, entry]));
+  const compactPlacementById = useMemo(() => new Map(
+    getAdaptiveGridCompactPlacements(renderLayout).map((placement) => [placement.id, placement]),
+  ), [renderLayout]);
 
   function announce(text: string) {
     setAnnouncement((current) => ({ sequence: current.sequence + 1, text }));
@@ -1027,6 +1101,18 @@ export function AdaptiveGrid({
   }
 
   useEffect(() => {
+    if (typeof window === 'undefined') return undefined;
+    const updateFromViewport = () => setViewportMode(currentAdaptiveGridViewportMode());
+    window.addEventListener('resize', updateFromViewport, { passive: true });
+    window.addEventListener('orientationchange', updateFromViewport, { passive: true });
+    updateFromViewport();
+    return () => {
+      window.removeEventListener('resize', updateFromViewport);
+      window.removeEventListener('orientationchange', updateFromViewport);
+    };
+  }, []);
+
+  useEffect(() => {
     const element = gridElementRef.current;
     if (!element) return undefined;
     let cancelled = false;
@@ -1050,21 +1136,14 @@ export function AdaptiveGrid({
     setEditing(false);
     setCanUndo(false);
     setReady(false);
+    let stopListeningForMotionPreference: (() => void) | null = null;
 
     void import('gridstack').then(({ GridStack }) => {
       if (cancelled) return;
-      const reducedMotion = typeof window.matchMedia === 'function'
-        && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-      const responsiveColumns: NonNullable<GridStackOptions['columnOpts']> = {
-        breakpointForWindow: false,
-        columnMax: ADAPTIVE_GRID_BASE_COLUMNS,
-        layout: 'moveScale',
-        breakpoints: [
-          { w: 1199, c: 8, layout: 'moveScale' },
-          { w: 767, c: 4, layout: 'moveScale' },
-          { w: 479, c: 1, layout: 'list' },
-        ],
-      };
+      const motionPreference = typeof window.matchMedia === 'function'
+        ? window.matchMedia('(prefers-reduced-motion: reduce)')
+        : null;
+      const reducedMotion = motionPreference?.matches ?? false;
       const options: GridStackOptions = {
         acceptWidgets: false,
         alwaysShowResizeHandle: false,
@@ -1094,15 +1173,19 @@ export function AdaptiveGrid({
       gridRef.current = grid;
       suppressGridChangeRef.current = true;
       try {
-        // Seed the canonical 12-column layout before responsive mode runs.
-        // GridStack otherwise selects a narrow column count in its constructor
-        // and cannot cache the original geometry, which can make constrained
-        // widgets overlap during an initial narrow-page load.
+        // GridStack always retains the canonical editable 12-column geometry.
+        // Compact screens render that geometry as a natural-height CSS flow,
+        // so rotating a device cannot corrupt or overwrite the saved desktop layout.
         grid.load(gridWidgets(selected, items), false);
-        grid.updateOptions({ columnOpts: responsiveColumns });
         grid.enableMove(false).enableResize(false);
       } finally {
         suppressGridChangeRef.current = false;
+      }
+      if (motionPreference) {
+        stopListeningForMotionPreference = listenForMediaQueryChange(
+          motionPreference,
+          (event) => grid.setAnimation(!event.matches),
+        );
       }
       grid.on('change', () => {
         if (
@@ -1128,6 +1211,7 @@ export function AdaptiveGrid({
 
     return () => {
       cancelled = true;
+      stopListeningForMotionPreference?.();
       const grid = gridRef.current;
       if (grid) {
         gridRef.current = null;
@@ -1140,9 +1224,42 @@ export function AdaptiveGrid({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [configSignature, namespacedDetailsStorageKey, namespacedStorageKey]);
 
+  useEffect(() => {
+    const grid = gridRef.current;
+    if (!grid) return;
+    if (viewportMode === 'desktop') {
+      grid.enableMove(editingRef.current).enableResize(editingRef.current);
+      return;
+    }
+
+    grid.enableMove(false).enableResize(false);
+    if (!editingRef.current) return;
+
+    // A fixed-row drag session cannot be represented faithfully by the compact
+    // natural-height flow. Restore the pre-edit snapshot when a resize/orientation
+    // change crosses the compact breakpoint rather than persisting ambiguous geometry.
+    const snapshot = editSnapshotRef.current ?? committedLayoutRef.current;
+    const hiddenDetailSnapshot = editHiddenDetailSnapshotRef.current
+      ?? committedHiddenDetailTokensRef.current;
+    loadWithoutRemovingReactNodes(snapshot);
+    workingLayoutRef.current = cloneLayout(snapshot);
+    workingHiddenDetailTokensRef.current = cloneHiddenDetailTokens(hiddenDetailSnapshot);
+    historyRef.current = [];
+    editSnapshotRef.current = null;
+    editHiddenDetailSnapshotRef.current = null;
+    editingRef.current = false;
+    setEditing(false);
+    setCanUndo(false);
+    setRenderLayout(cloneLayout(committedLayoutRef.current));
+    setRenderHiddenDetailTokens(cloneHiddenDetailTokens(committedHiddenDetailTokensRef.current));
+    announce(stringsRef.current.compactEditingCancelled);
+    // loadWithoutRemovingReactNodes and announce are stable ref-backed component helpers.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [viewportMode]);
+
   function beginEditing() {
     const grid = gridRef.current;
-    if (!ready || !grid) {
+    if (!ready || !grid || viewportMode !== 'desktop') {
       announce(strings.unavailable);
       return;
     }
@@ -1374,12 +1491,22 @@ export function AdaptiveGrid({
   const rootClassName = [
     'adaptive-grid',
     editing ? 'adaptive-grid--editing' : '',
+    `adaptive-grid--${viewportMode}`,
     className ?? '',
   ].filter(Boolean).join(' ');
 
   return (
-    <section className={rootClassName} aria-label={ariaLabel ?? strings.grid}>
-      <div className="adaptive-grid__toolbar" role="toolbar" aria-label={strings.toolbar}>
+    <section
+      className={rootClassName}
+      aria-label={ariaLabel ?? strings.grid}
+      data-layout-mode={viewportMode}
+    >
+      <div
+        className="adaptive-grid__toolbar"
+        role="toolbar"
+        aria-label={strings.toolbar}
+        hidden={viewportMode !== 'desktop'}
+      >
         {!editing ? (
           <button type="button" onClick={beginEditing} disabled={!ready}>
             {strings.edit}
@@ -1406,11 +1533,13 @@ export function AdaptiveGrid({
       <div ref={gridElementRef} className="grid-stack adaptive-grid__grid">
         {items.map((item, index) => {
           const layout = layoutById.get(item.id) ?? curatedLayout[index];
+          const compactPlacement = compactPlacementById.get(item.id);
           const headingId = `${gridId}-widget-${index}`;
           const detailContext: AdaptiveGridDetailContextValue = {
             widgetId: item.id,
             hiddenDetailTokens: renderHiddenDetailTokens,
           };
+          const widgetStyle: CSSProperties = { order: compactPlacement?.order ?? index };
           const attributes = {
             'gs-id': item.id,
             'gs-x': String(layout.x),
@@ -1425,10 +1554,16 @@ export function AdaptiveGrid({
           return (
             <div
               key={item.id}
-              className="grid-stack-item adaptive-grid__widget"
+              className={[
+                'grid-stack-item',
+                'adaptive-grid__widget',
+                compactPlacement?.tabletSpan === 2 ? 'adaptive-grid__widget--wide' : '',
+              ].filter(Boolean).join(' ')}
               data-widget-id={item.id}
+              data-compact-span={compactPlacement?.tabletSpan ?? 1}
               role="group"
               aria-labelledby={headingId}
+              style={widgetStyle}
               {...attributes}
             >
               <div className="grid-stack-item-content adaptive-grid__widget-content">

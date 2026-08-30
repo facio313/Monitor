@@ -332,7 +332,12 @@ describe('authentication', () => {
       authenticated: true,
       groups: ['user', 'admin', 'chief-admin', 'portfolio-v2'],
       role: 'chief-admin',
-      permissions: ['dashboard:read', 'auth-inventory:read'],
+      permissions: [
+        'dashboard:read',
+        'auth-inventory:read',
+        'infrastructure-ledger:read',
+        'system-updates:check',
+      ],
     });
     expect(String(session.headers['set-cookie'])).toContain('monitor_session=;');
     expect(existsSync(authStateFile)).toBe(true);
@@ -764,6 +769,7 @@ describe('dashboard ingestion', () => {
       .set('Cookie', cookie)
       .expect(200);
     expect(response.body.stale).toBe(true);
+    expect(response.body.latestObservedAt).toBeNull();
     expect(response.body.latest).toMatchObject({
       timestamp: '2026-08-19T12:00:00.000Z',
       cpuPercent: null,
@@ -773,6 +779,7 @@ describe('dashboard ingestion', () => {
       diskReadBytesPerSecond: null,
     });
     expect(response.body.series).toEqual([]);
+    expect(response.body.currentTraffic).toEqual([]);
     expect(response.body.alerts).toEqual([]);
     expect(response.body.powerEvents).toEqual([]);
     expect(response.body.reliability).toEqual({
@@ -833,6 +840,14 @@ describe('dashboard ingestion', () => {
         message: 'One or more expected SSH listeners are unavailable.', durationSeconds: null,
       },
       {
+        timestamp: '2026-08-19T11:57:30.100Z', severity: 'warning', kind: 'rcu-stall', status: 'expedited',
+        message: 'Kernel reported a short expedited RCU grace-period delay.', durationSeconds: null,
+      },
+      {
+        timestamp: '2026-08-19T11:57:30.900Z', severity: 'warning', kind: 'rcu-stall', status: 'expedited',
+        message: 'Kernel reported a short expedited RCU grace-period delay.', durationSeconds: null,
+      },
+      {
         timestamp: '2026-08-19T11:56:30Z', severity: 'critical', kind: 'nvme-reset', status: 'active',
         message: 'NVMe reset at 192.0.2.10 token=abc123', durationSeconds: null,
       },
@@ -882,6 +897,14 @@ describe('dashboard ingestion', () => {
       {
         timestamp: '2026-08-19T11:58:00.100Z', severity: 'critical', kind: 'nvme-reset', status: 'active',
         message: 'Kernel reported an NVMe controller reset.', durationSeconds: null,
+      },
+      {
+        timestamp: '2026-08-19T11:57:30.900Z', severity: 'warning', kind: 'rcu-stall', status: 'expedited',
+        message: 'Kernel reported a short expedited RCU grace-period delay.', durationSeconds: null,
+      },
+      {
+        timestamp: '2026-08-19T11:57:30.100Z', severity: 'warning', kind: 'rcu-stall', status: 'expedited',
+        message: 'Kernel reported a short expedited RCU grace-period delay.', durationSeconds: null,
       },
       {
         timestamp: '2026-08-19T11:57:00.000Z', severity: 'critical', kind: 'ssh-listener', status: 'unavailable',
@@ -935,17 +958,40 @@ describe('dashboard ingestion', () => {
     const directory = dataDirectory();
     writeFileSync(join(directory, 'current.json'), JSON.stringify({
       secret: 'do-not-return',
-      host: { hostname: 'host\u0000name', os: 'Linux', architecture: 'arm64', password: 'hidden' },
+      host: {
+        hostname: 'host\u0000name', os: 'Linux', architecture: 'arm64',
+        logicalCpuCount: 8.5, password: 'hidden',
+      },
       latest: {
         timestamp: '2026-08-19T11:59:00Z',
         cpu: { percent: 20 },
         memoryUsedBytes: 50,
         memoryTotalBytes: 100,
         memoryPercent: 50,
+        swapTotalBytes: 100,
+        swapUsedBytes: 20,
+        swapPercent: 20,
         temperatureC: 42,
+        cpuPressureSomeAvg10: 12.5,
+        cpuPressureFullAvg10: 101,
+        memoryPressureSomeAvg10: '4.5',
+        ioPressureSomeAvg10: 3.5,
+        networkRxErrorsPerSecond: 0.25,
+        networkTxErrorsPerSecond: -1,
+        networkRxDroppedPerSecond: '1',
+        networkTxDroppedPerSecond: 1_000_000_000_001,
         diskReadBytesPerSecond: 12,
       },
-      disks: [{ mount: '/', usedBytes: 1, totalBytes: 2, command: 'df -h' }],
+      disks: [
+        {
+          mount: '/', usedBytes: 1, totalBytes: 2, availableBytes: 1,
+          inodeUsedPercent: 12.5, readOnly: false, command: 'df -h',
+        },
+        {
+          mount: '/invalid', usedBytes: 1, totalBytes: 2, availableBytes: 3,
+          inodeUsedPercent: 101, readOnly: 'false',
+        },
+      ],
       containers: [
         {
           name: 'web', owner: 'cks', state: 'running', health: 'healthy',
@@ -982,18 +1028,44 @@ describe('dashboard ingestion', () => {
     expect(serialized).not.toContain('/etc/shadow');
     expect(serialized).not.toContain('abc123');
     expect(response.body.host.hostname).toBe('host name');
-    expect(response.body.host).toEqual({ hostname: 'host name', os: 'Linux', architecture: 'arm64', uptimeSeconds: null });
-    expect(response.body.latest).toMatchObject({ temperatureC: 42, diskReadBytesPerSecond: 12 });
+    expect(response.body.host).toEqual({
+      hostname: 'host name', os: 'Linux', architecture: 'arm64', logicalCpuCount: null,
+      uptimeSeconds: null,
+    });
+    expect(response.body.latest).toMatchObject({
+      temperatureC: 42,
+      swapTotalBytes: 100,
+      swapUsedBytes: 20,
+      swapPercent: 20,
+      cpuPressureSomeAvg10: 12.5,
+      cpuPressureFullAvg10: null,
+      memoryPressureSomeAvg10: null,
+      ioPressureSomeAvg10: 3.5,
+      networkRxErrorsPerSecond: 0.25,
+      networkTxErrorsPerSecond: null,
+      networkRxDroppedPerSecond: null,
+      networkTxDroppedPerSecond: null,
+      diskReadBytesPerSecond: 12,
+    });
     expect(Object.keys(response.body.latest)).toEqual([
       'timestamp',
       'cpuPercent',
       'memoryPercent',
       'memoryUsedBytes',
       'memoryTotalBytes',
+      'swapTotalBytes',
+      'swapUsedBytes',
+      'swapPercent',
       'temperatureC',
       'load1',
       'load5',
       'load15',
+      'cpuPressureSomeAvg10',
+      'cpuPressureFullAvg10',
+      'memoryPressureSomeAvg10',
+      'memoryPressureFullAvg10',
+      'ioPressureSomeAvg10',
+      'ioPressureFullAvg10',
       'powerState',
       'supplyVoltageVolts',
       'throttledFlags',
@@ -1001,10 +1073,22 @@ describe('dashboard ingestion', () => {
       'gpuClockHz',
       'networkRxBytesPerSecond',
       'networkTxBytesPerSecond',
+      'networkRxErrorsPerSecond',
+      'networkTxErrorsPerSecond',
+      'networkRxDroppedPerSecond',
+      'networkTxDroppedPerSecond',
       'diskReadBytesPerSecond',
       'diskWriteBytesPerSecond',
     ]);
     expect(response.body.disks[0].usedPercent).toBe(50);
+    expect(response.body.disks[0]).toEqual({
+      mount: '/', totalBytes: 2, usedBytes: 1, availableBytes: 1, usedPercent: 50,
+      inodeUsedPercent: 12.5, readOnly: false,
+    });
+    expect(response.body.disks[1]).toEqual({
+      mount: '/invalid', totalBytes: 2, usedBytes: 1, availableBytes: null,
+      usedPercent: 50, inodeUsedPercent: null, readOnly: null,
+    });
     expect(response.body.containers).toHaveLength(3);
     expect(response.body.containers[0]).toMatchObject({
       name: 'cks-workload', owner: 'cks', state: 'running', health: 'healthy', cpuPercent: 250,
@@ -1015,9 +1099,49 @@ describe('dashboard ingestion', () => {
     expect(response.body.containers[2]).toMatchObject({
       name: 'pilgrimage', owner: 'cks', state: 'exited', health: 'none', cpuPercent: null,
     });
+    expect(response.body.currentTraffic).toEqual([]);
     expect(response.body.alerts[0]).toMatchObject({ kind: null, status: null });
     expect(response.body.privilegeEvents[0].action).toBe('sudo');
     expect(response.body.privilegeEvents[0].result).toBe('success');
+  });
+
+  it('exposes only exact bounded current-window traffic aggregates', async () => {
+    const directory = dataDirectory();
+    const currentPath = join(directory, 'current.json');
+    const traffic = [{
+      app: 'monitor',
+      requestCount: 20,
+      status2xx: 15,
+      status3xx: 1,
+      status4xx: 2,
+      status5xx: 2,
+      slowCount: 3,
+      avgResponseMs: 125.5,
+      maxResponseMs: 1_250,
+    }];
+    writeFileSync(currentPath, JSON.stringify({
+      currentTraffic: traffic,
+      rawClient: 'top-level-secret',
+    }));
+    const app = appFor(directory);
+    const cookie = await loginCookie(app);
+
+    const response = await request(app)
+      .get('/monitor/api/dashboard?range=1h')
+      .set('Cookie', cookie)
+      .expect(200);
+    expect(response.body.currentTraffic).toEqual(traffic);
+    expect(JSON.stringify(response.body)).not.toContain('top-level-secret');
+
+    writeFileSync(currentPath, JSON.stringify({
+      currentTraffic: [{ ...traffic[0], rawClient: 'entry-secret' }],
+    }));
+    const rejected = await request(app)
+      .get('/monitor/api/dashboard?range=1h')
+      .set('Cookie', cookie)
+      .expect(200);
+    expect(rejected.body.currentTraffic).toEqual([]);
+    expect(JSON.stringify(rejected.body)).not.toContain('entry-secret');
   });
 
   it('strictly reconstructs bounded incident snapshots and drops malformed or out-of-range records', async () => {
@@ -1036,10 +1160,19 @@ describe('dashboard ingestion', () => {
         memoryPercent: 61,
         memoryUsedBytes: 610,
         memoryTotalBytes: 1_000,
+        swapTotalBytes: 2_000,
+        swapUsedBytes: 500,
+        swapPercent: 25,
         temperatureC: 76.5,
         load1: 4.5,
         load5: 2.5,
         load15: 1.5,
+        cpuPressureSomeAvg10: 12.5,
+        cpuPressureFullAvg10: null,
+        memoryPressureSomeAvg10: 1.5,
+        memoryPressureFullAvg10: 0.25,
+        ioPressureSomeAvg10: 8.75,
+        ioPressureFullAvg10: 3.5,
         powerState: 'normal',
         supplyVoltageVolts: 5.04,
         throttledFlags: 0,
@@ -1047,6 +1180,10 @@ describe('dashboard ingestion', () => {
         gpuClockHz: 910_000_000,
         networkRxBytesPerSecond: 12_345,
         networkTxBytesPerSecond: 6_789,
+        networkRxErrorsPerSecond: 0.25,
+        networkTxErrorsPerSecond: 0.5,
+        networkRxDroppedPerSecond: 0.75,
+        networkTxDroppedPerSecond: 1,
         diskReadBytesPerSecond: 987_654,
         diskWriteBytesPerSecond: 456_789,
         cpu: { percent: 1 },
@@ -1158,10 +1295,19 @@ describe('dashboard ingestion', () => {
         memoryPercent: 61,
         memoryUsedBytes: 610,
         memoryTotalBytes: 1_000,
+        swapTotalBytes: 2_000,
+        swapUsedBytes: 500,
+        swapPercent: 25,
         temperatureC: 76.5,
         load1: 4.5,
         load5: 2.5,
         load15: 1.5,
+        cpuPressureSomeAvg10: 12.5,
+        cpuPressureFullAvg10: null,
+        memoryPressureSomeAvg10: 1.5,
+        memoryPressureFullAvg10: 0.25,
+        ioPressureSomeAvg10: 8.75,
+        ioPressureFullAvg10: 3.5,
         powerState: 'normal',
         supplyVoltageVolts: 5.04,
         throttledFlags: 0,
@@ -1169,6 +1315,10 @@ describe('dashboard ingestion', () => {
         gpuClockHz: 910_000_000,
         networkRxBytesPerSecond: 12_345,
         networkTxBytesPerSecond: 6_789,
+        networkRxErrorsPerSecond: 0.25,
+        networkTxErrorsPerSecond: 0.5,
+        networkRxDroppedPerSecond: 0.75,
+        networkTxDroppedPerSecond: 1,
         diskReadBytesPerSecond: 987_654,
         diskWriteBytesPerSecond: 456_789,
       },
@@ -1387,6 +1537,16 @@ describe('dashboard ingestion', () => {
     expect(response.body.series).toHaveLength(1);
     expect(response.body.series[0]).toMatchObject({
       cpuPercent: 12,
+      swapTotalBytes: null,
+      swapUsedBytes: null,
+      swapPercent: null,
+      cpuPressureSomeAvg10: null,
+      memoryPressureSomeAvg10: null,
+      ioPressureSomeAvg10: null,
+      networkRxErrorsPerSecond: null,
+      networkTxErrorsPerSecond: null,
+      networkRxDroppedPerSecond: null,
+      networkTxDroppedPerSecond: null,
       powerState: 'under-voltage',
       supplyVoltageVolts: 4.75,
       throttledFlags: 1,
@@ -1411,9 +1571,17 @@ describe('dashboard ingestion', () => {
       timestamp: new Date(NOW - 3_600_000 + index * 3_000).toISOString(),
       cpu: { percent: index % 101 },
       memoryPercent: index === 723 ? 99.7 : 42,
+      swapPercent: index === 650 ? 88.8 : 0,
       temperatureC: index === 612 ? 91.2 : 48,
       load1: index === 522 ? 18 : 0.8,
+      cpuPressureSomeAvg10: index === 701 ? 72.5 : 0,
+      memoryPressureFullAvg10: index === 702 ? 62.5 : 0,
+      ioPressureSomeAvg10: index === 703 ? 82.5 : 0,
       networkRxBytesPerSecond: index === 333 ? 98_000_000 : 1_000,
+      networkRxErrorsPerSecond: index === 704 ? 12.5 : 0,
+      networkTxErrorsPerSecond: index === 705 ? 10.5 : 0,
+      networkRxDroppedPerSecond: index === 706 ? 8.5 : 0,
+      networkTxDroppedPerSecond: index === 707 ? 6.5 : 0,
       diskWriteBytesPerSecond: index === 277 ? 77_000_000 : 2_000,
       powerState: index === 400 ? 'under-voltage' : 'normal',
       supplyVoltageVolts: index === 137 ? 4.2 : index === 811 ? 5.8 : 5.1,
@@ -1429,7 +1597,10 @@ describe('dashboard ingestion', () => {
       .expect(200);
     expect(response.body.series).toHaveLength(360);
     const timestamps = new Set(response.body.series.map((sample: { timestamp: string }) => sample.timestamp));
-    for (const index of [0, 137, 277, 333, 400, 401, 522, 612, 723, 811, 999]) {
+    for (const index of [
+      0, 137, 277, 333, 400, 401, 522, 612, 650, 701, 702, 703, 704, 705,
+      706, 707, 723, 811, 999,
+    ]) {
       expect(timestamps.has(samples[index]!.timestamp)).toBe(true);
     }
     expect(response.body.powerSummary).toEqual({

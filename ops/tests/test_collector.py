@@ -68,7 +68,14 @@ def empty_pressure():
 
 class ParsingTests(unittest.TestCase):
     def test_proc_parsers_and_rates(self):
-        self.assertEqual(collector.parse_proc_stat("cpu  100 2 30 400 5 0 0 0\n"), (537, 405))
+        proc_stat = (
+            "cpu  100 2 30 400 5 0 0 0\n"
+            "cpu0 50 1 15 200 2 0 0 0\n"
+            "cpu1 50 1 15 200 3 0 0 0\n"
+        )
+        self.assertEqual(collector.parse_proc_stat(proc_stat), (537, 405))
+        self.assertEqual(collector.parse_logical_cpu_count(proc_stat), 2)
+        self.assertIsNone(collector.parse_logical_cpu_count("cpu 1 2 3 4\n"))
         self.assertAlmostEqual(collector.calculate_cpu((600, 440), [500, 400]), 60.0)
         self.assertIsNone(collector.calculate_cpu((600, 440), None))
         self.assertIsNone(collector.calculate_cpu(None, [500, 400]))
@@ -78,14 +85,49 @@ class ParsingTests(unittest.TestCase):
         self.assertEqual((total, available), (1_024_000, 256_000))
         self.assertEqual(collector.parse_meminfo("MemTotal: 1000 kB\n"), (1_024_000, None))
         self.assertEqual(collector.parse_meminfo("malformed\n"), (None, None))
-        net = collector.parse_net_dev(
-            "Inter-| Receive | Transmit\n lo: 9 0 0 0 0 0 0 0 9 0 0 0 0 0 0 0\n"
-            "eth0: 100 0 0 0 0 0 0 0 250 0 0 0 0 0 0 0\n"
+        self.assertEqual(
+            collector.parse_swapinfo("SwapTotal: 1000 kB\nSwapFree: 250 kB\n"),
+            (1_024_000, 768_000, 75.0),
         )
-        self.assertEqual(net, (100, 250))
+        self.assertEqual(
+            collector.parse_swapinfo("SwapTotal: 0 kB\nSwapFree: 0 kB\n"),
+            (0, 0, 0.0),
+        )
+        self.assertEqual(
+            collector.parse_swapinfo("SwapTotal: 1000 kB\n"),
+            (1_024_000, None, None),
+        )
+        self.assertEqual(collector.parse_swapinfo("malformed\n"), (None, None, None))
+        net = collector.parse_net_dev(
+            "Inter-| Receive | Transmit\n lo: 9 0 9 9 0 0 0 0 9 0 9 9 0 0 0 0\n"
+            "eth0: 100 0 3 4 0 0 0 0 250 0 5 6 0 0 0 0\n"
+            "wlan0: 50 0 1 2 0 0 0 0 75 0 2 3 0 0 0 0\n"
+        )
+        self.assertEqual(net, (150, 325, 4, 7, 6, 9))
         self.assertEqual(collector.rate_pair((300, 650), [100, 250], 2), (100.0, 200.0))
         self.assertEqual(collector.rate_pair((300, 650), None, 2), (None, None))
         self.assertIsNone(collector.parse_net_dev("malformed\n"))
+        self.assertIsNone(collector.parse_net_dev(
+            "lo: 9 0 0 0 0 0 0 0 9 0 0 0 0 0 0 0\n"
+        ))
+        self.assertEqual(
+            collector.network_rate_values(
+                (300, 650, 7, 11, 13, 17), [100, 250, 3, 5, 4, 6], 2,
+            ),
+            (100.0, 200.0, 2.0, 3.0, 4.5, 5.5),
+        )
+        self.assertEqual(
+            collector.network_rate_values(
+                (300, 650, 7, 11, 13, 17), [100, 250], 2,
+            ),
+            (100.0, 200.0, None, None, None, None),
+        )
+        self.assertEqual(
+            collector.network_rate_values(
+                (90, 650, 7, 11, 13, 17), [100, 250, 3, 5, 4, 6], 2,
+            ),
+            (None, 200.0, 2.0, 3.0, 4.5, 5.5),
+        )
 
     def test_diskstats_ignores_partitions_and_malformed(self):
         text = (
@@ -108,11 +150,14 @@ class ParsingTests(unittest.TestCase):
     def test_mountinfo_and_vcgencmd_parsers(self):
         mounts = collector.parse_mountinfo(
             "36 25 8:1 / / rw - ext4 /dev/sda1 rw\n"
+            "37 25 8:2 / /archive ro - ext4 /dev/sda2 ro\n"
             "37 25 0:4 / /proc rw - proc proc rw\n"
             "38 malformed\n"
         )
-        self.assertEqual(mounts, [("/", "/dev/sda1", "ext4")])
-        self.assertEqual(collector.parse_vcgencmd("get_throttled", "throttled=0x50005"), ("throttledFlags", 0x50005))
+        self.assertEqual(mounts, [
+            ("/", "/dev/sda1", "ext4", False),
+            ("/archive", "/dev/sda2", "ext4", True),
+        ])
         self.assertEqual(collector.parse_vcgencmd("measure_temp", "temp=48.7'C"), ("temperatureC", 48.7))
         self.assertEqual(collector.parse_vcgencmd("get_mem gpu", "gpu=4M"), ("gpuMemoryBytes", 4 * 1024 ** 2))
         self.assertEqual(collector.parse_vcgencmd("measure_clock core", "frequency(48)=500000000"), ("gpuClockHz", 500_000_000))
@@ -125,6 +170,42 @@ class ParsingTests(unittest.TestCase):
         )
         self.assertEqual(collector.parse_loadavg("1.25 2.50 3.75 1/100 1"), (1.25, 2.5, 3.75))
         self.assertEqual(collector.parse_loadavg("not-a-number"), (None, None, None))
+
+    def test_filesystem_export_adds_available_inode_and_read_only_signals(self):
+        mountinfo = (
+            "36 25 8:1 / / rw,relatime - ext4 /dev/sda1 rw\n"
+            "37 25 8:2 / /archive ro,relatime - ext4 /dev/sda2 ro\n"
+        )
+        usage = mock.Mock(total=1_000, used=600, free=300)
+        inode_stats = mock.Mock(f_files=100, f_ffree=25)
+        with mock.patch.object(collector.shutil, "disk_usage", return_value=usage), \
+             mock.patch.object(collector.os, "statvfs", return_value=inode_stats):
+            disks = collector.collect_filesystems(mountinfo, Path("/fixture"))
+        self.assertEqual(disks, [
+            {
+                "mount": "/",
+                "totalBytes": 1_000,
+                "usedBytes": 600,
+                "availableBytes": 300,
+                "usedPercent": 60.0,
+                "inodeUsedPercent": 75.0,
+                "readOnly": False,
+            },
+            {
+                "mount": "/archive",
+                "totalBytes": 1_000,
+                "usedBytes": 600,
+                "availableBytes": 300,
+                "usedPercent": 60.0,
+                "inodeUsedPercent": 75.0,
+                "readOnly": True,
+            },
+        ])
+
+        with mock.patch.object(collector.shutil, "disk_usage", return_value=usage), \
+             mock.patch.object(collector.os, "statvfs", side_effect=OSError):
+            [disk] = collector.collect_filesystems(mountinfo.splitlines()[0], Path("/fixture"))
+        self.assertIsNone(disk["inodeUsedPercent"])
 
     def test_vcgencmd_voltage_parser_rejects_malformed_nonfinite_and_out_of_range(self):
         command = "pmic_read_adc EXT5V_V"
@@ -150,23 +231,39 @@ class ParsingTests(unittest.TestCase):
         self.assertIsNone(collector.supply_voltage_volts(float("nan")))
         self.assertIsNone(collector.supply_voltage_volts(True))
         self.assertIsNone(collector.supply_voltage_volts("4.9"))
-        self.assertIsNone(collector.parse_vcgencmd("get_throttled", "junk throttled=0x1"))
-        self.assertIsNone(collector.parse_vcgencmd("get_throttled", "throttled=0x100000000"))
+
+    def test_rpi_undervoltage_alarm_discovers_named_hwmon_sensor(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            sys_root = Path(temporary)
+            unrelated = sys_root / "class" / "hwmon" / "hwmon0"
+            sensor = sys_root / "class" / "hwmon" / "hwmon7"
+            unrelated.mkdir(parents=True)
+            sensor.mkdir(parents=True)
+            (unrelated / "name").write_text("nvme\n")
+            (unrelated / "in0_lcrit_alarm").write_text("1\n")
+            (sensor / "name").write_text("rpi_volt\n")
+            (sensor / "in0_lcrit_alarm").write_text("0\n")
+            self.assertEqual(collector.read_rpi_undervoltage_alarm(sys_root), 0)
+            (sensor / "in0_lcrit_alarm").write_text("1\n")
+            self.assertEqual(collector.read_rpi_undervoltage_alarm(sys_root), 1)
+            (sensor / "in0_lcrit_alarm").write_text("invalid\n")
+            self.assertIsNone(collector.read_rpi_undervoltage_alarm(sys_root))
 
     def test_collect_gpu_bounds_commands_and_ignores_failures(self):
         with tempfile.TemporaryDirectory() as temporary:
             executable = Path(temporary) / "vcgencmd"
             executable.write_text("#!/bin/sh\nexit 0\n")
             executable.chmod(0o755)
+            sys_root = Path(temporary) / "sys"
+            sensor = sys_root / "class" / "hwmon" / "hwmon4"
+            sensor.mkdir(parents=True)
+            (sensor / "name").write_text("rpi_volt\n")
+            (sensor / "in0_lcrit_alarm").write_text("1\n")
             calls = []
 
             def fake_run(arguments, **kwargs):
                 calls.append((arguments, kwargs))
                 invocation = tuple(arguments[1:])
-                if invocation == ("get_throttled",):
-                    return collector.subprocess.CompletedProcess(
-                        arguments, 0, stdout="throttled=0x50000\n", stderr=""
-                    )
                 if invocation == ("pmic_read_adc", "EXT5V_V"):
                     return collector.subprocess.CompletedProcess(
                         arguments, 0, stdout="EXT5V_V volt(24)=4.87654000V\n", stderr=""
@@ -178,9 +275,10 @@ class ParsingTests(unittest.TestCase):
                 )
 
             with mock.patch.object(collector.subprocess, "run", side_effect=fake_run):
-                result = collector.collect_gpu(str(executable), 1.25)
-            self.assertEqual(result, {"throttledFlags": 0x50000, "supplyVoltageVolts": 4.877})
-            self.assertEqual(len(calls), 6)
+                result = collector.collect_gpu(str(executable), 1.25, sys_root)
+            self.assertEqual(result, {"supplyVoltageVolts": 4.877, "throttledFlags": 1})
+            self.assertEqual(len(calls), 5)
+            self.assertNotIn(("get_throttled",), [tuple(call[0][1:]) for call in calls])
             self.assertTrue(all(call[1]["timeout"] == 1.25 for call in calls))
             self.assertTrue(all(call[1]["capture_output"] and call[1]["text"] for call in calls))
 
@@ -205,11 +303,53 @@ class ParsingTests(unittest.TestCase):
         self.assertIsNone(normalized["cpuPercent"])
         self.assertIsNone(normalized["supplyVoltageVolts"])
         self.assertIsNone(normalized["throttledFlags"])
+        for field_name in (
+            "swapTotalBytes", "swapUsedBytes", "swapPercent",
+            "cpuPressureSomeAvg10", "cpuPressureFullAvg10",
+            "memoryPressureSomeAvg10", "memoryPressureFullAvg10",
+            "ioPressureSomeAvg10", "ioPressureFullAvg10",
+            "networkRxErrorsPerSecond", "networkTxErrorsPerSecond",
+            "networkRxDroppedPerSecond", "networkTxDroppedPerSecond",
+        ):
+            self.assertIsNone(normalized[field_name], field_name)
+
+        power = {field: None for field in collector.POWER_SAMPLE_FIELDS}
+        power.update({"timestamp": "2026-08-20T03:00:30Z", "powerState": "normal"})
+        power_normalized = collector.existing_sample_record(power)
+        self.assertEqual(tuple(power_normalized), collector.SAMPLE_FIELDS)
+        self.assertIsNone(power_normalized["swapTotalBytes"])
+        self.assertIsNone(power_normalized["networkRxErrorsPerSecond"])
+
+        previous = {field: None for field in collector.PREVIOUS_SAMPLE_FIELDS}
+        previous.update({"timestamp": "2026-08-20T03:01:00Z", "powerState": "normal"})
+        previous_normalized = collector.existing_sample_record(previous)
+        self.assertEqual(tuple(previous_normalized), collector.SAMPLE_FIELDS)
+        self.assertIsNone(previous_normalized["swapTotalBytes"])
+        self.assertIsNone(previous_normalized["ioPressureFullAvg10"])
+        self.assertIsNone(previous_normalized["networkTxDroppedPerSecond"])
 
         current = dict(normalized, supplyVoltageVolts=True, throttledFlags=True)
         current_normalized = collector.existing_sample_record(current)
         self.assertIsNone(current_normalized["supplyVoltageVolts"])
         self.assertIsNone(current_normalized["throttledFlags"])
+        invalid_signals = dict(
+            normalized,
+            swapTotalBytes=100,
+            swapUsedBytes=101,
+            swapPercent=101,
+            cpuPressureSomeAvg10=-1,
+            ioPressureFullAvg10=float("inf"),
+            networkRxErrorsPerSecond=-1,
+            networkTxDroppedPerSecond=1_000_000_000_001,
+        )
+        invalid_normalized = collector.existing_sample_record(invalid_signals)
+        self.assertEqual(invalid_normalized["swapTotalBytes"], 100)
+        self.assertIsNone(invalid_normalized["swapUsedBytes"])
+        self.assertIsNone(invalid_normalized["swapPercent"])
+        self.assertIsNone(invalid_normalized["cpuPressureSomeAvg10"])
+        self.assertIsNone(invalid_normalized["ioPressureFullAvg10"])
+        self.assertIsNone(invalid_normalized["networkRxErrorsPerSecond"])
+        self.assertIsNone(invalid_normalized["networkTxDroppedPerSecond"])
         self.assertIsNone(collector.existing_sample_record({**legacy, "unexpected": "secret"}))
 
     def test_docker_reduction_has_exact_safe_fields(self):
@@ -593,6 +733,282 @@ class ParsingTests(unittest.TestCase):
             empty, pruned_state = collector.collect_containers(sockets, "/curl", 2, next_state)
         self.assertEqual(empty, [])
         self.assertEqual(pruned_state, {})
+
+    def test_system_inventory_uses_fixed_bounded_filesystem_sources(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            proc = root / "proc"
+            sys_root = root / "sys"
+            etc = root / "etc"
+            packages = root / "packages"
+            controller = sys_root / "class" / "nvme" / "nvme0"
+            device = controller / "device"
+            bootloader = (
+                sys_root / "firmware" / "devicetree" / "base" / "chosen" / "bootloader"
+            )
+            for directory in (
+                proc,
+                sys_root / "module" / "nvme_core" / "parameters",
+                sys_root / "module" / "pcie_aspm" / "parameters",
+                device / "of_node",
+                bootloader,
+                etc / "default",
+                packages / "lib" / "modules" / "6.8.0-1061-raspi",
+                packages / "lib" / "modules" / "6.8.0-1062-raspi",
+                packages / "lib" / "firmware" / "raspberrypi" / "bootloader-2712" / "default",
+            ):
+                directory.mkdir(parents=True, exist_ok=True)
+
+            (proc / "cmdline").write_text(
+                "root=LABEL=writable nvme_core.default_ps_max_latency_us=0 "
+                "pcie_aspm=off pcie_port_pm=off\n"
+            )
+            (sys_root / "module" / "nvme_core" / "parameters" / "default_ps_max_latency_us").write_text("0\n")
+            (sys_root / "module" / "pcie_aspm" / "parameters" / "policy").write_text(
+                "performance [default] powersave\n"
+            )
+            (sys_root / "firmware" / "devicetree" / "base" / "compatible").write_bytes(
+                b"raspberrypi,5-model-b\0brcm,bcm2712\0"
+            )
+            current_bootloader = int(dt.datetime(
+                2025, 12, 8, 19, 29, 54, tzinfo=dt.timezone.utc
+            ).timestamp())
+            (bootloader / "build-timestamp").write_bytes(current_bootloader.to_bytes(4, "big"))
+            (etc / "default" / "rpi-eeprom-update").write_text(
+                'FIRMWARE_RELEASE_STATUS="default"\n'
+            )
+            firmware = packages / "lib" / "firmware" / "raspberrypi" / "bootloader-2712" / "default"
+            (firmware / "pieeprom-2025-11-05.bin").write_bytes(b"fixture")
+            (firmware / "pieeprom-2025-12-08.bin").write_bytes(b"fixture")
+
+            (controller / "model").write_text("NE-256 2242\n")
+            (controller / "firmware_rev").write_text("SN25845\n")
+            (device / "current_link_speed").write_text("2.5 GT/s PCIe\n")
+            (device / "current_link_width").write_text("1\n")
+            (device / "max_link_speed").write_text("8.0 GT/s PCIe\n")
+            (device / "max_link_width").write_text("4\n")
+            (device / "of_node" / "max-link-speed").write_bytes((1).to_bytes(4, "big"))
+            (device / "aer_dev_correctable").write_text("RxErr 7\nTOTAL_ERR_COR 7\n")
+            (device / "aer_dev_nonfatal").write_text("DLP 2\nTOTAL_ERR_NONFATAL 2\n")
+            (device / "aer_dev_fatal").write_text("DLP 0\nTOTAL_ERR_FATAL 0\n")
+            pci_config = bytearray(256)
+            pci_config[0x34] = 0x40
+            pci_config[0x40] = 0x10
+            pci_config[0x4A:0x4C] = (0x3).to_bytes(2, "little")
+            (device / "config").write_bytes(pci_config)
+
+            now = dt.datetime(2026, 8, 27, 7, 0, tzinfo=dt.timezone.utc)
+            summary = collector.update_kernel_event_summary(
+                collector.empty_kernel_event_summary(),
+                [
+                    collector.reliability_event("2026-08-27T05:59:00Z", "kernel-warning", "active"),
+                    collector.reliability_event("2026-08-27T06:00:30Z", "rcu-stall", "expedited"),
+                    collector.reliability_event("2026-08-27T06:01:00Z", "rcu-stall", "active"),
+                    collector.reliability_event("2026-08-27T06:02:00Z", "nvme-reset", "active"),
+                    collector.reliability_event("2026-08-27T06:03:00Z", "pcie-aer", "fatal"),
+                ],
+                "2026-08-27T06:00:00Z",
+                now,
+            )
+            config = collector.Config(
+                proc_root=proc,
+                sys_root=sys_root,
+                etc_root=etc,
+                package_root=packages,
+            )
+            with mock.patch.object(collector.platform, "release", return_value="6.8.0-1061-raspi"):
+                system = collector.collect_system(config, summary)
+
+            self.assertEqual(system["versions"], {
+                "kernelRunning": "6.8.0-1061-raspi",
+                "kernelLatestInstalled": "6.8.0-1062-raspi",
+                "kernelRebootRequired": True,
+                "bootloaderCurrent": "2025-12-08",
+                "bootloaderLatest": "2025-12-08",
+                "bootloaderChannel": "default",
+                "nvmeModel": "NE-256 2242",
+                "nvmeFirmware": "SN25845",
+                "collector": collector.COLLECTOR_VERSION,
+            })
+            self.assertEqual(system["pcie"], {
+                "configuredGeneration": 1,
+                "negotiatedGeneration": 1,
+                "negotiatedSpeedGtps": 2.5,
+                "negotiatedWidth": 1,
+                "endpointMaxGeneration": 3,
+                "endpointMaxWidth": 4,
+                "aspmDisabled": True,
+                "nvmePowerSavingDisabled": True,
+                "aerCorrectableCount": 7,
+                "aerNonFatalCount": 2,
+                "aerFatalCount": 0,
+                "correctableStatusActive": True,
+                "nonFatalStatusActive": True,
+                "fatalStatusActive": False,
+            })
+            self.assertEqual(system["kernel"]["warning"], {
+                "count": 0, "lastEventAt": None,
+            })
+            self.assertEqual(system["kernel"]["rcuStall"], {
+                "count": 1, "lastEventAt": "2026-08-27T06:01:00Z",
+            })
+            self.assertEqual(system["kernel"]["rcuExpedited"], {
+                "count": 1, "lastEventAt": "2026-08-27T06:00:30Z",
+            })
+            self.assertEqual(system["kernel"]["nvmeReset"]["count"], 1)
+            self.assertEqual(system["kernel"]["pcieAerFatal"]["count"], 1)
+            self.assertEqual(set(system["kernel"]), set(collector.KERNEL_EVENT_SUMMARY_KEYS))
+            self.assertNotIn("serial", json.dumps(system).lower())
+
+    def test_kernel_summary_contract_rejects_partial_or_inconsistent_values(self):
+        summary = collector.empty_kernel_event_summary()
+        self.assertEqual(collector.existing_kernel_event_summary(summary), summary)
+        self.assertIsNone(collector.existing_kernel_event_summary({**summary, "raw": {}}))
+        malformed = collector.empty_kernel_event_summary()
+        malformed["oops"] = {"count": 1, "lastEventAt": None}
+        self.assertIsNone(collector.existing_kernel_event_summary(malformed))
+
+    def test_v2_kernel_summary_migration_only_uses_retained_current_boot_evidence(self):
+        legacy = {
+            key: {"count": 0, "lastEventAt": None}
+            for key in collector.LEGACY_KERNEL_EVENT_SUMMARY_KEYS
+        }
+        legacy["warning"] = {
+            "count": 5, "lastEventAt": "2026-08-27T06:05:00Z",
+        }
+        legacy["nvmeReset"] = {
+            "count": 2, "lastEventAt": "2026-08-27T06:04:00Z",
+        }
+        expedited = collector.reliability_event(
+            "2026-08-27T06:02:00Z", "rcu-stall", "expedited"
+        )
+        migrated = collector.migrate_v2_kernel_event_summary(
+            legacy,
+            [
+                collector.reliability_event(
+                    "2026-08-27T05:59:00Z", "kernel-warning", "active"
+                ),
+                collector.reliability_event(
+                    "2026-08-27T06:01:00Z", "kernel-warning", "active"
+                ),
+                expedited,
+                dict(expedited),
+            ],
+            "2026-08-27T06:00:00Z",
+            dt.datetime(2026, 8, 27, 7, 0, tzinfo=dt.timezone.utc),
+        )
+
+        self.assertEqual(migrated["warning"], {
+            "count": 1, "lastEventAt": "2026-08-27T06:01:00Z",
+        })
+        self.assertEqual(migrated["rcuExpedited"], {
+            "count": 1, "lastEventAt": "2026-08-27T06:02:00Z",
+        })
+        self.assertEqual(migrated["nvmeReset"], {
+            "count": 2, "lastEventAt": "2026-08-27T06:04:00Z",
+        })
+
+    def test_kernel_summary_deduplicates_exact_rows_but_counts_subsecond_events(self):
+        now = dt.datetime(2026, 8, 27, 7, 0, tzinfo=dt.timezone.utc)
+        first = collector.reliability_event(
+            "2026-08-27T06:03:00.100000Z", "pcie-aer", "fatal"
+        )
+        second = collector.reliability_event(
+            "2026-08-27T06:03:00.900000Z", "pcie-aer", "fatal"
+        )
+        summary = collector.update_kernel_event_summary(
+            collector.empty_kernel_event_summary(),
+            [first, dict(first), second],
+            "2026-08-27T06:00:00Z",
+            now,
+        )
+        self.assertEqual(summary["pcieAerFatal"], {
+            "count": 2,
+            "lastEventAt": "2026-08-27T06:03:00.900000Z",
+        })
+        merged = collector.merge_reliability_records(
+            [], [first, dict(first), second], 10
+        )
+        self.assertEqual(
+            [record["timestamp"] for record in merged],
+            ["2026-08-27T06:03:00.100000Z", "2026-08-27T06:03:00.900000Z"],
+        )
+
+    def test_rcu_backfill_requires_boot_boundary_and_prior_event_coverage(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            kernel = root / "kern.log"
+            config = collector.Config(kernel_log=kernel)
+            now = dt.datetime(2026, 8, 27, 7, 0, tzinfo=dt.timezone.utc)
+            kernel.write_text(
+                "2026-08-27T06:10:00.100000Z kernel: rcu: INFO: "
+                "rcu_preempt detected expedited stalls on CPUs/tasks raw=secret\n"
+            )
+            self.assertIsNone(collector.bounded_current_boot_rcu_backfill(
+                config, "2026-08-27T06:00:00Z", now,
+                "2026-08-27T06:10:00Z",
+            ))
+            kernel.write_text(
+                "2026-08-27T06:00:00Z kernel: boot marker\n"
+                "2026-08-27T06:10:00.100000Z kernel: rcu: INFO: "
+                "rcu_preempt detected expedited stalls on CPUs/tasks raw=secret\n"
+            )
+            self.assertIsNone(collector.bounded_current_boot_rcu_backfill(
+                config, "2026-08-27T06:00:00Z", now,
+                "2026-08-27T06:11:00Z",
+            ))
+            records = collector.bounded_current_boot_rcu_backfill(
+                config, "2026-08-27T06:00:00Z", now,
+                "2026-08-27T06:10:00Z",
+            )
+            self.assertEqual(len(records or []), 1)
+            self.assertNotIn("secret", json.dumps(records))
+
+    def test_hardened_sysfs_config_read_leaves_pcie_status_bits_unknown(self):
+        # Linux limits unprivileged PCI sysfs config reads to the 64-byte
+        # conventional header. The collector deliberately has no CAP_SYS_ADMIN.
+        self.assertEqual(collector.pcie_device_status(bytes(64)), (None, None, None))
+
+    def test_latest_kernel_requires_a_configured_image_when_dpkg_state_exists(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for version in ("6.8.0-1061-raspi", "6.8.0-1062-raspi"):
+                (root / "lib" / "modules" / version).mkdir(parents=True)
+            status = root / "var" / "lib" / "dpkg" / "status"
+            status.parent.mkdir(parents=True)
+            status.write_text(
+                "Package: linux-image-raspi\n"
+                "Status: install ok installed\n\n"
+                "Package: linux-image-6.8.0-1061-raspi\n"
+                "Status: install ok installed\n\n"
+                "Package: linux-image-6.8.0-1062-raspi\n"
+                "Status: install ok half-configured\n"
+            )
+            self.assertEqual(
+                collector.latest_installed_kernel(root), "6.8.0-1061-raspi"
+            )
+            status.write_text(
+                status.read_text().replace("install ok half-configured", "install ok installed")
+            )
+            self.assertEqual(
+                collector.latest_installed_kernel(root), "6.8.0-1062-raspi"
+            )
+
+    def test_latest_kernel_uses_dpkg_when_modules_are_hidden(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            status = root / "var" / "lib" / "dpkg" / "status"
+            status.parent.mkdir(parents=True)
+            status.write_text(
+                "Package: linux-image-6.8.0-1061-raspi\n"
+                "Status: install ok installed\n\n"
+                "Package: linux-image-6.8.0-1062-raspi\n"
+                "Status: hold ok installed\n"
+            )
+            self.assertFalse((root / "lib" / "modules").exists())
+            self.assertEqual(
+                collector.latest_installed_kernel(root), "6.8.0-1062-raspi"
+            )
 
 
 class IncidentTests(unittest.TestCase):
@@ -1490,7 +1906,11 @@ class RedactionTests(unittest.TestCase):
                 "nvme-io", "active",
             ),
             (
-                "2026-08-26T00:00:03Z kernel: rcu: INFO: rcu_preempt detected expedited stalls on CPUs/tasks",
+                "2026-08-26T00:00:03.123456Z kernel: rcu: INFO: rcu_preempt detected expedited stalls on CPUs/tasks",
+                "rcu-stall", "expedited",
+            ),
+            (
+                "2026-08-26T00:00:03Z kernel: rcu: INFO: rcu_preempt detected stalls on CPUs/tasks",
                 "rcu-stall", "active",
             ),
             (
@@ -1509,6 +1929,46 @@ class RedactionTests(unittest.TestCase):
                 "2026-08-26T00:00:07Z kernel: eth0: Link is Up 1000 Mbps",
                 "network-link", "recovered",
             ),
+            (
+                "2026-08-26T00:00:08Z pcieport 0000:00:00.0: AER: Corrected error received: secret",
+                "pcie-aer", "correctable",
+            ),
+            (
+                "2026-08-26T00:00:09Z pcieport 0000:00:00.0: AER: Uncorrectable (Non-Fatal) error received",
+                "pcie-aer", "nonfatal",
+            ),
+            (
+                "2026-08-26T00:00:10Z PCIe Bus Error: severity=Uncorrected (Fatal), type=secret",
+                "pcie-aer", "fatal",
+            ),
+            (
+                "2026-08-26T00:00:11Z brcm-pcie 1000110000.pcie: link down token=secret",
+                "pcie-link", "down",
+            ),
+            (
+                "2026-08-26T00:00:12Z pcieport 0000:00:00.0: link training failed",
+                "pcie-link", "degraded",
+            ),
+            (
+                "2026-08-26T00:00:13Z brcm-pcie 1000110000.pcie: link up, 2.5 GT/s PCIe x1",
+                "pcie-link", "recovered",
+            ),
+            (
+                "2026-08-26T00:00:14Z kernel: WARNING: CPU: 2 PID: 123 at private.c:4",
+                "kernel-warning", "active",
+            ),
+            (
+                "2026-08-26T00:00:15Z kernel: Internal error: Oops: 00000000 private",
+                "kernel-oops", "active",
+            ),
+            (
+                "2026-08-26T00:00:16Z kernel: Kernel panic - not syncing: private",
+                "kernel-panic", "active",
+            ),
+            (
+                "2026-08-26T00:00:17Z kernel: INFO: task secret-app:123 blocked for more than 120 seconds",
+                "hung-task", "active",
+            ),
         )
         for line, kind, status in cases:
             with self.subTest(kind=kind, status=status):
@@ -1516,6 +1976,8 @@ class RedactionTests(unittest.TestCase):
                 self.assertIsNotNone(record)
                 self.assertEqual(record["kind"], kind)
                 self.assertEqual(record["status"], status)
+                if status == "expedited":
+                    self.assertEqual(record["timestamp"], "2026-08-26T00:00:03.123456Z")
                 self.assertEqual(set(record), set(collector.RELIABILITY_FIELDS))
                 self.assertEqual(collector.existing_reliability_record(record), record)
                 encoded = json.dumps(record).lower()
@@ -1555,6 +2017,20 @@ class RedactionTests(unittest.TestCase):
             self.assertTrue(collector.observed_ssh_listeners(proc, {22, 22022}))
             self.assertTrue(collector.observed_network_link(sys_root, "eth0"))
             self.assertTrue(collector.observed_nvme_mitigation(sys_root))
+
+            (proc / "cmdline").write_text(
+                "root=LABEL=writable nvme_core.default_ps_max_latency_us=0 "
+                "pcie_aspm=off pcie_port_pm=off\n"
+            )
+            (sys_root / "module" / "nvme_core" / "parameters" / "default_ps_max_latency_us").write_text("100000\n")
+            (sys_root / "module" / "pcie_aspm" / "parameters" / "policy").write_text(
+                "performance [default] powersave\n"
+            )
+            self.assertTrue(collector.observed_nvme_mitigation(sys_root, proc))
+            (proc / "cmdline").write_text(
+                "nvme_core.default_ps_max_latency_us=0 pcie_aspm=off\n"
+            )
+            self.assertFalse(collector.observed_nvme_mitigation(sys_root, proc))
 
             (proc / "net" / "tcp6").write_text(header)
             (sys_root / "class" / "net" / "eth0" / "carrier").write_text("0\n")
@@ -1606,8 +2082,11 @@ class FilesystemTests(unittest.TestCase):
             )
             kernel = root / "kern.log"
             kernel.write_text(
+                "2026-08-26T00:00:00Z kernel: boot marker\n"
                 "2026-08-26T00:09:01Z kernel: nvme nvme0: controller is down; will reset token=secret\n"
-                "2026-08-26T00:09:02Z kernel: rcu: INFO: rcu_preempt detected expedited stalls on CPUs/tasks\n"
+                "2026-08-26T00:09:02.100000Z kernel: rcu: INFO: rcu_preempt detected expedited stalls on CPUs/tasks token=secret-a\n"
+                "2026-08-26T00:09:02.200000Z kernel: rcu: INFO: rcu_preempt detected expedited stalls on CPUs/tasks token=secret-b\n"
+                "2026-08-26T00:09:02.900000Z kernel: rcu: INFO: rcu_preempt detected expedited stalls on CPUs/tasks token=secret-c\n"
             )
             config = collector.Config(
                 output_dir=output,
@@ -1641,6 +2120,111 @@ class FilesystemTests(unittest.TestCase):
                 stat.S_IMODE((output / ".state" / "reliability-state.json").stat().st_mode),
                 0o600,
             )
+            first_state = json.loads(
+                (output / ".state" / "reliability-state.json").read_text()
+            )
+            self.assertEqual(first_state["version"], 5)
+            self.assertEqual(first_state["kernelSummary"]["nvmeReset"]["count"], 1)
+            self.assertEqual(first_state["kernelSummary"]["warning"]["count"], 0)
+            self.assertEqual(first_state["kernelSummary"]["rcuExpedited"]["count"], 3)
+            self.assertEqual(first_state["kernelSummary"]["rcuStall"]["count"], 0)
+
+            legacy_v4_state = json.loads(json.dumps(first_state))
+            legacy_v4_state["version"] = 4
+            legacy_v4_state["kernelSummary"]["rcuExpedited"] = {
+                "count": 1,
+                "lastEventAt": "2026-08-26T00:09:02Z",
+            }
+            kernel.rename(root / "kern.log.1")
+            kernel.write_text("")
+            current_kernel_metadata = kernel.stat()
+            legacy_v4_state["kernelCursor"] = {
+                "inode": current_kernel_metadata.st_ino,
+                "offset": current_kernel_metadata.st_size,
+            }
+            (output / ".state" / "reliability-state.json").write_text(
+                json.dumps(legacy_v4_state) + "\n"
+            )
+            rows_before_backfill = (output / "reliability.jsonl").read_text()
+            collector.collect_reliability(config, first_now, 600)
+            backfilled_state = json.loads(
+                (output / ".state" / "reliability-state.json").read_text()
+            )
+            self.assertEqual(backfilled_state["version"], 5)
+            self.assertEqual(
+                backfilled_state["kernelSummary"]["rcuExpedited"],
+                {"count": 3, "lastEventAt": "2026-08-26T00:09:02.900000Z"},
+            )
+            self.assertEqual(
+                (output / "reliability.jsonl").read_text(), rows_before_backfill
+            )
+            collector.collect_reliability(config, first_now, 600)
+            self.assertEqual(
+                json.loads(
+                    (output / ".state" / "reliability-state.json").read_text()
+                )["kernelSummary"]["rcuExpedited"]["count"],
+                3,
+            )
+            with kernel.open("a") as handle:
+                handle.write(
+                    "2026-08-26T00:09:03.100000Z kernel: rcu: INFO: "
+                    "rcu_preempt detected expedited stalls on CPUs/tasks raw=secret-d\n"
+                )
+            collector.collect_reliability(config, first_now, 600)
+            after_append_state = json.loads(
+                (output / ".state" / "reliability-state.json").read_text()
+            )
+            self.assertEqual(
+                after_append_state["kernelSummary"]["rcuExpedited"]["count"], 4
+            )
+
+            legacy_v2_state = json.loads(json.dumps(after_append_state))
+            legacy_v2_state["version"] = 2
+            legacy_v2_state["kernelSummary"].pop("rcuExpedited")
+            legacy_v2_state["kernelSummary"]["warning"] = {
+                "count": 5, "lastEventAt": "2026-08-26T00:09:02Z",
+            }
+            self.assertEqual(
+                collector.existing_reliability_state(legacy_v2_state)["version"], 2
+            )
+            (output / ".state" / "reliability-state.json").write_text(
+                json.dumps(legacy_v2_state) + "\n"
+            )
+            collector.collect_reliability(config, first_now, 600)
+            migrated_state = json.loads(
+                (output / ".state" / "reliability-state.json").read_text()
+            )
+            self.assertEqual(migrated_state["version"], 5)
+            self.assertEqual(migrated_state["kernelSummary"]["nvmeReset"]["count"], 1)
+            self.assertEqual(migrated_state["kernelSummary"]["warning"]["count"], 0)
+            self.assertEqual(migrated_state["kernelSummary"]["rcuExpedited"]["count"], 4)
+            self.assertEqual(migrated_state["kernelSummary"]["rcuStall"]["count"], 0)
+            legacy_v1_state = {
+                key: value
+                for key, value in migrated_state.items()
+                if key != "kernelSummary"
+            }
+            legacy_v1_state["version"] = 1
+            (output / ".state" / "reliability-state.json").write_text(
+                json.dumps(legacy_v1_state) + "\n"
+            )
+            collector.collect_reliability(config, first_now, 600)
+            migrated_state = json.loads(
+                (output / ".state" / "reliability-state.json").read_text()
+            )
+            self.assertEqual(migrated_state["version"], 5)
+            self.assertEqual(migrated_state["kernelSummary"]["nvmeReset"]["count"], 1)
+            self.assertEqual(migrated_state["kernelSummary"]["warning"]["count"], 0)
+            self.assertEqual(migrated_state["kernelSummary"]["rcuExpedited"]["count"], 4)
+            self.assertEqual(migrated_state["kernelSummary"]["rcuStall"]["count"], 0)
+            migrated_rows = [
+                json.loads(line)
+                for line in (output / "reliability.jsonl").read_text().splitlines()
+            ]
+            self.assertEqual(
+                sum(row["kind"] == "rcu-stall" for row in migrated_rows), 4
+            )
+            first_rows = migrated_rows
 
             (proc / "sys" / "kernel" / "random" / "boot_id").write_text(
                 "22222222-2222-4222-8222-222222222222\n"
@@ -1668,6 +2252,15 @@ class FilesystemTests(unittest.TestCase):
             )
             gap = next(row for row in rows if row["kind"] == "collector-gap")
             self.assertEqual(gap["durationSeconds"], 300)
+            second_state = json.loads(
+                (output / ".state" / "reliability-state.json").read_text()
+            )
+            self.assertEqual(second_state["kernelSummary"]["nvmeReset"]["count"], 0)
+            self.assertEqual(second_state["kernelSummary"]["rcuStall"]["count"], 0)
+            self.assertEqual(second_state["kernelSummary"]["rcuExpedited"]["count"], 0)
+            self.assertEqual(second_state["kernelSummary"]["oomKill"], {
+                "count": 1, "lastEventAt": "2026-08-26T00:14:30Z",
+            })
 
             # A crash after the event file but before private state publication
             # is replayed idempotently on the next run.
@@ -1985,7 +2578,9 @@ class FilesystemTests(unittest.TestCase):
                 directory.mkdir(parents=True, exist_ok=True)
             (proc / "stat").write_text("bad cpu values\n")
             (proc / "meminfo").write_text("MemTotal: nope\n")
-            (proc / "net" / "dev").write_text("malformed\n")
+            (proc / "net" / "dev").write_text(
+                "eth0: 100 0 1 3 0 0 0 0 200 0 2 4 0 0 0 0\n"
+            )
             (proc / "diskstats").write_text("malformed\n")
             (proc / "loadavg").write_text("not-a-number\n")
             (proc / "uptime").write_text("also-bad\n")
@@ -2041,25 +2636,43 @@ class FilesystemTests(unittest.TestCase):
                 "gpuClockHz": 500_000_000,
             }
             with mock.patch.object(collector, "collect_gpu", return_value=gpu), \
-                 mock.patch.object(collector, "docker_get", side_effect=fake_docker):
+                 mock.patch.object(collector, "docker_get", side_effect=fake_docker), \
+                 mock.patch.object(collector.time, "monotonic", side_effect=[100.0, 160.0]):
                 current = collector.run(config, now)
                 first_delta_state = json.loads((runtime / "delta-state.json").read_text())
                 docker_sample[0] = 1
+                (proc / "net" / "dev").write_text(
+                    "eth0: 700 0 7 9 0 0 0 0 800 0 8 10 0 0 0 0\n"
+                )
                 second = collector.run(config, now + dt.timedelta(minutes=1))
 
             self.assertEqual(set(current), {
-                "generatedAt", "host", "latest", "disks", "containers", "reliability",
+                "generatedAt", "host", "latest", "disks", "containers", "currentTraffic",
+                "reliability", "system",
             })
-            self.assertEqual(set(current["host"]), {"hostname", "os", "architecture", "uptimeSeconds"})
+            self.assertEqual(current["currentTraffic"], [])
+            self.assertEqual(set(current["host"]), {
+                "hostname", "os", "architecture", "logicalCpuCount", "uptimeSeconds",
+            })
+            self.assertIsNone(current["host"]["logicalCpuCount"])
             self.assertEqual(set(current["reliability"]), {
                 "bootStartedAt", "collectorGapSeconds", "sshListenersAvailable",
                 "networkLinkAvailable", "nvmeMitigationActive",
             })
+            self.assertEqual(set(current["system"]), {"versions", "pcie", "kernel"})
             self.assertEqual(tuple(current["latest"]), collector.SAMPLE_FIELDS)
             for field_name in (
                 "cpuPercent", "memoryPercent", "memoryUsedBytes", "memoryTotalBytes",
-                "load1", "load5", "load15", "networkRxBytesPerSecond",
-                "networkTxBytesPerSecond", "diskReadBytesPerSecond",
+                "swapTotalBytes", "swapUsedBytes", "swapPercent",
+                "load1", "load5", "load15",
+                "cpuPressureSomeAvg10", "cpuPressureFullAvg10",
+                "memoryPressureSomeAvg10", "memoryPressureFullAvg10",
+                "ioPressureSomeAvg10", "ioPressureFullAvg10",
+                "networkRxBytesPerSecond",
+                "networkTxBytesPerSecond",
+                "networkRxErrorsPerSecond", "networkTxErrorsPerSecond",
+                "networkRxDroppedPerSecond", "networkTxDroppedPerSecond",
+                "diskReadBytesPerSecond",
                 "diskWriteBytesPerSecond",
             ):
                 self.assertIsNone(current["latest"][field_name], field_name)
@@ -2068,10 +2681,19 @@ class FilesystemTests(unittest.TestCase):
             self.assertEqual(current["latest"]["throttledFlags"], 0x50000)
             self.assertEqual(current["latest"]["gpuMemoryBytes"], 4 * 1024 ** 2)
             self.assertEqual(current["latest"]["gpuClockHz"], 500_000_000)
-            self.assertEqual(set(current["disks"][0]), {"mount", "totalBytes", "usedBytes", "usedPercent"})
+            self.assertEqual(set(current["disks"][0]), {
+                "mount", "totalBytes", "usedBytes", "availableBytes", "usedPercent",
+                "inodeUsedPercent", "readOnly",
+            })
             self.assertIsNone(current["containers"][0]["cpuPercent"])
             self.assertEqual(current["containers"][0]["memoryBytes"], 40)
             self.assertEqual(second["containers"][0]["cpuPercent"], 20.0)
+            self.assertEqual(second["latest"]["networkRxBytesPerSecond"], 10.0)
+            self.assertEqual(second["latest"]["networkTxBytesPerSecond"], 10.0)
+            self.assertEqual(second["latest"]["networkRxErrorsPerSecond"], 0.1)
+            self.assertEqual(second["latest"]["networkTxErrorsPerSecond"], 0.1)
+            self.assertEqual(second["latest"]["networkRxDroppedPerSecond"], 0.1)
+            self.assertEqual(second["latest"]["networkTxDroppedPerSecond"], 0.1)
             self.assertIn(f"cks:{container_id}", first_delta_state["containers"])
             self.assertEqual(stat.S_IMODE((runtime / "delta-state.json").stat().st_mode), 0o600)
             self.assertNotIn(container_id, (output / "current.json").read_text())
@@ -2092,6 +2714,10 @@ class FilesystemTests(unittest.TestCase):
             self.assertTrue(all(tuple(sample) == collector.SAMPLE_FIELDS for sample in history))
             self.assertEqual([sample["supplyVoltageVolts"] for sample in history], [None, 4.87, 4.87])
             self.assertEqual([sample["throttledFlags"] for sample in history], [None, 0x50000, 0x50000])
+            self.assertEqual(
+                [sample["networkRxErrorsPerSecond"] for sample in history],
+                [None, None, 0.1],
+            )
             self.assertTrue((runtime / "delta-state.json").is_file())
 
     def test_bounded_exports_keep_newest_records(self):
@@ -2131,12 +2757,12 @@ class FilesystemTests(unittest.TestCase):
             self.assertTrue(all(set(record) == {"timestamp", "severity", "kind", "status", "message"} for record in records))
             self.assertEqual(
                 records[0]["message"],
-                "Current vcgencmd throttle flags are 0x5. Full flags are 0x00050005. "
+                "Current hwmon power flags are 0x5. Full flags are 0x00050005. "
                 "Supply voltage is 4.812 V.",
             )
             self.assertEqual(
                 records[1]["message"],
-                "Current vcgencmd throttle condition recovered. Full flags are 0x00050000. "
+                "Current hwmon power condition recovered. Full flags are 0x00050000. "
                 "Supply voltage is 4.924 V.",
             )
 
@@ -2223,6 +2849,7 @@ class FilesystemTests(unittest.TestCase):
             config = collector.config_from_environment([])
         self.assertEqual(config.privilege_logs, [Path("/var/log/privilege-events.log")])
         self.assertEqual(config.kernel_log, Path("/var/log/kern.log"))
+        self.assertEqual(config.package_root, Path("/"))
         self.assertEqual(config.kernel_max_input_bytes, 8_388_608)
         self.assertEqual(config.command_timeout, 2.0)
         self.assertEqual(config.traffic_log, Path("/var/log/nginx/monitor-traffic.jsonl"))
@@ -2268,6 +2895,7 @@ class FilesystemTests(unittest.TestCase):
         self.assertIn("BindPaths=-/dev/vcio", unit)
         self.assertIn("DeviceAllow=/dev/vcio rw", unit)
         self.assertIn("InaccessiblePaths=/home /root", unit)
+        self.assertIn("MONITOR_PACKAGE_ROOT=/", defaults)
         self.assertIn("TemporaryFileSystem=/run:ro", unit)
         self.assertIn("BindPaths=/run/monitor-collector", unit)
         self.assertIn("BindReadOnlyPaths=/run/monitor-container-exporter/containers.json", unit)

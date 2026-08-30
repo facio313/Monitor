@@ -1,0 +1,30 @@
+[Unit]
+Description=Apply fixed-policy Monitor host update requests
+Documentation=file:/usr/local/share/doc/monitor-updater/README.md
+Wants=network-online.target
+After=local-fs.target network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/usr/bin/python3 /usr/local/lib/monitor-updater/monitor_update_worker.py --incoming=/var/lib/monitor-update/incoming --processing=/var/lib/monitor-update/processing --plan=/var/lib/monitor-update/plan.json --public-status=/var/lib/monitor-export/system-update.json --audit-log=/var/log/monitor-update-audit.jsonl --lock=/run/monitor-update-worker.lock --request-user=monitor-updater --peer-uid=1001 --public-group=cks
+UMask=0027
+
+# Package maintainer scripts require normal root filesystem and service-manager
+# access. The safety boundary is therefore the tiny, fixed-argv worker and its
+# strict queue parser, not a misleading partial sandbox around APT.
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=false
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+Nice=10
+OOMScoreAdjust=-500
+TimeoutStartSec=infinity
+# Match the distro APT safety posture: stopping the unit may terminate the
+# Python supervisor, but never signal an in-flight apt/dpkg child. The child
+# remains in the unit cgroup and the unit cannot be restarted over it.
+KillMode=process
+TimeoutStopSec=900
+SendSIGKILL=no

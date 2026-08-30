@@ -3,13 +3,17 @@ import {
   ADAPTIVE_GRID_BASE_COLUMNS,
   ADAPTIVE_GRID_DETAILS_SCHEMA_VERSION,
   ADAPTIVE_GRID_MAX_ROWS,
+  ADAPTIVE_GRID_PHONE_MAX_WIDTH,
   ADAPTIVE_GRID_SCHEMA_VERSION,
+  ADAPTIVE_GRID_TABLET_MAX_WIDTH,
   adaptiveGridDetailsStorageKey,
   adaptiveGridStorageKey,
   applyAdaptiveGridCommand,
   applyAdaptiveGridListCommand,
+  getAdaptiveGridCompactPlacements,
   getCuratedAdaptiveGridDetailVisibility,
   getCuratedAdaptiveGridLayout,
+  getAdaptiveGridViewportMode,
   inflateGridStackSavedLayout,
   normalizeAdaptiveGridDetailVisibility,
   normalizeAdaptiveGridLayout,
@@ -80,6 +84,43 @@ function stored(layout: unknown, overrides: Record<string, unknown> = {}) {
     ...overrides,
   });
 }
+
+describe('adaptive-grid compact presentation', () => {
+  it.each([
+    [320, 'phone'],
+    [ADAPTIVE_GRID_PHONE_MAX_WIDTH, 'phone'],
+    [ADAPTIVE_GRID_PHONE_MAX_WIDTH + 1, 'tablet'],
+    [768, 'tablet'],
+    [820, 'tablet'],
+    [ADAPTIVE_GRID_TABLET_MAX_WIDTH, 'tablet'],
+    [ADAPTIVE_GRID_TABLET_MAX_WIDTH + 1, 'desktop'],
+    [1440, 'desktop'],
+  ] as const)('maps a %dpx viewport to the %s flow', (width, expected) => {
+    expect(getAdaptiveGridViewportMode(width)).toBe(expected);
+  });
+
+  it('rejects viewport widths that cannot represent a CSS viewport', () => {
+    expect(() => getAdaptiveGridViewportMode(-1)).toThrow(/viewport width/i);
+    expect(() => getAdaptiveGridViewportMode(Number.NaN)).toThrow(/viewport width/i);
+    expect(() => getAdaptiveGridViewportMode(Number.POSITIVE_INFINITY)).toThrow(/viewport width/i);
+  });
+
+  it('derives saved-layout reading order and makes only wider-than-half widgets span tablet columns', () => {
+    expect(getAdaptiveGridCompactPlacements([
+      { id: 'last', x: 0, y: 8, w: 6 },
+      { id: 'feature', x: 0, y: 0, w: 12 },
+      { id: 'right', x: 6, y: 4, w: 6 },
+      { id: 'left', x: 0, y: 4, w: 6 },
+      { id: 'wide', x: 0, y: 12, w: 7 },
+    ])).toEqual([
+      { id: 'last', order: 3, tabletSpan: 1 },
+      { id: 'feature', order: 0, tabletSpan: 2 },
+      { id: 'right', order: 2, tabletSpan: 1 },
+      { id: 'left', order: 1, tabletSpan: 1 },
+      { id: 'wide', order: 4, tabletSpan: 2 },
+    ]);
+  });
+});
 
 describe('adaptive-grid curated layout and storage identity', () => {
   it('returns a fresh, exact copy of the curated 12-column layout', () => {

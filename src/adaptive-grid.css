@@ -13,6 +13,10 @@
   gap: 7px;
 }
 
+.adaptive-grid__toolbar[hidden] {
+  display: none;
+}
+
 .adaptive-grid__toolbar button,
 .adaptive-grid__widget-controls button,
 .adaptive-grid__detail-switch {
@@ -276,6 +280,85 @@
   opacity: .8;
 }
 
+/* Compact dashboards deliberately stop using GridStack's absolute, fixed-row
+   presentation. The canonical 12-column geometry remains mounted underneath
+   for desktop editing, while CSS provides a stable natural-height reading flow. */
+@media (max-width: 1024px) {
+  .adaptive-grid__toolbar {
+    min-height: 0;
+    margin-bottom: 0;
+  }
+
+  .adaptive-grid__grid {
+    height: auto !important;
+    margin: 0;
+    display: grid !important;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    align-items: stretch;
+    gap: 14px;
+  }
+
+  .adaptive-grid__grid > .adaptive-grid__widget {
+    width: auto !important;
+    height: auto !important;
+    min-width: 0;
+    min-height: 0;
+    margin: 0;
+    padding: 0;
+    position: relative !important;
+    inset: auto !important;
+    transform: none !important;
+    grid-column: span 1;
+    align-self: stretch;
+  }
+
+  .adaptive-grid__grid > .adaptive-grid__widget--wide {
+    grid-column: 1 / -1;
+  }
+
+  .adaptive-grid__grid > .adaptive-grid__widget > .adaptive-grid__widget-content {
+    box-sizing: border-box;
+    width: 100% !important;
+    height: 100% !important;
+    min-height: 0;
+    margin: 0;
+    position: relative !important;
+    inset: auto !important;
+    overflow: visible !important;
+  }
+
+  .adaptive-grid__widget-body {
+    overflow: visible !important;
+    overscroll-behavior: auto;
+  }
+
+  .adaptive-grid__widget-body > * {
+    height: auto !important;
+    min-height: 100%;
+  }
+
+  .adaptive-grid__widget-body :where(
+    .cockpit-panel-body,
+    .incident-compact-list,
+    .ops-log-compact
+  ) {
+    max-height: none !important;
+    overflow: visible !important;
+  }
+
+  .adaptive-grid__grid > .grid-stack-placeholder,
+  .adaptive-grid .grid-stack-item > .ui-resizable-handle,
+  .adaptive-grid--editing .adaptive-grid__drag-handle,
+  .adaptive-grid--editing .adaptive-grid__widget-controls {
+    display: none !important;
+    pointer-events: none !important;
+  }
+
+  .adaptive-grid__grid.grid-stack-animate > .adaptive-grid__widget {
+    transition: none;
+  }
+}
+
 @media (max-width: 767px) {
   .adaptive-grid__toolbar {
     justify-content: flex-start;
@@ -313,9 +396,33 @@
   }
 }
 
-/* Coarse pointers keep native page scrolling. Editing remains fully available
-   through the explicit buttons, without accidental drag/resize gestures. */
+@media (max-width: 640px) {
+  .adaptive-grid__grid {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 12px;
+  }
+
+  .adaptive-grid__grid > .adaptive-grid__widget,
+  .adaptive-grid__grid > .adaptive-grid__widget--wide {
+    grid-column: 1 / -1;
+  }
+}
+
+/* Coarse pointers keep native page scrolling. Wide-screen editing remains
+   available through explicit 44px controls without accidental drag gestures. */
 @media (any-pointer: coarse) {
+  .adaptive-grid__toolbar button,
+  .adaptive-grid__widget-controls button {
+    min-width: 44px;
+    min-height: 44px;
+    height: 44px;
+  }
+
+  .adaptive-grid__widget-body :where(button, a, select, input) {
+    min-height: 44px;
+    touch-action: manipulation;
+  }
+
   .adaptive-grid__drag-handle {
     display: none !important;
     pointer-events: none;

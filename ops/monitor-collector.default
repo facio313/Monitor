@@ -5,6 +5,7 @@ MONITOR_RUNTIME_DIR=/run/monitor-collector
 MONITOR_PROC_ROOT=/proc
 MONITOR_SYS_ROOT=/sys
 MONITOR_ETC_ROOT=/etc
+MONITOR_PACKAGE_ROOT=/
 MONITOR_EVENTS_LOG=/var/log/server-watch/events.log
 MONITOR_KERNEL_LOG=/var/log/kern.log
 MONITOR_PRIVILEGE_LOGS=/var/log/privilege-events.log

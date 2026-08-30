@@ -1,0 +1,194 @@
+.monitor-pagination {
+  width: 100%;
+  min-width: 0;
+  margin-top: 12px;
+  padding-top: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  border-top: 1px solid var(--control-border, var(--border-soft, #253a36));
+}
+
+.monitor-pagination-range {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+  color: var(--control-muted, var(--muted, #93a39f));
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", ui-monospace, monospace;
+  font-size: 10px;
+  line-height: 1.35;
+  white-space: nowrap;
+}
+
+.monitor-pagination-range > span {
+  color: var(--control-faint, var(--faint, #687b77));
+  font-size: 8px;
+  letter-spacing: .04em;
+}
+
+.monitor-pagination-controls,
+.monitor-pagination-pages {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 4px;
+}
+
+.monitor-pagination button {
+  min-width: 38px;
+  min-height: 38px;
+  padding: 0 9px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  border: 1px solid var(--control-border-strong, #35504a);
+  border-radius: 7px;
+  color: var(--control-muted, #a4b3af);
+  background: rgb(8 18 16 / 92%);
+  font: inherit;
+  font-size: 10px;
+  font-weight: 750;
+  cursor: pointer;
+}
+
+.monitor-pagination button:hover:not(:disabled) {
+  border-color: #4e8179;
+  color: var(--control-text, #e5eeec);
+  background: #112622;
+}
+
+.monitor-pagination button:focus-visible {
+  outline: 2px solid var(--control-cyan, var(--cyan, #55d9d1));
+  outline-offset: 2px;
+}
+
+.monitor-pagination button:disabled {
+  opacity: .38;
+  cursor: default;
+}
+
+.monitor-pagination .monitor-pagination-action {
+  min-width: 82px;
+}
+
+.monitor-pagination .monitor-pagination-page {
+  padding-inline: 6px;
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", ui-monospace, monospace;
+}
+
+.monitor-pagination .monitor-pagination-page[aria-current="page"] {
+  border-color: #4b9289;
+  color: #dcfffa;
+  background: #173b35;
+  box-shadow: inset 0 0 0 1px rgb(85 217 209 / 12%);
+  cursor: default;
+}
+
+.monitor-pagination-ellipsis {
+  width: 18px;
+  flex: 0 0 18px;
+  color: var(--control-faint, #687b77);
+  text-align: center;
+}
+
+.incident-compact-feed {
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.incident-compact-feed .monitor-pagination {
+  margin-top: auto;
+}
+
+.ops-log-compact > .monitor-pagination {
+  position: sticky;
+  bottom: 0;
+  z-index: 1;
+  padding-bottom: 2px;
+  background: var(--control-panel, #0b1715);
+}
+
+.container-list-pagination,
+.incident-detail-pagination,
+.ledger-pagination,
+.update-package-pagination {
+  margin-top: 14px;
+}
+
+@media (max-width: 560px) {
+  .monitor-pagination {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .monitor-pagination-range {
+    width: 100%;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: baseline;
+  }
+
+  .monitor-pagination-range > span {
+    text-align: right;
+  }
+
+  .monitor-pagination-controls {
+    width: 100%;
+    justify-content: space-between;
+    overflow-x: auto;
+    overscroll-behavior-inline: contain;
+    scrollbar-width: thin;
+  }
+
+  .monitor-pagination-pages {
+    justify-content: center;
+  }
+
+  .monitor-pagination button {
+    min-width: 40px;
+    min-height: 42px;
+    padding-inline: 7px;
+  }
+
+  .monitor-pagination .monitor-pagination-action {
+    min-width: 44px;
+  }
+
+  .monitor-pagination-action-text {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+  }
+}
+
+@media (max-width: 360px) {
+  .monitor-pagination-pages {
+    gap: 2px;
+  }
+
+  .monitor-pagination .monitor-pagination-page {
+    min-width: 36px;
+  }
+
+  .monitor-pagination-ellipsis {
+    width: 12px;
+    flex-basis: 12px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .monitor-pagination * {
+    scroll-behavior: auto !important;
+    transition: none !important;
+  }
+}

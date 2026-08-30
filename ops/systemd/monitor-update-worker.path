@@ -1,0 +1,12 @@
+[Unit]
+Description=Watch for validated Monitor host update requests
+Documentation=file:/usr/local/share/doc/monitor-updater/README.md
+After=local-fs.target
+
+[Path]
+PathExistsGlob=/var/lib/monitor-update/incoming/request-*.json
+PathExistsGlob=/var/lib/monitor-update/processing/request-*.json
+Unit=monitor-update-worker.service
+
+[Install]
+WantedBy=multi-user.target

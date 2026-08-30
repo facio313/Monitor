@@ -4,8 +4,8 @@ import { BonifacioReturnLink } from './components/BonifacioReturnLink';
 import { MonitorDashboard } from './components/MonitorDashboard';
 import { Icon } from './components/Icon';
 import { LoginScreen } from './components/LoginScreen';
-import { monitorPageFromPath, monitorPathForPage } from './dashboard-model';
-import type { MonitorPage } from './types';
+import { monitorPageFromPath, monitorPathForPage, monitorRangeFromSearch } from './dashboard-model';
+import type { MonitorPage, TimeRange } from './types';
 
 type SessionState = 'checking' | 'authenticated' | 'anonymous';
 
@@ -54,9 +54,12 @@ export default function App() {
     };
   }, []);
 
-  const handleNavigate = useCallback((nextPage: MonitorPage) => {
-    const target = monitorPathForPage(nextPage);
-    if (window.location.pathname !== target || window.location.hash) {
+  const handleNavigate = useCallback((nextPage: MonitorPage, anchor?: string, requestedRange?: TimeRange) => {
+    const range = requestedRange ?? monitorRangeFromSearch(window.location.search);
+    const search = `?range=${encodeURIComponent(range)}`;
+    const hash = anchor ? `#${encodeURIComponent(anchor)}` : '';
+    const target = `${monitorPathForPage(nextPage)}${search}${hash}`;
+    if (`${window.location.pathname}${window.location.search}${window.location.hash}` !== target) {
       window.history.pushState(null, '', target);
     }
     setPage(nextPage);

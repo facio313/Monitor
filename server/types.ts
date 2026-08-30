@@ -8,10 +8,19 @@ export interface TelemetrySample {
   memoryPercent: number | null;
   memoryUsedBytes: number | null;
   memoryTotalBytes: number | null;
+  swapTotalBytes: number | null;
+  swapUsedBytes: number | null;
+  swapPercent: number | null;
   temperatureC: number | null;
   load1: number | null;
   load5: number | null;
   load15: number | null;
+  cpuPressureSomeAvg10: number | null;
+  cpuPressureFullAvg10: number | null;
+  memoryPressureSomeAvg10: number | null;
+  memoryPressureFullAvg10: number | null;
+  ioPressureSomeAvg10: number | null;
+  ioPressureFullAvg10: number | null;
   powerState: string | null;
   supplyVoltageVolts: number | null;
   throttledFlags: number | null;
@@ -19,6 +28,10 @@ export interface TelemetrySample {
   gpuClockHz: number | null;
   networkRxBytesPerSecond: number | null;
   networkTxBytesPerSecond: number | null;
+  networkRxErrorsPerSecond: number | null;
+  networkTxErrorsPerSecond: number | null;
+  networkRxDroppedPerSecond: number | null;
+  networkTxDroppedPerSecond: number | null;
   diskReadBytesPerSecond: number | null;
   diskWriteBytesPerSecond: number | null;
 }
@@ -26,6 +39,18 @@ export interface TelemetrySample {
 export interface IncidentPressureWindow {
   someAvg10: number | null;
   fullAvg10: number | null;
+}
+
+export interface TrafficAggregate {
+  app: string;
+  requestCount: number;
+  status2xx: number;
+  status3xx: number;
+  status4xx: number;
+  status5xx: number;
+  slowCount: number;
+  avgResponseMs: number | null;
+  maxResponseMs: number | null;
 }
 
 export type IncidentReason =
@@ -65,17 +90,7 @@ export interface DashboardIncident {
     memoryBytes: number | null;
     memoryPercent: number | null;
   }>;
-  traffic: Array<{
-    app: string;
-    requestCount: number;
-    status2xx: number;
-    status3xx: number;
-    status4xx: number;
-    status5xx: number;
-    slowCount: number;
-    avgResponseMs: number | null;
-    maxResponseMs: number | null;
-  }>;
+  traffic: TrafficAggregate[];
   peaks: {
     cpuPercent: number | null;
     memoryPercent: number | null;
@@ -85,14 +100,66 @@ export interface DashboardIncident {
   durationSeconds: number | null;
 }
 
+export interface KernelEventCounter {
+  count: number;
+  lastEventAt: string | null;
+}
+
+export interface SystemSnapshot {
+  versions: {
+    kernelRunning: string | null;
+    kernelLatestInstalled: string | null;
+    kernelRebootRequired: boolean | null;
+    bootloaderCurrent: string | null;
+    bootloaderLatest: string | null;
+    bootloaderChannel: string | null;
+    nvmeModel: string | null;
+    nvmeFirmware: string | null;
+    collector: string | null;
+  };
+  pcie: {
+    configuredGeneration: number | null;
+    negotiatedGeneration: number | null;
+    negotiatedSpeedGtps: number | null;
+    negotiatedWidth: number | null;
+    endpointMaxGeneration: number | null;
+    endpointMaxWidth: number | null;
+    aspmDisabled: boolean | null;
+    nvmePowerSavingDisabled: boolean | null;
+    aerCorrectableCount: number | null;
+    aerNonFatalCount: number | null;
+    aerFatalCount: number | null;
+    correctableStatusActive: boolean | null;
+    nonFatalStatusActive: boolean | null;
+    fatalStatusActive: boolean | null;
+  };
+  kernel: {
+    warning: KernelEventCounter;
+    oops: KernelEventCounter;
+    panic: KernelEventCounter;
+    hungTask: KernelEventCounter;
+    rcuStall: KernelEventCounter;
+    rcuExpedited: KernelEventCounter;
+    oomKill: KernelEventCounter;
+    filesystemError: KernelEventCounter;
+    nvmeReset: KernelEventCounter;
+    nvmeIo: KernelEventCounter;
+    pcieAerCorrectable: KernelEventCounter;
+    pcieAerNonFatal: KernelEventCounter;
+    pcieAerFatal: KernelEventCounter;
+  };
+}
+
 export interface DashboardResponse {
   generatedAt: string;
   range: DashboardRange;
   stale: boolean;
+  latestObservedAt: string | null;
   host: {
     hostname: string | null;
     os: string | null;
     architecture: string | null;
+    logicalCpuCount: number | null;
     uptimeSeconds: number | null;
   };
   reliability: {
@@ -102,6 +169,7 @@ export interface DashboardResponse {
     networkLinkAvailable: boolean | null;
     nvmeMitigationActive: boolean | null;
   };
+  system: SystemSnapshot;
   latest: TelemetrySample;
   series: TelemetrySample[];
   telemetrySummary: {
@@ -132,7 +200,10 @@ export interface DashboardResponse {
     mount: string;
     totalBytes: number | null;
     usedBytes: number | null;
+    availableBytes: number | null;
     usedPercent: number | null;
+    inodeUsedPercent: number | null;
+    readOnly: boolean | null;
   }>;
   containers: Array<{
     name: string;
@@ -143,6 +214,7 @@ export interface DashboardResponse {
     memoryBytes: number | null;
     memoryPercent: number | null;
   }>;
+  currentTraffic: TrafficAggregate[];
   alerts: Array<{
     timestamp: string;
     severity: 'info' | 'warning' | 'critical';
@@ -172,6 +244,12 @@ export interface DashboardResponse {
       | 'rcu-stall'
       | 'oom-kill'
       | 'filesystem-error'
+      | 'pcie-aer'
+      | 'pcie-link'
+      | 'kernel-warning'
+      | 'kernel-oops'
+      | 'kernel-panic'
+      | 'hung-task'
       | 'nvme-mitigation';
     status: string;
     message: string;
@@ -185,4 +263,130 @@ export interface DashboardResponse {
     result: 'success' | 'failure' | 'unknown';
   }>;
   incidents: DashboardIncident[];
+}
+
+export type InfrastructureLedgerCategory =
+  | 'network'
+  | 'security'
+  | 'identity-access'
+  | 'dns-edge'
+  | 'reliability'
+  | 'compute-kernel'
+  | 'storage-filesystem'
+  | 'backup-recovery'
+  | 'observability-logging'
+  | 'service-deployment'
+  | 'containers'
+  | 'packages-firmware'
+  | 'governance-documentation'
+  | 'hardware-physical';
+
+export type InfrastructureLedgerStatus =
+  | 'completed'
+  | 'in-progress'
+  | 'pending'
+  | 'deferred'
+  | 'recommended'
+  | 'observed'
+  | 'superseded'
+  | 'not-applicable';
+
+export type InfrastructureLedgerWorkType =
+  | 'change'
+  | 'configuration'
+  | 'audit'
+  | 'hardening'
+  | 'mitigation'
+  | 'update'
+  | 'verification'
+  | 'incident'
+  | 'maintenance'
+  | 'recommendation'
+  | 'decision'
+  | 'documentation';
+
+export type InfrastructureLedgerPriority = 'critical' | 'high' | 'medium' | 'low' | 'informational';
+export type InfrastructureLedgerConfidence = 'current-state' | 'documented' | 'inferred' | 'recommendation';
+export type InfrastructureLedgerVerification = 'verified' | 'partially-verified' | 'unverified' | 'not-applicable';
+export type InfrastructureLedgerApplicability = 'applicable' | 'needs-assessment' | 'not-applicable';
+export type InfrastructureLedgerImpact = 'none' | 'observed-none' | 'low' | 'brief' | 'maintenance-window-required' | 'unknown';
+export type InfrastructureLedgerSensitivity = 'public' | 'internal' | 'restricted';
+export type InfrastructureLedgerCsfFunction = 'govern' | 'identify' | 'protect' | 'detect' | 'respond' | 'recover';
+
+export interface InfrastructureLedgerText {
+  ko: string;
+  en: string;
+}
+
+export interface InfrastructureLedgerEvidence {
+  kind: 'runtime' | 'file' | 'journal' | 'package-log' | 'repository' | 'session' | 'standard' | 'operator';
+  reference: string;
+  observedAt: string;
+  note: InfrastructureLedgerText;
+}
+
+export interface InfrastructureLedgerEntry {
+  id: string;
+  itemKey: string;
+  revision: number;
+  occurredAt: string;
+  recordedAt: string;
+  category: InfrastructureLedgerCategory;
+  workType: InfrastructureLedgerWorkType;
+  status: InfrastructureLedgerStatus;
+  priority: InfrastructureLedgerPriority;
+  confidence: InfrastructureLedgerConfidence;
+  verification: InfrastructureLedgerVerification;
+  applicability: InfrastructureLedgerApplicability;
+  impact: InfrastructureLedgerImpact;
+  sensitivity: InfrastructureLedgerSensitivity;
+  csfFunctions: InfrastructureLedgerCsfFunction[];
+  title: InfrastructureLedgerText;
+  summary: InfrastructureLedgerText;
+  rationale: InfrastructureLedgerText;
+  details: InfrastructureLedgerText;
+  outcome: InfrastructureLedgerText;
+  nextAction: InfrastructureLedgerText;
+  actor: string;
+  scope: string[];
+  evidence: InfrastructureLedgerEvidence[];
+  referenceIds: string[];
+  relatedIds: string[];
+  supersedes: string | null;
+  dueAt: string | null;
+  recurrence: InfrastructureLedgerText | null;
+}
+
+export interface InfrastructureLedgerReference {
+  id: string;
+  title: string;
+  publisher: string;
+  url: string;
+  publishedAt: string | null;
+  accessedAt: string;
+}
+
+export interface InfrastructureLedgerResponse {
+  schemaVersion: 1;
+  generatedAt: string;
+  updatedAt: string;
+  limits: {
+    usedBytes: number;
+    maximumBytes: number;
+    maximumEntries: number;
+    maximumReferences: number;
+  };
+  coverage: {
+    from: string | null;
+    through: string;
+    sources: Array<{
+      id: string;
+      label: InfrastructureLedgerText;
+      from: string | null;
+      through: string | null;
+    }>;
+    limitations: InfrastructureLedgerText[];
+  };
+  references: InfrastructureLedgerReference[];
+  entries: InfrastructureLedgerEntry[];
 }

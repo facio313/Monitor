@@ -16,6 +16,7 @@ import type {
   AlertEvent,
   ContainerStatus,
   DashboardPayload,
+  MonitorLocale,
   MonitorPage,
   PeakIncident,
   PowerEvent,
@@ -41,6 +42,7 @@ import {
 } from '../utils';
 import { Icon, type IconName } from './Icon';
 import { PasswordChangeDialog } from './PasswordChangeDialog';
+import { Pagination, paginateItems, usePagination } from './Pagination';
 
 const RANGES: Array<{ value: TimeRange; label: string }> = [
   { value: '1h', label: '1H' },
@@ -1034,10 +1036,20 @@ function StatusBadge({ value, tone }: { value: unknown; tone?: StatusTone }) {
   return <span className={`status-badge badge-${tone ?? normalizeTone(safeValue)}`}><span />{label}</span>;
 }
 
-export function ContainerList({ containers }: { containers: ContainerStatus[] }) {
+export function ContainerList({ containers, paginationOptions }: {
+  containers: ContainerStatus[];
+  paginationOptions?: { pageSize: number; locale: MonitorLocale };
+}) {
   const [sort, setSort] = useState<ContainerSort>(DEFAULT_CONTAINER_SORT);
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(() => new Set());
   const groups = useMemo(() => groupContainers(containers, sort), [containers, sort]);
+  const groupSignature = groups.map((group) => group.key).join('\u001f');
+  const pagination = usePagination({
+    totalItems: groups.length,
+    pageSize: paginationOptions?.pageSize ?? Math.max(groups.length, 1),
+    resetKey: `${sort.key ?? 'grouped'}\u001e${sort.direction}\u001e${groupSignature}`,
+  });
+  const visibleGroups = paginationOptions ? paginateItems(groups, pagination) : groups;
   const groupedKeys = groups.filter((group) => group.grouped).map((group) => group.key);
   const allGroupsExpanded = groupedKeys.length > 0 && groupedKeys.every((key) => expandedGroups.has(key));
 
@@ -1081,9 +1093,9 @@ export function ContainerList({ containers }: { containers: ContainerStatus[] })
             <ContainerSortHeader column="cpu" label="CPU" sort={sort} onSort={handleSort} />
             <ContainerSortHeader column="memory" label="Memory" sort={sort} onSort={handleSort} />
           </tr></thead>
-          {groups.map((group, groupIndex) => {
+          {visibleGroups.map((group, groupIndex) => {
             const expanded = group.grouped && expandedGroups.has(group.key);
-            const childRegionId = containerGroupRegionId(group, groupIndex, 'desktop');
+            const childRegionId = containerGroupRegionId(group, pagination.startIndex + groupIndex, 'desktop');
             return (
               <Fragment key={`${group.key}-desktop`}>
                 <tbody>
@@ -1134,9 +1146,9 @@ export function ContainerList({ containers }: { containers: ContainerStatus[] })
           {sort.key === null ? 'Grouped' : sort.direction === 'ascending' ? 'Ascending ↑' : 'Descending ↓'}
         </button>
       </div>
-      <div className="container-cards">{groups.map((group, groupIndex) => {
+      <div className="container-cards">{visibleGroups.map((group, groupIndex) => {
         const expanded = group.grouped && expandedGroups.has(group.key);
-        const childRegionId = containerGroupRegionId(group, groupIndex, 'mobile');
+        const childRegionId = containerGroupRegionId(group, pagination.startIndex + groupIndex, 'mobile');
         if (!group.grouped) {
           const child = group.children[0];
           return <ContainerCard container={child.container} key={`${child.key}-mobile`} />;
@@ -1170,6 +1182,16 @@ export function ContainerList({ containers }: { containers: ContainerStatus[] })
           </section>
         );
       })}</div>
+      {paginationOptions && (
+        <Pagination
+          model={pagination}
+          locale={paginationOptions.locale}
+          onPageChange={pagination.setPage}
+          ariaLabel={paginationOptions.locale === 'ko' ? '서비스와 컨테이너 페이지' : 'Service and container pages'}
+          itemLabel={paginationOptions.locale === 'ko' ? '개 서비스' : 'services'}
+          className="container-list-pagination"
+        />
+      )}
     </>
   );
 }
@@ -1935,7 +1957,13 @@ function reliabilityKindLabel(kind: ReliabilityEvent['kind']): string {
     'network-link': 'Network link',
     'nvme-reset': 'NVMe controller reset',
     'nvme-io': 'NVMe I/O error',
+    'pcie-aer': 'PCIe AER error',
+    'pcie-link': 'PCIe link error',
     'rcu-stall': 'Kernel RCU stall',
+    'kernel-warning': 'Kernel warning',
+    'kernel-oops': 'Kernel oops',
+    'kernel-panic': 'Kernel panic',
+    'hung-task': 'Hung task',
     'oom-kill': 'Out-of-memory kill',
     'filesystem-error': 'Filesystem error',
     'nvme-mitigation': 'NVMe mitigation',

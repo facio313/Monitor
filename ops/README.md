@@ -13,27 +13,53 @@ starts. Neither helper changes Docker or host configuration.
 The default output root is `/var/lib/monitor-export`:
 
 - `current.json`: atomically replaced snapshot with exactly the public keys
-  `generatedAt`, `host`, `latest`, `disks`, `containers`, and `reliability`.
-  `latest` includes memory byte totals, all three load averages, current power
-  state, supply voltage, the complete `get_throttled` flags integer, and GPU
-  allocation/clock fields in addition to the rate metrics. The nullable fields
+  `generatedAt`, `host`, `latest`, `disks`, `containers`, `currentTraffic`,
+  `reliability`, and `system`.
+  `host` includes the online logical-CPU count derived from aggregate
+  `/proc/stat`. `latest` includes memory and swap byte totals/usage, swap
+  percentage, all three load averages, current CPU/memory/I/O PSI `some` and
+  `full` avg10 percentages, current power state, supply voltage, the standard
+  Raspberry Pi hwmon under-voltage alarm encoded in bit 0 of
+  `throttledFlags`, GPU allocation/clock fields, and aggregate non-loopback
+  network byte/error/drop rates in addition to the disk rate metrics. Network
+  interface names never enter the export. The nullable fields
   `supplyVoltageVolts` and `throttledFlags` immediately follow `powerState` in
   both current and history samples.
-  Each disk is exactly `mount`, `totalBytes`, `usedBytes`, and `usedPercent`.
+  Each disk is exactly `mount`, `totalBytes`, `usedBytes`, `availableBytes`,
+  `usedPercent`, `inodeUsedPercent`, and `readOnly`. Inode usage is aggregate;
+  filenames and inode identities are never collected.
+  Each `currentTraffic` entry is exactly `app`, `requestCount`, `status2xx`,
+  `status3xx`, `status4xx`, `status5xx`, `slowCount`, `avgResponseMs`, and
+  `maxResponseMs`; at most 16 allow-listed app groups are emitted.
   `reliability` contains only the calculated boot time, the prior collector
   heartbeat gap, expected SSH-listener availability, primary physical-link
   availability, and runtime NVMe power-management mitigation state. The boot
   ID used to detect a restart stays in private collector state.
+  `system` is a fixed, serial-free snapshot containing running/latest-installed
+  kernel versions, bootloader channel/dates, NVMe model/firmware, collector
+  version, configured/negotiated PCIe link properties, AER counters/status,
+  power-saving settings, and current-boot semantic kernel-event counters with
+  their last timestamps.
+  The collector deliberately lacks `CAP_SYS_ADMIN`, so Linux normally truncates
+  PCI config-space reads before the optional Device Status bits. Those three
+  nullable flags remain unknown while capability-free AER counters and semantic
+  kernel events remain authoritative; do not broaden collector capabilities.
 - `history/YYYY-MM-DD.jsonl`: atomically replaced daily sample series. At most
   2,000 valid rows are kept per day, and files older than 30 calendar days are
-  pruned. On rewrite, valid rows from the immediately preceding sample contract
-  are migrated by adding the two new nullable power fields; foreign fields,
-  invalid timestamps, booleans in numeric fields, and non-finite numbers are
-  not propagated.
+  pruned. On rewrite, valid rows from all three retained sample contracts
+  (before nullable power fields, after power fields, and after swap/PSI fields)
+  are migrated to the current exact schema by adding nullable aggregate network
+  error/drop rates. Foreign fields, invalid timestamps, booleans in numeric
+  fields, inconsistent swap values, negative rates, out-of-range percentages,
+  and non-finite numbers are not propagated.
+  The private delta-state migration accepts the prior two-counter network
+  baseline: RX/TX byte rates remain available on the first upgraded interval,
+  while the four newly introduced error/drop rates remain `null` until the next
+  complete six-counter interval.
 - `alerts.jsonl`: at most 5,000 semantic `SNAPSHOT`, `metrics`, `RECOVERED`, or
   fixed maintenance events. Raw lines are never copied. On Raspberry Pi-class
-  hosts with `vcgencmd`, current throttle/power transitions are also emitted
-  here. A transition message includes the validated full flags and, when
+  hosts with the `rpi_volt` hwmon sensor, current under-voltage transitions are
+  also emitted here. A transition message includes the validated flags and, when
   available, the validated supply-voltage observation; voltage changes alone
   never create an alert.
 - `power.jsonl`: at most 5,000 fixed-message kernel power/storage events with
@@ -48,9 +74,15 @@ The default output root is `/var/lib/monitor-export`:
   nullable `durationSeconds`. It records boot transitions, collector gaps over
   three minutes, expected SSH listener loss/recovery, primary-link
   loss/recovery, NVMe reset/I/O errors, RCU stalls, OOM kills, filesystem
-  errors, and runtime NVMe mitigation transitions. Kernel lines are mapped to
-  fixed messages; IP addresses, ports, PIDs, process names, paths, usernames,
+  errors, PCIe AER/link events, kernel warnings/oops/panics, hung tasks, and
+  runtime NVMe mitigation transitions. Kernel lines are mapped to fixed
+  messages; IP addresses, ports, PIDs, process names, paths, usernames,
   commands, and raw log text are never exported.
+  Expedited RCU short-delay rows remain in this log and are also counted in a
+  dedicated current-boot `system.kernel.rcuExpedited` field rather than the
+  generic warning or active-stall counters. Kernel reliability timestamps keep
+  available microsecond precision, so distinct reports within the same second
+  remain distinct while exact replayed rows are still deduplicated.
 - `privilege.jsonl`: at most 5,000 records containing **only** `timestamp`,
   `actor`, `target`, `action`, and `result`. In particular, command text and
   arguments are never exported. The default source is the already-focused
@@ -89,7 +121,8 @@ deleted or overwritten. The sole linked-file exception is the collector's own
 interrupted no-replace publication: exactly one strict-name temporary sibling
 with the same device/inode, owner, mode, and link count is unlinked and the
 state directory fsynced before the journal is fully revalidated and replayed.
-Reliability rows and their boot/listener/link/kernel-cursor state use the same
+Reliability rows and their boot/listener/link/kernel-cursor/current-boot-count
+state use the same
 events-before-state invariant through a separate bounded mode-`0600`
 `.state/pending-reliability-commit.json`. A crash after the public atomic
 rewrite but before private state publication is replayed by digest without
@@ -104,8 +137,8 @@ only in `/run/monitor-container-exporter/cpu-state.json`, owned by `cks` mode
 `0600`; the root collector is bind-mounted only the separate reduced
 `containers.json` file. Neither PID nor container ID enters a public export.
 
-When `vcgencmd` exists, the collector reads throttle/power flags, GPU
-temperature, allocated memory, core clock, core voltage, and on Raspberry Pi 5
+When `vcgencmd` exists, the collector reads GPU temperature, allocated memory,
+core clock, core voltage, and on Raspberry Pi 5
 the external supply rail using `/usr/bin/vcgencmd pmic_read_adc EXT5V_V`, all
 with the same strict command timeout and a 256-byte output limit per command.
 Only a finite `EXT5V_V` value in the protocol sanity range 0–10 V is accepted;
@@ -113,16 +146,17 @@ it is rounded to three decimal places. That broad input bound is not a health
 threshold. A malformed response, unsupported command, timeout, or non-zero
 exit produces `null`, never zero fabricated from failure.
 
-GPU temperature is used as the host temperature fallback; memory, clock,
-supply voltage, and full unsigned 32-bit throttle flags populate the public
-snapshot; and current throttle transitions become semantic alerts. Active
-low-bit conditions take precedence. When those bits are clear but historical
-high bits remain set (for example `0x50000`), the snapshot reports
-`powerState: "degraded-history"`; it reports `normal` only when neither current
-nor historical flags are present. No voltage threshold is used to classify
-power state or emit alerts: kernel events and `vcgencmd get_throttled` remain
-authoritative. The dedicated kernel cursor also captures brief under-voltage
-events that begin and recover between one-minute `vcgencmd` samples.
+GPU temperature is used as the host temperature fallback; memory, clock, and
+supply voltage populate the public snapshot. The current under-voltage alarm is
+discovered by the exact hwmon sensor name `rpi_volt` and read from its standard
+read-only `in0_lcrit_alarm` attribute; hwmon indices are never assumed stable.
+It maps to bit 0 of the compatible unsigned 32-bit `throttledFlags` field.
+Retained samples can still contain legacy high-bit history, but the collector
+never invokes deprecated `vcgencmd get_throttled`, which emits a kernel warning
+on current Raspberry Pi kernels. No voltage threshold is used to classify power
+state or emit alerts: the hwmon alarm and kernel events remain authoritative.
+The dedicated kernel cursor also captures brief under-voltage events that begin
+and recover between one-minute hwmon samples.
 
 `MONITOR_KERNEL_LOG` defaults to `/var/log/kern.log`. On the first run and after
 rotation, the collector examines only the newest 8 MiB
@@ -195,10 +229,60 @@ installation, and removal share one maintenance lock. The retention path
 remains installed after traffic logging is removed, and a root-owned retirement
 marker created only after a successful Nginx reload then permits it to expire
 the final inactive file once the marker itself has aged for 48 hours. Only
-per-app counts and latency
-summaries for one collector capture interval can enter an incident export. They
+per-app counts, status classes, slow counts, and latency summaries for one
+collector capture interval can enter `currentTraffic` and an incident export.
+An empty current list can also mean the optional source was unavailable. These
 are request counts, not people or unique visitors; calculating visitors would
 require a stable client identifier that this input intentionally never records.
+
+## Infrastructure work ledger
+
+`infrastructure_ledger.py` manages a record deliberately separate from the
+collector's bounded telemetry and event retention. The canonical stream is
+`/var/lib/monitor-infrastructure-ledger/events.jsonl`; its catalog and lock are
+in the same root-only mode-`0700` directory. The Monitor-readable
+materialization is `/var/lib/monitor-export/infrastructure-ledger.json`, owned
+`root:cks` mode `0640` and consumed through the existing read-only `/data`
+mount.
+
+Keep the reviewed bootstrap record outside the public checkout as a root-owned
+mode-`0600` file. Verify it, then install it explicitly:
+
+```sh
+cd /home/cks/Monitor/ops
+sudo /usr/bin/python3 infrastructure_ledger.py verify \
+  --input /root/reviewed-monitor-ledger-seed.json
+sudo sh install-infrastructure-ledger.sh \
+  /root/reviewed-monitor-ledger-seed.json
+sudo /usr/local/sbin/monitor-infrastructure-ledger publish
+sudo -u cks python3 -m json.tool \
+  /var/lib/monitor-export/infrastructure-ledger.json >/dev/null
+```
+
+For an upgrade with an existing canonical stream, run the installer without a
+seed argument. It updates the writer and republishes that stream. A first-time
+installation refuses to proceed without an explicit absolute private seed
+path. Real ledger seeds are ignored by Git; the public repository contains the
+schema, implementation, and synthetic test fixtures only.
+
+`sync-seed` is idempotent: an identical event is skipped, while reusing an ID
+or reference with different content fails. `append --input FILE` accepts one
+exact-schema entry and checks revision and source links against the full stream
+before appending and fsyncing it. `publish` recreates only the sanitized public
+snapshot. None of these commands prune canonical history.
+
+Mutation input is staged as a root-owned regular file with no group/world write
+permission; mode `0600` under `/root` is the expected boundary for append. The
+installer copies the explicitly supplied private seed into a short-lived
+mode-`0600` staging file before invoking the installed writer.
+
+The writer rejects symlinks, hard links, broad permissions, oversized input,
+unknown fields and enums, broken revision chains, and credential-like text.
+Inputs must contain semantic evidence references, never raw shell commands or
+arguments, passwords, tokens, cookies, private keys, client addresses, or
+personal identifiers. Completed work requires evidence and a verified or
+partially verified state. Back up the private canonical directory separately
+and exercise restore; the Monitor export is a derived copy, not the backup.
 
 ## Install
 

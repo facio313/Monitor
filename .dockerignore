@@ -2,9 +2,12 @@
 .github
 node_modules
 dist
+.runtime
 data
 secrets
 auth-state
 .env
 *.log
+coverage
+ops/ledger/initial-ledger.json
 README.md

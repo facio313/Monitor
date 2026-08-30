@@ -1,0 +1,47 @@
+[Unit]
+Description=Unprivileged Monitor host update request gateway
+Documentation=file:/usr/local/share/doc/monitor-updater/README.md
+Requires=monitor-update-gateway.socket
+After=local-fs.target monitor-update-gateway.socket
+
+[Service]
+Type=simple
+User=monitor-updater
+Group=monitor-updater
+ExecStart=/usr/bin/python3 /usr/local/lib/monitor-updater/monitor_update_gateway.py --listen-fd=3 --queue-dir=/var/lib/monitor-update/incoming --peer-uid=1001
+UMask=0077
+
+# The public application reaches only this fixed-protocol, unprivileged
+# process. It may write only reduced request records and cannot run APT.
+# The socket manager opens the root-owned host pathname before this service
+# starts and passes that listening socket as FD 3. The gateway never resolves
+# or reopens the socket path from inside its mount namespace.
+ProtectSystem=strict
+ProtectHome=true
+InaccessiblePaths=/home /root
+ReadWritePaths=/var/lib/monitor-update/incoming
+PrivateTmp=true
+PrivateDevices=true
+PrivateNetwork=true
+NoNewPrivileges=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+CapabilityBoundingSet=
+TasksMax=16
+MemoryHigh=32M
+MemoryMax=48M
+Restart=on-failure
+RestartSec=2s
+TimeoutStartSec=10s
+TimeoutStopSec=10s

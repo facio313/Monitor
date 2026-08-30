@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 
-SAMPLE_FIELDS = (
+POWER_SAMPLE_FIELDS = (
     "timestamp",
     "cpuPercent",
     "memoryPercent",
@@ -53,11 +53,62 @@ SAMPLE_FIELDS = (
     "diskWriteBytesPerSecond",
 )
 LEGACY_SAMPLE_FIELDS = tuple(
-    field for field in SAMPLE_FIELDS if field not in {"supplyVoltageVolts", "throttledFlags"}
+    field
+    for field in POWER_SAMPLE_FIELDS
+    if field not in {"supplyVoltageVolts", "throttledFlags"}
 )
+PREVIOUS_SAMPLE_FIELDS = (
+    "timestamp",
+    "cpuPercent",
+    "memoryPercent",
+    "memoryUsedBytes",
+    "memoryTotalBytes",
+    "swapTotalBytes",
+    "swapUsedBytes",
+    "swapPercent",
+    "temperatureC",
+    "load1",
+    "load5",
+    "load15",
+    "cpuPressureSomeAvg10",
+    "cpuPressureFullAvg10",
+    "memoryPressureSomeAvg10",
+    "memoryPressureFullAvg10",
+    "ioPressureSomeAvg10",
+    "ioPressureFullAvg10",
+    "powerState",
+    "supplyVoltageVolts",
+    "throttledFlags",
+    "gpuMemoryBytes",
+    "gpuClockHz",
+    "networkRxBytesPerSecond",
+    "networkTxBytesPerSecond",
+    "diskReadBytesPerSecond",
+    "diskWriteBytesPerSecond",
+)
+NETWORK_QUALITY_SAMPLE_FIELDS = (
+    "networkRxErrorsPerSecond",
+    "networkTxErrorsPerSecond",
+    "networkRxDroppedPerSecond",
+    "networkTxDroppedPerSecond",
+)
+SAMPLE_FIELDS = (
+    *PREVIOUS_SAMPLE_FIELDS[:-2],
+    *NETWORK_QUALITY_SAMPLE_FIELDS,
+    *PREVIOUS_SAMPLE_FIELDS[-2:],
+)
+SAMPLE_FIELD_SCHEMAS = frozenset({
+    frozenset(LEGACY_SAMPLE_FIELDS),
+    frozenset(POWER_SAMPLE_FIELDS),
+    frozenset(PREVIOUS_SAMPLE_FIELDS),
+    frozenset(SAMPLE_FIELDS),
+})
 MAX_UINT32 = (1 << 32) - 1
+MAX_SAFE_COUNTER = (1 << 53) - 1
 MAX_SUPPLY_VOLTAGE_VOLTS = 10.0
 DEFAULT_KERNEL_MAX_INPUT_BYTES = 8_388_608
+MAX_KERNEL_BACKFILL_BYTES = 16_777_216
+COLLECTOR_VERSION = "1.0.0"
 DEFAULT_SOCKETS = {
     "cks": "/run/user/1001/docker.sock",
 }
@@ -141,6 +192,50 @@ VIRTUAL_FILESYSTEMS = {
     "overlay", "proc", "pstore", "ramfs", "securityfs", "sysfs", "tmpfs",
     "tracefs",
 }
+LEGACY_KERNEL_EVENT_SUMMARY_KEYS = (
+    "warning",
+    "oops",
+    "panic",
+    "hungTask",
+    "rcuStall",
+    "oomKill",
+    "filesystemError",
+    "nvmeReset",
+    "nvmeIo",
+    "pcieAerCorrectable",
+    "pcieAerNonFatal",
+    "pcieAerFatal",
+)
+KERNEL_EVENT_SUMMARY_KEYS = (
+    "warning",
+    "oops",
+    "panic",
+    "hungTask",
+    "rcuStall",
+    "rcuExpedited",
+    "oomKill",
+    "filesystemError",
+    "nvmeReset",
+    "nvmeIo",
+    "pcieAerCorrectable",
+    "pcieAerNonFatal",
+    "pcieAerFatal",
+)
+KERNEL_EVENT_SUMMARY_MAP = {
+    ("kernel-warning", "active"): "warning",
+    ("kernel-oops", "active"): "oops",
+    ("kernel-panic", "active"): "panic",
+    ("hung-task", "active"): "hungTask",
+    ("rcu-stall", "expedited"): "rcuExpedited",
+    ("rcu-stall", "active"): "rcuStall",
+    ("oom-kill", "active"): "oomKill",
+    ("filesystem-error", "active"): "filesystemError",
+    ("nvme-reset", "active"): "nvmeReset",
+    ("nvme-io", "active"): "nvmeIo",
+    ("pcie-aer", "correctable"): "pcieAerCorrectable",
+    ("pcie-aer", "nonfatal"): "pcieAerNonFatal",
+    ("pcie-aer", "fatal"): "pcieAerFatal",
+}
 
 
 def utc_now() -> dt.datetime:
@@ -149,6 +244,13 @@ def utc_now() -> dt.datetime:
 
 def iso_timestamp(value: dt.datetime) -> str:
     return value.astimezone(dt.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def iso_event_timestamp(value: dt.datetime) -> str:
+    """Canonicalize an event time without merging distinct sub-second events."""
+    normalized = value.astimezone(dt.timezone.utc)
+    timespec = "microseconds" if normalized.microsecond else "seconds"
+    return normalized.isoformat(timespec=timespec).replace("+00:00", "Z")
 
 
 def finite_number(value: Any, default: float | None = None) -> float | None:
@@ -196,6 +298,14 @@ def read_text(path: Path, maximum: int = 1_048_576) -> str:
             return handle.read(maximum)
     except (OSError, ValueError):
         return ""
+
+
+def read_bytes(path: Path, maximum: int = 4096) -> bytes:
+    try:
+        with path.open("rb") as handle:
+            return handle.read(maximum)
+    except (OSError, ValueError):
+        return b""
 
 
 def ensure_directory(path: Path, mode: int = 0o750) -> None:
@@ -464,6 +574,22 @@ def parse_proc_stat(text: str) -> tuple[int, int] | None:
     return None
 
 
+def parse_logical_cpu_count(text: str) -> int | None:
+    cpu_ids: set[int] = set()
+    for line in text.splitlines():
+        fields = line.split()
+        if not fields:
+            continue
+        match = re.fullmatch(r"cpu(\d+)", fields[0])
+        if match is None:
+            continue
+        identifier = int(match.group(1))
+        if identifier > 4095:
+            return None
+        cpu_ids.add(identifier)
+    return len(cpu_ids) if cpu_ids else None
+
+
 def calculate_cpu(current: tuple[int, int] | None, previous: Any) -> float | None:
     if current is None or not isinstance(previous, list) or len(previous) != 2:
         return None
@@ -496,6 +622,24 @@ def parse_meminfo(text: str) -> tuple[int | None, int | None]:
     return total, min(total, max(0, available))
 
 
+def parse_swapinfo(text: str) -> tuple[int | None, int | None, float | None]:
+    values: dict[str, int] = {}
+    for line in text.splitlines():
+        match = re.match(r"^([A-Za-z_()]+):\s+(\d+)\s*(kB)?", line)
+        if match:
+            multiplier = 1024 if match.group(3) else 1
+            values[match.group(1)] = int(match.group(2)) * multiplier
+    total = values.get("SwapTotal")
+    free = values.get("SwapFree")
+    if total is None or total < 0:
+        return None, None, None
+    if free is None or free < 0:
+        return total, None, None
+    used = total - min(total, free)
+    percent = round(100.0 * used / total, 2) if total > 0 else 0.0
+    return total, used, percent
+
+
 def parse_loadavg(text: str) -> tuple[float | None, float | None, float | None]:
     fields = text.split()
     values: list[float | None] = []
@@ -510,29 +654,53 @@ def parse_uptime(text: str) -> int:
     return max(0, int(value or 0))
 
 
-def parse_net_dev(text: str) -> tuple[int, int] | None:
+def parse_net_dev(text: str) -> tuple[int, int, int, int, int, int] | None:
     received = transmitted = 0
+    receive_errors = transmit_errors = 0
+    receive_dropped = transmit_dropped = 0
     observed = False
     for line in text.splitlines():
         if ":" not in line:
             continue
         interface, counters = line.split(":", 1)
         fields = counters.split()
-        if len(fields) < 9:
+        if len(fields) < 12:
             continue
         try:
             current_received = int(fields[0])
             current_transmitted = int(fields[8])
+            current_receive_errors = int(fields[2])
+            current_transmit_errors = int(fields[10])
+            current_receive_dropped = int(fields[3])
+            current_transmit_dropped = int(fields[11])
         except ValueError:
             continue
-        if current_received < 0 or current_transmitted < 0:
+        if any(value < 0 for value in (
+            current_received,
+            current_transmitted,
+            current_receive_errors,
+            current_transmit_errors,
+            current_receive_dropped,
+            current_transmit_dropped,
+        )):
             continue
-        observed = True
         if interface.strip() == "lo":
             continue
+        observed = True
         received += current_received
         transmitted += current_transmitted
-    return (received, transmitted) if observed else None
+        receive_errors += current_receive_errors
+        transmit_errors += current_transmit_errors
+        receive_dropped += current_receive_dropped
+        transmit_dropped += current_transmit_dropped
+    return (
+        received,
+        transmitted,
+        receive_errors,
+        transmit_errors,
+        receive_dropped,
+        transmit_dropped,
+    ) if observed else None
 
 
 def parse_diskstats(text: str) -> tuple[int, int] | None:
@@ -580,6 +748,44 @@ def rate_pair(
     if first < 0 or second < 0:
         return None, None
     return round(first / elapsed, 2), round(second / elapsed, 2)
+
+
+def network_rate_values(
+    current: tuple[int, int, int, int, int, int] | None,
+    previous: Any,
+    elapsed: float,
+) -> tuple[
+    float | None,
+    float | None,
+    float | None,
+    float | None,
+    float | None,
+    float | None,
+]:
+    if (
+        current is None
+        or not isinstance(previous, list)
+        or len(previous) not in {2, 6}
+        or not math.isfinite(elapsed)
+        or elapsed <= 0
+    ):
+        return None, None, None, None, None, None
+    rates: list[float | None] = []
+    for index, counter in enumerate(current):
+        if index >= len(previous):
+            rates.append(None)
+            continue
+        prior = previous[index]
+        if (
+            isinstance(prior, bool)
+            or not isinstance(prior, int)
+            or prior < 0
+            or counter < prior
+        ):
+            rates.append(None)
+            continue
+        rates.append(round((counter - prior) / elapsed, 2))
+    return rates[0], rates[1], rates[2], rates[3], rates[4], rates[5]
 
 
 def parse_pressure(text: str) -> dict[str, float | None]:
@@ -754,20 +960,54 @@ def read_temperature(sys_root: Path) -> float | None:
     return round(max(values), 1) if values else None
 
 
-def parse_mountinfo(text: str) -> list[tuple[str, str, str]]:
-    mounts: list[tuple[str, str, str]] = []
+def read_rpi_undervoltage_alarm(sys_root: Path) -> int | None:
+    """Read the standard Raspberry Pi hwmon under-voltage alarm.
+
+    Recent Raspberry Pi kernels warn when the legacy firmware
+    ``get_throttled`` attribute is queried. The hwmon driver polls that
+    firmware state itself and exposes the current alarm as a safe boolean.
+    Discover by sensor name because hwmon indices are not stable across boots.
+    """
+    hwmon_root = sys_root / "class" / "hwmon"
+    try:
+        devices = sorted(hwmon_root.glob("hwmon*"))[:256]
+    except OSError:
+        devices = []
+    found_normal = False
+    for device in devices:
+        if read_text(device / "name", 64).strip() != "rpi_volt":
+            continue
+        alarm = read_text(device / "in0_lcrit_alarm", 16).strip()
+        if alarm == "1":
+            return 1
+        if alarm == "0":
+            found_normal = True
+    return 0 if found_normal else None
+
+
+def parse_mountinfo(text: str) -> list[tuple[str, str, str, bool]]:
+    mounts: list[tuple[str, str, str, bool]] = []
     for line in text.splitlines():
         fields = line.split()
         try:
             separator = fields.index("-")
             mount_point = fields[4].replace("\\040", " ").replace("\\134", "\\")
+            mount_options = fields[5].split(",")
             filesystem = fields[separator + 1]
             device = fields[separator + 2]
+            super_options = fields[separator + 3].split(",")
         except (ValueError, IndexError):
             continue
         if filesystem in VIRTUAL_FILESYSTEMS or not mount_point.startswith("/"):
             continue
-        mounts.append((mount_point, device, filesystem))
+        if not ({"ro", "rw"} & set(mount_options)):
+            continue
+        mounts.append((
+            mount_point,
+            device,
+            filesystem,
+            "ro" in mount_options or "ro" in super_options,
+        ))
     return mounts
 
 
@@ -775,7 +1015,7 @@ def collect_filesystems(mountinfo: str, mount_root: Path | None = None) -> list[
     disks: list[dict[str, Any]] = []
     seen: set[str] = set()
     seen_devices: set[str] = set()
-    for mount_point, device, filesystem in parse_mountinfo(mountinfo):
+    for mount_point, device, filesystem, read_only in parse_mountinfo(mountinfo):
         if mount_point in seen or device in seen_devices:
             continue
         seen.add(mount_point)
@@ -786,13 +1026,28 @@ def collect_filesystems(mountinfo: str, mount_root: Path | None = None) -> list[
             continue
         if usage.total <= 0:
             continue
+        inode_used_percent: float | None = None
+        try:
+            filesystem_stats = os.statvfs(actual_path)
+            inode_total = int(filesystem_stats.f_files)
+            inode_free = int(filesystem_stats.f_ffree)
+            if inode_total > 0 and 0 <= inode_free <= inode_total:
+                inode_used_percent = round(
+                    100.0 * (inode_total - inode_free) / inode_total,
+                    2,
+                )
+        except (OSError, OverflowError, TypeError, ValueError):
+            pass
         seen_devices.add(device)
         percent = round(100.0 * usage.used / usage.total, 2) if usage.total else 0.0
         disks.append({
             "mount": mount_point,
             "totalBytes": usage.total,
             "usedBytes": usage.used,
+            "availableBytes": max(0, min(usage.total, usage.free)),
             "usedPercent": percent,
+            "inodeUsedPercent": inode_used_percent,
+            "readOnly": read_only,
         })
     return sorted(disks, key=lambda item: item["mount"])
 
@@ -807,11 +1062,438 @@ def parse_os_release(text: str) -> str:
     return bounded_text(values.get("PRETTY_NAME") or values.get("NAME") or platform.system(), 128)
 
 
+def safe_version(value: Any, maximum: int = 128) -> str | None:
+    text = str(value).strip()
+    if not text or len(text) > maximum:
+        return None
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+:/ -]*", text) is None:
+        return None
+    return text
+
+
+def empty_kernel_event_summary() -> dict[str, dict[str, Any]]:
+    return {
+        key: {"count": 0, "lastEventAt": None}
+        for key in KERNEL_EVENT_SUMMARY_KEYS
+    }
+
+
+def _existing_kernel_event_summary_for_keys(
+    value: Any,
+    keys: Sequence[str],
+) -> dict[str, dict[str, Any]] | None:
+    if not isinstance(value, Mapping) or set(value) != set(keys):
+        return None
+    result: dict[str, dict[str, Any]] = {}
+    for key in keys:
+        raw = value.get(key)
+        if not isinstance(raw, Mapping) or set(raw) != {"count", "lastEventAt"}:
+            return None
+        count = raw.get("count")
+        if isinstance(count, bool) or not isinstance(count, int) or not 0 <= count <= MAX_SAFE_COUNTER:
+            return None
+        raw_timestamp = raw.get("lastEventAt")
+        if raw_timestamp is None:
+            timestamp = None
+        else:
+            parsed = parse_iso_timestamp(raw_timestamp)
+            if parsed is None:
+                return None
+            timestamp = iso_event_timestamp(parsed)
+        if (count == 0) != (timestamp is None):
+            return None
+        result[key] = {"count": count, "lastEventAt": timestamp}
+    return result
+
+
+def existing_kernel_event_summary(value: Any) -> dict[str, dict[str, Any]] | None:
+    return _existing_kernel_event_summary_for_keys(value, KERNEL_EVENT_SUMMARY_KEYS)
+
+
+def existing_legacy_kernel_event_summary(
+    value: Any,
+) -> dict[str, dict[str, Any]] | None:
+    return _existing_kernel_event_summary_for_keys(
+        value, LEGACY_KERNEL_EVENT_SUMMARY_KEYS
+    )
+
+
+def migrate_v2_kernel_event_summary(
+    legacy_summary: Mapping[str, Mapping[str, Any]],
+    retained_records: Sequence[Mapping[str, Any]],
+    boot_started_at: str | None,
+    now: dt.datetime,
+) -> dict[str, dict[str, Any]]:
+    """Split the ambiguous v2 warning counter using retained boot evidence only."""
+    normalized = existing_legacy_kernel_event_summary(legacy_summary)
+    if normalized is None:
+        return empty_kernel_event_summary()
+    result = empty_kernel_event_summary()
+    for key in LEGACY_KERNEL_EVENT_SUMMARY_KEYS:
+        if key != "warning":
+            result[key] = dict(normalized[key])
+    retained = (
+        update_kernel_event_summary(
+            empty_kernel_event_summary(), retained_records, boot_started_at, now
+        )
+        if boot_started_at is not None
+        else empty_kernel_event_summary()
+    )
+    result["warning"] = dict(retained["warning"])
+    result["rcuExpedited"] = dict(retained["rcuExpedited"])
+    return result
+
+
+def update_kernel_event_summary(
+    summary: Mapping[str, Mapping[str, Any]],
+    records: Sequence[Mapping[str, Any]],
+    boot_started_at: str | None,
+    now: dt.datetime,
+) -> dict[str, dict[str, Any]]:
+    normalized = existing_kernel_event_summary(summary)
+    result = normalized if normalized is not None else empty_kernel_event_summary()
+    boot_started = parse_iso_timestamp(boot_started_at) if boot_started_at else None
+    seen: set[tuple[str, str, str]] = set()
+    for record in records:
+        kind = str(record.get("kind", ""))
+        status = str(record.get("status", ""))
+        key = KERNEL_EVENT_SUMMARY_MAP.get((kind, status))
+        timestamp_text = event_timestamp(
+            str(record.get("timestamp", "")), "", preserve_subseconds=True
+        )
+        timestamp = parse_iso_timestamp(timestamp_text)
+        if key is None or timestamp is None:
+            continue
+        if boot_started is not None and timestamp < boot_started:
+            continue
+        if timestamp > now + dt.timedelta(minutes=1):
+            continue
+        identity = (timestamp_text, kind, status)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        current = result[key]
+        current["count"] = min(MAX_SAFE_COUNTER, int(current["count"]) + 1)
+        previous = parse_iso_timestamp(current.get("lastEventAt"))
+        if previous is None or timestamp > previous:
+            current["lastEventAt"] = timestamp_text
+    return result
+
+
+def read_device_tree_uint32(path: Path) -> int | None:
+    payload = read_bytes(path, 5)
+    return int.from_bytes(payload, "big") if len(payload) == 4 else None
+
+
+def bootloader_date(sys_root: Path) -> str | None:
+    timestamp = read_device_tree_uint32(
+        sys_root / "firmware" / "devicetree" / "base" / "chosen" / "bootloader" / "build-timestamp"
+    )
+    if timestamp is None:
+        return None
+    try:
+        value = dt.datetime.fromtimestamp(timestamp, dt.timezone.utc).date()
+    except (OverflowError, OSError, ValueError):
+        return None
+    return value.isoformat() if dt.date(2012, 1, 1) <= value <= dt.date(2100, 1, 1) else None
+
+
+def bootloader_channel(etc_root: Path) -> str | None:
+    text = read_text(etc_root / "default" / "rpi-eeprom-update", 8192)
+    match = re.search(
+        r'^\s*FIRMWARE_RELEASE_STATUS\s*=\s*["\']?(default|latest)["\']?\s*(?:#.*)?$',
+        text,
+        re.MULTILINE,
+    )
+    return match.group(1) if match else None
+
+
+def raspberry_pi_soc(sys_root: Path) -> str | None:
+    compatible = read_bytes(
+        sys_root / "firmware" / "devicetree" / "base" / "compatible",
+        4096,
+    ).split(b"\0")
+    for value in compatible:
+        match = re.fullmatch(rb"brcm,bcm(2711|2712)", value)
+        if match:
+            return match.group(1).decode("ascii")
+    return None
+
+
+def latest_bootloader_date(
+    package_root: Path,
+    sys_root: Path,
+    channel: str | None,
+) -> str | None:
+    if channel not in {"default", "latest"}:
+        return None
+    soc = raspberry_pi_soc(sys_root)
+    if soc is None:
+        return None
+    candidates: list[dt.date] = []
+    relative = Path("firmware") / "raspberrypi" / f"bootloader-{soc}" / channel
+    for library in ("lib", "usr/lib"):
+        directory = package_root / library / relative
+        try:
+            paths = list(directory.glob("pieeprom-????-??-??.bin"))[:256]
+        except OSError:
+            continue
+        for path in paths:
+            match = re.fullmatch(r"pieeprom-(\d{4}-\d{2}-\d{2})\.bin", path.name)
+            if not match:
+                continue
+            try:
+                candidates.append(dt.date.fromisoformat(match.group(1)))
+            except ValueError:
+                continue
+    return max(candidates).isoformat() if candidates else None
+
+
+def natural_version_key(value: str) -> tuple[tuple[int, int | str], ...]:
+    return tuple(
+        (0, int(part)) if part.isdigit() else (1, part.lower())
+        for part in re.split(r"(\d+)", value)
+        if part
+    )
+
+
+def latest_installed_kernel(package_root: Path) -> str | None:
+    status_path = package_root / "var" / "lib" / "dpkg" / "status"
+    configured: set[str] = set()
+    try:
+        size = status_path.stat().st_size
+    except OSError:
+        size = 0
+    if 0 < size <= 16_777_216:
+        status = read_text(status_path, 16_777_217)
+        if len(status.encode("utf-8", errors="replace")) <= 16_777_216:
+            for paragraph in re.split(r"\n\s*\n", status):
+                package_match = re.search(r"^Package:\s*(\S+)\s*$", paragraph, re.MULTILINE)
+                state_match = re.search(r"^Status:\s*(.+?)\s*$", paragraph, re.MULTILINE)
+                if not package_match or not state_match:
+                    continue
+                state_fields = state_match.group(1).split()
+                if (
+                    len(state_fields) != 3
+                    or state_fields[0] not in {"install", "hold"}
+                    or state_fields[1:] != ["ok", "installed"]
+                ):
+                    continue
+                image_match = re.fullmatch(r"linux-image-(?!unsigned-)([0-9][A-Za-z0-9._+-]*)", package_match.group(1))
+                if image_match and safe_version(image_match.group(1)) is not None:
+                    configured.add(image_match.group(1))
+    if configured:
+        return max(configured, key=natural_version_key)
+
+    # ProtectKernelModules intentionally hides /lib/modules from the hardened
+    # production unit. Keep it only as a fallback for non-dpkg test hosts or
+    # systems whose package database is unavailable.
+    directory = package_root / "lib" / "modules"
+    try:
+        module_names = [
+            path.name for path in directory.iterdir()
+            if path.is_dir() and not path.is_symlink() and safe_version(path.name) is not None
+        ][:512]
+    except OSError:
+        return None
+    return max(module_names, key=natural_version_key) if module_names else None
+
+
+def first_nvme_controller(sys_root: Path) -> Path | None:
+    directory = sys_root / "class" / "nvme"
+    try:
+        paths = sorted(
+            (path for path in directory.iterdir() if re.fullmatch(r"nvme\d+", path.name)),
+            key=lambda path: int(path.name[4:]),
+        )
+    except OSError:
+        return None
+    return paths[0] if paths else None
+
+
+def parse_link_speed_gtps(value: str) -> float | None:
+    match = re.fullmatch(r"\s*([0-9]+(?:\.[0-9]+)?)\s+GT/s(?:\s+PCIe)?\s*", value)
+    speed = finite_number(match.group(1) if match else None)
+    if speed is None or not 0 < speed <= 128:
+        return None
+    return round(speed, 3)
+
+
+def generation_for_speed(speed: float | None) -> int | None:
+    if speed is None:
+        return None
+    for generation, expected in enumerate((2.5, 5.0, 8.0, 16.0, 32.0, 64.0), start=1):
+        if math.isclose(speed, expected, rel_tol=0.01, abs_tol=0.05):
+            return generation
+    return None
+
+
+def parse_link_width(value: str) -> int | None:
+    match = re.fullmatch(r"\s*(\d{1,2})\s*", value)
+    width = int(match.group(1)) if match else None
+    return width if width is not None and 1 <= width <= 32 else None
+
+
+def configured_pcie_generation(sys_root: Path, controller: Path | None) -> int | None:
+    if controller is None:
+        return None
+    try:
+        sys_real = sys_root.resolve()
+        endpoint = (controller / "device").resolve()
+        endpoint.relative_to(sys_real)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    for candidate in (endpoint, *endpoint.parents):
+        try:
+            candidate.relative_to(sys_real)
+        except ValueError:
+            break
+        generation = read_device_tree_uint32(candidate / "of_node" / "max-link-speed")
+        if generation is not None:
+            return generation if 1 <= generation <= 6 else None
+        if candidate == sys_real:
+            break
+    return None
+
+
+def aer_total(value: str, label: str) -> int | None:
+    match = re.search(rf"^{re.escape(label)}\s+(\d+)\s*$", value, re.MULTILINE)
+    if not match:
+        return None
+    result = int(match.group(1))
+    return result if result <= MAX_SAFE_COUNTER else None
+
+
+def pcie_device_status(config: bytes) -> tuple[bool | None, bool | None, bool | None]:
+    if len(config) < 0x40:
+        return None, None, None
+    pointer = config[0x34] & 0xFC
+    visited: set[int] = set()
+    while pointer and pointer not in visited and len(visited) < 48:
+        visited.add(pointer)
+        if pointer + 2 > len(config):
+            break
+        capability = config[pointer]
+        next_pointer = config[pointer + 1] & 0xFC
+        if capability == 0x10:
+            if pointer + 12 > len(config):
+                break
+            status = int.from_bytes(config[pointer + 10:pointer + 12], "little")
+            return bool(status & 0x1), bool(status & 0x2), bool(status & 0x4)
+        pointer = next_pointer
+    return None, None, None
+
+
+def cmdline_tokens(proc_root: Path) -> set[str]:
+    return set(read_text(proc_root / "cmdline", 16_384).strip().split())
+
+
+def pcie_power_settings(proc_root: Path, sys_root: Path) -> tuple[bool | None, bool | None]:
+    tokens = cmdline_tokens(proc_root)
+    aspm_policy = read_text(
+        sys_root / "module" / "pcie_aspm" / "parameters" / "policy", 256
+    ).strip().lower()
+    latency = read_text(
+        sys_root / "module" / "nvme_core" / "parameters" / "default_ps_max_latency_us", 64
+    ).strip()
+    aspm_off = "pcie_aspm=off" in tokens
+    if aspm_off:
+        aspm_disabled: bool | None = True
+    elif aspm_policy:
+        aspm_disabled = "[performance]" in aspm_policy or aspm_policy == "performance"
+    else:
+        aspm_disabled = None
+    if "nvme_core.default_ps_max_latency_us=0" in tokens or latency == "0":
+        nvme_power_disabled: bool | None = True
+    elif latency:
+        nvme_power_disabled = False
+    else:
+        nvme_power_disabled = None
+    return aspm_disabled, nvme_power_disabled
+
+
+def collect_system(
+    config: "Config",
+    kernel_summary: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+    controller = first_nvme_controller(config.sys_root)
+    device = controller / "device" if controller is not None else None
+    kernel_running = safe_version(platform.release())
+    kernel_latest = latest_installed_kernel(config.package_root)
+    channel = bootloader_channel(config.etc_root)
+    current_bootloader = bootloader_date(config.sys_root)
+    latest_bootloader = latest_bootloader_date(
+        config.package_root, config.sys_root, channel
+    )
+    negotiated_speed = parse_link_speed_gtps(
+        read_text(device / "current_link_speed", 64) if device is not None else ""
+    )
+    endpoint_speed = parse_link_speed_gtps(
+        read_text(device / "max_link_speed", 64) if device is not None else ""
+    )
+    aspm_disabled, nvme_power_disabled = pcie_power_settings(
+        config.proc_root, config.sys_root
+    )
+    correctable_status, nonfatal_status, fatal_status = pcie_device_status(
+        read_bytes(device / "config", 4096) if device is not None else b""
+    )
+    normalized_kernel = existing_kernel_event_summary(kernel_summary)
+    if normalized_kernel is None:
+        normalized_kernel = empty_kernel_event_summary()
+    return {
+        "versions": {
+            "kernelRunning": kernel_running,
+            "kernelLatestInstalled": kernel_latest,
+            "kernelRebootRequired": (
+                kernel_running != kernel_latest
+                if kernel_running is not None and kernel_latest is not None
+                else None
+            ),
+            "bootloaderCurrent": current_bootloader,
+            "bootloaderLatest": latest_bootloader,
+            "bootloaderChannel": channel,
+            "nvmeModel": safe_version(
+                read_text(controller / "model", 256), 128
+            ) if controller is not None else None,
+            "nvmeFirmware": safe_version(
+                read_text(controller / "firmware_rev", 128), 64
+            ) if controller is not None else None,
+            "collector": COLLECTOR_VERSION,
+        },
+        "pcie": {
+            "configuredGeneration": configured_pcie_generation(config.sys_root, controller),
+            "negotiatedGeneration": generation_for_speed(negotiated_speed),
+            "negotiatedSpeedGtps": negotiated_speed,
+            "negotiatedWidth": parse_link_width(
+                read_text(device / "current_link_width", 64) if device is not None else ""
+            ),
+            "endpointMaxGeneration": generation_for_speed(endpoint_speed),
+            "endpointMaxWidth": parse_link_width(
+                read_text(device / "max_link_width", 64) if device is not None else ""
+            ),
+            "aspmDisabled": aspm_disabled,
+            "nvmePowerSavingDisabled": nvme_power_disabled,
+            "aerCorrectableCount": aer_total(
+                read_text(device / "aer_dev_correctable", 8192) if device is not None else "",
+                "TOTAL_ERR_COR",
+            ),
+            "aerNonFatalCount": aer_total(
+                read_text(device / "aer_dev_nonfatal", 8192) if device is not None else "",
+                "TOTAL_ERR_NONFATAL",
+            ),
+            "aerFatalCount": aer_total(
+                read_text(device / "aer_dev_fatal", 8192) if device is not None else "",
+                "TOTAL_ERR_FATAL",
+            ),
+            "correctableStatusActive": correctable_status,
+            "nonFatalStatusActive": nonfatal_status,
+            "fatalStatusActive": fatal_status,
+        },
+        "kernel": normalized_kernel,
+    }
+
+
 def parse_vcgencmd(command: str, output: str) -> tuple[str, Any] | None:
-    if command == "get_throttled":
-        match = re.fullmatch(r"\s*throttled=0x([0-9a-fA-F]{1,8})\s*", output)
-        value = int(match.group(1), 16) if match else None
-        return ("throttledFlags", value) if value is not None else None
     if command == "measure_temp":
         match = re.search(r"=(-?[0-9.]+)", output)
         value = finite_number(match.group(1) if match else None)
@@ -840,26 +1522,32 @@ def parse_vcgencmd(command: str, output: str) -> tuple[str, Any] | None:
     return None
 
 
-def collect_gpu(vcgencmd: str, timeout: float) -> dict[str, Any]:
-    if not vcgencmd or not (Path(vcgencmd).is_file() and os.access(vcgencmd, os.X_OK)):
-        return {}
+def collect_gpu(vcgencmd: str, timeout: float, sys_root: Path | None = None) -> dict[str, Any]:
     result: dict[str, Any] = {}
-    for invocation in (
-        ("get_throttled",), ("measure_temp",), ("get_mem", "gpu"),
-        ("measure_clock", "core"), ("measure_volts", "core"),
-        ("pmic_read_adc", "EXT5V_V"),
-    ):
-        try:
-            completed = subprocess.run(
-                [vcgencmd, *invocation], capture_output=True, text=True, timeout=timeout, check=False
-            )
-        except (OSError, subprocess.SubprocessError):
-            continue
-        if completed.returncode != 0:
-            continue
-        parsed = parse_vcgencmd(" ".join(invocation), completed.stdout[:256])
-        if parsed:
-            result[parsed[0]] = parsed[1]
+    if vcgencmd and Path(vcgencmd).is_file() and os.access(vcgencmd, os.X_OK):
+        for invocation in (
+            ("measure_temp",), ("get_mem", "gpu"),
+            ("measure_clock", "core"), ("measure_volts", "core"),
+            ("pmic_read_adc", "EXT5V_V"),
+        ):
+            try:
+                completed = subprocess.run(
+                    [vcgencmd, *invocation], capture_output=True, text=True, timeout=timeout, check=False
+                )
+            except (OSError, subprocess.SubprocessError):
+                continue
+            if completed.returncode != 0:
+                continue
+            parsed = parse_vcgencmd(" ".join(invocation), completed.stdout[:256])
+            if parsed:
+                result[parsed[0]] = parsed[1]
+    if sys_root is not None:
+        alarm = read_rpi_undervoltage_alarm(sys_root)
+        if alarm is not None:
+            # Preserve the public uint32 contract: bit 0 is the current
+            # under-voltage condition. Legacy high-bit history remains
+            # readable in retained samples but is no longer queried.
+            result["throttledFlags"] = alarm
     return result
 
 
@@ -1227,6 +1915,10 @@ RELIABILITY_EVENT_DETAILS = {
         "critical",
         "Kernel reported an RCU stall.",
     ),
+    ("rcu-stall", "expedited"): (
+        "warning",
+        "Kernel reported a short expedited RCU grace-period delay.",
+    ),
     ("oom-kill", "active"): (
         "critical",
         "Kernel reported an out-of-memory kill.",
@@ -1234,6 +1926,46 @@ RELIABILITY_EVENT_DETAILS = {
     ("filesystem-error", "active"): (
         "critical",
         "Kernel reported a filesystem or block I/O error.",
+    ),
+    ("pcie-aer", "correctable"): (
+        "warning",
+        "Kernel reported a correctable PCIe AER event.",
+    ),
+    ("pcie-aer", "nonfatal"): (
+        "critical",
+        "Kernel reported a non-fatal PCIe AER event.",
+    ),
+    ("pcie-aer", "fatal"): (
+        "critical",
+        "Kernel reported a fatal PCIe AER event.",
+    ),
+    ("pcie-link", "down"): (
+        "critical",
+        "Kernel reported that the PCIe link went down.",
+    ),
+    ("pcie-link", "degraded"): (
+        "warning",
+        "Kernel reported degraded PCIe link training.",
+    ),
+    ("pcie-link", "recovered"): (
+        "info",
+        "Kernel reported that the PCIe link recovered.",
+    ),
+    ("kernel-warning", "active"): (
+        "warning",
+        "Kernel reported an internal warning.",
+    ),
+    ("kernel-oops", "active"): (
+        "critical",
+        "Kernel reported an oops.",
+    ),
+    ("kernel-panic", "active"): (
+        "critical",
+        "Kernel reported a panic.",
+    ),
+    ("hung-task", "active"): (
+        "critical",
+        "Kernel reported a hung task.",
     ),
     ("nvme-mitigation", "active"): (
         "info",
@@ -1260,14 +1992,15 @@ MAINTENANCE_EVENT_DETAILS = {
 }
 
 
-def event_timestamp(line: str, fallback: str) -> str:
+def event_timestamp(line: str, fallback: str, preserve_subseconds: bool = False) -> str:
+    formatter = iso_event_timestamp if preserve_subseconds else iso_timestamp
     match = TIMESTAMP_RE.match(line)
     if match:
         try:
             parsed = dt.datetime.fromisoformat(match.group(1).replace("Z", "+00:00"))
             if parsed.tzinfo is None:
                 parsed = parsed.replace(tzinfo=dt.timezone.utc)
-            return iso_timestamp(parsed)
+            return formatter(parsed)
         except ValueError:
             pass
     syslog = SYSLOG_TIMESTAMP_RE.match(line)
@@ -1283,7 +2016,7 @@ def event_timestamp(line: str, fallback: str) -> str:
             if candidate > reference + dt.timedelta(days=2):
                 naive = naive.replace(year=naive.year - 1)
                 candidate = dt.datetime.fromtimestamp(time.mktime(naive.timetuple()), dt.timezone.utc)
-            return iso_timestamp(candidate)
+            return formatter(candidate)
         except (OverflowError, ValueError):
             pass
     return fallback
@@ -1447,7 +2180,7 @@ def reliability_event(
 ) -> dict[str, Any]:
     severity, message = RELIABILITY_EVENT_DETAILS[(kind, status)]
     return {
-        "timestamp": event_timestamp(timestamp, ""),
+        "timestamp": event_timestamp(timestamp, "", preserve_subseconds=True),
         "severity": severity,
         "kind": kind,
         "status": status,
@@ -1462,7 +2195,9 @@ def existing_reliability_record(record: Mapping[str, Any]) -> dict[str, Any] | N
     }
     if set(record) != required:
         return None
-    timestamp = event_timestamp(str(record.get("timestamp", "")), "")
+    timestamp = event_timestamp(
+        str(record.get("timestamp", "")), "", preserve_subseconds=True
+    )
     if not timestamp:
         return None
     event = (str(record.get("kind", "")), str(record.get("status", "")))
@@ -1508,6 +2243,59 @@ def sanitize_kernel_reliability_line(
         "I/O Error" in line or re.search(r"I/O error,\s*dev\s+nvme", line, re.IGNORECASE)
     ):
         event = ("nvme-io", "active")
+    elif (
+        "aer:" in lowered or "pcie bus error" in lowered
+    ) and re.search(
+        r"(?:uncorrectable\s*\(non[- ]fatal\)|severity\s*=\s*uncorrected\s*\(non[- ]fatal\)|non[- ]fatal error)",
+        lowered,
+    ):
+        event = ("pcie-aer", "nonfatal")
+    elif (
+        "aer:" in lowered or "pcie bus error" in lowered
+    ) and re.search(
+        r"(?:uncorrectable\s*\(fatal\)|severity\s*=\s*uncorrected\s*\(fatal\)|fatal error)",
+        lowered,
+    ):
+        event = ("pcie-aer", "fatal")
+    elif (
+        "aer:" in lowered or "pcie bus error" in lowered
+    ) and re.search(
+        r"(?:\bcorrected error\b|severity\s*=\s*corrected\b|\bcorrectable error\b)",
+        lowered,
+    ):
+        event = ("pcie-aer", "correctable")
+    elif re.search(r"\b(?:pcie|pcieport)\b", lowered) and re.search(
+        r"\blink (?:is )?down\b|\bfailed to bring up (?:the )?link\b",
+        lowered,
+    ):
+        event = ("pcie-link", "down")
+    elif re.search(r"\b(?:pcie|pcieport)\b", lowered) and re.search(
+        r"\b(?:link degraded|link training failed|failed to train (?:the )?link|link retrain(?:ing)? failed)\b",
+        lowered,
+    ):
+        event = ("pcie-link", "degraded")
+    elif re.search(r"\b(?:pcie|pcieport)\b", lowered) and re.search(
+        r"\blink (?:is )?(?:up|recovered)\b",
+        lowered,
+    ):
+        event = ("pcie-link", "recovered")
+    elif re.search(r"\bkernel panic\b.*\bnot syncing\b|\bpanic:\s", lowered):
+        event = ("kernel-panic", "active")
+    elif re.search(
+        r"\b(?:oops:|internal error:\s*oops|bug:\s+unable to handle kernel)",
+        lowered,
+    ):
+        event = ("kernel-oops", "active")
+    elif re.search(
+        r"\b(?:info:\s+task\s+.+\s+blocked for more than\s+\d+\s+seconds|hung_task:)",
+        lowered,
+    ):
+        event = ("hung-task", "active")
+    elif re.search(
+        r"\brcu(?:_preempt)?:?.*detected expedited stalls?",
+        lowered,
+    ):
+        event = ("rcu-stall", "expedited")
     elif re.search(r"\brcu(?:_preempt)?:?.*(?:detected .*stalls?|stall detected|kthread starved)", lowered):
         event = ("rcu-stall", "active")
     elif re.search(r"\b(?:out of memory: killed process|oom-kill:)", lowered):
@@ -1518,6 +2306,8 @@ def sanitize_kernel_reliability_line(
         lowered,
     ):
         event = ("filesystem-error", "active")
+    elif re.search(r"\bwarning:\s+(?:cpu:|at\s+)", lowered):
+        event = ("kernel-warning", "active")
     elif re.search(
         rf"\b{re.escape(primary_interface)}\b.*\b(?:link is down|lost carrier|carrier lost)\b",
         lowered,
@@ -1530,7 +2320,86 @@ def sanitize_kernel_reliability_line(
         event = ("network-link", "recovered")
     if event is None:
         return None
-    return reliability_event(event_timestamp(line, fallback_timestamp), *event)
+    return reliability_event(
+        event_timestamp(line, fallback_timestamp, preserve_subseconds=True), *event
+    )
+
+
+def bounded_current_boot_rcu_backfill(
+    config: "Config",
+    boot_started_at: str,
+    now: dt.datetime,
+    prior_last_event_at: str | None,
+) -> list[dict[str, Any]] | None:
+    """Reconstruct precise expedited-RCU rows from one bounded log rotation.
+
+    This is private migration evidence only: callers must not append these
+    replayed rows to the public reliability timeline. A complete, single-link
+    current source (and optional immediate `.1` rotation) must span the boot
+    start through the prior last event, otherwise the migration fails closed.
+    """
+    boot_started = parse_iso_timestamp(boot_started_at)
+    prior_last = parse_iso_timestamp(prior_last_event_at) if prior_last_event_at else None
+    if boot_started is None:
+        return None
+    sources = [config.kernel_log.with_name(config.kernel_log.name + ".1"), config.kernel_log]
+    source_times: list[dt.datetime] = []
+    records: list[dict[str, Any]] = []
+    saw_source = False
+    for source in sources:
+        try:
+            metadata = source.stat(follow_symlinks=False)
+        except OSError:
+            continue
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_size > MAX_KERNEL_BACKFILL_BYTES
+        ):
+            return None
+        saw_source = True
+        lines, _cursor = read_new_lines(
+            source, {}, MAX_KERNEL_BACKFILL_BYTES
+        )
+        for line in lines:
+            timestamp_text = event_timestamp(
+                line, "", preserve_subseconds=True
+            )
+            timestamp = parse_iso_timestamp(timestamp_text)
+            if timestamp is None:
+                continue
+            source_times.append(timestamp)
+            if timestamp < boot_started or timestamp > now + dt.timedelta(minutes=1):
+                continue
+            record = sanitize_kernel_reliability_line(
+                line, iso_timestamp(now), config.primary_interface
+            )
+            if (
+                record is not None
+                and record.get("kind") == "rcu-stall"
+                and record.get("status") == "expedited"
+            ):
+                records.append(record)
+    record_times = [
+        timestamp
+        for record in records
+        if (timestamp := parse_iso_timestamp(record.get("timestamp"))) is not None
+    ]
+    if (
+        not saw_source
+        or not source_times
+        or not any(
+            abs((timestamp - boot_started).total_seconds()) <= 60
+            for timestamp in source_times
+        )
+        or prior_last is not None
+        and (not record_times or max(record_times) < prior_last)
+    ):
+        return None
+    return [
+        dict(record)
+        for record in stable_deduplicate_records(records, RELIABILITY_FIELDS)
+    ]
 
 
 def parse_listening_tcp_ports(proc_root: Path) -> set[int]:
@@ -1572,19 +2441,26 @@ def observed_network_link(sys_root: Path, interface: str) -> bool | None:
     return None
 
 
-def observed_nvme_mitigation(sys_root: Path) -> bool | None:
-    latency_path = sys_root / "module" / "nvme_core" / "parameters" / "default_ps_max_latency_us"
-    aspm_path = sys_root / "module" / "pcie_aspm" / "parameters" / "policy"
-    latency = read_text(latency_path, 64).strip()
-    aspm = read_text(aspm_path, 256).strip().lower()
-    if not latency and not aspm:
+def observed_nvme_mitigation(
+    sys_root: Path,
+    proc_root: Path = Path("/proc"),
+) -> bool | None:
+    aspm_disabled, nvme_power_disabled = pcie_power_settings(proc_root, sys_root)
+    if aspm_disabled is None and nvme_power_disabled is None:
         return None
-    return latency == "0" and ("[performance]" in aspm or aspm == "performance")
+    tokens = cmdline_tokens(proc_root)
+    aspm_mitigation_complete = aspm_disabled is True
+    if "pcie_aspm=off" in tokens:
+        # A cmdline-declared mitigation also disables PCIe port power
+        # management. This is the exact deployed fallback when sysfs does not
+        # expose a selectable performance policy.
+        aspm_mitigation_complete = "pcie_port_pm=off" in tokens
+    return aspm_mitigation_complete and nvme_power_disabled is True
 
 
 def existing_sample_record(record: Mapping[str, Any]) -> dict[str, Any] | None:
     fields = frozenset(record)
-    if fields not in {frozenset(SAMPLE_FIELDS), frozenset(LEGACY_SAMPLE_FIELDS)}:
+    if fields not in SAMPLE_FIELD_SCHEMAS:
         return None
     timestamp = event_timestamp(str(record.get("timestamp", "")), "")
     if not timestamp:
@@ -1604,12 +2480,57 @@ def existing_sample_record(record: Mapping[str, Any]) -> dict[str, Any] | None:
             normalized[field] = supply_voltage_volts(value)
         elif field == "throttledFlags":
             normalized[field] = uint32(value)
+        elif field in {"swapTotalBytes", "swapUsedBytes"}:
+            normalized[field] = (
+                value
+                if isinstance(value, int)
+                and not isinstance(value, bool)
+                and 0 <= value <= MAX_SAFE_COUNTER
+                else None
+            )
+        elif field in {
+            "swapPercent",
+            "cpuPressureSomeAvg10",
+            "cpuPressureFullAvg10",
+            "memoryPressureSomeAvg10",
+            "memoryPressureFullAvg10",
+            "ioPressureSomeAvg10",
+            "ioPressureFullAvg10",
+        }:
+            parsed = finite_number(value)
+            normalized[field] = (
+                round(parsed, 2)
+                if parsed is not None and 0 <= parsed <= 100
+                else None
+            )
+        elif field in NETWORK_QUALITY_SAMPLE_FIELDS:
+            parsed = finite_number(value)
+            normalized[field] = (
+                round(parsed, 2)
+                if parsed is not None and 0 <= parsed <= 1_000_000_000_000
+                else None
+            )
         elif value is None:
             normalized[field] = None
         elif isinstance(value, bool) or not isinstance(value, (int, float)):
             normalized[field] = None
         else:
             normalized[field] = value if finite_number(value) is not None else None
+    swap_total = normalized["swapTotalBytes"]
+    swap_used = normalized["swapUsedBytes"]
+    if swap_total is not None and swap_used is not None:
+        if swap_used > swap_total:
+            normalized["swapUsedBytes"] = None
+            normalized["swapPercent"] = None
+        else:
+            expected_percent = round(
+                100.0 * swap_used / swap_total,
+                2,
+            ) if swap_total > 0 else 0.0
+            if normalized["swapPercent"] is not None and not math.isclose(
+                normalized["swapPercent"], expected_percent, abs_tol=0.01
+            ):
+                normalized["swapPercent"] = None
     return normalized
 
 
@@ -2128,6 +3049,10 @@ def existing_incident_record(record: Mapping[str, Any]) -> dict[str, Any] | None
         "gpuMemoryBytes": (0, 1 << 60), "gpuClockHz": (0, 1_000_000_000_000),
         "networkRxBytesPerSecond": (0, 1_000_000_000_000),
         "networkTxBytesPerSecond": (0, 1_000_000_000_000),
+        "networkRxErrorsPerSecond": (0, 1_000_000_000_000),
+        "networkTxErrorsPerSecond": (0, 1_000_000_000_000),
+        "networkRxDroppedPerSecond": (0, 1_000_000_000_000),
+        "networkTxDroppedPerSecond": (0, 1_000_000_000_000),
         "diskReadBytesPerSecond": (0, 1_000_000_000_000),
         "diskWriteBytesPerSecond": (0, 1_000_000_000_000),
     }
@@ -2774,11 +3699,22 @@ RELIABILITY_FIELDS = (
 
 
 def existing_reliability_state(value: Any) -> dict[str, Any] | None:
-    required = {
+    legacy_required = {
         "version", "bootId", "lastSeenAt", "sshListenersAvailable",
         "networkLinkAvailable", "nvmeMitigationActive", "kernelCursor",
     }
-    if not isinstance(value, Mapping) or set(value) != required or value.get("version") != 1:
+    summary_required = legacy_required | {"kernelSummary"}
+    fields = frozenset(value) if isinstance(value, Mapping) else frozenset()
+    version = value.get("version") if isinstance(value, Mapping) else None
+    if (
+        not isinstance(value, Mapping)
+        or isinstance(version, bool)
+        or not isinstance(version, int)
+        or version not in {1, 2, 3, 4, 5}
+        or fields not in {frozenset(legacy_required), frozenset(summary_required)}
+        or (version == 1 and fields != frozenset(legacy_required))
+        or (version in {2, 3, 4, 5} and fields != frozenset(summary_required))
+    ):
         return None
     boot_id = value.get("bootId")
     if boot_id is not None and (
@@ -2800,13 +3736,23 @@ def existing_reliability_state(value: Any) -> dict[str, Any] | None:
     kernel_cursor = existing_traffic_cursor(value.get("kernelCursor"))
     if kernel_cursor is None:
         return None
-    return {
-        "version": 1,
+    kernel_summary = None
+    if version == 2:
+        kernel_summary = existing_legacy_kernel_event_summary(value.get("kernelSummary"))
+    elif version in {3, 4, 5}:
+        kernel_summary = existing_kernel_event_summary(value.get("kernelSummary"))
+    if version != 1 and kernel_summary is None:
+        return None
+    result = {
+        "version": version,
         "bootId": boot_id,
         "lastSeenAt": iso_timestamp(last_seen),
         **states,
         "kernelCursor": kernel_cursor,
     }
+    if kernel_summary is not None:
+        result["kernelSummary"] = kernel_summary
+    return result
 
 
 def load_reliability_records(config: "Config", limit: int) -> list[dict[str, Any]]:
@@ -3270,8 +4216,9 @@ def export_sanitized_logs(config: "Config", now_text: str, gpu: Mapping[str, Any
             new_alert_records.append(sanitized)
     next_alert_cursor = cursor
 
-    # vcgencmd low bits describe a currently active under-voltage, frequency
-    # cap, throttle, or thermal limit. Export transitions, not one alert/minute.
+    # The standard Raspberry Pi hwmon alarm maps to low bit 0. Retained legacy
+    # samples can still contain the other firmware bits. Export transitions,
+    # not one alert per minute.
     flags = uint32(gpu.get("throttledFlags")) if isinstance(gpu, Mapping) else None
     voltage = supply_voltage_volts(gpu.get("supplyVoltageVolts")) if isinstance(gpu, Mapping) else None
     if flags is not None:
@@ -3286,7 +4233,7 @@ def export_sanitized_logs(config: "Config", now_text: str, gpu: Mapping[str, Any
                 "severity": "warning",
                 "kind": "power",
                 "status": "active",
-                "message": f"Current vcgencmd throttle flags are 0x{active_flags:x}." + detail,
+                "message": f"Current hwmon power flags are 0x{active_flags:x}." + detail,
             })
         elif not active_flags and previous_flags not in {None, 0}:
             new_alert_records.append({
@@ -3294,7 +4241,7 @@ def export_sanitized_logs(config: "Config", now_text: str, gpu: Mapping[str, Any
                 "severity": "info",
                 "kind": "power",
                 "status": "recovered",
-                "message": "Current vcgencmd throttle condition recovered." + detail,
+                "message": "Current hwmon power condition recovered." + detail,
             })
     next_power_flags = active_flags if flags is not None else uint32(cursors.get("powerFlags"))
 
@@ -3404,6 +4351,7 @@ class Config:
     proc_root: Path = Path("/proc")
     sys_root: Path = Path("/sys")
     etc_root: Path = Path("/etc")
+    package_root: Path = Path("/")
     mountinfo: Path | None = None
     mount_root: Path | None = None
     events_log: Path = Path("/var/log/server-watch/events.log")
@@ -3455,6 +4403,7 @@ def config_from_environment(arguments: Sequence[str] | None = None) -> Config:
     parser.add_argument("--proc-root", default=env.get("MONITOR_PROC_ROOT", "/proc"))
     parser.add_argument("--sys-root", default=env.get("MONITOR_SYS_ROOT", "/sys"))
     parser.add_argument("--etc-root", default=env.get("MONITOR_ETC_ROOT", "/etc"))
+    parser.add_argument("--package-root", default=env.get("MONITOR_PACKAGE_ROOT", "/"))
     parser.add_argument("--mountinfo", default=env.get("MONITOR_MOUNTINFO"))
     parser.add_argument("--mount-root", default=env.get("MONITOR_MOUNT_ROOT"))
     parser.add_argument("--events-log", default=env.get("MONITOR_EVENTS_LOG", "/var/log/server-watch/events.log"))
@@ -3539,6 +4488,7 @@ def config_from_environment(arguments: Sequence[str] | None = None) -> Config:
     return Config(
         output_dir=Path(values.output_dir), runtime_dir=Path(values.runtime_dir),
         proc_root=Path(values.proc_root), sys_root=Path(values.sys_root), etc_root=Path(values.etc_root),
+        package_root=Path(values.package_root),
         mountinfo=Path(values.mountinfo) if values.mountinfo else None,
         mount_root=Path(values.mount_root) if values.mount_root else None,
         events_log=Path(values.events_log), kernel_log=Path(values.kernel_log),
@@ -3606,12 +4556,17 @@ def collect_reliability(
     config: Config,
     now: dt.datetime,
     uptime_seconds: int | None,
-) -> dict[str, Any]:
+    include_kernel_summary: bool = False,
+) -> dict[str, Any] | tuple[dict[str, Any], dict[str, dict[str, Any]]]:
     """Persist bounded host-availability evidence and return its public summary."""
     replay_pending_reliability_commit(config)
     now_text = iso_timestamp(now)
     state_path = config.output_dir / ".state" / "reliability-state.json"
-    previous = existing_reliability_state(load_json(state_path))
+    raw_previous = load_json(state_path)
+    previous = existing_reliability_state(raw_previous)
+    previous_version = previous.get("version") if previous is not None else None
+    migrated_from_v1 = previous_version == 1
+    migrated_from_v2 = previous_version == 2
 
     raw_boot_id = read_text(
         config.proc_root / "sys" / "kernel" / "random" / "boot_id", 128
@@ -3626,7 +4581,7 @@ def collect_reliability(
 
     ssh_available = observed_ssh_listeners(config.proc_root, config.ssh_ports)
     network_available = observed_network_link(config.sys_root, config.primary_interface)
-    mitigation_active = observed_nvme_mitigation(config.sys_root)
+    mitigation_active = observed_nvme_mitigation(config.sys_root, config.proc_root)
     events: list[dict[str, Any]] = []
 
     previous_seen = parse_iso_timestamp(previous.get("lastSeenAt")) if previous else None
@@ -3659,6 +4614,29 @@ def collect_reliability(
             gap_seconds,
         ))
 
+    prior_expedited = (
+        previous.get("kernelSummary", {}).get("rcuExpedited", {})
+        if previous is not None
+        else {}
+    )
+    needs_precision_backfill = (
+        previous_version in {3, 4}
+        and not boot_changed
+        and isinstance(prior_expedited, Mapping)
+        and int(prior_expedited.get("count", 0)) > 0
+        and boot_started_at is not None
+    )
+    precise_rcu_backfill = (
+        bounded_current_boot_rcu_backfill(
+            config,
+            boot_started_at,
+            now,
+            prior_expedited.get("lastEventAt"),
+        )
+        if needs_precision_backfill
+        else None
+    )
+
     previous_ssh = previous.get("sshListenersAvailable") if previous else None
     if ssh_available is False and previous_ssh is not False:
         events.append(reliability_event(now_text, "ssh-listener", "unavailable"))
@@ -3679,39 +4657,93 @@ def collect_reliability(
             "active" if mitigation_active else "incomplete",
         ))
 
-    prior_cursor = previous.get("kernelCursor", {}) if previous else {}
+    # Re-read the bounded kernel source once when upgrading the private v1
+    # state. This reconstructs current-boot counts and discovers the supported
+    # fixed event kinds; public event deduplication prevents replayed legacy
+    # kinds from multiplying. The v2 cursor stays intact because only its
+    # combined warning field needs a retained-evidence split.
+    prior_cursor = previous.get("kernelCursor", {}) if previous and not migrated_from_v1 else {}
     if not isinstance(prior_cursor, Mapping):
         prior_cursor = {}
     lines, kernel_cursor = read_new_lines(
         config.kernel_log, prior_cursor, config.kernel_max_input_bytes
     )
+    kernel_events: list[dict[str, Any]] = []
     for line in lines:
         record = sanitize_kernel_reliability_line(
             line, now_text, config.primary_interface
         )
         if record is not None:
             events.append(record)
+            kernel_events.append(record)
+
+    retained_records = load_reliability_records(config, config.max_log_records)
+    if previous is None or boot_changed:
+        kernel_summary = update_kernel_event_summary(
+            empty_kernel_event_summary(), kernel_events, boot_started_at, now
+        )
+    elif migrated_from_v1:
+        reconstructable = retained_records if boot_started_at is not None else []
+        kernel_summary = update_kernel_event_summary(
+            empty_kernel_event_summary(),
+            [*reconstructable, *kernel_events],
+            boot_started_at,
+            now,
+        )
+    elif migrated_from_v2:
+        prior_kernel_summary = migrate_v2_kernel_event_summary(
+            previous.get("kernelSummary", {}),
+            retained_records,
+            boot_started_at,
+            now,
+        )
+        kernel_summary = update_kernel_event_summary(
+            prior_kernel_summary, kernel_events, boot_started_at, now
+        )
+    else:
+        kernel_summary = update_kernel_event_summary(
+            previous.get("kernelSummary", {}), kernel_events, boot_started_at, now
+        )
+
+    if precise_rcu_backfill is not None:
+        reconstructed = update_kernel_event_summary(
+            empty_kernel_event_summary(),
+            [*precise_rcu_backfill, *kernel_events],
+            boot_started_at,
+            now,
+        )["rcuExpedited"]
+        current_expedited = kernel_summary["rcuExpedited"]
+        if int(reconstructed["count"]) > int(current_expedited["count"]):
+            kernel_summary["rcuExpedited"] = reconstructed
+
+    state_version = (
+        previous_version
+        if needs_precision_backfill and precise_rcu_backfill is None
+        else 5
+    )
 
     state = {
-        "version": 1,
+        "version": state_version,
         "bootId": boot_id,
         "lastSeenAt": now_text,
         "sshListenersAvailable": ssh_available,
         "networkLinkAvailable": network_available,
         "nvmeMitigationActive": mitigation_active,
         "kernelCursor": kernel_cursor,
+        "kernelSummary": kernel_summary,
     }
     if existing_reliability_state(state) is None:
         raise ValueError("reliability state did not satisfy the private contract")
     write_pending_reliability_commit(config, events, state)
     replay_pending_reliability_commit(config)
-    return {
+    summary = {
         "bootStartedAt": boot_started_at,
         "collectorGapSeconds": gap_seconds,
         "sshListenersAvailable": ssh_available,
         "networkLinkAvailable": network_available,
         "nvmeMitigationActive": mitigation_active,
     }
+    return (summary, kernel_summary) if include_kernel_summary else summary
 
 
 def run(config: Config, now: dt.datetime | None = None) -> dict[str, Any]:
@@ -3735,7 +4767,8 @@ def run(config: Config, now: dt.datetime | None = None) -> dict[str, Any]:
         monotonic = time.monotonic()
         elapsed = monotonic - (finite_number(prior.get("monotonic"), monotonic) or monotonic)
 
-        cpu = parse_proc_stat(read_text(config.proc_root / "stat"))
+        proc_stat = read_text(config.proc_root / "stat")
+        cpu = parse_proc_stat(proc_stat)
         previous_cpu = prior.get("cpu")
         host_cpu_delta = 0
         if cpu is not None and isinstance(previous_cpu, list) and len(previous_cpu) == 2:
@@ -3743,14 +4776,16 @@ def run(config: Config, now: dt.datetime | None = None) -> dict[str, Any]:
                 host_cpu_delta = max(0, cpu[0] - int(previous_cpu[0]))
             except (TypeError, ValueError):
                 host_cpu_delta = 0
-        memory_total, memory_available = parse_meminfo(read_text(config.proc_root / "meminfo"))
+        meminfo = read_text(config.proc_root / "meminfo")
+        memory_total, memory_available = parse_meminfo(meminfo)
+        swap_total, swap_used, swap_percent = parse_swapinfo(meminfo)
         network = parse_net_dev(read_text(config.proc_root / "net" / "dev"))
         disk = parse_diskstats(read_text(config.proc_root / "diskstats"))
-        network_rates = rate_pair(network, prior.get("network"), elapsed)
+        network_rates = network_rate_values(network, prior.get("network"), elapsed)
         disk_rates = rate_pair(disk, prior.get("disk"), elapsed)
         temperature = read_temperature(config.sys_root)
         pressure = collect_pressure(config.proc_root)
-        gpu = collect_gpu(config.vcgencmd, config.command_timeout)
+        gpu = collect_gpu(config.vcgencmd, config.command_timeout, config.sys_root)
         if temperature is None and isinstance(gpu.get("temperatureC"), (int, float)):
             temperature = gpu["temperatureC"]
 
@@ -3779,10 +4814,19 @@ def run(config: Config, now: dt.datetime | None = None) -> dict[str, Any]:
                 else None
             ),
             "memoryTotalBytes": memory_total,
+            "swapTotalBytes": swap_total,
+            "swapUsedBytes": swap_used,
+            "swapPercent": swap_percent,
             "temperatureC": temperature,
             "load1": load1,
             "load5": load5,
             "load15": load15,
+            "cpuPressureSomeAvg10": pressure["cpu"]["someAvg10"],
+            "cpuPressureFullAvg10": pressure["cpu"]["fullAvg10"],
+            "memoryPressureSomeAvg10": pressure["memory"]["someAvg10"],
+            "memoryPressureFullAvg10": pressure["memory"]["fullAvg10"],
+            "ioPressureSomeAvg10": pressure["io"]["someAvg10"],
+            "ioPressureFullAvg10": pressure["io"]["fullAvg10"],
             "powerState": power_state,
             "supplyVoltageVolts": supply_voltage,
             "throttledFlags": power_flags,
@@ -3790,6 +4834,10 @@ def run(config: Config, now: dt.datetime | None = None) -> dict[str, Any]:
             "gpuClockHz": gpu.get("gpuClockHz") if isinstance(gpu.get("gpuClockHz"), int) else None,
             "networkRxBytesPerSecond": network_rates[0],
             "networkTxBytesPerSecond": network_rates[1],
+            "networkRxErrorsPerSecond": network_rates[2],
+            "networkTxErrorsPerSecond": network_rates[3],
+            "networkRxDroppedPerSecond": network_rates[4],
+            "networkTxDroppedPerSecond": network_rates[5],
             "diskReadBytesPerSecond": disk_rates[0],
             "diskWriteBytesPerSecond": disk_rates[1],
         }
@@ -3800,6 +4848,7 @@ def run(config: Config, now: dt.datetime | None = None) -> dict[str, Any]:
             "hostname": bounded_text(socket.gethostname(), 255),
             "os": parse_os_release(read_text(config.etc_root / "os-release", 8192)),
             "architecture": bounded_text(platform.machine() or "unknown", 64),
+            "logicalCpuCount": parse_logical_cpu_count(proc_stat),
             "uptimeSeconds": uptime_seconds,
         }
         if config.container_input is not None:
@@ -3813,14 +4862,19 @@ def run(config: Config, now: dt.datetime | None = None) -> dict[str, Any]:
             config.proc_root, prior.get("processes"), host_cpu_delta, config.process_uids
         )
         traffic, traffic_cursor, traffic_available = collect_traffic(config, now)
-        reliability = collect_reliability(config, now, uptime_seconds)
+        reliability, kernel_summary = collect_reliability(
+            config, now, uptime_seconds, include_kernel_summary=True
+        )
+        system = collect_system(config, kernel_summary)
         current = {
             "generatedAt": now_text,
             "host": host,
             "latest": latest,
             "disks": collect_filesystems(read_text(config.mountinfo_path), config.mount_root),
             "containers": containers,
+            "currentTraffic": traffic,
             "reliability": reliability,
+            "system": system,
         }
         # The strict public snapshot schema has no GPU object. GPU temperature,
         # supply voltage, and throttle flags contribute only to the safe latest

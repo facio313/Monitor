@@ -27,6 +27,7 @@ const MAX_INCIDENT_REASONS = 16;
 const MAX_INCIDENT_PROCESSES = 32;
 const MAX_INCIDENT_CONTAINERS = 256;
 const MAX_INCIDENT_TRAFFIC = 64;
+const MAX_CURRENT_TRAFFIC = 16;
 const MAX_POWER_CORRELATION_MS = 2 * 60 * 1_000;
 const MAX_UINT32 = 0xffff_ffff;
 const MAX_INCIDENT_DURATION_SECONDS = 366 * 24 * 60 * 60;
@@ -34,6 +35,18 @@ const MAX_RESPONSE_TIME_MS = 300_000;
 const MAX_INCIDENT_COUNT = 1_000_000_000;
 const MAX_RELIABILITY_DURATION_SECONDS = 366 * 24 * 60 * 60;
 const MAX_CONTAINER_CPU_PERCENT = 1024;
+const MAX_TELEMETRY_RATE = 1_000_000_000_000;
+const TRAFFIC_AGGREGATE_FIELDS = new Set([
+  'app',
+  'requestCount',
+  'status2xx',
+  'status3xx',
+  'status4xx',
+  'status5xx',
+  'slowCount',
+  'avgResponseMs',
+  'maxResponseMs',
+]);
 const INCIDENT_REASON_ORDER: IncidentReason[] = [
   'cpu',
   'memory',
@@ -109,6 +122,12 @@ const RELIABILITY_KINDS = new Set<DashboardResponse['reliabilityEvents'][number]
   'rcu-stall',
   'oom-kill',
   'filesystem-error',
+  'pcie-aer',
+  'pcie-link',
+  'kernel-warning',
+  'kernel-oops',
+  'kernel-panic',
+  'hung-task',
   'nvme-mitigation',
 ]);
 const RELIABILITY_EVENT_CONTRACT = {
@@ -122,8 +141,19 @@ const RELIABILITY_EVENT_CONTRACT = {
   'nvme-reset:active': { severity: 'critical', message: 'Kernel reported an NVMe controller reset.' },
   'nvme-io:active': { severity: 'critical', message: 'Kernel reported an NVMe I/O error.' },
   'rcu-stall:active': { severity: 'critical', message: 'Kernel reported an RCU stall.' },
+  'rcu-stall:expedited': { severity: 'warning', message: 'Kernel reported a short expedited RCU grace-period delay.' },
   'oom-kill:active': { severity: 'critical', message: 'Kernel reported an out-of-memory kill.' },
   'filesystem-error:active': { severity: 'critical', message: 'Kernel reported a filesystem or block I/O error.' },
+  'pcie-aer:correctable': { severity: 'warning', message: 'Kernel reported a correctable PCIe AER event.' },
+  'pcie-aer:nonfatal': { severity: 'critical', message: 'Kernel reported a non-fatal PCIe AER event.' },
+  'pcie-aer:fatal': { severity: 'critical', message: 'Kernel reported a fatal PCIe AER event.' },
+  'pcie-link:down': { severity: 'critical', message: 'Kernel reported that the PCIe link went down.' },
+  'pcie-link:degraded': { severity: 'warning', message: 'Kernel reported degraded PCIe link training.' },
+  'pcie-link:recovered': { severity: 'info', message: 'Kernel reported that the PCIe link recovered.' },
+  'kernel-warning:active': { severity: 'warning', message: 'Kernel reported an internal warning.' },
+  'kernel-oops:active': { severity: 'critical', message: 'Kernel reported an oops.' },
+  'kernel-panic:active': { severity: 'critical', message: 'Kernel reported a panic.' },
+  'hung-task:active': { severity: 'critical', message: 'Kernel reported a hung task.' },
   'nvme-mitigation:active': { severity: 'info', message: 'Runtime NVMe power-management mitigation is active.' },
   'nvme-mitigation:incomplete': { severity: 'warning', message: 'Runtime NVMe power-management mitigation is not fully active.' },
 } as const;
@@ -278,6 +308,32 @@ function timestampOf(record: JsonRecord): string | null {
   return isoTimestamp(first(record, ['timestamp', 'collectedAt', 'generatedAt', 'time', 'ts']));
 }
 
+function normalizeSwap(
+  totalValue: unknown,
+  usedValue: unknown,
+  percentValue: unknown,
+): Pick<TelemetrySample, 'swapTotalBytes' | 'swapUsedBytes' | 'swapPercent'> {
+  const swapTotalBytes = integer(totalValue);
+  let swapUsedBytes = integer(usedValue);
+  let swapPercent = percent(percentValue);
+  if (swapTotalBytes !== null && swapUsedBytes !== null) {
+    if (swapUsedBytes > swapTotalBytes) {
+      swapUsedBytes = null;
+      swapPercent = null;
+    } else {
+      const expectedPercent = swapTotalBytes > 0
+        ? Math.round((100 * swapUsedBytes / swapTotalBytes) * 100) / 100
+        : 0;
+      if (swapPercent === null) {
+        swapPercent = expectedPercent;
+      } else if (Math.abs(swapPercent - expectedPercent) > 0.01) {
+        swapPercent = null;
+      }
+    }
+  }
+  return { swapTotalBytes, swapUsedBytes, swapPercent };
+}
+
 function normalizeSample(value: unknown): TelemetrySample | null {
   if (!isRecord(value)) return null;
   const timestamp = timestampOf(value);
@@ -289,6 +345,11 @@ function normalizeSample(value: unknown): TelemetrySample | null {
   const gpu = recordAt(value, 'gpu');
   const thermal = recordAt(value, 'thermal');
   const power = recordAt(value, 'power');
+  const swap = recordAt(value, 'swap');
+  const pressure = recordAt(value, 'pressure');
+  const cpuPressure = recordAt(pressure, 'cpu');
+  const memoryPressure = recordAt(pressure, 'memory');
+  const ioPressure = recordAt(pressure, 'io');
   const load = first(cpu, ['loadAverage', 'load']) ?? first(value, ['loadAverage', 'load']);
   const loadValues = Array.isArray(load) ? load : [];
 
@@ -304,6 +365,11 @@ function normalizeSample(value: unknown): TelemetrySample | null {
   if (memoryPercent === null && memoryUsedBytes !== null && memoryTotalBytes && memoryTotalBytes > 0) {
     memoryPercent = Math.min(100, (memoryUsedBytes / memoryTotalBytes) * 100);
   }
+  const normalizedSwap = normalizeSwap(
+    first(value, ['swapTotalBytes']) ?? first(swap, ['totalBytes', 'total']),
+    first(value, ['swapUsedBytes']) ?? first(swap, ['usedBytes', 'used']),
+    first(value, ['swapPercent']) ?? first(swap, ['percent', 'usedPercent']),
+  );
 
   return {
     timestamp,
@@ -311,6 +377,7 @@ function normalizeSample(value: unknown): TelemetrySample | null {
     memoryPercent,
     memoryUsedBytes,
     memoryTotalBytes,
+    ...normalizedSwap,
     temperatureC: finite(
       first(value, ['temperatureC', 'temperature'])
         ?? first(thermal, ['temperatureC', 'temperature', 'cpuTemperatureC'])
@@ -321,6 +388,24 @@ function normalizeSample(value: unknown): TelemetrySample | null {
     load1: finite(loadValues[0] ?? first(cpu, ['load1']) ?? first(value, ['load1'])),
     load5: finite(loadValues[1] ?? first(cpu, ['load5']) ?? first(value, ['load5'])),
     load15: finite(loadValues[2] ?? first(cpu, ['load15']) ?? first(value, ['load15'])),
+    cpuPressureSomeAvg10: percent(
+      first(value, ['cpuPressureSomeAvg10']) ?? first(cpuPressure, ['someAvg10']),
+    ),
+    cpuPressureFullAvg10: percent(
+      first(value, ['cpuPressureFullAvg10']) ?? first(cpuPressure, ['fullAvg10']),
+    ),
+    memoryPressureSomeAvg10: percent(
+      first(value, ['memoryPressureSomeAvg10']) ?? first(memoryPressure, ['someAvg10']),
+    ),
+    memoryPressureFullAvg10: percent(
+      first(value, ['memoryPressureFullAvg10']) ?? first(memoryPressure, ['fullAvg10']),
+    ),
+    ioPressureSomeAvg10: percent(
+      first(value, ['ioPressureSomeAvg10']) ?? first(ioPressure, ['someAvg10']),
+    ),
+    ioPressureFullAvg10: percent(
+      first(value, ['ioPressureFullAvg10']) ?? first(ioPressure, ['fullAvg10']),
+    ),
     powerState: cleanText(
       first(value, ['powerState'])
         ?? first(power, ['state', 'status'])
@@ -345,6 +430,18 @@ function normalizeSample(value: unknown): TelemetrySample | null {
     networkTxBytesPerSecond: finite(first(network, [
       'txBytesPerSecond', 'transmitBytesPerSecond', 'txBps',
     ]) ?? first(value, ['networkTxBytesPerSecond'])),
+    networkRxErrorsPerSecond: finite(
+      first(value, ['networkRxErrorsPerSecond']), 0, MAX_TELEMETRY_RATE,
+    ),
+    networkTxErrorsPerSecond: finite(
+      first(value, ['networkTxErrorsPerSecond']), 0, MAX_TELEMETRY_RATE,
+    ),
+    networkRxDroppedPerSecond: finite(
+      first(value, ['networkRxDroppedPerSecond']), 0, MAX_TELEMETRY_RATE,
+    ),
+    networkTxDroppedPerSecond: finite(
+      first(value, ['networkTxDroppedPerSecond']), 0, MAX_TELEMETRY_RATE,
+    ),
     diskReadBytesPerSecond: finite(first(disk, [
       'readBytesPerSecond', 'readBps', 'diskReadBytesPerSecond',
     ]) ?? first(value, ['diskReadBytesPerSecond'])),
@@ -361,10 +458,19 @@ function emptySample(timestamp: string): TelemetrySample {
     memoryPercent: null,
     memoryUsedBytes: null,
     memoryTotalBytes: null,
+    swapTotalBytes: null,
+    swapUsedBytes: null,
+    swapPercent: null,
     temperatureC: null,
     load1: null,
     load5: null,
     load15: null,
+    cpuPressureSomeAvg10: null,
+    cpuPressureFullAvg10: null,
+    memoryPressureSomeAvg10: null,
+    memoryPressureFullAvg10: null,
+    ioPressureSomeAvg10: null,
+    ioPressureFullAvg10: null,
     powerState: null,
     supplyVoltageVolts: null,
     throttledFlags: null,
@@ -372,6 +478,10 @@ function emptySample(timestamp: string): TelemetrySample {
     gpuClockHz: null,
     networkRxBytesPerSecond: null,
     networkTxBytesPerSecond: null,
+    networkRxErrorsPerSecond: null,
+    networkTxErrorsPerSecond: null,
+    networkRxDroppedPerSecond: null,
+    networkTxDroppedPerSecond: null,
     diskReadBytesPerSecond: null,
     diskWriteBytesPerSecond: null,
   };
@@ -482,13 +592,24 @@ function downsampleTelemetry(values: TelemetrySample[], maximum: number): Teleme
   const extremaFields: Array<keyof TelemetrySample> = [
     'cpuPercent',
     'memoryPercent',
+    'swapPercent',
     'temperatureC',
     'load1',
     'load5',
     'load15',
+    'cpuPressureSomeAvg10',
+    'cpuPressureFullAvg10',
+    'memoryPressureSomeAvg10',
+    'memoryPressureFullAvg10',
+    'ioPressureSomeAvg10',
+    'ioPressureFullAvg10',
     'supplyVoltageVolts',
     'networkRxBytesPerSecond',
     'networkTxBytesPerSecond',
+    'networkRxErrorsPerSecond',
+    'networkTxErrorsPerSecond',
+    'networkRxDroppedPerSecond',
+    'networkTxDroppedPerSecond',
     'diskReadBytesPerSecond',
     'diskWriteBytesPerSecond',
   ];
@@ -550,6 +671,7 @@ function normalizeHost(current: JsonRecord | null): DashboardResponse['host'] {
     hostname: cleanText(first(host, ['hostname', 'name']), 128),
     os: cleanText(first(host, ['os', 'platform', 'release', 'kernel']), 128),
     architecture: cleanText(first(host, ['architecture', 'arch']), 32),
+    logicalCpuCount: integer(first(host, ['logicalCpuCount']), 1, 4096),
     uptimeSeconds: finite(first(host, ['uptimeSeconds', 'uptime']), 0),
   };
 }
@@ -573,6 +695,108 @@ function normalizeReliability(current: JsonRecord | null): DashboardResponse['re
   };
 }
 
+const SYSTEM_KERNEL_KEYS = [
+  'warning',
+  'oops',
+  'panic',
+  'hungTask',
+  'rcuStall',
+  'rcuExpedited',
+  'oomKill',
+  'filesystemError',
+  'nvmeReset',
+  'nvmeIo',
+  'pcieAerCorrectable',
+  'pcieAerNonFatal',
+  'pcieAerFatal',
+] as const;
+
+function systemText(value: unknown, maximumLength: number): string | null {
+  if (
+    typeof value !== 'string'
+    || value.length < 1
+    || value.length > maximumLength
+    || !/^[A-Za-z0-9][A-Za-z0-9._+:/ -]*$/.test(value)
+  ) return null;
+  return value.trim() || null;
+}
+
+function calendarDate(value: unknown): string | null {
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return null;
+  const date = new Date(`${value}T00:00:00.000Z`);
+  return Number.isFinite(date.getTime()) && date.toISOString().slice(0, 10) === value
+    ? value
+    : null;
+}
+
+function normalizeSystemKernel(
+  value: JsonRecord | undefined,
+  nowMs: number,
+  bootStartedMs: number | null,
+): DashboardResponse['system']['kernel'] {
+  return Object.fromEntries(SYSTEM_KERNEL_KEYS.map((key) => {
+    const raw = recordAt(value, key);
+    const count = integer(own(raw, 'count'), 0);
+    const timestamp = isoTimestamp(own(raw, 'lastEventAt'));
+    const time = timestamp ? new Date(timestamp).getTime() : Number.NaN;
+    if (
+      count === null
+      || !timestamp && count !== 0
+      || timestamp && (
+        count === 0
+        || time > nowMs + 60_000
+        || bootStartedMs !== null && time < bootStartedMs
+      )
+    ) return [key, { count: 0, lastEventAt: null }];
+    return [key, { count, lastEventAt: timestamp }];
+  })) as DashboardResponse['system']['kernel'];
+}
+
+function normalizeSystem(
+  current: JsonRecord | null,
+  nowMs: number,
+): DashboardResponse['system'] {
+  const system = recordAt(current ?? undefined, 'system');
+  const versions = recordAt(system, 'versions');
+  const pcie = recordAt(system, 'pcie');
+  const channel = own(versions, 'bootloaderChannel');
+  const bootStartedAt = isoTimestamp(own(
+    recordAt(current ?? undefined, 'reliability'),
+    'bootStartedAt',
+  ));
+  const bootStartedMs = bootStartedAt ? new Date(bootStartedAt).getTime() : null;
+  return {
+    versions: {
+      kernelRunning: systemText(own(versions, 'kernelRunning'), 128),
+      kernelLatestInstalled: systemText(own(versions, 'kernelLatestInstalled'), 128),
+      kernelRebootRequired: optionalBoolean(own(versions, 'kernelRebootRequired')),
+      bootloaderCurrent: calendarDate(own(versions, 'bootloaderCurrent')),
+      bootloaderLatest: calendarDate(own(versions, 'bootloaderLatest')),
+      bootloaderChannel: channel === 'default' || channel === 'latest' ? channel : null,
+      nvmeModel: systemText(own(versions, 'nvmeModel'), 128),
+      nvmeFirmware: systemText(own(versions, 'nvmeFirmware'), 64),
+      collector: systemText(own(versions, 'collector'), 64),
+    },
+    pcie: {
+      configuredGeneration: integer(own(pcie, 'configuredGeneration'), 1, 6),
+      negotiatedGeneration: integer(own(pcie, 'negotiatedGeneration'), 1, 6),
+      negotiatedSpeedGtps: finite(own(pcie, 'negotiatedSpeedGtps'), 0.1, 128),
+      negotiatedWidth: integer(own(pcie, 'negotiatedWidth'), 1, 32),
+      endpointMaxGeneration: integer(own(pcie, 'endpointMaxGeneration'), 1, 6),
+      endpointMaxWidth: integer(own(pcie, 'endpointMaxWidth'), 1, 32),
+      aspmDisabled: optionalBoolean(own(pcie, 'aspmDisabled')),
+      nvmePowerSavingDisabled: optionalBoolean(own(pcie, 'nvmePowerSavingDisabled')),
+      aerCorrectableCount: integer(own(pcie, 'aerCorrectableCount'), 0),
+      aerNonFatalCount: integer(own(pcie, 'aerNonFatalCount'), 0),
+      aerFatalCount: integer(own(pcie, 'aerFatalCount'), 0),
+      correctableStatusActive: optionalBoolean(own(pcie, 'correctableStatusActive')),
+      nonFatalStatusActive: optionalBoolean(own(pcie, 'nonFatalStatusActive')),
+      fatalStatusActive: optionalBoolean(own(pcie, 'fatalStatusActive')),
+    },
+    kernel: normalizeSystemKernel(recordAt(system, 'kernel'), nowMs, bootStartedMs),
+  };
+}
+
 function normalizeDisks(current: JsonRecord | null): DashboardResponse['disks'] {
   const input = current ? first(current, ['disks', 'filesystems']) : undefined;
   if (!Array.isArray(input)) return [];
@@ -582,6 +806,10 @@ function normalizeDisks(current: JsonRecord | null): DashboardResponse['disks'] 
     if (!mount || !mount.startsWith('/')) return [];
     const usedBytes = finite(first(value, ['usedBytes', 'used']));
     const totalBytes = finite(first(value, ['totalBytes', 'total', 'sizeBytes']));
+    let availableBytes = integer(first(value, ['availableBytes']));
+    if (availableBytes !== null && totalBytes !== null && availableBytes > totalBytes) {
+      availableBytes = null;
+    }
     let usagePercent = percent(first(value, ['percent', 'usagePercent', 'usedPercent']));
     if (usagePercent === null && usedBytes !== null && totalBytes && totalBytes > 0) {
       usagePercent = Math.min(100, (usedBytes / totalBytes) * 100);
@@ -590,7 +818,10 @@ function normalizeDisks(current: JsonRecord | null): DashboardResponse['disks'] 
       mount,
       totalBytes,
       usedBytes,
+      availableBytes,
       usedPercent: usagePercent,
+      inodeUsedPercent: percent(first(value, ['inodeUsedPercent'])),
+      readOnly: optionalBoolean(first(value, ['readOnly'])),
     }];
   });
 }
@@ -757,9 +988,10 @@ function normalizeReliabilitySeverity(
 
 function reliabilityEventDedupeKey(
   event: DashboardResponse['reliabilityEvents'][number],
+  preserveSubseconds = true,
 ): string {
   return [
-    event.timestamp.slice(0, 19),
+    preserveSubseconds ? event.timestamp : event.timestamp.slice(0, 19),
     event.kind,
     event.status.toLowerCase(),
     event.message.toLowerCase(),
@@ -823,14 +1055,23 @@ function normalizeReliabilityEvents(
   });
   dedicated.sort((left, right) => right.timestamp.localeCompare(left.timestamp));
   legacy.sort((left, right) => right.timestamp.localeCompare(left.timestamp));
-  const seen = new Set<string>();
-  return [...dedicated, ...legacy]
-    .filter((event) => {
-      const key = reliabilityEventDedupeKey(event);
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    })
+  const dedicatedExact = new Set<string>();
+  const dedicatedSeconds = new Set<string>();
+  const uniqueDedicated = dedicated.filter((event) => {
+    const exactKey = reliabilityEventDedupeKey(event);
+    if (dedicatedExact.has(exactKey)) return false;
+    dedicatedExact.add(exactKey);
+    dedicatedSeconds.add(reliabilityEventDedupeKey(event, false));
+    return true;
+  });
+  const legacySeconds = new Set<string>();
+  const uniqueLegacy = legacy.filter((event) => {
+    const secondKey = reliabilityEventDedupeKey(event, false);
+    if (dedicatedSeconds.has(secondKey) || legacySeconds.has(secondKey)) return false;
+    legacySeconds.add(secondKey);
+    return true;
+  });
+  return [...uniqueDedicated, ...uniqueLegacy]
     .sort((left, right) => right.timestamp.localeCompare(left.timestamp))
     .slice(0, MAX_EVENTS);
 }
@@ -995,16 +1236,28 @@ function normalizeIncidentMetrics(
     && memoryTotalBytes !== null
     && memoryUsedBytes > memoryTotalBytes
   ) return null;
+  const normalizedSwap = normalizeSwap(
+    own(value, 'swapTotalBytes'),
+    own(value, 'swapUsedBytes'),
+    own(value, 'swapPercent'),
+  );
   return {
     timestamp: observedAt,
     cpuPercent: percent(own(value, 'cpuPercent')),
     memoryPercent: percent(own(value, 'memoryPercent')),
     memoryUsedBytes,
     memoryTotalBytes,
+    ...normalizedSwap,
     temperatureC: finite(own(value, 'temperatureC'), -100, 250),
     load1: finite(own(value, 'load1')),
     load5: finite(own(value, 'load5')),
     load15: finite(own(value, 'load15')),
+    cpuPressureSomeAvg10: percent(own(value, 'cpuPressureSomeAvg10')),
+    cpuPressureFullAvg10: percent(own(value, 'cpuPressureFullAvg10')),
+    memoryPressureSomeAvg10: percent(own(value, 'memoryPressureSomeAvg10')),
+    memoryPressureFullAvg10: percent(own(value, 'memoryPressureFullAvg10')),
+    ioPressureSomeAvg10: percent(own(value, 'ioPressureSomeAvg10')),
+    ioPressureFullAvg10: percent(own(value, 'ioPressureFullAvg10')),
     powerState: cleanText(own(value, 'powerState'), 32),
     supplyVoltageVolts: finite(own(value, 'supplyVoltageVolts'), 0, 10),
     throttledFlags: uint32(own(value, 'throttledFlags')),
@@ -1012,6 +1265,18 @@ function normalizeIncidentMetrics(
     gpuClockHz: finite(own(value, 'gpuClockHz')),
     networkRxBytesPerSecond: finite(own(value, 'networkRxBytesPerSecond')),
     networkTxBytesPerSecond: finite(own(value, 'networkTxBytesPerSecond')),
+    networkRxErrorsPerSecond: finite(
+      own(value, 'networkRxErrorsPerSecond'), 0, MAX_TELEMETRY_RATE,
+    ),
+    networkTxErrorsPerSecond: finite(
+      own(value, 'networkTxErrorsPerSecond'), 0, MAX_TELEMETRY_RATE,
+    ),
+    networkRxDroppedPerSecond: finite(
+      own(value, 'networkRxDroppedPerSecond'), 0, MAX_TELEMETRY_RATE,
+    ),
+    networkTxDroppedPerSecond: finite(
+      own(value, 'networkTxDroppedPerSecond'), 0, MAX_TELEMETRY_RATE,
+    ),
     diskReadBytesPerSecond: finite(own(value, 'diskReadBytesPerSecond')),
     diskWriteBytesPerSecond: finite(own(value, 'diskWriteBytesPerSecond')),
   };
@@ -1073,6 +1338,28 @@ function normalizeIncidentTraffic(value: unknown): DashboardResponse['incidents'
       maxResponseMs,
     }];
   });
+}
+
+function normalizeCurrentTraffic(current: JsonRecord | null): DashboardResponse['currentTraffic'] {
+  const input = own(current ?? undefined, 'currentTraffic');
+  if (input === undefined) return [];
+  if (!Array.isArray(input) || input.length > MAX_CURRENT_TRAFFIC) return [];
+  for (const candidate of input) {
+    if (!isRecord(candidate)) return [];
+    const fields = Object.keys(candidate);
+    if (
+      fields.length !== TRAFFIC_AGGREGATE_FIELDS.size
+      || fields.some((field) => !TRAFFIC_AGGREGATE_FIELDS.has(field))
+    ) return [];
+  }
+  const normalized = normalizeIncidentTraffic(input);
+  if (
+    normalized === null
+    || normalized.length !== input.length
+    || normalized.some((item) => item.avgResponseMs === null || item.maxResponseMs === null)
+    || new Set(normalized.map((item) => item.app)).size !== normalized.length
+  ) return [];
+  return normalized;
 }
 
 function normalizeIncident(
@@ -1241,14 +1528,17 @@ export function readDashboard(
     generatedAt: new Date(nowMs).toISOString(),
     range,
     stale: !Number.isFinite(latestTime) || nowMs - latestTime > staleAfterMs,
+    latestObservedAt: observedLatest?.timestamp ?? null,
     host: normalizeHost(current),
     reliability: normalizeReliability(current),
+    system: normalizeSystem(current, nowMs),
     latest,
     series: downsampleTelemetry(samples, MAX_SERIES_POINTS),
     telemetrySummary: summarizeTelemetry(samples),
     powerSummary: summarizePower(samples),
     disks: normalizeDisks(current),
     containers: normalizeContainers(current),
+    currentTraffic: normalizeCurrentTraffic(current),
     alerts: normalizeAlerts(alerts, cutoff, nowMs),
     powerEvents: normalizePowerEvents(power, alerts, samples, cutoff, nowMs),
     reliabilityEvents: normalizeReliabilityEvents(reliability, power, cutoff, nowMs),

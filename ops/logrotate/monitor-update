@@ -1,0 +1,9 @@
+/var/log/monitor-update-audit.jsonl {
+    daily
+    rotate 30
+    maxage 30
+    missingok
+    compress
+    delaycompress
+    create 0640 root adm
+}

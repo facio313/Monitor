@@ -16,9 +16,17 @@ host proc/sys + selected logs + privacy request counts -+
                                               root systemd collector
                                                         |
                                 /var/lib/monitor-export (bounded JSON/JSONL)
+                                                        ^
+root-only append ledger -> validated public ledger -----+
                                                         | read-only bind mount
                                                         v
 browser -> TLS/Nginx + central SSO -> Express API + React UI
+                                      |
+                                      +-> /run/monitor-update/gateway.sock
+                                          (narrow host bind from
+                                           /var/lib/monitor-update-socket)
+                                          -> unprivileged request queue
+                                          -> fixed-policy root APT worker
 ```
 
 The privilege boundary is intentional: the root collector reads protected host
@@ -26,7 +34,12 @@ inputs but its mount namespace contains no Docker socket. A separate one-shot
 helper runs as the same unprivileged `cks` account that already owns the sole
 rootless daemon and writes only a strictly validated, fixed-schema snapshot.
 The web container receives neither Docker sockets nor raw logs; it can read
-only the collector's reduced export. In production SSO
+only the collector's reduced export. Its one non-read capability is the exact
+`/run/monitor-update/gateway.sock` Unix socket described below, supplied by a
+read-only bind of the narrow host directory
+`/var/lib/monitor-update-socket`. That socket
+accepts only bounded `check` and plan-bound `apply-safe` requests and leads to
+an unprivileged gateway, not directly to APT. In production SSO
 mode the application has no password database, session database, auth-state
 directory, or other writable user store. It consumes only the identity asserted
 by the central SSO edge, protected by a dedicated read-only edge secret.
@@ -63,7 +76,9 @@ During central cutover only the exact v1 strings remain recognized. Legacy
 no-dashboard behavior. `developer` is never exposed as a current runtime role
 and never grants the admin-only auth inventory. Every entitled user can read the
 dashboard, while the metadata-only legacy auth inventory requires `admin` or
-`chief-admin`. Roles and grants are recalculated from trusted headers on every
+`chief-admin`. The legacy admin compatibility identity may check for updates,
+but it is deliberately denied host package apply; applying requires a canonical
+v2 `chief-admin` header. Roles and grants are recalculated from trusted headers on every
 request and are never stored in a Monitor cookie.
 Local login and password changes stay disabled, and the SSO session check
 expires any legacy Monitor cookie presented by that browser. In `local` mode
@@ -77,9 +92,19 @@ The dashboard provides:
 - a Korean-first control-room view with an explicit English switch, large page
   and panel headings, persistent critical-state strip, and an in-product guide
   for load, throughput, PSI, stale data, and peak incidents;
+- a prominent system-affect field that synthesizes compute, memory, thermal,
+  network, storage, service, and reliability evidence into an accessible
+  textual state plus a decorative wave field. Danger/caution findings reshape
+  its color, energy, turbulence, and movement and link to the winning evidence;
+  the canvas pauses offscreen, in hidden tabs, and behind dialogs, honors
+  reduced-motion preferences, and uses a lower pixel ratio on coarse pointers;
 - CPU, memory, temperature, 1/5/15-minute load, network, disk-I/O, filesystem,
   container, power, reliability, incident, and event views using area, line,
   composed, horizontal/stacked bar, histogram, and donut charts;
+- operator headroom for logical-CPU-normalized load, swap, CPU/memory/I/O PSI
+  `some` and `full`, free bytes, filesystem/inode use, read-only mounts,
+  non-loopback interface error/drop rates, and the latest privacy-reduced app
+  request/5xx/slow/latency interval;
 - `1h`, `24h`, `7d`, and `30d` ranges, with at most 360 chart points;
 - host, EXT5V supply/power/GPU, filesystem, and allow-listed `cks` container status;
 - host-reliability state and a fixed-message timeline for boot transitions,
@@ -88,20 +113,36 @@ The dashboard provides:
 - bounded peak-incident evidence with PSI, fixed executable classes,
   fixed-label `cks` workloads, and per-capture app request counts (not visitors);
 - recent semantic alerts and privilege outcomes without commands or arguments;
+- a separate administrator-only infrastructure work ledger for completed,
+  observed, pending, deferred, and standards-recommended work, including
+  revision history, rationale, impact, evidence, and follow-up filters;
+- a prioritized operational assessment that separates current state,
+  current-boot evidence, last-known samples, and selected-range observations. Named danger/caution
+  links open reload-safe subsystem guidance with the problem, likely symptoms,
+  resolution checks, collected evidence, and a jump to the related data grid;
 - stale-data and refresh-error indicators and one-minute visible-tab refreshes;
-- a 12/8/4/1-column adaptive GridStack layout. Pointer move/resize is available
-  only in explicit edit mode; keyboard controls, undo, cancel, save, and curated
-  default reset remain available. Strictly validated schema-versioned geometry
-  is stored per SSO subject in browser local storage and contains no telemetry.
+- a desktop 12-column adaptive GridStack layout. At 1024px and below it becomes
+  a natural-height two-column reading flow, and at 640px and below a one-column
+  flow, so saved desktop row heights cannot clip tablet or phone content.
+  Pointer move/resize is available only in explicit desktop edit mode; keyboard
+  controls, undo, cancel, save, and curated default reset remain available.
+  Strictly validated schema-versioned geometry is stored per SSO subject in
+  browser local storage and contains no telemetry;
+- bounded pagination for operational logs, incidents, service groups and full
+  service tables, infrastructure ledger entries, update packages, vital-sign
+  tiles, and current app traffic. Filters reset or clamp the active page and
+  every pager exposes localized range/total and keyboard-readable controls.
 
 The overview keeps operational scanning compact while every subsystem has a
 reload-safe detail route under `/monitor/details/:section`: `resources`,
-`network`, `storage`, `containers`, `reliability`, `power`, `incidents`, and
-`logs`. Detail pages use the same authenticated, bounded API snapshot and add
-range summaries, full charts, service tables, incident evidence, traffic
-status-class aggregates, and searchable structured event records. The event
-view never presents those reduced records as raw logs and states that commands,
-arguments, and credentials are not collected.
+`network`, `storage`, `containers`, `reliability`, `maintenance`,
+`infrastructure`, `power`, `incidents`, and `logs`. Detail pages use the same
+authenticated, bounded API
+snapshot and add diagnosis/response guidance, range summaries, full charts,
+service tables, incident evidence, traffic status-class aggregates, and
+searchable structured event records. The event view never presents those
+reduced records as raw logs and states that commands, arguments, and credentials
+are not collected.
 
 ## Requirements
 
@@ -155,9 +196,20 @@ do not expose hash contents or remove a running local-mode store.
 The host-specific production definition is
 `/etc/portfolio-deploy/monitor.compose.yml`. It binds the application to
 `127.0.0.1:5181`, mounts `/var/lib/monitor-export` read-only, mounts only the
-edge secret at `/run/secrets/monitor_edge_secret`, and requires an explicit
-image tag. There must be no writable auth-state mount or local password/session
-secret in this definition.
+edge secret at `/run/secrets/monitor_edge_secret`, and binds only the narrow
+`/var/lib/monitor-update-socket` read-only at the container's
+`/run/monitor-update` directory for the updater socket. It
+requires an explicit image tag. There must be no writable auth-state mount,
+local password/session secret, Docker socket, or broader host path mount in
+this definition.
+
+Install the separate updater broker before adding that socket-directory bind. The
+installer creates no package plan and runs no package action:
+
+```sh
+sudo sh ops/install-updater.sh
+systemctl status monitor-update-gateway.socket monitor-update-worker.path
+```
 
 ```sh
 sudo -u cks env \
@@ -255,10 +307,77 @@ after a successful Nginx reload permits it to expire the final inactive log.
 That marker must itself age for 48 hours, giving graceful Nginx workers time to
 release the old descriptor before deletion.
 
-The collector reduces those observations to per-app request and response-time
-summaries for one capture interval and attaches them only to bounded peak
-incidents. Dashboard request counts therefore show requests in that capture,
-not people or unique visitors.
+The collector reduces those observations to per-app request, status-class,
+slow-request, and response-time summaries for one capture interval. The newest
+complete interval is exposed as `currentTraffic`; the same fixed-schema list is
+attached to bounded peak incidents for correlation. An empty list means either
+that no accepted request rows occurred in the interval or that the optional
+source was unavailable—it is not proof of zero traffic. Dashboard request
+counts therefore describe requests in one capture, not people or unique
+visitors.
+
+## Infrastructure work ledger
+
+The telemetry event views and the infrastructure ledger serve different
+purposes. Telemetry remains a bounded signal stream for current diagnosis. The
+ledger at `/monitor/details/infrastructure` is an administrator-only,
+long-lived work record for what was changed or observed, why it mattered, how
+it was verified, its service impact, and what remains open. SSO `user` roles
+cannot list or read it; `admin` and `chief-admin` can read it. The browser and
+web container never write it.
+
+Prepare the reviewed bootstrap as a root-only file outside the checkout, then
+install the root-only writer before deploying the UI/API. The real bootstrap
+is deliberately ignored by Git because this repository is public and the
+ledger contains environment-specific operational history:
+
+```sh
+cd /home/cks/Monitor
+sudo install -o root -g root -m 0600 \
+  /path/to/reviewed-monitor-ledger-seed.json \
+  /root/reviewed-monitor-ledger-seed.json
+sudo sh ops/install-infrastructure-ledger.sh \
+  /root/reviewed-monitor-ledger-seed.json
+sudo /usr/local/sbin/monitor-infrastructure-ledger publish
+sudo -u cks python3 -m json.tool \
+  /var/lib/monitor-export/infrastructure-ledger.json >/dev/null
+```
+
+On an upgrade where the canonical stream already exists, omit the seed path;
+the installer replaces the validated writer and republishes the existing
+append-only stream. Initial installation fails closed without an explicit
+absolute seed path.
+
+The canonical append-only stream and catalog live under
+`/var/lib/monitor-infrastructure-ledger` as `root:root` mode `0600` inside a
+mode-`0700` directory. A validated, credential-free snapshot is atomically
+published as `/var/lib/monitor-export/infrastructure-ledger.json`, owned
+`root:cks` mode `0640`, through the export directory already mounted read-only
+into Monitor. Files that are linked, broadly writable, malformed, oversized,
+or contain credential-like material fail closed. Existing event IDs and source
+definitions cannot silently change; corrections are appended as a new
+revision with an explicit `supersedes` link.
+
+The private bootstrap reconstruction's coverage block states the retained
+evidence windows and deliberate gaps:
+history outside retention, raw shell/session contents, secrets, personal
+identifiers, authenticated third-party control-plane settings, and backup
+contents are not claimed as known. Future changes should be prepared as one
+strict entry object and appended with:
+
+```sh
+sudo /usr/local/sbin/monitor-infrastructure-ledger append \
+  --input /root/reviewed-monitor-ledger-entry.json
+```
+
+The append input must be a root-owned regular file that is not group- or
+world-writable; mode `0600` under `/root` is the expected staging boundary.
+Do not put command lines, arguments, tokens, cookies, passwords, private keys,
+client addresses, or personal data in that input. `publish` rebuilds the
+public snapshot from the canonical stream without deleting history. The
+writer fails when the 5,000-entry or 16 MiB safety bound is reached; it never
+prunes silently. Backup and restore-test the private canonical directory as a
+separate operational control.
 
 ## Local development
 
@@ -346,6 +465,7 @@ Application variables:
 | `HOST` | `0.0.0.0` | Express listen address |
 | `PORT` | `8080` | Express listen port |
 | `MONITOR_DATA_DIR` | `/data` | Sanitized collector export root |
+| `MONITOR_UPDATE_SOCKET` | `/run/monitor-update/gateway.sock` | SSO-only fixed-protocol updater gateway path inside the container |
 | `MONITOR_AUTH_STATE_FILE` | `/var/lib/monitor-auth/password.json` | Local-only disposable password-hash/session-epoch state file |
 | `MONITOR_PASSWORD_FILE` | unset | Local-only bootstrap password file; used only when auth state is absent |
 | `MONITOR_SESSION_SECRET_FILE` | unset | Local-only cookie HMAC secret file; at least 32 bytes |
@@ -372,6 +492,7 @@ Collector variables and defaults are:
 | `MONITOR_OUTPUT_DIR` | `/var/lib/monitor-export` |
 | `MONITOR_RUNTIME_DIR` | `/run/monitor-collector` |
 | `MONITOR_PROC_ROOT`, `MONITOR_SYS_ROOT`, `MONITOR_ETC_ROOT` | `/proc`, `/sys`, `/etc` |
+| `MONITOR_PACKAGE_ROOT` | `/`; fixture root for installed kernels and packaged Pi EEPROM files |
 | `MONITOR_EVENTS_LOG` | `/var/log/server-watch/events.log` |
 | `MONITOR_KERNEL_LOG` | `/var/log/kern.log` |
 | `MONITOR_PRIVILEGE_LOGS` | `/var/log/privilege-events.log` |
@@ -419,8 +540,8 @@ sudo systemctl restart monitor-collector.service
 
 The default root is `/var/lib/monitor-export`:
 
-- `current.json` contains `generatedAt`, `host`, `latest`, `disks`, and
-  `containers`.
+- `current.json` contains `generatedAt`, `host`, `latest`, `disks`,
+  `containers`, `currentTraffic`, `reliability`, and `system`.
 - `history/YYYY-MM-DD.jsonl` contains one reduced telemetry sample per line.
   Each day is capped at 2,000 rows and the default calendar retention is 30
   days.
@@ -431,6 +552,10 @@ The default root is `/var/lib/monitor-export`:
 - `incidents.jsonl` is capped at 1,000 records, 16 MiB, and 30 days. A record is
   written only on incident entry, during at most five one-minute follow-ups,
   when another threshold joins the same window, and on recovery.
+- `infrastructure-ledger.json` is a separately managed, bounded public
+  materialization of the root-only append stream. It is not collector telemetry
+  and is not pruned by telemetry retention. The API exposes it only to an
+  authenticated local session or an SSO `admin`/`chief-admin` identity.
 - `.state/log-cursors.json` stores durable source positions. New fixed-schema
   alert, power, and privilege rows plus next cursors and per-output base/final
   digests first enter the bounded mode-`0600`
@@ -450,29 +575,62 @@ The default root is `/var/lib/monitor-export`:
   `cks` exporter's private runtime file and are never mounted into the root
   collector.
 
-`host` contains hostname, OS, architecture, and uptime. A `latest`/history
-sample contains a timestamp plus CPU and memory percentages and byte totals,
-temperature, 1/5/15-minute load, power state, the sampled `supplyVoltageVolts`,
-numeric uint32 `throttledFlags`, GPU memory/clock, network RX/TX rates, and disk
-read/write rates. Missing or invalid sensors are represented as `null`.
+`host` contains hostname, OS, architecture, online logical-CPU count, and
+uptime. Top-level `system`
+contains a fixed, serial-free snapshot of running/latest-installed kernel,
+Raspberry Pi bootloader channel and dates, NVMe model/firmware, collector
+version, negotiated/configured PCIe generations and widths, ASPM/NVMe power
+settings, bounded AER counters/status flags, and current-boot semantic kernel
+event counts with their last timestamps. Missing legacy `system` data remains
+readable as explicit unknown values and zero event counts. A `latest`/history
+sample contains a timestamp plus CPU and memory percentages and byte totals;
+swap total/used bytes and percentage; temperature and 1/5/15-minute load;
+current Linux PSI `some`/`full` avg10 percentages for CPU, memory, and I/O;
+power state, the sampled `supplyVoltageVolts`, numeric uint32
+`throttledFlags`, GPU memory/clock, aggregate non-loopback network RX/TX byte,
+error, and dropped-packet rates, and disk read/write rates. Interface names are
+not exported. Missing, unsupported, reset, or invalid counters are represented
+as `null`.
+`latestObservedAt` is the timestamp of the last real telemetry sample, or
+`null` when `latest` is only the bounded synthetic fallback used to keep the
+response shape stable.
 
 Once per collector run, `vcgencmd pmic_read_adc EXT5V_V` supplies the single
-external 5 V rail sample and `vcgencmd get_throttled` supplies the numeric
-current/latched flags. EXT5V is a point-in-time rail voltage—not input current
+external 5 V rail sample, while the standard `rpi_volt/in0_lcrit_alarm` hwmon
+attribute supplies the current under-voltage state in bit 0 of the compatible
+flags field. The collector never invokes deprecated `vcgencmd get_throttled`.
+EXT5V is a point-in-time rail voltage—not input current
 in amperes, consumed or available watts, wall-outlet power, or the USB-C
 negotiated power profile. Monitor does not invent a voltage threshold from this
-sample. Kernel under-voltage/recovery reports and `vcgencmd` throttle flags are
+sample. Kernel under-voltage/recovery reports and the hwmon alarm are
 the authoritative condition signals; a missing voltage is unknown, not zero.
 
 The collector reads only its configured bounded portion of `/var/log/kern.log`
 and recognizes a narrow semantic allow-list: the exact Raspberry Pi
-`Undervoltage detected!` and `Voltage normalised` events, an NVMe controller
-down/reset pattern, and NVMe I/O-error patterns. It maps those to fixed
-under-voltage, recovery, NVMe-reset, or NVMe-I/O messages, deduplicates repeated
-same-second event kinds and statuses, and exports no device-specific raw text.
+`Undervoltage detected!` and `Voltage normalised` events; NVMe controller reset
+and I/O-error patterns; RCU stalls, OOM kills, filesystem errors, hung tasks,
+kernel warnings/oops/panics; and fixed PCIe AER and link transitions. It maps
+those to fixed messages and exports no device-specific raw text. Reliability
+records retain available sub-second precision and deduplicate only exact
+replays; the dedicated kernel power feed keeps its documented same-second
+semantic burst collapse.
+Short expedited RCU delays have their own current-boot `rcuExpedited` counter;
+they are not merged into the generic `warning` counter or the active
+`rcuStall` counter. That boot counter is authoritative when the bounded API
+timeline cap omits older individual rows.
 A missing kernel log is non-fatal and simply yields no new kernel power events.
 
-Each disk is reduced to mount, total/used bytes, and used percentage. Docker
+The hardened collector intentionally has no `CAP_SYS_ADMIN`. Linux therefore
+limits its PCI config-space read to the conventional 64-byte header, so the
+three PCIe Device Status active-bit fields normally remain `null` in production.
+They are optional diagnostics, not health evidence. The capability-free sysfs
+AER counters and fixed kernel-log AER events are the authoritative PCIe error
+signals; do not grant `CAP_SYS_ADMIN` merely to populate the optional bits.
+
+Each filesystem is reduced to its mount, total/used/available bytes, used and
+inode-used percentages, and read-only state. These are aggregate `statvfs`
+properties; no filenames, directory contents, or inode identities are read or
+exported. Docker
 list requests are restricted to explicitly reviewed Compose projects, and
 only exact reviewed project/service pairs become fixed, distinct workload
 labels. Previous app-level labels and the generic `cks-workload` value remain
@@ -518,7 +676,12 @@ GET    /monitor/api/auth/session
 DELETE /monitor/api/auth/session
 POST   /monitor/api/auth/password
 GET    /monitor/api/dashboard?range=1h|24h|7d|30d
+GET    /monitor/api/infrastructure-ledger      # admin/chief-admin in SSO mode
 GET    /monitor/api/operations/auth-inventory  # admin/chief-admin, aggregate only
+GET    /monitor/api/system-updates              # authenticated, sanitized state
+POST   /monitor/api/system-updates/check        # canonical/legacy admin or canonical chief-admin
+POST   /monitor/api/system-updates/prepare      # canonical chief-admin, current plan only
+POST   /monitor/api/system-updates/apply        # canonical chief-admin, one-use confirmation
 ```
 
 ## Security boundaries
@@ -533,6 +696,11 @@ GET    /monitor/api/operations/auth-inventory  # admin/chief-admin, aggregate on
   nested schema. The web container also has no socket mount.
 - Export files are bounded, atomically replaced, and readable by the `cks`
   deployment boundary without becoming world-readable.
+- The infrastructure ledger has a separate root-only append stream. A narrow
+  writer validates exact fields, revision chains, source references, size,
+  links, permissions, and credential-like content before atomically replacing
+  the read-only public snapshot; the API independently validates it and applies
+  the administrator role gate.
 - Hashed process identifiers exist only in the mode-`0600` runtime delta file
   and are never exported. Incident evidence contains fixed executable classes
   only. The bounded Nginx input has no client or request identifier;
@@ -544,6 +712,12 @@ GET    /monitor/api/operations/auth-inventory  # admin/chief-admin, aggregate on
   mount, no writable user/auth store, no Linux capabilities,
   `no-new-privileges`, a small tmpfs, and CPU, memory, PID, and log-size limits.
   Only the local Compose overlay adds a disposable writable auth-state mount.
+- The updater socket is a deliberate write capability. Its unprivileged gateway
+  verifies peer UID 1001 and cannot invoke APT. A separate root worker revalidates
+  the queue and exposes only fixed package-check and confirmed safe-apply
+  operations. Host processes running as trusted deployment account `cks` share
+  that UID trust boundary; no other container receives the runtime-directory
+  bind. See `ops/UPDATER.md` for the exact plan, audit, and failure contracts.
 - Local-mode sessions are HMAC-signed, one-hour by default, and stored in `HttpOnly`,
   `Secure`, `SameSite=Strict` cookies scoped to `/monitor`. Login permits five
   failed attempts per 15 minutes; state-changing API requests enforce origin
@@ -566,7 +740,10 @@ GET    /monitor/api/operations/auth-inventory  # admin/chief-admin, aggregate on
 
 This is a private operations view. Keep it behind the central HTTPS SSO gate,
 do not expose port `5181`, and do not mount additional host paths into the
-container.
+container beyond the read-only telemetry export, edge secret, and the exact
+read-only `/var/lib/monitor-update-socket` host directory at
+`/run/monitor-update` in the container. Never mount broader `/var/lib` or
+`/run`, Docker, systemd, APT, or host filesystem paths.
 
 ## GitHub Actions deployment
 
@@ -633,20 +810,25 @@ Diagnostics do not require exposing secret values:
 sudo systemctl status monitor-collector.timer monitor-collector.service
 sudo journalctl -u monitor-collector.service -n 100 --no-pager
 sudo /usr/bin/vcgencmd pmic_read_adc EXT5V_V
-sudo /usr/bin/vcgencmd get_throttled
+sudo -u cks jq '.latest | {powerState, supplyVoltageVolts, throttledFlags}' /var/lib/monitor-export/current.json
+for hwmon in /sys/class/hwmon/hwmon*; do
+  [ "$(cat "$hwmon/name" 2>/dev/null)" = rpi_volt ] || continue
+  cat "$hwmon/in0_lcrit_alarm"
+done
 sudo systemctl start monitor-collector.service
 sudo -u cks tail -n 20 /var/lib/monitor-export/power.jsonl
 sudo -u cks env XDG_RUNTIME_DIR=/run/user/1001 DOCKER_HOST=unix:///run/user/1001/docker.sock docker logs --tail 100 monitor
 sudo nginx -t
 ```
 
-`pmic_read_adc EXT5V_V` confirms whether this board exposes the sampled rail;
-`get_throttled` reports current low bits and latched historical high bits. An
-unsupported command or missing reading should appear as `null`, not as a
-fabricated zero. Inspect the sanitized `power.jsonl` export rather than copying
-raw kernel-log lines into tickets or chat. If the file is absent, run the
-collector once and check its journal; absence remains normal on hosts without a
-matching kernel event.
+`pmic_read_adc EXT5V_V` confirms whether this board exposes the sampled rail.
+The fixed-schema snapshot and the Raspberry Pi `rpi_volt` hwmon alarm expose the
+safe current power state. Do not invoke deprecated `vcgencmd get_throttled` on
+this kernel: merely reading it emits a kernel warning. An unsupported command or
+missing reading should appear as `null`, not as a fabricated zero. Inspect the
+sanitized `power.jsonl` export rather than copying raw kernel-log lines into
+tickets or chat. If the file is absent, run the collector once and check its
+journal; absence remains normal on hosts without a matching kernel event.
 
 Remove the container and active privacy request logging, then the collector:
 
@@ -668,7 +850,9 @@ the logging configuration, then waits 48 hours before that final file becomes
 eligible. The collector uninstaller
 deliberately preserves
 `/var/lib/monitor-export` and
-`/etc/default/monitor-collector`. It also leaves the edge credential, production Compose file, deployment
+`/etc/default/monitor-collector`. It does not remove the independent
+`/var/lib/monitor-infrastructure-ledger` canonical record. It also leaves the
+edge credential, production Compose file, deployment
 dispatcher entry, Nginx route, and container images in place. Local disposable
 auth state beneath the worktree is separate and can be removed when no longer
 needed.

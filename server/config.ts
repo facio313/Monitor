@@ -17,6 +17,7 @@ interface CommonRuntimeConfig {
   staleAfterMs: number;
   allowedOrigins: string[];
   legacyAuthStateFile: string;
+  updateSocketPath: string;
 }
 
 export interface SsoRuntimeConfig extends CommonRuntimeConfig {
@@ -45,6 +46,7 @@ export interface ConfigOverrides {
   allowedOrigins?: string[];
   ssoEnabled?: boolean;
   edgeSecret?: string;
+  updateSocketPath?: string;
 }
 
 function ssoEnabledFromPortfolioContract(): boolean {
@@ -137,6 +139,11 @@ export function loadConfig(overrides: ConfigOverrides = {}): RuntimeConfig {
       overrides.authStateFile
         ?? process.env.MONITOR_AUTH_STATE_FILE
         ?? '/var/lib/monitor-auth/password.json',
+    ),
+    updateSocketPath: resolve(
+      overrides.updateSocketPath
+        ?? process.env.MONITOR_UPDATE_SOCKET
+        ?? '/run/monitor-update/gateway.sock',
     ),
   };
 

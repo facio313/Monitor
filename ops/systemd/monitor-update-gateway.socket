@@ -1,0 +1,18 @@
+[Unit]
+Description=Monitor host update request socket
+Documentation=file:/usr/local/share/doc/monitor-updater/README.md
+After=systemd-tmpfiles-setup.service
+RequiresMountsFor=/var/lib
+
+[Socket]
+ListenStream=/var/lib/monitor-update-socket/gateway.sock
+DirectoryMode=0750
+SocketMode=0660
+SocketUser=monitor-updater
+SocketGroup=cks
+RemoveOnStop=true
+Accept=no
+Backlog=16
+
+[Install]
+WantedBy=sockets.target

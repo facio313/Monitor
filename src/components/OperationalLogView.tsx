@@ -8,9 +8,15 @@ import { localized } from '../dashboard-model';
 import type { MonitorLocale } from '../types';
 import { formatDateTime, safeText } from '../utils';
 import { Icon } from './Icon';
+import { Pagination, paginateItems, usePagination } from './Pagination';
 
 const CATEGORIES: OperationalLogCategory[] = ['alert', 'reliability', 'power', 'privilege'];
 const SEVERITIES: OperationalLogSeverity[] = ['critical', 'warning', 'info'];
+const RECORDED_KERNEL_KINDS = new Set([
+  'nvme-reset', 'nvme-io', 'pcie-aer', 'pcie-link', 'rcu-stall',
+  'kernel-warning', 'kernel-oops', 'kernel-panic', 'hung-task', 'oom-kill',
+  'filesystem-error',
+]);
 
 function categoryLabel(category: OperationalLogCategory, locale: MonitorLocale): string {
   const labels: Record<OperationalLogCategory, [string, string]> = {
@@ -32,7 +38,17 @@ function severityLabel(severity: OperationalLogSeverity, locale: MonitorLocale):
 }
 
 function localizedEventTitle(entry: OperationalLogEntry, locale: MonitorLocale): string {
-  if (locale === 'en') return entry.title;
+  const kindKey = entry.kind.toLowerCase();
+  const statusKey = entry.status.toLowerCase();
+  if (locale === 'en') {
+    if (statusKey === 'active' && kindKey === 'nvme-mitigation') {
+      return `${entry.kind.replace(/[-_]+/g, ' ')} · enabled`;
+    }
+    if (statusKey === 'active' && RECORDED_KERNEL_KINDS.has(kindKey)) {
+      return `${entry.kind.replace(/[-_]+/g, ' ')} · recorded`;
+    }
+    return entry.title;
+  }
   const kindLabels: Record<string, string> = {
     'host-boot': '호스트 부팅',
     'collector-gap': '수집 공백',
@@ -40,7 +56,13 @@ function localizedEventTitle(entry: OperationalLogEntry, locale: MonitorLocale):
     'network-link': '네트워크 연결',
     'nvme-reset': 'NVMe 컨트롤러 재설정',
     'nvme-io': 'NVMe 입출력 오류',
+    'pcie-aer': 'PCIe AER 오류',
+    'pcie-link': 'PCIe 링크 오류',
     'rcu-stall': '커널 RCU 지연',
+    'kernel-warning': '커널 경고',
+    'kernel-oops': '커널 Oops',
+    'kernel-panic': '커널 패닉',
+    'hung-task': '커널 작업 정지',
     'oom-kill': '메모리 부족 종료',
     'filesystem-error': '파일시스템 오류',
     'nvme-mitigation': 'NVMe 완화 조치',
@@ -55,8 +77,17 @@ function localizedEventTitle(entry: OperationalLogEntry, locale: MonitorLocale):
   };
   const statusLabels: Record<string, string> = {
     active: '발생 중',
+    expedited: '짧은 지연',
     recovered: '복구됨',
     resolved: '해결됨',
+    restarted: '재시작됨',
+    detected: '감지됨',
+    correctable: '교정 가능',
+    nonfatal: '비치명',
+    fatal: '치명',
+    down: '연결 끊김',
+    degraded: '성능 저하',
+    incomplete: '미적용',
     success: '성공',
     failure: '실패',
     allowed: '허용',
@@ -66,8 +97,12 @@ function localizedEventTitle(entry: OperationalLogEntry, locale: MonitorLocale):
     unavailable: '사용 불가',
     unknown: '상태 미확인',
   };
-  const kind = kindLabels[entry.kind.toLowerCase()] ?? entry.kind.replace(/[-_]+/g, ' ');
-  const status = statusLabels[entry.status.toLowerCase()] ?? entry.status.replace(/[-_]+/g, ' ');
+  const kind = kindLabels[kindKey] ?? entry.kind.replace(/[-_]+/g, ' ');
+  const status = statusKey === 'active' && kindKey === 'nvme-mitigation'
+    ? '적용됨'
+    : statusKey === 'active' && RECORDED_KERNEL_KINDS.has(kindKey)
+      ? '발생 기록'
+      : statusLabels[statusKey] ?? entry.status.replace(/[-_]+/g, ' ');
   return `${kind} · ${status}`;
 }
 
@@ -91,7 +126,13 @@ export function OperationalLogView({ entries, locale, compact = false, category 
     return [entry.title, entry.message, entry.kind, entry.status, entry.actor, entry.target]
       .some((value) => typeof value === 'string' && value.toLocaleLowerCase().includes(normalizedQuery));
   }), [entries, normalizedQuery, selectedCategory, selectedSeverity]);
-  const shown = compact ? filtered.slice(0, 6) : filtered;
+  const entrySignature = useMemo(() => entries.map((entry) => entry.id).join('\u001f'), [entries]);
+  const pagination = usePagination({
+    totalItems: filtered.length,
+    pageSize: compact ? 4 : 10,
+    resetKey: `${compact ? 'compact' : 'full'}\u001e${selectedCategory}\u001e${selectedSeverity}\u001e${normalizedQuery}\u001e${entrySignature}`,
+  });
+  const shown = paginateItems(filtered, pagination);
 
   return (
     <div className={`ops-log${compact ? ' ops-log-compact' : ''}`}>
@@ -175,6 +216,14 @@ export function OperationalLogView({ entries, locale, compact = false, category 
           <span>{localized(locale, '기간이나 필터를 바꿔 확인하세요.', 'Change the time range or loosen the filters.')}</span>
         </div>
       )}
+      <Pagination
+        model={pagination}
+        locale={locale}
+        onPageChange={pagination.setPage}
+        ariaLabel={localized(locale, '운영 로그 페이지', 'Operational log pages')}
+        itemLabel={localized(locale, '건', 'records')}
+        className="ops-log-pagination"
+      />
     </div>
   );
 }

@@ -8,3 +8,7 @@ auth-state/
 *.log
 .DS_Store
 coverage/
+
+# Environment-specific infrastructure history is private host input. The
+# public repository contains the schema, writer, tests, and UI, not real data.
+ops/ledger/initial-ledger.json
