@@ -3758,6 +3758,7 @@ class FilesystemTests(unittest.TestCase):
         self.assertIn("MONITOR_KERNEL_LOG=/var/log/kern.log", defaults)
         self.assertIn("MONITOR_EXPECTED_INTERVAL_SECONDS=60", defaults)
         self.assertIn("MONITOR_AGENT_LIFECYCLE=active", defaults)
+
         self.assertIn("MONITOR_KERNEL_MAX_INPUT_BYTES=8388608", defaults)
         self.assertIn("MONITOR_RULE_PACK=/usr/local/lib/monitor-collector/rules/default-rules.v1.json", defaults)
         self.assertIn("MONITOR_LOG_SOURCES_CONFIG=/etc/monitor-collector/log-sources.json", defaults)
@@ -3835,6 +3836,26 @@ class FilesystemTests(unittest.TestCase):
         )
         self.assertIn('"$(id -u cks)" -ne 1001', installer)
         self.assertIn('"$(getent group cks | cut -d: -f3)" -ne 1001', installer)
+
+    def test_configured_mountinfo_failure_preserves_previous_snapshot(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output = root / "output"
+            output.mkdir()
+            current_path = output / "current.json"
+            current_path.write_text('{"sentinel":"preserved"}\n')
+            config = collector.Config(
+                output_dir=output,
+                runtime_dir=root / "run",
+                mountinfo=root / "missing-mountinfo",
+            )
+
+            with self.assertRaisesRegex(
+                RuntimeError, "configured mountinfo has no collectable filesystems"
+            ):
+                collector.run(config)
+
+            self.assertEqual(current_path.read_text(), '{"sentinel":"preserved"}\n')
 
     def test_notification_delivery_counter_becomes_a_restart_safe_delta(self):
         with tempfile.TemporaryDirectory() as temporary:

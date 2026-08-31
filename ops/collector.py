@@ -7465,6 +7465,14 @@ def run(config: Config, now: dt.datetime | None = None) -> dict[str, Any]:
         monotonic = _sample_monotonic()
         elapsed = monotonic - (finite_number(prior.get("monotonic"), monotonic) or monotonic)
 
+        mountinfo = read_text(config.mountinfo_path)
+        filesystems = collect_filesystems(mountinfo, config.mount_root)
+        if config.mountinfo is not None and not filesystems:
+            # A configured host-namespace mount source is a required production
+            # observation surface. Preserve the previous complete snapshot if
+            # its bind disappears instead of publishing a false empty inventory.
+            raise RuntimeError("configured mountinfo has no collectable filesystems")
+
         proc_stat = read_text(config.proc_root / "stat")
         cpu = parse_proc_stat(proc_stat)
         previous_cpu = prior.get("cpu")
@@ -7594,7 +7602,7 @@ def run(config: Config, now: dt.datetime | None = None) -> dict[str, Any]:
             "heartbeat": heartbeat,
             "host": host,
             "latest": latest,
-            "disks": collect_filesystems(read_text(config.mountinfo_path), config.mount_root),
+            "disks": filesystems,
             "containers": containers,
             "containerCollection": container_collection,
             "dockerEventCollection": docker_event_collection,
