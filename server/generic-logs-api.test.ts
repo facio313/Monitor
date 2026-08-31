@@ -117,6 +117,29 @@ async function loginCookie(app: ReturnType<typeof createApp>): Promise<string> {
 }
 
 describe('generic log HTTP API', () => {
+  it('uses the safe export-root owner when no test-only UID override is supplied', async () => {
+    const directory = fixtureDirectory();
+    writeFixture(directory);
+    const app = createApp({
+      password: PASSWORD,
+      authStateFile: join(directory, 'auth-state.json'),
+      sessionSecret: SESSION_SECRET,
+      dataDir: directory,
+      securityStateDir: directory,
+      now: () => NOW,
+      ssoEnabled: false,
+    });
+    const cookie = await loginCookie(app);
+
+    const response = await request(app)
+      .get('/monitor/api/generic-logs?limit=1')
+      .set('Cookie', cookie)
+      .expect(200);
+
+    expect(response.body.collection.status).toBe('fresh');
+    expect(response.body.page).toMatchObject({ returned: 1, total: 2 });
+  });
+
   it('requires authentication and maps repeated filter parameters to the strict read model', async () => {
     const directory = fixtureDirectory();
     writeFixture(directory);

@@ -20,7 +20,8 @@ function payload(): DashboardPayload {
       writableLayerBytes: 1_500_000_000, volumeCount: 1, bindMountCount: 2,
       tmpfsMountCount: 1, networkAttachmentCount: 1, publishedPortCount: 1,
       privileged: true, hostPid: true, hostIpc: false, hostNetwork: true,
-      dockerSocketMounted: true, sensitiveBindMounted: true, rootUser: true,
+      dockerSocketMounted: true, sensitiveBindMounted: true, writableSensitiveBindMounted: true,
+      rootUser: true,
       readOnlyRootFilesystem: false, addedCapabilityCount: 2, dangerousCapabilityCount: 2,
       excessiveCapabilities: true, imageName: 'registry.example/ops/monitor', imageTag: 'latest',
       imageDigest: `sha256:${'1'.repeat(64)}`, imageDigestSource: 'local-image-id',
@@ -55,6 +56,7 @@ describe('DockerDiagnosticsPanel', () => {
     expect(markup).toContain('Writable layer');
     expect(markup).toContain('registry.example/ops/monitor:latest');
     expect(markup).toContain('Docker socket mounted');
+    expect(markup).toContain('Writable sensitive bind mount');
     expect(markup).toContain('Host PID namespace');
     expect(markup).toContain('Host network');
     expect(markup).toContain('Root user');
@@ -64,6 +66,31 @@ describe('DockerDiagnosticsPanel', () => {
     expect(markup).toContain('Not collected');
     expect(markup).toContain('exit 137');
     expect(markup).not.toContain('a'.repeat(64));
+  });
+
+  it('shows a known read-only sensitive bind as evidence without reporting it as high risk', () => {
+    const readOnly = payload();
+    Object.assign(readOnly.containers[0], {
+      privileged: false,
+      dockerSocketMounted: false,
+      hostPid: false,
+      hostIpc: false,
+      hostNetwork: false,
+      sensitiveBindMounted: true,
+      writableSensitiveBindMounted: false,
+      rootUser: false,
+      readOnlyRootFilesystem: true,
+      excessiveCapabilities: false,
+    });
+    const markup = renderToStaticMarkup(createElement(DockerDiagnosticsPanel, {
+      data: readOnly, locale: 'en',
+    }));
+
+    expect(markup).toContain('<dt>Sensitive bind</dt><dd>Yes</dd>');
+    expect(markup).toContain('<dt>Writable sensitive bind</dt><dd>No</dd>');
+    expect(markup).not.toContain('Writable sensitive bind mount');
+    expect(markup).not.toContain('Sensitive bind writability unverified');
+    expect(markup).toContain('No high-risk setting was found in the collected summary.');
   });
 
   it('does not present last-known container diagnostics as current when events are fresh', () => {

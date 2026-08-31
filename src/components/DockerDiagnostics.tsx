@@ -50,7 +50,11 @@ function securityFindings(container: ContainerStatus, locale: MonitorLocale): st
   if (container.hostPid) findings.push(t(locale, '호스트 PID 공유', 'Host PID namespace'));
   if (container.hostIpc) findings.push(t(locale, '호스트 IPC 공유', 'Host IPC namespace'));
   if (container.hostNetwork) findings.push(t(locale, '호스트 네트워크 공유', 'Host network'));
-  if (container.sensitiveBindMounted) findings.push(t(locale, '민감 경로 bind', 'Sensitive bind mount'));
+  if (container.sensitiveBindMounted && container.writableSensitiveBindMounted === true) {
+    findings.push(t(locale, '쓰기 가능한 민감 경로 bind', 'Writable sensitive bind mount'));
+  } else if (container.sensitiveBindMounted && container.writableSensitiveBindMounted !== false) {
+    findings.push(t(locale, '민감 bind 쓰기 권한 미확인', 'Sensitive bind writability unverified'));
+  }
   if (container.rootUser) findings.push(t(locale, 'root 사용자', 'Root user'));
   if (container.readOnlyRootFilesystem === false) findings.push(t(locale, '쓰기 가능한 rootfs', 'Writable root filesystem'));
   if (container.excessiveCapabilities) findings.push(t(locale, '과도한 capability', 'Elevated capabilities'));
@@ -197,6 +201,7 @@ export function DockerDiagnosticsPanel({ data, locale }: {
                 <div><dt>{t(locale, '호스트 네트워크', 'Host network')}</dt><dd>{booleanState(container.hostNetwork, locale)}</dd></div>
                 <div><dt>{t(locale, 'Docker 소켓', 'Docker socket')}</dt><dd>{booleanState(container.dockerSocketMounted, locale)}</dd></div>
                 <div><dt>{t(locale, '민감 bind', 'Sensitive bind')}</dt><dd>{booleanState(container.sensitiveBindMounted, locale)}</dd></div>
+                <div><dt>{t(locale, '쓰기 가능한 민감 bind', 'Writable sensitive bind')}</dt><dd>{booleanState(container.writableSensitiveBindMounted, locale)}</dd></div>
                 <div><dt>{t(locale, 'root 사용자', 'Root user')}</dt><dd>{booleanState(container.rootUser, locale)}</dd></div>
                 <div><dt>{t(locale, '읽기 전용 rootfs', 'Read-only rootfs')}</dt><dd>{booleanState(container.readOnlyRootFilesystem, locale)}</dd></div>
                 <div><dt>{t(locale, '추가 / 고위험 capability', 'Added / dangerous capabilities')}</dt><dd>{count(container.addedCapabilityCount)} / {count(container.dangerousCapabilityCount)}</dd></div>

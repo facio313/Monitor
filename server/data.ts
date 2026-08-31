@@ -1157,12 +1157,16 @@ const CONTAINER_V3_ONLY_FIELDS = [
   'networkErrors', 'networkErrorsPerSecond', 'writableLayerBytes', 'volumeCount',
   'bindMountCount', 'tmpfsMountCount', 'networkAttachmentCount', 'publishedPortCount',
   'privileged', 'hostPid', 'hostIpc', 'hostNetwork', 'dockerSocketMounted',
-  'sensitiveBindMounted', 'rootUser', 'readOnlyRootFilesystem', 'addedCapabilityCount',
+  'sensitiveBindMounted', 'writableSensitiveBindMounted', 'rootUser',
+  'readOnlyRootFilesystem', 'addedCapabilityCount',
   'dangerousCapabilityCount', 'excessiveCapabilities', 'imageName', 'imageTag',
   'imageDigest', 'imageDigestSource', 'usesLatestTag', 'imageDigestDrift',
   'imageDigestChanged',
 ] as const;
 const CONTAINER_V3_FIELDS = [...CONTAINER_V2_FIELDS, ...CONTAINER_V3_ONLY_FIELDS] as const;
+const CONTAINER_V3_LEGACY_FIELDS = CONTAINER_V3_FIELDS.filter(
+  (field) => field !== 'writableSensitiveBindMounted',
+);
 type ContainerRow = DashboardResponse['containers'][number];
 type ContainerV3Extras = Pick<ContainerRow, (typeof CONTAINER_V3_ONLY_FIELDS)[number]>;
 const EMPTY_CONTAINER_V3_EXTRAS: ContainerV3Extras = {};
@@ -1184,7 +1188,10 @@ function nullableContainerBoolean(record: JsonRecord, field: string): boolean | 
   return value === null ? null : typeof value === 'boolean' ? value : undefined;
 }
 
-function normalizeContainerV3Extras(record: JsonRecord): ContainerV3Extras | null {
+function normalizeContainerV3Extras(
+  record: JsonRecord,
+  legacyWithoutWritableSensitiveBind: boolean,
+): ContainerV3Extras | null {
   const instanceId = own(record, 'instanceId');
   if (typeof instanceId !== 'string' || !/^[a-f0-9]{32}$/.test(instanceId)) return null;
   const integers = {
@@ -1213,13 +1220,17 @@ function normalizeContainerV3Extras(record: JsonRecord): ContainerV3Extras | nul
     networkTxBytesPerSecond: nullableContainerNumber(record, 'networkTxBytesPerSecond', 1e15),
     networkErrorsPerSecond: nullableContainerNumber(record, 'networkErrorsPerSecond', 1e15),
   };
+  const sensitiveBindMounted = nullableContainerBoolean(record, 'sensitiveBindMounted');
   const booleans = {
     privileged: nullableContainerBoolean(record, 'privileged'),
     hostPid: nullableContainerBoolean(record, 'hostPid'),
     hostIpc: nullableContainerBoolean(record, 'hostIpc'),
     hostNetwork: nullableContainerBoolean(record, 'hostNetwork'),
     dockerSocketMounted: nullableContainerBoolean(record, 'dockerSocketMounted'),
-    sensitiveBindMounted: nullableContainerBoolean(record, 'sensitiveBindMounted'),
+    sensitiveBindMounted,
+    writableSensitiveBindMounted: legacyWithoutWritableSensitiveBind
+      ? (sensitiveBindMounted === false ? false : null)
+      : nullableContainerBoolean(record, 'writableSensitiveBindMounted'),
     rootUser: nullableContainerBoolean(record, 'rootUser'),
     readOnlyRootFilesystem: nullableContainerBoolean(record, 'readOnlyRootFilesystem'),
     excessiveCapabilities: nullableContainerBoolean(record, 'excessiveCapabilities'),
@@ -1246,6 +1257,9 @@ function normalizeContainerV3Extras(record: JsonRecord): ContainerV3Extras | nul
     || (imageName === null && booleans.usesLatestTag !== null)
     || (imageName !== null && booleans.usesLatestTag !== (imageTag === 'latest'))
     || (imageDigestSource === 'repo-digest' && imageName === null)
+    || (booleans.sensitiveBindMounted === null && booleans.writableSensitiveBindMounted !== null)
+    || (booleans.sensitiveBindMounted === false && booleans.writableSensitiveBindMounted !== false)
+    || (booleans.writableSensitiveBindMounted === true && booleans.sensitiveBindMounted !== true)
     || (imageDigest === null && (booleans.imageDigestDrift !== null || booleans.imageDigestChanged !== null))
     || (imageDigest !== null && booleans.imageDigestDrift === null)
     || (numbers.blockReadBytesPerSecond !== null && integers.blockReadBytes === null)
@@ -1307,8 +1321,11 @@ function normalizeContainerList(
     const v3 = CONTAINER_V3_ONLY_FIELDS.some((field) => Object.prototype.hasOwnProperty.call(value, field));
     const v2 = !v3 && CONTAINER_V2_ONLY_FIELDS.some((field) => Object.prototype.hasOwnProperty.call(value, field));
     const modern = v2 || v3;
+    const legacyV3 = v3
+      && !Object.prototype.hasOwnProperty.call(value, 'writableSensitiveBindMounted')
+      && exactKeys(value, CONTAINER_V3_LEGACY_FIELDS);
     if (
-      (v3 && !exactKeys(value, CONTAINER_V3_FIELDS))
+      (v3 && !legacyV3 && !exactKeys(value, CONTAINER_V3_FIELDS))
       || (v2 && !exactKeys(value, CONTAINER_V2_FIELDS))
     ) {
       return [];
@@ -1383,7 +1400,9 @@ function normalizeContainerList(
       || (healthcheckConfigured === true && !['healthy', 'unhealthy', 'starting'].includes(health ?? ''))
       || (healthcheckConfigured === null && health !== null)
     )) return [];
-    const v3Extras = v3 ? normalizeContainerV3Extras(value) : EMPTY_CONTAINER_V3_EXTRAS;
+    const v3Extras = v3
+      ? normalizeContainerV3Extras(value, legacyV3)
+      : EMPTY_CONTAINER_V3_EXTRAS;
     if (v3Extras === null) return [];
     return [{
       name,

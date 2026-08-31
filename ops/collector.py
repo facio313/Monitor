@@ -168,10 +168,15 @@ CONTAINER_FIELDS = CONTAINER_V2_FIELDS + (
     "networkErrors", "networkErrorsPerSecond", "writableLayerBytes", "volumeCount",
     "bindMountCount", "tmpfsMountCount", "networkAttachmentCount", "publishedPortCount",
     "privileged", "hostPid", "hostIpc", "hostNetwork", "dockerSocketMounted",
-    "sensitiveBindMounted", "rootUser", "readOnlyRootFilesystem", "addedCapabilityCount",
+    "sensitiveBindMounted", "writableSensitiveBindMounted", "rootUser",
+    "readOnlyRootFilesystem", "addedCapabilityCount",
     "dangerousCapabilityCount", "excessiveCapabilities", "imageName", "imageTag",
     "imageDigest", "imageDigestSource", "usesLatestTag", "imageDigestDrift",
     "imageDigestChanged",
+)
+CONTAINER_V3_LEGACY_FIELDS = tuple(
+    field_name for field_name in CONTAINER_FIELDS
+    if field_name != "writableSensitiveBindMounted"
 )
 CONTAINER_STATES = frozenset({
     "created", "running", "paused", "restarting", "removing", "exited", "dead", "unknown",
@@ -2174,12 +2179,14 @@ def _reduce_mount_summary(value: Any) -> dict[str, int | bool | None]:
         "tmpfsMountCount": None,
         "dockerSocketMounted": None,
         "sensitiveBindMounted": None,
+        "writableSensitiveBindMounted": None,
     }
     if not isinstance(value, list) or len(value) > MAX_CONTAINER_MOUNT_COUNT:
         return result
     counts = {"volume": 0, "bind": 0, "tmpfs": 0}
     docker_socket = False
     sensitive_bind = False
+    writable_sensitive_bind: bool | None = False
     sensitive_roots = ("/", "/boot", "/dev", "/etc", "/home", "/proc", "/root", "/run", "/sys")
 
     def normalized_path(candidate: Any) -> str | None:
@@ -2207,18 +2214,30 @@ def _reduce_mount_summary(value: Any) -> dict[str, int | bool | None]:
         ):
             docker_socket = True
         if mount_type == "bind":
-            for path in (source, destination):
-                if path is None:
-                    continue
-                if path == "/" or any(path == root or path.startswith(root + "/") for root in sensitive_roots[1:]):
-                    sensitive_bind = True
-                    break
+            # Only the host source represents host exposure. A conventional
+            # in-container destination such as /etc/app is not itself a
+            # sensitive host bind.
+            mount_is_sensitive = source is not None and (
+                source == "/"
+                or any(
+                    source == root or source.startswith(root + "/")
+                    for root in sensitive_roots[1:]
+                )
+            )
+            if mount_is_sensitive:
+                sensitive_bind = True
+                writable = raw_mount.get("RW")
+                if writable is True:
+                    writable_sensitive_bind = True
+                elif writable is not False and writable_sensitive_bind is False:
+                    writable_sensitive_bind = None
     return {
         "volumeCount": counts["volume"],
         "bindMountCount": counts["bind"],
         "tmpfsMountCount": counts["tmpfs"],
         "dockerSocketMounted": docker_socket,
         "sensitiveBindMounted": sensitive_bind,
+        "writableSensitiveBindMounted": writable_sensitive_bind,
     }
 
 
@@ -2465,6 +2484,7 @@ def docker_security_details(inspect: Mapping[str, Any] | None) -> dict[str, int 
         "hostNetwork": None,
         "dockerSocketMounted": None,
         "sensitiveBindMounted": None,
+        "writableSensitiveBindMounted": None,
         "rootUser": None,
         "readOnlyRootFilesystem": None,
         "addedCapabilityCount": None,
@@ -2482,6 +2502,18 @@ def docker_security_details(inspect: Mapping[str, Any] | None) -> dict[str, int 
     ipc_mode = host.get("IpcMode")
     network_mode = host.get("NetworkMode")
     root_user = config.get("RootUser") if isinstance(config.get("RootUser"), bool) else None
+    sensitive_bind = (
+        mounts.get("sensitiveBindMounted")
+        if isinstance(mounts.get("sensitiveBindMounted"), bool) else None
+    )
+    writable_sensitive_bind = (
+        mounts.get("writableSensitiveBindMounted")
+        if isinstance(mounts.get("writableSensitiveBindMounted"), bool) else None
+    )
+    if writable_sensitive_bind is None and sensitive_bind is False:
+        # A pre-field reduced MountSummary still proves that no sensitive bind
+        # exists, so the derived "any writable" answer is definitively false.
+        writable_sensitive_bind = False
     raw_capabilities = host.get("CapAdd")
     capability_count: int | None = None
     dangerous_count: int | None = None
@@ -2513,7 +2545,8 @@ def docker_security_details(inspect: Mapping[str, Any] | None) -> dict[str, int 
         "hostIpc": ipc_mode == "host" if isinstance(ipc_mode, str) else None,
         "hostNetwork": network_mode == "host" if isinstance(network_mode, str) else None,
         "dockerSocketMounted": mounts.get("dockerSocketMounted") if isinstance(mounts.get("dockerSocketMounted"), bool) else None,
-        "sensitiveBindMounted": mounts.get("sensitiveBindMounted") if isinstance(mounts.get("sensitiveBindMounted"), bool) else None,
+        "sensitiveBindMounted": sensitive_bind,
+        "writableSensitiveBindMounted": writable_sensitive_bind,
         "rootUser": root_user,
         "readOnlyRootFilesystem": read_only,
         "addedCapabilityCount": capability_count,
@@ -2548,7 +2581,8 @@ def normalize_private_container_state(value: Any) -> dict[str, int | str]:
     if restart_count is not None:
         result["restartCount"] = restart_count
     for field_name in (
-        "sampleAtUnixMs", "cpuPeriods", "cpuThrottledPeriods", "blockReadBytes",
+        "sampleAtUnixMs", "cpuPeriods", "cpuThrottledPeriods",
+        "cpuThrottledTimeNanoseconds", "blockReadBytes",
         "blockWriteBytes", "networkRxBytes", "networkTxBytes", "networkErrors",
     ):
         parsed = bounded_integer(value.get(field_name), 0, MAX_SAFE_COUNTER)
@@ -2597,6 +2631,7 @@ def private_container_counters(stats: Mapping[str, Any] | None) -> dict[str, int
     sources = {
         "cpuPeriods": throttle.get("periods"),
         "cpuThrottledPeriods": throttle.get("throttled_periods"),
+        "cpuThrottledTimeNanoseconds": throttle.get("throttled_time"),
     }
     block = stats.get("blkio_stats") if isinstance(stats.get("blkio_stats"), Mapping) else {}
     sources.update({
@@ -2707,6 +2742,7 @@ def container_from_api(
     cpu_throttled_percent: float | None = None
     cpu_throttled_periods: int | None = None
     cpu_throttled_seconds: float | None = None
+    cpu_throttled_time_nanoseconds: int | None = None
     block_read_bytes: int | None = None
     block_write_bytes: int | None = None
     network_rx_bytes: int | None = None
@@ -2718,27 +2754,13 @@ def container_from_api(
         pid_count = bounded_integer(raw_pids.get("current"), 0, MAX_CONTAINER_PID_LIMIT)
         raw_cpu = stats.get("cpu_stats") if isinstance(stats.get("cpu_stats"), Mapping) else {}
         throttle = raw_cpu.get("throttling_data") if isinstance(raw_cpu.get("throttling_data"), Mapping) else {}
-        periods = bounded_integer(throttle.get("periods"), 0, MAX_SAFE_COUNTER)
         throttled = bounded_integer(throttle.get("throttled_periods"), 0, MAX_SAFE_COUNTER)
         throttled_time = bounded_integer(throttle.get("throttled_time"), 0, MAX_SAFE_COUNTER)
+        cpu_throttled_time_nanoseconds = throttled_time
         cpu_throttled_periods = throttled
         cpu_throttled_seconds = (
             round(throttled_time / 1_000_000_000, 6) if throttled_time is not None else None
         )
-        previous_periods = bounded_integer(normalized_previous.get("cpuPeriods"), 0, MAX_SAFE_COUNTER)
-        previous_throttled = bounded_integer(
-            normalized_previous.get("cpuThrottledPeriods"), 0, MAX_SAFE_COUNTER
-        )
-        if (
-            periods is not None and throttled is not None
-            and previous_periods is not None and previous_throttled is not None
-            and periods >= previous_periods and throttled >= previous_throttled
-            and periods > previous_periods
-        ):
-            cpu_throttled_percent = round(min(
-                100.0,
-                100.0 * (throttled - previous_throttled) / (periods - previous_periods),
-            ), 2)
         raw_block = stats.get("blkio_stats") if isinstance(stats.get("blkio_stats"), Mapping) else {}
         block_read_bytes = bounded_integer(raw_block.get("readBytes"), 0, MAX_CONTAINER_IO_BYTES)
         block_write_bytes = bounded_integer(raw_block.get("writeBytes"), 0, MAX_CONTAINER_IO_BYTES)
@@ -2760,6 +2782,22 @@ def container_from_api(
         and 0 < sample_at_unix_ms - previous_sample_ms <= 86_400_000
         else None
     )
+    previous_throttled_time = bounded_integer(
+        normalized_previous.get("cpuThrottledTimeNanoseconds"), 0, MAX_SAFE_COUNTER
+    )
+    if (
+        cpu_throttled_time_nanoseconds is not None
+        and previous_throttled_time is not None
+        and cpu_throttled_time_nanoseconds >= previous_throttled_time
+        and elapsed_seconds is not None
+    ):
+        throttled_delta_seconds = (
+            cpu_throttled_time_nanoseconds - previous_throttled_time
+        ) / 1_000_000_000
+        cpu_throttled_percent = round(min(
+            100.0,
+            100.0 * throttled_delta_seconds / elapsed_seconds,
+        ), 2)
     block_read_rate = _container_counter_rate(
         block_read_bytes, normalized_previous.get("blockReadBytes"), elapsed_seconds
     )
@@ -2848,6 +2886,7 @@ def container_from_api(
         "hostNetwork": security["hostNetwork"],
         "dockerSocketMounted": security["dockerSocketMounted"],
         "sensitiveBindMounted": security["sensitiveBindMounted"],
+        "writableSensitiveBindMounted": security["writableSensitiveBindMounted"],
         "rootUser": security["rootUser"],
         "readOnlyRootFilesystem": security["readOnlyRootFilesystem"],
         "addedCapabilityCount": security["addedCapabilityCount"],
@@ -3399,7 +3438,8 @@ def normalize_container_values(
         fields = set(value)
         legacy = fields == set(LEGACY_CONTAINER_FIELDS)
         v2 = fields == set(CONTAINER_V2_FIELDS)
-        v3 = fields == set(CONTAINER_FIELDS)
+        v3_legacy = fields == set(CONTAINER_V3_LEGACY_FIELDS)
+        v3 = fields == set(CONTAINER_FIELDS) or v3_legacy
         if not legacy and not v2 and not v3:
             raise ValueError("container telemetry workload has unexpected fields")
         name = value.get("name")
@@ -3564,7 +3604,7 @@ def normalize_container_values(
             }
             boolean_fields = (
                 "privileged", "hostPid", "hostIpc", "hostNetwork", "dockerSocketMounted",
-                "sensitiveBindMounted", "rootUser", "readOnlyRootFilesystem",
+                "sensitiveBindMounted", "writableSensitiveBindMounted", "rootUser", "readOnlyRootFilesystem",
                 "excessiveCapabilities", "usesLatestTag", "imageDigestDrift", "imageDigestChanged",
             )
             normalized.update({"instanceId": instance_id})
@@ -3577,6 +3617,18 @@ def normalize_container_values(
                 for field_name, maximum in number_fields.items()
             })
             normalized.update({field_name: optional_boolean(field_name) for field_name in boolean_fields})
+            if v3_legacy:
+                normalized["writableSensitiveBindMounted"] = (
+                    False if normalized["sensitiveBindMounted"] is False else None
+                )
+            sensitive_bind = normalized["sensitiveBindMounted"]
+            writable_sensitive_bind = normalized["writableSensitiveBindMounted"]
+            if (
+                (sensitive_bind is None and writable_sensitive_bind is not None)
+                or (sensitive_bind is False and writable_sensitive_bind is not False)
+                or (writable_sensitive_bind is True and sensitive_bind is not True)
+            ):
+                raise ValueError("container telemetry workload has inconsistent sensitive bind state")
             image_name = value.get("imageName")
             image_tag = value.get("imageTag")
             image_digest = value.get("imageDigest")

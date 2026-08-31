@@ -35,7 +35,7 @@ dead-man 실제 run도 최종 증거가 생기기 전까지 pending이다. 최�
 | ingest compatibility | 신규 admission은 metric/event homogeneous만 허용한다. 기존 mixed queue entry는 startup에서 거부하지 않고 idempotency·capacity를 보존한 채 읽는 migration 경로가 있다. | downstream claim/ack와 시계열 materializer 없음. |
 | Linux telemetry | `ops/linux_telemetry.py`가 CPU/core/frequency, memory/swap/vmstat/PSI, filesystem/inode/RO, block latency/queue/utilization, NIC/TCP/conntrack, process/PID/FD/cgroup, allowlist systemd, thermal/RPi, boot/time/kernel source 상태를 발행한다. | privileged SMART·일부 platform event는 explicit unsupported/partial. |
 | Linux API·UI | `server/data.ts`와 `server/types.ts`가 exact bounded `linux` contract를 검증하며 `LinuxDiagnosticsPanel`이 resources/network/storage/reliability/power 화면에 연결된다. | 기준선 문서의 “server/UI 미연결” 설명은 더 이상 유효하지 않다. |
-| Docker v3 | exact 56-field row가 lifecycle, CPU/memory/PID/throttling, block/network total·rate, storage counts, security booleans/capability counts와 image digest evidence를 제공한다. raw ID는 opaque digest이고 env/command/raw mount/address는 버린다. | health output, restart 원인, cgroup memory event, volume filesystem 연결은 남음. |
+| Docker v3 | exact 57-field row가 lifecycle, CPU/memory/PID/throttling, block/network total·rate, storage counts, 민감한 호스트 source bind의 쓰기 가능 여부를 포함한 security booleans/capability counts와 image digest evidence를 제공한다. raw ID는 opaque digest이고 env/command/raw mount/address는 버린다. | health output, restart 원인, cgroup memory event, volume filesystem 연결은 남음. |
 | Docker event stream | cursor/replay/reconnect/dedup/gap과 최대 128개 allowlisted lifecycle event를 발행하고 API·`DockerDiagnosticsPanel` timeline에 연결한다. stale/permission/unavailable은 container 0개 정상으로 승격되지 않는다. | daemon 자체 lifecycle 상세 모델은 부분적. |
 | Compose·image UX | project/service grouping, resource·security·image·storage diagnostics, digest drift/latest/change와 상단 action links가 연결된다. 정상 rule 목록은 compact하고 Docker/rule 운영 timeline은 함께 볼 수 있다. | desired replica/deploy intent/orphan volume은 없음. |
 | generic logs | allowlist file/journald input, bounded cursor/tail, JSON/logfmt/syslog/plain/multiline parser, pre-storage credential·PII·PEM redaction, priority quota/drop accounting과 digest-bound explorer가 연결된다. | Docker stdout/stderr acquisition은 explicit unsupported. |
@@ -66,8 +66,8 @@ dead-man 실제 run도 최종 증거가 생기기 전까지 pending이다. 최�
 
 ### Docker 개인정보 경계
 
-Docker v3의 56 fields에는 자원 total/rate, lifecycle, limit, mount/network count,
-security boolean과 image evidence만 있다. raw container ID는 domain-separated opaque
+Docker v3의 57 fields에는 자원 total/rate, lifecycle, limit, mount/network count,
+민감한 호스트 source bind의 쓰기 가능 여부를 포함한 security boolean과 image evidence만 있다. raw container ID는 domain-separated opaque
 digest가 되고 raw mount path, IP/MAC, command, environment, health/log body는 공개되지
 않는다. counter 감소·instance 변경·긴 gap의 rate는 0이 아니라 `null`이며 last-known
 source의 delta를 현재 evidence로 평가하지 않는다.

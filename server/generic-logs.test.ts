@@ -375,6 +375,28 @@ describe('generic log read model', () => {
     expect(readGenericLogPage(linkedRoot, {}, NOW, OWNER).collection.status).toBe('collection_error');
   });
 
+  it('derives the mapped owner only from a stable non-writable export root', () => {
+    const root = directory();
+    writeRecords(root, [record('2026-08-30T11:59:00.000Z', 'mapped owner')]);
+    writeStatus(root);
+
+    expect(readGenericLogPage(root, {}, NOW).collection.status).toBe('fresh');
+    expect(readGenericLogPage(root, {}, NOW, OWNER + 1).collection.status).toBe('collection_error');
+
+    chmodSync(root, 0o770);
+    expect(readGenericLogPage(root, {}, NOW).collection.status).toBe('collection_error');
+
+    const realParent = directory();
+    const nestedRoot = join(realParent, 'export');
+    mkdirSync(nestedRoot, { mode: 0o700 });
+    writeRecords(nestedRoot, [record('2026-08-30T11:59:00.000Z', 'aliased root')]);
+    writeStatus(nestedRoot);
+    const aliasParent = directory();
+    symlinkSync(realParent, join(aliasParent, 'mapped-parent'));
+    expect(readGenericLogPage(join(aliasParent, 'mapped-parent', 'export'), {}, NOW).collection.status)
+      .toBe('collection_error');
+  });
+
   it('surfaces a strict collector failure marker until a successful collection clears it', () => {
     const root = directory();
     writeRecords(root, [record('2026-08-30T11:59:00.000Z', 'cached before marker')]);

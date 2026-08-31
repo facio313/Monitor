@@ -113,8 +113,8 @@ The dashboard provides:
 - an action-first overview whose persistent status, operational findings, and
   rule summary share heartbeat, Docker collection, rule, compute, memory,
   thermal, network, storage, service, and reliability evidence. Delayed or
-  failed collection and firing rules therefore affect the overall state; the
-  decorative overview canvas has been removed;
+  failed collection and firing rules therefore affect the overall state, while
+  a status-driven monochrome grain-wave canvas visualizes the same assessment;
 - CPU, memory, temperature, 1/5/15-minute load, network, disk-I/O, filesystem,
   container, power, reliability, incident, and event views using area, line,
   composed, horizontal/stacked bar, histogram, and donut charts;
@@ -707,8 +707,10 @@ Collector variables and defaults are:
 | `MONITOR_GENERIC_LOG_MAX_FILE_BYTES` | `16777216` |
 | `MONITOR_GENERIC_LOG_TOTAL_TIMEOUT` | `15` seconds across one collection cycle |
 
-`MONITOR_MOUNTINFO` and `MONITOR_MOUNT_ROOT` are normally unset and exist for
-fixture roots. The installed source of truth is
+`MONITOR_MOUNTINFO` and `MONITOR_MOUNT_ROOT` remain fixture overrides. The
+production unit pins `--mountinfo=/proc/1/mountinfo` so filesystem state comes
+from the host mount namespace rather than the collector's intentionally
+read-only `ProtectSystem` view. The installed source of truth is
 `/etc/default/monitor-collector`, seeded from
 `ops/monitor-collector.default`. Colon-separate additional privilege log
 fallbacks only when necessary; enabling overlapping sources can duplicate
@@ -734,11 +736,12 @@ The default root is `/var/lib/monitor-export`:
   `syntheticProbeCollection`, `syntheticProbes`, `currentTraffic`,
   `reliability`, `system`, and `linux`. Container source status distinguishes
   fresh, bounded last-known, unavailable, permission-denied, and collection
-  error observations. A new container row is the fixed 56-field reduced v3
+  error observations. A new container row is the fixed 57-field reduced v3
   contract. Its 17-field compatibility prefix covers safe identity/lifecycle,
   health, CPU/memory, limits, restart/OOM and timestamps; the v3 suffix covers
   opaque instance identity, PIDs/throttling, block I/O, network totals/rates,
-  writable-layer and mount/network counts, security booleans/capability counts,
+  writable-layer and mount/network counts, security booleans including sensitive-bind
+  writability, capability counts,
   and validated image tag/digest/drift evidence. Missing Docker evidence remains
   `null`; raw IDs, commands, environment, raw mount paths, Actor attributes, and
   network addresses are never published. Legacy seven-field rows are read with

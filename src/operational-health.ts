@@ -1,4 +1,9 @@
-import { NETWORK_FAULT_RATE_THRESHOLDS, PSI_THRESHOLDS } from './operational-thresholds';
+import {
+  NETWORK_DROP_RATE_THRESHOLDS,
+  NETWORK_ERROR_RATE_THRESHOLDS,
+  PSI_THRESHOLDS,
+} from './operational-thresholds';
+import { unresolvedIncidents } from './incident-read-model';
 import type {
   ContainerStatus,
   DashboardPayload,
@@ -440,7 +445,7 @@ const DEFINITIONS: Record<OperationalFindingId, OperationalFindingDefinition> = 
     priority: 1,
     title: ['컨테이너 권한 노출 확인', 'Container privilege exposure needs review'],
     summary: ['호스트 또는 Docker 제어면에 과도하게 접근할 수 있는 컨테이너가 있습니다.', 'A container has elevated access to the host or Docker control plane.'],
-    problem: ['privileged 모드, Docker 소켓, 민감 bind 또는 고위험 capability는 컨테이너 침해가 호스트 침해로 확대될 가능성을 높입니다.', 'Privileged mode, Docker socket access, sensitive binds, or dangerous capabilities increase the chance that a container compromise reaches the host.'],
+    problem: ['privileged 모드, Docker 소켓, 쓰기 가능한 민감 bind 또는 고위험 capability는 컨테이너 침해가 호스트 침해로 확대될 가능성을 높이고, 읽기 전용 민감 bind도 자격 증명을 노출할 수 있습니다.', 'Privileged mode, Docker socket access, writable sensitive binds, or dangerous capabilities can extend a container compromise to the host, while read-only sensitive binds can still expose credentials.'],
     symptoms: [
       ['보안 요약에 privileged, Docker socket, host namespace 또는 capability 노출이 표시됩니다.', 'The security summary reports privileged mode, Docker socket access, host namespaces, or capability exposure.'],
       ['컨테이너 내부 작업이 호스트 프로세스·네트워크·Docker 객체에 영향을 줄 수 있습니다.', 'Activity inside the container may affect host processes, networking, or Docker objects.'],
@@ -691,7 +696,10 @@ function projectedLinuxSignals(data: DashboardPayload): LinuxFindingSignals {
 
   const reliabilityStatus = collectionSignal('reliability:status', '신뢰성 수집', 'reliability collection', linux.reliability.status);
   const clockStatus = collectionSignal('reliability:clock', '시계 수집', 'clock collection', linux.reliability.clock.status);
-  const timeStatus = collectionSignal('reliability:time-sync', '시간 동기화 수집', 'time synchronization collection', linux.reliability.clock.timeSync.status);
+  const timeStatus = linux.reliability.clock.timeSync.synchronized === true
+    && linux.reliability.clock.timeSync.status === 'partial'
+    ? null
+    : collectionSignal('reliability:time-sync', '시간 동기화 수집', 'time synchronization collection', linux.reliability.clock.timeSync.status);
   const systemdStatus = collectionSignal('reliability:systemd', 'systemd 수집', 'systemd collection', linux.reliability.systemd.status);
   for (const signal of [reliabilityStatus, clockStatus, timeStatus, systemdStatus]) if (signal) result.reliability.push(signal);
   if (linux.reliability.clock.timeSync.synchronized === false) result.reliability.push({
@@ -713,7 +721,29 @@ function projectedLinuxSignals(data: DashboardPayload): LinuxFindingSignals {
   });
   for (const unit of linux.reliability.systemd.units) {
     const unitName = unit.unit.slice(0, 96) || 'unit';
-    if (unit.activeState !== 'active' || !['success', 'unknown'].includes(unit.result)) result.reliability.push({
+    const expectedInactiveOneshot = unitName === 'monitor-collector.service'
+      || unitName === 'monitor-container-exporter.service';
+    if (unit.restartCountStatus === 'observed_invocation_changes') {
+      const invocationSignal = collectionSignal(
+        `reliability:unit:${unitName}:invocation`,
+        `${unitName} 실행 상태 수집`,
+        `${unitName} invocation collection`,
+        unit.invocationStatus,
+      );
+      if (invocationSignal) result.reliability.push(invocationSignal);
+      if (!expectedInactiveOneshot && unit.activeState !== 'active') result.reliability.push({
+        key: `reliability:unit:${unitName}:state`,
+        level: unit.activeState === 'inactive' ? 'danger' : 'caution',
+        ko: `${unitName} ${unit.activeState}`,
+        en: `${unitName} ${unit.activeState}`,
+      });
+      continue;
+    }
+    const failed = unit.loadState !== 'loaded'
+      || !['success', 'unknown'].includes(unit.result)
+      || (unit.execMainStatus !== null && unit.execMainStatus !== 0)
+      || (!expectedInactiveOneshot && unit.activeState !== 'active');
+    if (failed) result.reliability.push({
       key: `reliability:unit:${unitName}:state`, level: 'danger',
       ko: `${unitName} ${unit.activeState}/${unit.result}`, en: `${unitName} ${unit.activeState}/${unit.result}`,
     });
@@ -797,8 +827,8 @@ function projectedContainerRuntimeSignals(data: DashboardPayload): FindingSignal
       `PID 한도 ${percent(pidRatio)}`, `PID limit ${percent(pidRatio)}`,
     );
     const networkErrors = container.networkErrorsPerSecond;
-    if (typeof networkErrors === 'number' && Number.isFinite(networkErrors) && networkErrors >= NETWORK_FAULT_RATE_THRESHOLDS.caution) add(
-      'network-errors', networkErrors >= NETWORK_FAULT_RATE_THRESHOLDS.danger ? 'danger' : 'caution',
+    if (typeof networkErrors === 'number' && Number.isFinite(networkErrors) && networkErrors >= NETWORK_ERROR_RATE_THRESHOLDS.caution) add(
+      'network-errors', networkErrors >= NETWORK_ERROR_RATE_THRESHOLDS.danger ? 'danger' : 'caution',
       `네트워크 오류 ${networkErrors.toFixed(networkErrors >= 1 ? 1 : 3)}/s`,
       `network errors ${networkErrors.toFixed(networkErrors >= 1 ? 1 : 3)}/s`,
     );
@@ -816,7 +846,13 @@ function projectedContainerSecuritySignals(data: DashboardPayload): FindingSigna
     const add = (key: string, level: OperationalFindingLevel, ko: string, en: string) => signals.push({ key: `${entityKey}:${key}`, entityKey, level, ko: `${label} ${ko}`, en: `${label} ${en}` });
     if (container.privileged === true) add('privileged', 'danger', 'privileged', 'privileged');
     if (container.dockerSocketMounted === true) add('docker-socket', 'danger', 'Docker 소켓', 'Docker socket');
-    if (container.sensitiveBindMounted === true) add('sensitive-bind', 'danger', '민감 bind', 'sensitive bind');
+    if (container.sensitiveBindMounted === true && container.writableSensitiveBindMounted === true) {
+      add('writable-sensitive-bind', 'danger', '쓰기 가능한 민감 bind', 'writable sensitive bind');
+    } else if (container.sensitiveBindMounted === true && container.writableSensitiveBindMounted === false) {
+      add('read-only-sensitive-bind', 'caution', '읽기 전용 민감 bind', 'read-only sensitive bind');
+    } else if (container.sensitiveBindMounted === true && container.writableSensitiveBindMounted !== false) {
+      add('unknown-sensitive-bind-access', 'danger', '민감 bind 쓰기 권한 미확인', 'sensitive bind writability unverified');
+    }
     if ((container.dangerousCapabilityCount ?? 0) > 0) add('dangerous-capabilities', 'danger', '고위험 capability', 'dangerous capabilities');
     if (container.hostPid === true) add('host-pid', 'caution', 'host PID', 'host PID');
     if (container.hostIpc === true) add('host-ipc', 'caution', 'host IPC', 'host IPC');
@@ -1139,7 +1175,10 @@ export function operationalFindings(data: DashboardPayload): OperationalFinding[
   };
   pressureMetric('CPU', 'CPU', data.latest?.cpuPercent, 75, 90);
   pressureMetric('메모리', 'memory', data.latest?.memoryPercent, 75, 90);
-  pressureMetric('스왑', 'swap', data.latest?.swapPercent, 50, 85);
+  const memoryPressureActive = (data.latest?.memoryPercent ?? 0) >= 75
+    || (data.latest?.memoryPressureSomeAvg10 ?? 0) >= PSI_THRESHOLDS.memorySome.caution
+    || (data.latest?.memoryPressureFullAvg10 ?? 0) >= PSI_THRESHOLDS.memoryFull.caution;
+  if (memoryPressureActive) pressureMetric('스왑', 'swap', data.latest?.swapPercent, 50, 85);
   pressureMetric('온도', 'temperature', data.latest?.temperatureC, 75, 85, '°C');
   const logicalCpuCount = typeof data.host.logicalCpuCount === 'number'
     && Number.isSafeInteger(data.host.logicalCpuCount)
@@ -1280,23 +1319,33 @@ export function operationalFindings(data: DashboardPayload): OperationalFinding[
     findings.push(finding('connectivity', networkDown ? 'danger' : 'caution', snapshotScope, [ko, en], Number(networkDown || networkUnknown) + Number(sshDown || sshUnknown), snapshotObservedAt));
   }
 
-  const networkFaults = [
+  const networkErrorFaults = [
     ['수신 오류', 'RX errors', data.latest?.networkRxErrorsPerSecond],
     ['송신 오류', 'TX errors', data.latest?.networkTxErrorsPerSecond],
+  ] as const;
+  const networkDropFaults = [
     ['수신 드롭', 'RX drops', data.latest?.networkRxDroppedPerSecond],
     ['송신 드롭', 'TX drops', data.latest?.networkTxDroppedPerSecond],
   ] as const;
-  const observedNetworkFaults = networkFaults.filter((entry) => typeof entry[2] === 'number' && Number.isFinite(entry[2]) && entry[2] > 0);
-  const networkFaultRate = observedNetworkFaults.reduce((total, entry) => total + (entry[2] ?? 0), 0);
   const networkEvidenceKo: string[] = [];
   const networkEvidenceEn: string[] = [];
   let networkLevel: OperationalFindingLevel | null = null;
-  if (networkFaultRate >= NETWORK_FAULT_RATE_THRESHOLDS.caution) {
+  let networkSignalCount = 0;
+  const assessNetworkFaults = (
+    entries: typeof networkErrorFaults | typeof networkDropFaults,
+    thresholds: { caution: number; danger: number },
+  ) => {
+    const observed = entries.filter((entry) => typeof entry[2] === 'number' && Number.isFinite(entry[2]) && entry[2] > 0);
+    const rate = observed.reduce((total, entry) => total + (entry[2] ?? 0), 0);
+    if (rate < thresholds.caution) return;
     const formatRate = (value: number | null | undefined) => `${(value ?? 0).toFixed((value ?? 0) >= 1 ? 1 : 3)}/s`;
-    networkEvidenceKo.push(...observedNetworkFaults.map(([ko, , value]) => `${ko} ${formatRate(value)}`));
-    networkEvidenceEn.push(...observedNetworkFaults.map(([, en, value]) => `${en} ${formatRate(value)}`));
-    networkLevel = networkFaultRate >= NETWORK_FAULT_RATE_THRESHOLDS.danger ? 'danger' : 'caution';
-  }
+    networkEvidenceKo.push(...observed.map(([ko, , value]) => `${ko} ${formatRate(value)}`));
+    networkEvidenceEn.push(...observed.map(([, en, value]) => `${en} ${formatRate(value)}`));
+    networkSignalCount += observed.length;
+    networkLevel = strongerLevel(networkLevel, rate >= thresholds.danger ? 'danger' : 'caution');
+  };
+  assessNetworkFaults(networkErrorFaults, NETWORK_ERROR_RATE_THRESHOLDS);
+  assessNetworkFaults(networkDropFaults, NETWORK_DROP_RATE_THRESHOLDS);
   for (const signal of linuxSignals.network) {
     networkEvidenceKo.push(signal.ko);
     networkEvidenceEn.push(signal.en);
@@ -1308,7 +1357,7 @@ export function operationalFindings(data: DashboardPayload): OperationalFinding[
       networkLevel,
       snapshotScope,
       [networkEvidenceKo.join(' · '), networkEvidenceEn.join(' · ')],
-      observedNetworkFaults.length + linuxSignals.network.length,
+      networkSignalCount + linuxSignals.network.length,
       latestTimestamp([snapshotObservedAt, linuxSignals.network.length ? linuxSignals.observedAt : null]),
     ));
   }
@@ -1509,7 +1558,7 @@ export function operationalFindings(data: DashboardPayload): OperationalFinding[
     ));
   }
 
-  const activeIncidents = data.incidents.filter((incident) => incident.phase === 'active');
+  const activeIncidents = unresolvedIncidents(data.incidents);
   if (activeIncidents.length) {
     const generatedAt = new Date(data.generatedAt).getTime();
     const freshnessCutoff = Number.isFinite(generatedAt) ? generatedAt - 5 * 60_000 : Number.POSITIVE_INFINITY;

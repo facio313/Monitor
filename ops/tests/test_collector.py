@@ -3739,6 +3739,7 @@ class FilesystemTests(unittest.TestCase):
         self.assertIn("Wants=monitor-container-exporter.service", unit)
         self.assertNotIn("Requires=monitor-container-exporter.service", unit)
         self.assertIn("BindReadOnlyPaths=-/run/monitor-container-exporter/containers.json", unit)
+        self.assertIn("--mountinfo=/proc/1/mountinfo", unit)
         self.assertNotIn("/run/user/1001/docker.sock", unit)
         self.assertIn("User=cks", exporter_unit)
         self.assertNotIn("ProtectHome=", exporter_unit)

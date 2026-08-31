@@ -60,7 +60,7 @@ The default output root is `/var/lib/monitor-export`:
   Each disk is exactly `mount`, `totalBytes`, `usedBytes`, `availableBytes`,
   `usedPercent`, `inodeUsedPercent`, and `readOnly`. Inode usage is aggregate;
   filenames and inode identities are never collected.
-  Each new current `containers` row is the exact 56-field reduced v3 contract.
+  Each new current `containers` row is the exact 57-field reduced v3 contract.
   Its first 17 fields preserve the v2 migration prefix:
   `name`, `project`, `owner`, `state`, `health`,
   `healthcheckConfigured`, `cpuPercent`, `memoryBytes`, `memoryPercent`,
@@ -68,9 +68,14 @@ The default output root is `/var/lib/monitor-export`:
   `restartCountDelta`, `oomKilled`, `startedAt`, and `finishedAt`.
   The v3 suffix is the opaque `instanceId`; current PID and CPU-throttle
   readings; block-I/O and network totals/rates; writable-layer bytes and
-  volume/bind/tmpfs/network/published-port counts; fixed security booleans and
-  capability counts; and validated image name, tag, content digest/source,
+  volume/bind/tmpfs/network/published-port counts; fixed security booleans,
+  including whether any bind from a sensitive host source is writable;
+  capability counts; and
+  validated image name, tag, content digest/source,
   latest-tag, current-replica drift, and same-reference digest-change state.
+  `cpuThrottledPercent` is the delta of cumulative throttled time divided by
+  the sample wall-clock interval; `cpuThrottledPeriods` remains a cumulative
+  diagnostic counter and is not treated as a utilization percentage.
   Health, restart/OOM state, lifecycle timestamps, and configured limits come
   from an identity-bound Docker inspect response; an unavailable detail stays
   `null` and is never inferred from presentation text. Container IDs remain

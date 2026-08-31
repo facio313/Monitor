@@ -588,6 +588,55 @@ class AlertStoreTests(unittest.TestCase):
             self.assertEqual(evaluation["summary"], {"pending": 1})
             self.assertEqual((root / "rule-alerts.jsonl").read_text(), "")
 
+    def test_pack_upgrade_ignores_an_older_private_state_schema(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pack = self.create_pack(root, "2026.08.31.test")
+            state_path = root / ".state" / "rule-state.json"
+            state_path.parent.mkdir()
+            state_path.write_text(json.dumps({
+                "schemaVersion": 1,
+                "rulePackVersion": "2026.08.30.test",
+                "states": {
+                    "CpuUsageHigh:host/monitor-test": {
+                        "phase": "inactive",
+                        "breachSamples": 0,
+                        "recoverySamples": 0,
+                        "missingSamples": 0,
+                        "openedAt": None,
+                        "changedAt": "2026-08-30T11:59:00Z",
+                        "lastEvaluatedAt": "2026-08-30T11:59:00Z",
+                        "lastValue": 10,
+                        "observationStatus": "ok",
+                    },
+                },
+            }), encoding="utf-8")
+            state_path.chmod(0o600)
+
+            evaluation = evaluate_and_persist(snapshot(95), NOW, pack, root)
+
+            self.assertEqual(evaluation["status"], "ok")
+            self.assertEqual(evaluation["summary"], {"pending": 1})
+            rewritten = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(rewritten["rulePackVersion"], "2026.08.31.test")
+
+    def test_current_pack_still_rejects_an_invalid_private_state_schema(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pack = self.create_pack(root)
+            state_path = root / ".state" / "rule-state.json"
+            state_path.parent.mkdir()
+            state_path.write_text(json.dumps({
+                "schemaVersion": 1,
+                "rulePackVersion": "2026.08.30.test",
+                "states": {"CpuUsageHigh:host/monitor-test": {"phase": "inactive"}},
+            }), encoding="utf-8")
+            state_path.chmod(0o600)
+
+            evaluation = evaluate_and_persist(snapshot(95), NOW, pack, root)
+
+            self.assertEqual(evaluation["status"], "collection_error")
+
     def test_invalid_pack_is_an_explicit_collection_error(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

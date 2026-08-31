@@ -402,6 +402,36 @@ function isInside(root: string, target: string): boolean {
   return child === '' || (!child.startsWith(`..${sep}`) && child !== '..' && !child.startsWith(sep));
 }
 
+function trustedDataRootOwnerUid(root: string): number | null {
+  try {
+    const before = lstatSync(root);
+    if (
+      !before.isDirectory()
+      || before.isSymbolicLink()
+      || before.nlink < 1
+      || (before.mode & 0o022) !== 0
+      || !Number.isSafeInteger(before.uid)
+      || before.uid < 0
+    ) return null;
+    const realRoot = realpathSync(root);
+    if (realRoot !== root) return null;
+    const after = lstatSync(root);
+    if (
+      !after.isDirectory()
+      || after.isSymbolicLink()
+      || after.dev !== before.dev
+      || after.ino !== before.ino
+      || after.uid !== before.uid
+      || after.gid !== before.gid
+      || after.mode !== before.mode
+      || after.nlink !== before.nlink
+    ) return null;
+    return before.uid;
+  } catch {
+    return null;
+  }
+}
+
 function openStrictFile(
   root: string,
   fileName: string,
@@ -846,13 +876,14 @@ export function readGenericLogPage(
   dataDirectory: string,
   query: GenericLogQuery = {},
   nowMs = Date.now(),
-  expectedOwnerUid = 0,
+  expectedOwnerUid?: number,
 ): GenericLogPage {
   const normalizedQuery = normalizeQuery(query);
   const root = resolve(dataDirectory);
-  const recordRead = readRecords(root, expectedOwnerUid);
-  const statusRead = readStatuses(root, expectedOwnerUid);
-  const failureMarker = readFailureMarker(root, expectedOwnerUid);
+  const ownerUid = expectedOwnerUid ?? trustedDataRootOwnerUid(root) ?? -1;
+  const recordRead = readRecords(root, ownerUid);
+  const statusRead = readStatuses(root, ownerUid);
+  const failureMarker = readFailureMarker(root, ownerUid);
   const collectionStatus = overallCollectionStatus(
     recordRead.status,
     statusRead,

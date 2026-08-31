@@ -31,7 +31,8 @@ function container() {
     writableLayerBytes: 1_500_000_000, volumeCount: 1, bindMountCount: 2,
     tmpfsMountCount: 1, networkAttachmentCount: 1, publishedPortCount: 1,
     privileged: true, hostPid: true, hostIpc: false, hostNetwork: true,
-    dockerSocketMounted: true, sensitiveBindMounted: true, rootUser: true,
+    dockerSocketMounted: true, sensitiveBindMounted: true, writableSensitiveBindMounted: true,
+    rootUser: true,
     readOnlyRootFilesystem: false, addedCapabilityCount: 2, dangerousCapabilityCount: 2,
     excessiveCapabilities: true, imageName: 'registry.example/ops/monitor', imageTag: 'latest',
     imageDigest: `sha256:${'1'.repeat(64)}`, imageDigestSource: 'repo-digest',
@@ -84,6 +85,27 @@ describe('Docker v3 collector contract', () => {
     }]);
   });
 
+  it('preserves read-only sensitive binds and migrates the prior exact v3 row as unknown', () => {
+    const readOnly = snapshot();
+    readOnly.containers = [{
+      ...container(),
+      writableSensitiveBindMounted: false,
+    }];
+    expect(read(readOnly).containers[0]).toMatchObject({
+      sensitiveBindMounted: true,
+      writableSensitiveBindMounted: false,
+    });
+
+    const legacy = snapshot();
+    const legacyContainer = { ...container() } as Record<string, unknown>;
+    delete legacyContainer.writableSensitiveBindMounted;
+    legacy.containers = [legacyContainer as ReturnType<typeof container>];
+    expect(read(legacy).containers[0]).toMatchObject({
+      sensitiveBindMounted: true,
+      writableSensitiveBindMounted: null,
+    });
+  });
+
   it('fails closed on row extras, inconsistent latest state, and event extras', () => {
     const rowExtra = snapshot();
     rowExtra.containers = [{ ...container(), environment: 'TOKEN=secret' } as ReturnType<typeof container>];
@@ -102,6 +124,12 @@ describe('Docker v3 collector contract', () => {
     const inconsistentCapabilities = snapshot();
     inconsistentCapabilities.containers = [{ ...container(), excessiveCapabilities: false }];
     expect(read(inconsistentCapabilities).containers).toEqual([]);
+
+    const inconsistentSensitiveBind = snapshot();
+    inconsistentSensitiveBind.containers = [{
+      ...container(), sensitiveBindMounted: false, writableSensitiveBindMounted: true,
+    }];
+    expect(read(inconsistentSensitiveBind).containers).toEqual([]);
 
     const eventExtra = snapshot();
     eventExtra.dockerEvents = [{ ...event(), rawActor: 'secret' } as ReturnType<typeof event>];

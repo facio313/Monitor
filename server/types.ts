@@ -534,6 +534,7 @@ export interface DashboardResponse {
     hostNetwork?: boolean | null;
     dockerSocketMounted?: boolean | null;
     sensitiveBindMounted?: boolean | null;
+    writableSensitiveBindMounted?: boolean | null;
     rootUser?: boolean | null;
     readOnlyRootFilesystem?: boolean | null;
     addedCapabilityCount?: number | null;

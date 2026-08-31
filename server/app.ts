@@ -1096,7 +1096,7 @@ export function createApp(options: AppOptions = {}) {
           config.dataDir,
           genericLogQuery(request),
           now(),
-          options.genericLogOwnerUid ?? 0,
+          options.genericLogOwnerUid,
         ));
       } catch (error) {
         if (error instanceof GenericLogQueryError) {

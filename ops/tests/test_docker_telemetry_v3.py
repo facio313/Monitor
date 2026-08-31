@@ -63,7 +63,10 @@ def reduced_inspect(image: str = IMAGE_B) -> dict[str, object]:
             "CapAdd": ["NET_ADMIN", "SYS_PTRACE"],
         },
         "Mounts": [
-            {"Type": "bind", "Source": "/run/user/1001/docker.sock", "Destination": "/run/docker.sock"},
+            {
+                "Type": "bind", "Source": "/run/user/1001/docker.sock",
+                "Destination": "/run/docker.sock", "RW": True,
+            },
             {"Type": "volume", "Source": "/secret/volume-id", "Destination": "/data"},
             {"Type": "tmpfs", "Source": "", "Destination": "/tmp"},
         ],
@@ -101,6 +104,44 @@ def reduced_stats(read: str = "2026-08-30T12:01:00Z") -> dict[str, object]:
 
 
 class DockerTelemetryV3Tests(unittest.TestCase):
+    def test_sensitive_bind_writability_is_reduced_without_exporting_paths(self) -> None:
+        read_only = collector.reduce_container_inspect({
+            "Mounts": [{
+                "Type": "bind",
+                "Source": "/home/cks/.config/monitor/edge-secret",
+                "Destination": "/run/secrets/monitor-edge",
+                "RW": False,
+            }],
+        })["MountSummary"]
+        self.assertTrue(read_only["sensitiveBindMounted"])
+        self.assertFalse(read_only["writableSensitiveBindMounted"])
+
+        unknown = collector.reduce_container_inspect({
+            "Mounts": [{
+                "Type": "bind", "Source": "/etc/monitor/config", "Destination": "/config",
+            }],
+        })["MountSummary"]
+        self.assertTrue(unknown["sensitiveBindMounted"])
+        self.assertIsNone(unknown["writableSensitiveBindMounted"])
+
+        writable = collector.reduce_container_inspect({
+            "Mounts": [
+                {"Type": "bind", "Source": "/etc/monitor/a", "Destination": "/a", "RW": False},
+                {"Type": "bind", "Source": "/root/monitor/b", "Destination": "/b", "RW": True},
+            ],
+        })["MountSummary"]
+        self.assertTrue(writable["writableSensitiveBindMounted"])
+        self.assertNotIn("/etc/monitor", json.dumps(writable))
+        self.assertNotIn("/root/monitor", json.dumps(writable))
+
+        no_sensitive_bind = collector.reduce_container_inspect({
+            "Mounts": [{
+                "Type": "bind", "Source": "/srv/monitor", "Destination": "/etc/monitor", "RW": True,
+            }],
+        })["MountSummary"]
+        self.assertFalse(no_sensitive_bind["sensitiveBindMounted"])
+        self.assertFalse(no_sensitive_bind["writableSensitiveBindMounted"])
+
     def test_digest_pinned_latest_reference_and_root_group_are_reduced_correctly(self) -> None:
         inspect = {
             **reduced_inspect(),
@@ -145,6 +186,7 @@ class DockerTelemetryV3Tests(unittest.TestCase):
                 "sampleAtUnixMs": int((NOW - dt.timedelta(seconds=60)).timestamp() * 1000),
                 "cpuPeriods": 100,
                 "cpuThrottledPeriods": 10,
+                "cpuThrottledTimeNanoseconds": 1_300_000_000,
                 "blockReadBytes": 1000,
                 "blockWriteBytes": 3000,
                 "networkRxBytes": 8000,
@@ -160,9 +202,13 @@ class DockerTelemetryV3Tests(unittest.TestCase):
         self.assertEqual(tuple(row), collector.CONTAINER_FIELDS)
         self.assertRegex(row["instanceId"], r"^[a-f0-9]{32}$")
         self.assertEqual(row["pidCount"], 180)
-        self.assertEqual(row["cpuThrottledPercent"], 40)
+        self.assertEqual(row["cpuThrottledPercent"], 2)
         self.assertEqual(row["cpuThrottledPeriods"], 50)
         self.assertEqual(row["cpuThrottledSeconds"], 2.5)
+        self.assertEqual(
+            collector.private_container_counters(stats)["cpuThrottledTimeNanoseconds"],
+            2_500_000_000,
+        )
         self.assertEqual(row["blockReadBytesPerSecond"], 100)
         self.assertEqual(row["blockWriteBytesPerSecond"], 100)
         self.assertEqual(row["networkRxBytesPerSecond"], 200)
@@ -175,6 +221,7 @@ class DockerTelemetryV3Tests(unittest.TestCase):
         self.assertTrue(row["hostNetwork"])
         self.assertTrue(row["dockerSocketMounted"])
         self.assertTrue(row["sensitiveBindMounted"])
+        self.assertTrue(row["writableSensitiveBindMounted"])
         self.assertTrue(row["rootUser"])
         self.assertFalse(row["readOnlyRootFilesystem"])
         self.assertEqual(row["dangerousCapabilityCount"], 2)
@@ -190,8 +237,20 @@ class DockerTelemetryV3Tests(unittest.TestCase):
 
         normalized = collector.normalize_container_values([row], NOW + dt.timedelta(seconds=60))
         self.assertEqual(normalized, [row])
+        legacy_row = dict(row)
+        legacy_row.pop("writableSensitiveBindMounted")
+        legacy_normalized = collector.normalize_container_values(
+            [legacy_row], NOW + dt.timedelta(seconds=60)
+        )
+        self.assertIsNone(legacy_normalized[0]["writableSensitiveBindMounted"])
         with self.assertRaises(ValueError):
             collector.normalize_container_values([{**row, "rawMount": "/secret"}], NOW)
+        with self.assertRaises(ValueError):
+            collector.normalize_container_values([{
+                **row,
+                "sensitiveBindMounted": False,
+                "writableSensitiveBindMounted": True,
+            }], NOW)
         with self.assertRaises(ValueError):
             collector.normalize_container_values([{**row, "usesLatestTag": False}], NOW)
         with self.assertRaises(ValueError):
@@ -210,6 +269,16 @@ class DockerTelemetryV3Tests(unittest.TestCase):
             }], NOW)
         with self.assertRaises(ValueError):
             collector.normalize_container_values([{**row, "excessiveCapabilities": False}], NOW)
+
+        reset_row = collector.container_from_api(
+            raw_container(), "cks", stats,
+            previous_state={
+                "sampleAtUnixMs": int((NOW - dt.timedelta(seconds=60)).timestamp() * 1000),
+                "cpuThrottledTimeNanoseconds": 3_000_000_000,
+            },
+            inspect=inspect,
+        )
+        self.assertIsNone(reset_row["cpuThrottledPercent"])
 
     def test_digest_drift_is_unknown_with_missing_digest_and_true_for_mixed_replicas(self) -> None:
         rows = [

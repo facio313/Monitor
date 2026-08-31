@@ -557,9 +557,27 @@ def _load_previous(path: Path, pack_version: str) -> dict[str, Any]:
     if payload is None:
         return {}
     try:
-        bundle = _normalize_private_bundle(json.loads(payload.decode("utf-8")))
+        raw_bundle = json.loads(payload.decode("utf-8"))
     except (UnicodeError, json.JSONDecodeError) as error:
         raise ValueError("private rule state is invalid") from error
+    # A rule-pack upgrade intentionally resets streak state.  Validate the
+    # bounded envelope before looking at the version, but do not require an
+    # older pack's per-state schema to match the current reader: that would
+    # turn an otherwise safe reset into a permanent collection error.
+    raw_version = raw_bundle.get("rulePackVersion") if isinstance(raw_bundle, Mapping) else None
+    raw_states = raw_bundle.get("states") if isinstance(raw_bundle, Mapping) else None
+    if (
+        isinstance(raw_bundle, Mapping)
+        and frozenset(raw_bundle) == PRIVATE_BUNDLE_FIELDS
+        and raw_bundle.get("schemaVersion") == SCHEMA_VERSION
+        and isinstance(raw_version, str)
+        and PACK_VERSION.fullmatch(raw_version) is not None
+        and isinstance(raw_states, Mapping)
+        and len(raw_states) <= MAX_STATES
+        and raw_version != pack_version
+    ):
+        return {}
+    bundle = _normalize_private_bundle(raw_bundle)
     if bundle["rulePackVersion"] != pack_version:
         return {}
     return bundle["states"]

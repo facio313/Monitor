@@ -13,7 +13,13 @@ export const PSI_THRESHOLDS = {
   ioFull: { caution: 1, danger: 8 },
 } as const satisfies Record<string, OperationalThreshold>;
 
-export const NETWORK_FAULT_RATE_THRESHOLDS = {
-  caution: 0.001,
+/** Interface errors and packet drops have different operational scales. */
+export const NETWORK_ERROR_RATE_THRESHOLDS = {
+  caution: 0.1,
   danger: 1,
+} as const satisfies OperationalThreshold;
+
+export const NETWORK_DROP_RATE_THRESHOLDS = {
+  caution: 1,
+  danger: 10,
 } as const satisfies OperationalThreshold;

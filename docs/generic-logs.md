@@ -131,6 +131,12 @@ new prefix.
 - `generic-log-collection-error.json` is a strict, non-secret marker for unsafe
   configuration or persistence failure. A successful transaction clears it.
 
+The HTTP reader derives the expected public-file UID from the stable,
+canonical, non-group/world-writable export root before checking every snapshot file. This
+keeps ownership validation intact when a rootless user namespace represents
+host `root` with its overflow UID inside the container; an unsafe or changing
+root still fails closed as `collection_error`.
+
 The generic-log subsystem is isolated from host telemetry. An unsafe source is
 visible as a per-source degraded state; an unsafe configuration or durable
 store is `collection_error`; neither prevents `current.json` and host history

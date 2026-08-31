@@ -69,6 +69,7 @@ describe('monitor overview composition', () => {
     expect(markup).toContain('aria-label="Change password"');
     expect(markup).toContain('aria-label="Sign out"');
     expect(markup).toContain('class="system-strip');
+    expect(markup).toContain('data-renderer="monochrome-density-grain-wave"');
   });
 
   it('keeps operational evidence above the dashboard and restores the mobile traffic table as a scroller', () => {
@@ -80,7 +81,8 @@ describe('monitor overview composition', () => {
     expect(css).toMatch(/\.health-overview-findings\s*\{[^}]*grid-template-columns: repeat\(3,/s);
     expect(css).toMatch(/\.rule-health-compact \.rule-health-header\s*\{[^}]*min-height: 64px;/s);
     expect(overviewComposition.indexOf('<OperationalHealthOverview')).toBeLessThan(overviewComposition.indexOf('<RuleHealthSummary'));
-    expect(overviewComposition.indexOf('<RuleHealthSummary')).toBeLessThan(overviewComposition.indexOf('<AdaptiveGrid'));
+    expect(overviewComposition.indexOf('<RuleHealthSummary')).toBeLessThan(overviewComposition.indexOf('<SystemEmotionEngine'));
+    expect(overviewComposition.indexOf('<SystemEmotionEngine')).toBeLessThan(overviewComposition.indexOf('<AdaptiveGrid'));
     expect(overviewComposition).toContain('<RuleHealthSummary evaluation={data.ruleEvaluation} alerts={data.ruleAlerts} locale={locale} stale={effectiveStale} compactWhenNominal />');
   });
 

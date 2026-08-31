@@ -62,7 +62,7 @@ include를 의도적으로 제거했다. alias는 SSO 뒤에 있으며, 원본 T
 | FA-09 | Raspberry Pi 온도, throttling, 저전압 | **통과** | `ops/linux_telemetry.py`와 rule/UI가 firmware·hwmon의 authoritative flag와 unsupported를 보존하고 전압만으로 상태를 발명하지 않는다. |
 | FA-10 | Docker daemon 상태 | 부분 통과 | typed collection/event-source 상태와 daemon 불가 rule은 있으나 daemon lifecycle/version/복구 자체의 완전한 상태 모델은 없다. |
 | FA-11 | Docker event stream | **통과** | `ops/collector.py`의 cursor/replay/reconnect/dedup/gap과 bounded privacy-reduced event, API/UI timeline이 연결된다. |
-| FA-12 | 컨테이너 CPU, 메모리, I/O, 네트워크 | **통과** | 56-field Docker v3 row가 CPU/memory/PID/throttling/block/network total·rate와 reset semantics를 제공한다. |
+| FA-12 | 컨테이너 CPU, 메모리, I/O, 네트워크 | **통과** | 57-field Docker v3 row가 CPU/memory/PID/throttling/block/network total·rate와 reset semantics를 제공한다. |
 | FA-13 | restart loop | 부분 통과 | restart total/delta·event와 duration rule은 있으나 exit code, 생존 시간, policy, manual/automatic 원인을 함께 판정하지 않는다. |
 | FA-14 | OOMKilled | 부분 통과 | inspect OOMKilled와 `oom` event/rule은 있으나 cgroup memory event 및 OOM 직전 상관 증거 bundle이 불완전하다. |
 | FA-15 | healthcheck | 부분 통과 | configured/healthy/unhealthy/unknown과 duration/recovery rule은 있으나 연속 실패 수·bounded output·최근 성공/실패 시각은 없다. |

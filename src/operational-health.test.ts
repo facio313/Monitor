@@ -308,6 +308,49 @@ describe('operational health assessment', () => {
     expect(operationalFindings(data)).toEqual([]);
   });
 
+  it('keeps synchronized fallback telemetry and successful oneshot invocations neutral', () => {
+    const data = payload();
+    data.linux = linuxDiagnostics();
+    data.linux.reliability.clock.timeSync.status = 'partial';
+    data.linux.reliability.clock.timeSync.synchronized = true;
+    data.linux.reliability.systemd.reason = 'bounded_runtime_observation';
+    data.linux.reliability.systemd.units = [
+      {
+        unit: 'monitor-collector.service', loadState: 'unknown', activeState: 'active', subState: 'running',
+        restartCount: 1_324, restartCountStatus: 'observed_invocation_changes', result: 'unknown',
+        execMainStatus: null, invocationStatus: 'supported',
+      },
+      {
+        unit: 'monitor-container-exporter.service', loadState: 'unknown', activeState: 'inactive', subState: 'unknown',
+        restartCount: 1_324, restartCountStatus: 'observed_invocation_changes', result: 'unknown',
+        execMainStatus: null, invocationStatus: 'supported',
+      },
+      {
+        unit: 'monitor-container-exporter.service', loadState: 'loaded', activeState: 'inactive', subState: 'dead',
+        restartCount: 0, restartCountStatus: 'systemd_manager', result: 'success',
+        execMainStatus: 0, invocationStatus: null,
+      },
+    ];
+
+    expect(operationalFindings(data).find((entry) => entry.id === 'linux-reliability')).toBeUndefined();
+
+    data.linux.reliability.clock.timeSync.status = 'collection_error';
+    expect(operationalFindings(data).find((entry) => entry.id === 'linux-reliability')).toMatchObject({
+      level: 'danger', count: 1,
+    });
+
+    data.linux.reliability.clock.timeSync.status = 'partial';
+    data.linux.reliability.systemd.units = [{
+      unit: 'nginx.service', loadState: 'unknown', activeState: 'inactive', subState: 'unknown',
+      restartCount: 18, restartCountStatus: 'observed_invocation_changes', result: 'unknown',
+      execMainStatus: null, invocationStatus: 'supported',
+    }];
+    expect(operationalFindings(data).find((entry) => entry.id === 'linux-reliability')).toMatchObject({
+      level: 'danger', count: 1,
+      evidence: [expect.stringContaining('nginx.service inactive'), expect.stringContaining('nginx.service inactive')],
+    });
+  });
+
   it('surfaces a top-level Linux collection failure even when diagnostics have no schema version', () => {
     const data = payload();
     data.linux = linuxDiagnostics();
@@ -330,7 +373,8 @@ describe('operational health assessment', () => {
       memoryLimitBytes: 1_000, restartCountDelta: 3, oomKilled: true,
       pidCount: 95, pidLimit: 100, cpuThrottledPercent: 25,
       networkErrorsPerSecond: 1.2, instanceId: 'a'.repeat(32), privileged: true,
-      dockerSocketMounted: true, sensitiveBindMounted: true, dangerousCapabilityCount: 2,
+      dockerSocketMounted: true, sensitiveBindMounted: true,
+      writableSensitiveBindMounted: true, dangerousCapabilityCount: 2,
     }];
     data.dockerEventCollection = {
       status: 'gap', observedAt: '2026-08-30T00:00:01Z', cursorAt: '2026-08-30T00:00:00Z',
@@ -349,6 +393,32 @@ describe('operational health assessment', () => {
     expect(operationalFindings(data).find((entry) => entry.id === 'docker-event-coverage')).toMatchObject({ level: 'danger', scope: 'current' });
     data.stale = true;
     expect(operationalFindings(data).find((entry) => entry.id === 'docker-event-coverage')).toMatchObject({ level: 'danger', scope: 'last-known' });
+  });
+
+  it('downgrades a known read-only sensitive bind but flags writable or unknown access', () => {
+    const data = payload();
+    data.containers = [{
+      name: 'monitor', project: 'monitor', owner: 'cks', state: 'running', health: 'healthy',
+      healthcheckConfigured: true, cpuPercent: 1, memoryBytes: 100, memoryPercent: 1,
+      sensitiveBindMounted: true, writableSensitiveBindMounted: false,
+    }];
+
+    expect(operationalFindings(data).find((entry) => entry.id === 'container-security')).toMatchObject({
+      level: 'caution', count: 1,
+      evidence: [expect.stringContaining('읽기 전용 민감 bind'), expect.stringContaining('read-only sensitive bind')],
+    });
+
+    data.containers[0].writableSensitiveBindMounted = true;
+    expect(operationalFindings(data).find((entry) => entry.id === 'container-security')).toMatchObject({
+      level: 'danger', count: 1,
+      evidence: [expect.stringContaining('쓰기 가능한 민감 bind'), expect.stringContaining('writable sensitive bind')],
+    });
+
+    data.containers[0].writableSensitiveBindMounted = null;
+    expect(operationalFindings(data).find((entry) => entry.id === 'container-security')).toMatchObject({
+      level: 'danger', count: 1,
+      evidence: [expect.stringContaining('쓰기 권한 미확인'), expect.stringContaining('writability unverified')],
+    });
   });
 
   it('surfaces reduced synthetic failures, latency, and certificate risk without requiring endpoint URLs', () => {
@@ -634,7 +704,7 @@ describe('operational health assessment', () => {
     });
   });
 
-  it('uses logical CPU count, PSI full stalls, swap, and inode headroom in resource decisions', () => {
+  it('uses logical CPU count, PSI full stalls, active swap pressure, and inode headroom in resource decisions', () => {
     const normalizedLoad = payload();
     normalizedLoad.host.logicalCpuCount = 8;
     normalizedLoad.latest = latest({ load1: 6 });
@@ -644,9 +714,17 @@ describe('operational health assessment', () => {
     fullStall.latest = latest({ memoryPressureFullAvg10: 5 });
     expect(operationalFindings(fullStall).find((entry) => entry.id === 'resource-pressure')).toMatchObject({ level: 'danger' });
 
-    const swapping = payload();
-    swapping.latest = latest({ swapTotalBytes: 1_000, swapUsedBytes: 600, swapPercent: 60 });
-    expect(operationalFindings(swapping).find((entry) => entry.id === 'resource-pressure')).toMatchObject({ level: 'caution' });
+    const retainedSwap = payload();
+    retainedSwap.latest = latest({ swapTotalBytes: 1_000, swapUsedBytes: 600, swapPercent: 60 });
+    expect(operationalFindings(retainedSwap).find((entry) => entry.id === 'resource-pressure')).toBeUndefined();
+
+    const activeSwapPressure = payload();
+    activeSwapPressure.latest = latest({
+      memoryPercent: 80, swapTotalBytes: 1_000, swapUsedBytes: 600, swapPercent: 60,
+    });
+    expect(operationalFindings(activeSwapPressure).find((entry) => entry.id === 'resource-pressure')).toMatchObject({
+      level: 'caution', evidence: [expect.stringContaining('스왑 60%'), expect.stringContaining('swap 60%')],
+    });
 
     const inodePressure = payload();
     inodePressure.disks[0].inodeUsedPercent = 92;
@@ -660,9 +738,19 @@ describe('operational health assessment', () => {
   it('reports live network counter faults and sanitized request failures', () => {
     const interfaceFault = payload();
     interfaceFault.latest = latest({ networkRxErrorsPerSecond: 0.02 });
+    expect(operationalFindings(interfaceFault).find((entry) => entry.id === 'network-quality')).toBeUndefined();
+    interfaceFault.latest.networkRxErrorsPerSecond = 0.2;
     expect(operationalFindings(interfaceFault).find((entry) => entry.id === 'network-quality')).toMatchObject({ level: 'caution', page: 'network' });
     interfaceFault.latest.networkRxErrorsPerSecond = 1.2;
     expect(operationalFindings(interfaceFault).find((entry) => entry.id === 'network-quality')).toMatchObject({ level: 'danger' });
+
+    const interfaceDrops = payload();
+    interfaceDrops.latest = latest({ networkRxDroppedPerSecond: 0.11 });
+    expect(operationalFindings(interfaceDrops).find((entry) => entry.id === 'network-quality')).toBeUndefined();
+    interfaceDrops.latest.networkRxDroppedPerSecond = 1.2;
+    expect(operationalFindings(interfaceDrops).find((entry) => entry.id === 'network-quality')).toMatchObject({ level: 'caution' });
+    interfaceDrops.latest.networkRxDroppedPerSecond = 10.2;
+    expect(operationalFindings(interfaceDrops).find((entry) => entry.id === 'network-quality')).toMatchObject({ level: 'danger' });
 
     const traffic = payload();
     traffic.currentTraffic = [{
@@ -758,6 +846,22 @@ describe('operational health assessment', () => {
       level: 'danger',
       scope: 'current',
     });
+  });
+
+  it('does not report an incident as unresolved after a newer recovered transition', () => {
+    const data = payload();
+    const active = { ...incident('2026-08-29T23:56:00Z'), id: 'incident-shared' };
+    const recovered = {
+      ...incident('2026-08-29T23:58:00Z'),
+      id: active.id,
+      startedAt: active.startedAt,
+      phase: 'recovered' as const,
+      endedAt: '2026-08-29T23:58:00Z',
+      durationSeconds: 120,
+    };
+    data.incidents = [active, recovered];
+
+    expect(operationalFindings(data).find((finding) => finding.id === 'active-incident')).toBeUndefined();
   });
 
   it('labels a latched throttle-history bit as current-boot evidence rather than a current fault', () => {

@@ -33,7 +33,11 @@ import {
   type OperationalLogEntry,
 } from '../dashboard-model';
 import type { OperationalFinding } from '../operational-health';
-import { NETWORK_FAULT_RATE_THRESHOLDS } from '../operational-thresholds';
+import {
+  NETWORK_DROP_RATE_THRESHOLDS,
+  NETWORK_ERROR_RATE_THRESHOLDS,
+  PSI_THRESHOLDS,
+} from '../operational-thresholds';
 import { useResponsivePageSize } from '../responsive-page-size';
 import type {
   ContainerStatus,
@@ -192,6 +196,24 @@ function statusTone(value: number | null | undefined, warning = 75, critical = 9
   return 'ok';
 }
 
+function strongerTone(
+  left: ReturnType<typeof statusTone>,
+  right: ReturnType<typeof statusTone>,
+): ReturnType<typeof statusTone> {
+  const order = { unknown: 0, ok: 1, caution: 2, danger: 3 } as const;
+  return order[left] >= order[right] ? left : right;
+}
+
+function networkFaultTone(
+  errorRate: number | null,
+  dropRate: number | null,
+): ReturnType<typeof statusTone> {
+  return strongerTone(
+    statusTone(errorRate, NETWORK_ERROR_RATE_THRESHOLDS.caution, NETWORK_ERROR_RATE_THRESHOLDS.danger),
+    statusTone(dropRate, NETWORK_DROP_RATE_THRESHOLDS.caution, NETWORK_DROP_RATE_THRESHOLDS.danger),
+  );
+}
+
 function statusWord(tone: ReturnType<typeof statusTone>, locale: MonitorLocale): string {
   if (tone === 'danger') return t(locale, '위험', 'WARNING');
   if (tone === 'caution') return t(locale, '주의', 'CAUTION');
@@ -261,12 +283,18 @@ export function VitalSignsWidget({ data, locale, onOpen }: Omit<VisualProps, 'ra
   const diskIo = latest?.diskReadBytesPerSecond == null && latest?.diskWriteBytesPerSecond == null
     ? null
     : (latest?.diskReadBytesPerSecond ?? 0) + (latest?.diskWriteBytesPerSecond ?? 0);
-  const networkFaultRate = sumObserved([
+  const networkErrorRate = sumObserved([
     latest?.networkRxErrorsPerSecond,
     latest?.networkTxErrorsPerSecond,
+  ]);
+  const networkDropRate = sumObserved([
     latest?.networkRxDroppedPerSecond,
     latest?.networkTxDroppedPerSecond,
   ]);
+  const networkFaultRate = sumObserved([networkErrorRate, networkDropRate]);
+  const currentMemoryPressure = (latest?.memoryPercent ?? 0) >= 75
+    || (latest?.memoryPressureSomeAvg10 ?? 0) >= PSI_THRESHOLDS.memorySome.caution
+    || (latest?.memoryPressureFullAvg10 ?? 0) >= PSI_THRESHOLDS.memoryFull.caution;
   const voltageTone = typeof latest?.supplyVoltageVolts !== 'number'
     ? 'unknown'
     : latest.supplyVoltageVolts < 4.63
@@ -291,14 +319,14 @@ export function VitalSignsWidget({ data, locale, onOpen }: Omit<VisualProps, 'ra
     <Vital key="cpu-psi" label={t(locale, 'CPU 실제 대기', 'CPU stall (PSI)')} term={t(locale, '최근 10초 중 적어도 하나의 작업이 CPU를 기다린 시간 비율입니다.', 'Share of the last 10 seconds in which at least one task waited for CPU.')} value={formatPercent(latest?.cpuPressureSomeAvg10, 1)} note={`full ${formatPercent(latest?.cpuPressureFullAvg10, 1)}`} tone={statusTone(latest?.cpuPressureSomeAvg10, 5, 20)} />,
     <Vital key="memory-psi" label={t(locale, '메모리 실제 대기', 'Memory stall (PSI)')} term={t(locale, '메모리 회수나 할당 때문에 작업이 실제로 멈춘 시간 비율입니다.', 'Share of time tasks actually stalled on memory allocation or reclaim.')} value={formatPercent(latest?.memoryPressureSomeAvg10, 1)} note={`full ${formatPercent(latest?.memoryPressureFullAvg10, 1)}`} tone={statusTone(latest?.memoryPressureSomeAvg10, 1, 10)} />,
     <Vital key="io-psi" label={t(locale, 'I/O 실제 대기', 'I/O stall (PSI)')} term={t(locale, '저장장치 입출력을 기다리느라 작업이 실제로 멈춘 시간 비율입니다.', 'Share of time tasks actually stalled while waiting for storage I/O.')} value={formatPercent(latest?.ioPressureSomeAvg10, 1)} note={`full ${formatPercent(latest?.ioPressureFullAvg10, 1)}`} tone={statusTone(latest?.ioPressureSomeAvg10, 5, 20)} />,
-    <Vital key="swap" label={t(locale, '스왑', 'Swap')} value={formatPercent(latest?.swapPercent, 1)} note={typeof latest?.swapTotalBytes === 'number' && latest.swapTotalBytes > 0 ? `${formatBytes(latest.swapUsedBytes)} / ${formatBytes(latest.swapTotalBytes)}` : t(locale, '스왑 없음 또는 미확인', 'No swap or unavailable')} tone={statusTone(latest?.swapPercent, 50, 85)} />,
+    <Vital key="swap" label={t(locale, '스왑', 'Swap')} value={formatPercent(latest?.swapPercent, 1)} note={typeof latest?.swapTotalBytes === 'number' && latest.swapTotalBytes > 0 ? `${formatBytes(latest.swapUsedBytes)} / ${formatBytes(latest.swapTotalBytes)}` : t(locale, '스왑 없음 또는 미확인', 'No swap or unavailable')} tone={latest?.swapPercent == null ? 'unknown' : currentMemoryPressure ? statusTone(latest.swapPercent, 50, 85) : 'ok'} />,
     <Vital key="services" label={t(locale, '서비스', 'Services')} value={data.containers.length ? `${running}/${data.containers.length}` : '—'} note={!data.containers.length ? t(locale, '추적 대상 없음', 'No services reported') : unhealthy ? t(locale, `${unhealthy}개 이상`, `${unhealthy} abnormal`) : t(locale, '모두 정상', 'All nominal')} tone={!data.containers.length ? 'unknown' : unhealthy ? 'danger' : 'ok'} />,
     <Vital key="disk-usage" label={t(locale, '디스크 최고 사용률', 'Highest disk usage')} value={formatPercent(highestDisk, 0)} note={t(locale, `${data.disks.length}개 볼륨`, `${data.disks.length} volumes`)} tone={statusTone(highestDisk)} />,
     <Vital key="voltage" label={t(locale, '공급 전압', 'Supply voltage')} value={voltage(latest?.supplyVoltageVolts)} note={t(locale, 'EXT5V 입력', 'EXT5V input')} tone={voltageTone} />,
     <Vital key="uptime" label={t(locale, '가동 시간', 'Uptime')} value={localUptime(data.host.uptimeSeconds, locale)} note={safeText(data.host.os, t(locale, '운영체제 미확인', 'OS unavailable'), 72)} tone={data.host.uptimeSeconds == null ? 'unknown' : 'ok'} />,
     <Vital key="network-rx" label={t(locale, '수신 처리량', 'Network receive')} value={formatRate(latest?.networkRxBytesPerSecond)} note={t(locale, '현재 초당 수신량', 'Current receive rate')} tone={latest?.networkRxBytesPerSecond == null ? 'unknown' : 'ok'} />,
     <Vital key="network-tx" label={t(locale, '송신 처리량', 'Network transmit')} value={formatRate(latest?.networkTxBytesPerSecond)} note={t(locale, '현재 초당 송신량', 'Current transmit rate')} tone={latest?.networkTxBytesPerSecond == null ? 'unknown' : 'ok'} />,
-    <Vital key="network-faults" label={t(locale, '네트워크 오류·드롭', 'Network errors and drops')} value={eventRate(networkFaultRate)} note={t(locale, '루프백 제외 인터페이스 합계', 'Non-loopback interfaces combined')} tone={statusTone(networkFaultRate, NETWORK_FAULT_RATE_THRESHOLDS.caution, NETWORK_FAULT_RATE_THRESHOLDS.danger)} />,
+    <Vital key="network-faults" label={t(locale, '네트워크 오류·드롭', 'Network errors and drops')} value={eventRate(networkFaultRate)} note={t(locale, '루프백 제외 인터페이스 합계', 'Non-loopback interfaces combined')} tone={networkFaultTone(networkErrorRate, networkDropRate)} />,
     <Vital key="disk-io" label={t(locale, '디스크 입출력', 'Disk I/O')} value={formatRate(diskIo)} note={`${t(locale, '읽기', 'read')} ${formatRate(latest?.diskReadBytesPerSecond)} · ${t(locale, '쓰기', 'write')} ${formatRate(latest?.diskWriteBytesPerSecond)}`} tone={diskIo == null ? 'unknown' : 'ok'} />,
     <Vital key="gpu-memory" label={t(locale, 'GPU 메모리 할당', 'GPU memory allocation')} value={formatBytes(latest?.gpuMemoryBytes)} note={t(locale, '사용량이 아닌 예약 용량', 'Reserved allocation, not usage')} tone={latest?.gpuMemoryBytes == null ? 'unknown' : 'ok'} />,
     <Vital key="gpu-clock" label={t(locale, 'GPU 클럭', 'GPU clock')} value={formatClock(latest?.gpuClockHz ?? null)} note={t(locale, '현재 그래픽 코어 주파수', 'Current graphics core frequency')} tone={latest?.gpuClockHz == null ? 'unknown' : 'ok'} />,
@@ -413,10 +441,10 @@ export function NetworkWidget({ data, range, locale, onOpen }: VisualProps) {
   const transmitVisible = detailVisible('transmit');
   const series = useMemo(() => chartSeries(data, range, locale), [data, range, locale]);
   const stats = data.telemetrySummary;
-  const receiveFaults = sumObserved([data.latest?.networkRxErrorsPerSecond, data.latest?.networkRxDroppedPerSecond]);
-  const transmitFaults = sumObserved([data.latest?.networkTxErrorsPerSecond, data.latest?.networkTxDroppedPerSecond]);
-  const faultRate = sumObserved([receiveFaults, transmitFaults]);
-  const faultTone = statusTone(faultRate, NETWORK_FAULT_RATE_THRESHOLDS.caution, NETWORK_FAULT_RATE_THRESHOLDS.danger);
+  const errorRate = sumObserved([data.latest?.networkRxErrorsPerSecond, data.latest?.networkTxErrorsPerSecond]);
+  const dropRate = sumObserved([data.latest?.networkRxDroppedPerSecond, data.latest?.networkTxDroppedPerSecond]);
+  const faultRate = sumObserved([errorRate, dropRate]);
+  const faultTone = networkFaultTone(errorRate, dropRate);
   const currentRequests = data.currentTraffic.reduce((total, traffic) => total + traffic.requestCount, 0);
   const currentServerErrors = data.currentTraffic.reduce((total, traffic) => total + traffic.status5xx, 0);
   return (
