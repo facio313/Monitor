@@ -31,6 +31,9 @@ SYNTHETIC_RULES = frozenset({
     "HttpEndpointDown", "HttpLatencyHigh",
     "TlsCertificateExpiring", "TlsCertificateInvalid",
 })
+SWAP_PRESSURE_MEMORY_USED_PERCENT = 75.0
+SWAP_PRESSURE_MEMORY_PSI_SOME_AVG10 = 1.0
+SWAP_PRESSURE_MEMORY_PSI_FULL_AVG10 = 0.2
 
 
 def _mapping(value: Any) -> Mapping[str, Any]:
@@ -42,6 +45,33 @@ def _number(value: Any) -> float | None:
         return None
     result = float(value)
     return result if math.isfinite(result) else None
+
+
+def _pressure_gated_swap_percent(latest: Mapping[str, Any]) -> float | None:
+    """Treat retained swap as healthy unless current memory pressure is proven.
+
+    A non-pressure observation is a valid false compound condition even when
+    the raw swap percentage is absent. If pressure is active, however, the raw
+    swap value is still required so the rule cannot invent a breach or recovery.
+    These thresholds match the operator-facing resource-pressure assessment.
+    """
+
+    memory_percent = _number(latest.get("memoryPercent"))
+    memory_some = _number(latest.get("memoryPressureSomeAvg10"))
+    memory_full = _number(latest.get("memoryPressureFullAvg10"))
+    if memory_percent is None and memory_some is None and memory_full is None:
+        return None
+    pressure_active = (
+        memory_percent is not None
+        and memory_percent >= SWAP_PRESSURE_MEMORY_USED_PERCENT
+    ) or (
+        memory_some is not None
+        and memory_some >= SWAP_PRESSURE_MEMORY_PSI_SOME_AVG10
+    ) or (
+        memory_full is not None
+        and memory_full >= SWAP_PRESSURE_MEMORY_PSI_FULL_AVG10
+    )
+    return _number(latest.get("swapPercent")) if pressure_active else 0.0
 
 
 def _timestamp(value: Any) -> dt.datetime | None:
@@ -219,7 +249,7 @@ def observations_for_snapshot(pack: RulePack, snapshot: Mapping[str, Any]) -> di
     memory_percent = _number(latest.get("memoryPercent"))
     host_metric("MemoryAvailableLow", 100.0 - memory_percent if memory_percent is not None else None)
     host_metric("MemoryPressureHigh", latest.get("memoryPressureSomeAvg10"))
-    host_metric("SwapUsageHigh", latest.get("swapPercent"))
+    host_metric("SwapUsageHigh", _pressure_gated_swap_percent(latest))
     if "SwapThrashing" in result:
         swap_in = _number(linux_memory.get("swapInBytesPerSecond"))
         swap_out = _number(linux_memory.get("swapOutBytesPerSecond"))

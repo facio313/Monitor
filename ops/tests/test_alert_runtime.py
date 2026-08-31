@@ -161,6 +161,120 @@ class AlertRuntimeTests(unittest.TestCase):
         self.assertEqual(observations["MonitoringDiskUsageHigh"][0].value, 86)
         self.assertEqual(observations["IngestLagHigh"][0].status, "unsupported")
 
+    def test_swap_usage_requires_observed_memory_pressure(self):
+        retained = self.snapshot()
+        retained["latest"].update({
+            "memoryPercent": 43.68,
+            "memoryPressureSomeAvg10": 0,
+            "memoryPressureFullAvg10": 0,
+            "swapPercent": 65.59,
+        })
+        observation = observations_for_snapshot(
+            self.pack, retained,
+        )["SwapUsageHigh"][0]
+        self.assertEqual((observation.status, observation.value), ("ok", 0))
+
+        for field, threshold in (
+            ("memoryPercent", 75),
+            ("memoryPressureSomeAvg10", 1),
+            ("memoryPressureFullAvg10", 0.2),
+        ):
+            with self.subTest(field=field):
+                pressured = self.snapshot()
+                pressured["latest"].update({
+                    "memoryPercent": 43.68,
+                    "memoryPressureSomeAvg10": 0,
+                    "memoryPressureFullAvg10": 0,
+                    "swapPercent": 65.59,
+                    field: threshold,
+                })
+                observation = observations_for_snapshot(
+                    self.pack, pressured,
+                )["SwapUsageHigh"][0]
+                self.assertEqual((observation.status, observation.value), ("ok", 65.59))
+
+        no_context = self.snapshot()
+        for field in (
+            "memoryPercent", "memoryPressureSomeAvg10", "memoryPressureFullAvg10"
+        ):
+            no_context["latest"].pop(field, None)
+        observation = observations_for_snapshot(
+            self.pack, no_context,
+        )["SwapUsageHigh"][0]
+        self.assertEqual(observation.status, "no_data")
+        self.assertIsNone(observation.value)
+
+        active_without_swap = self.snapshot()
+        active_without_swap["latest"].pop("swapPercent")
+        observation = observations_for_snapshot(
+            self.pack, active_without_swap,
+        )["SwapUsageHigh"][0]
+        self.assertEqual(observation.status, "no_data")
+        self.assertIsNone(observation.value)
+
+        retained_without_swap = retained.copy()
+        retained_without_swap["latest"] = retained["latest"].copy()
+        retained_without_swap["latest"].pop("swapPercent")
+        observation = observations_for_snapshot(
+            self.pack, retained_without_swap,
+        )["SwapUsageHigh"][0]
+        self.assertEqual((observation.status, observation.value), ("ok", 0))
+
+        legacy = self.snapshot()
+        legacy["latest"].update({"memoryPercent": 43.68, "swapPercent": 65.59})
+        legacy["latest"].pop("memoryPressureSomeAvg10", None)
+        legacy["latest"].pop("memoryPressureFullAvg10", None)
+        observation = observations_for_snapshot(
+            self.pack, legacy,
+        )["SwapUsageHigh"][0]
+        self.assertEqual((observation.status, observation.value), ("ok", 0))
+
+    def test_retained_swap_resolves_through_existing_hysteresis(self):
+        pressured = self.snapshot()
+        pressured["latest"].update({
+            "memoryPercent": 75,
+            "memoryPressureSomeAvg10": 0,
+            "memoryPressureFullAvg10": 0,
+            "swapPercent": 65.59,
+        })
+        state = {}
+        swap_rule = next(
+            rule for rule in self.pack.rules if rule.rule_id == "SwapUsageHigh"
+        )
+        for minute in range(swap_rule.for_samples):
+            result, _events = evaluate_snapshot(
+                self.pack, pressured, state, NOW + dt.timedelta(minutes=minute)
+            )
+            state = result["states"]
+        state_key = "SwapUsageHigh:host/11111111-1111-4111-8111-111111111111"
+        self.assertEqual(state[state_key]["phase"], "firing")
+
+        retained = self.snapshot()
+        retained["latest"].update({
+            "memoryPercent": 43.68,
+            "memoryPressureSomeAvg10": 0,
+            "memoryPressureFullAvg10": 0,
+            "swapPercent": 65.59,
+        })
+        phases = []
+        resolution_events = []
+        for offset in range(swap_rule.recovery_samples):
+            result, events = evaluate_snapshot(
+                self.pack,
+                retained,
+                state,
+                NOW + dt.timedelta(minutes=swap_rule.for_samples + offset),
+            )
+            state = result["states"]
+            phases.append(state[state_key]["phase"])
+            resolution_events.extend(
+                event for event in events
+                if event["ruleId"] == "SwapUsageHigh"
+                and event["transition"] == "resolved"
+            )
+        self.assertEqual(phases, ["recovering", "recovering", "inactive"])
+        self.assertEqual(len(resolution_events), 1)
+
     def test_synthetic_probe_evidence_feeds_http_and_tls_rules_without_deadman_aliasing(self):
         snapshot = self.snapshot()
         snapshot["syntheticProbeCollection"] = {
