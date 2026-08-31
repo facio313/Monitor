@@ -5,15 +5,73 @@ import { operationalLogs } from './dashboard-model';
 import {
   operationalFindingHref,
   operationalFindings,
+  operationalServiceStates,
 } from './operational-health';
 import { OperationalGuidance, OperationalHealthOverview, OperationalHealthSummary } from './components/OperationalHealth';
 import { OperationalLogView } from './components/OperationalLogView';
 import type {
   DashboardPayload,
+  LinuxDiagnostics,
   PeakIncident,
   SystemEventCount,
   TelemetrySample,
 } from './types';
+
+function linuxDiagnostics(): LinuxDiagnostics {
+  const capacity = () => ({ status: 'supported' as const, current: 1, maximum: 100, usedPercent: 1 });
+  return {
+    schemaVersion: 1,
+    collectedAt: '2026-08-30T00:00:00Z',
+    status: 'supported',
+    resources: {
+      status: 'supported', processCount: 10, processCountIsLowerBound: false,
+      observedProcessCount: 10, zombieCount: 0, threadCount: 20,
+      scanTruncated: false, deadlineReached: false,
+      pid: capacity(), systemFileDescriptors: capacity(), cgroupPids: { ...capacity(), version: 2 },
+    },
+    storage: { status: 'supported', truncated: false, devices: [] },
+    network: {
+      status: 'supported',
+      tcp: {
+        status: 'supported', rateStatus: 'ok', outgoingSegmentsPerSecond: 1,
+        retransmittedSegmentsPerSecond: 0, retransmissionPercent: 0,
+        states: {
+          established: 1, synSent: 0, synRecv: 0, finWait1: 0, finWait2: 0,
+          timeWait: 0, close: 0, closeWait: 0, lastAck: 0, listen: 1,
+          closing: 0, newSynRecv: 0,
+        },
+        socketScanStatus: 'supported', socketScanTruncated: false,
+        ephemeralPorts: { ...capacity(), rangeStart: 32_768, rangeEnd: 60_999 },
+        conntrack: capacity(),
+      },
+    },
+    reliability: {
+      status: 'supported',
+      clock: {
+        status: 'supported', uptimeSeconds: 3_600, bootTime: '2026-08-29T23:00:00Z',
+        rebootDetectedSincePreviousSample: false, unexpectedReboot: false,
+        unexpectedRebootStatus: 'not-detected',
+        timeSync: {
+          status: 'supported', reason: null, synchronized: true, ntpEnabled: true,
+          ntpSupported: true, clockDriftMilliseconds: 0, clockDriftStatus: 'supported',
+        },
+      },
+      systemd: { status: 'supported', reason: null, truncated: false, units: [] },
+    },
+    power: {
+      status: 'supported', truncated: false, maximumTemperatureCelsius: 45,
+      sensors: [], fans: [],
+      raspberryPi: {
+        status: 'supported', detected: true, temperatureCelsius: 45,
+        supplyVoltageVolts: 5.1, throttledFlags: 0, currentUnderVoltage: false,
+        currentFrequencyCapped: false, currentThrottled: false,
+        currentSoftTemperatureLimit: false, underVoltageOccurred: false,
+        frequencyCapOccurred: false, throttlingOccurred: false,
+        softTemperatureLimitOccurred: false, flagSource: 'vcgencmd',
+      },
+    },
+  };
+}
 
 function count(value = 0, lastEventAt: string | null = null): SystemEventCount {
   return { count: value, lastEventAt };
@@ -87,6 +145,7 @@ function payload(): DashboardPayload {
       networkLinkAvailable: true,
       nvmeMitigationActive: true,
     },
+    linux: { status: 'unsupported' } as DashboardPayload['linux'],
     latest: latest(),
     series: [],
     telemetrySummary: {
@@ -205,6 +264,128 @@ describe('operational health assessment', () => {
     expect(operationalFindings(payload())).toEqual([]);
   });
 
+  it('surfaces projected Linux resource, network, storage, reliability, and power evidence on its owning pages', () => {
+    const data = payload();
+    data.linux = linuxDiagnostics();
+    data.linux.resources.pid.usedPercent = 92;
+    data.linux.network.tcp.retransmissionPercent = 6;
+    data.linux.storage.devices = [{
+      name: 'nvme0n1', type: 'disk', rotational: false, rateStatus: 'ok',
+      queueDepth: 1, readLatencyMilliseconds: 10, writeLatencyMilliseconds: 20,
+      averageLatencyMilliseconds: 25, utilizationPercent: 82, averageQueueDepth: 1,
+      smartStatus: 'supported', raidStatus: 'supported', raidDegradedDevices: 1,
+      raidArrayState: 'degraded',
+    }];
+    data.linux.reliability.clock.timeSync.synchronized = false;
+    data.linux.reliability.systemd.units = [{
+      unit: 'monitor.service', loadState: 'loaded', activeState: 'failed', subState: 'failed',
+      restartCount: 2, restartCountStatus: 'systemd_manager', result: 'exit-code',
+      execMainStatus: 1, invocationStatus: 'supported',
+    }];
+    data.linux.power.raspberryPi.currentFrequencyCapped = true;
+
+    const findings = operationalFindings(data);
+    expect(findings.find((entry) => entry.id === 'resource-pressure')).toMatchObject({ level: 'danger', scope: 'current', page: 'resources' });
+    expect(findings.find((entry) => entry.id === 'network-quality')).toMatchObject({ level: 'danger', scope: 'current', page: 'network' });
+    expect(findings.find((entry) => entry.id === 'storage-integrity')).toMatchObject({ level: 'danger', scope: 'current', page: 'storage' });
+    expect(findings.find((entry) => entry.id === 'linux-reliability')).toMatchObject({ level: 'danger', scope: 'current', page: 'reliability', count: 2 });
+    expect(findings.find((entry) => entry.id === 'power-quality')).toMatchObject({ level: 'danger', scope: 'current', page: 'power' });
+    expect(operationalFindingHref(findings.find((entry) => entry.id === 'linux-reliability')!, '7d'))
+      .toBe('/monitor/details/reliability?range=7d#issue-linux-reliability');
+  });
+
+  it('keeps unsupported Linux and an explicitly unconfigured healthcheck neutral', () => {
+    const data = payload();
+    data.containers = [{
+      name: 'worker', owner: null, state: 'running', health: 'none', healthcheckConfigured: false,
+      cpuPercent: 1, memoryBytes: 1, memoryPercent: 1,
+    }];
+    expect(operationalFindings(data)).toEqual([]);
+
+    data.linux = linuxDiagnostics();
+    data.linux.network.tcp.rateStatus = 'warmup';
+    data.linux.network.tcp.socketScanStatus = 'unsupported';
+    expect(operationalFindings(data)).toEqual([]);
+  });
+
+  it('surfaces a top-level Linux collection failure even when diagnostics have no schema version', () => {
+    const data = payload();
+    data.linux = linuxDiagnostics();
+    data.linux.schemaVersion = null;
+    data.linux.status = 'collection_error';
+
+    expect(operationalFindings(data)).toEqual([
+      expect.objectContaining({
+        id: 'linux-reliability', level: 'danger', scope: 'current', count: 1,
+        evidence: [expect.stringContaining('Linux 진단 collection_error'), expect.stringContaining('Linux diagnostics collection_error')],
+      }),
+    ]);
+  });
+
+  it('aggregates Docker runtime and security risks by container and distinguishes event gaps from access failure', () => {
+    const data = payload();
+    data.containers = [{
+      name: 'monitor', project: 'monitor', owner: null, state: 'running', health: 'healthy',
+      healthcheckConfigured: true, cpuPercent: 1, memoryBytes: 950, memoryPercent: 1,
+      memoryLimitBytes: 1_000, restartCountDelta: 3, oomKilled: true,
+      pidCount: 95, pidLimit: 100, cpuThrottledPercent: 25,
+      networkErrorsPerSecond: 1.2, instanceId: 'a'.repeat(32), privileged: true,
+      dockerSocketMounted: true, sensitiveBindMounted: true, dangerousCapabilityCount: 2,
+    }];
+    data.dockerEventCollection = {
+      status: 'gap', observedAt: '2026-08-30T00:00:01Z', cursorAt: '2026-08-30T00:00:00Z',
+      reconnectCount: 2, gapCount: 1, gapDetected: true, logCollectionStatus: 'unsupported',
+    };
+
+    const findings = operationalFindings(data);
+    expect(operationalServiceStates(data)).toEqual(['danger']);
+    expect(findings.find((entry) => entry.id === 'service-fault')).toMatchObject({ level: 'danger', scope: 'current', count: 1 });
+    expect(findings.find((entry) => entry.id === 'container-security')).toMatchObject({ level: 'danger', scope: 'current', count: 1 });
+    expect(findings.find((entry) => entry.id === 'docker-event-coverage')).toMatchObject({ level: 'caution', scope: 'range', count: 1 });
+    expect(operationalFindingHref(findings.find((entry) => entry.id === 'container-security')!, '24h'))
+      .toBe('/monitor/details/containers?range=24h#issue-container-security');
+
+    data.dockerEventCollection.status = 'permission-denied';
+    expect(operationalFindings(data).find((entry) => entry.id === 'docker-event-coverage')).toMatchObject({ level: 'danger', scope: 'current' });
+    data.stale = true;
+    expect(operationalFindings(data).find((entry) => entry.id === 'docker-event-coverage')).toMatchObject({ level: 'danger', scope: 'last-known' });
+  });
+
+  it('surfaces reduced synthetic failures, latency, and certificate risk without requiring endpoint URLs', () => {
+    const data = payload();
+    data.syntheticProbeCollection = {
+      status: 'fresh', observedAt: '2026-08-30T00:00:00Z',
+    };
+    data.syntheticProbes = [{
+      id: 'public-ready', status: 'tls', checkedAt: '2026-08-30T00:00:00Z',
+      httpStatus: null, redirectCount: 0, latencyMilliseconds: 3_500,
+      certificateExpiresAt: null, certificateDaysRemaining: null,
+    }, {
+      id: 'certificate-watch', status: 'ok', checkedAt: '2026-08-30T00:00:01Z',
+      httpStatus: 200, redirectCount: 0, latencyMilliseconds: 25,
+      certificateExpiresAt: '2026-09-05T00:00:00Z', certificateDaysRemaining: 6,
+    }];
+
+    expect(operationalFindings(data).find((entry) => entry.id === 'synthetic-availability')).toMatchObject({
+      level: 'danger', scope: 'current', page: 'network', count: 2,
+      evidence: [
+        expect.stringContaining('public-ready 상태 tls'),
+        expect.stringContaining('public-ready status tls'),
+      ],
+    });
+    expect(JSON.stringify(operationalFindings(data))).not.toContain('token=');
+    expect(JSON.stringify(operationalFindings(data))).not.toContain('://');
+
+    data.syntheticProbeCollection = { status: 'permission-denied', observedAt: null };
+    data.syntheticProbes = [];
+    expect(operationalFindings(data).find((entry) => entry.id === 'synthetic-availability')).toMatchObject({
+      level: 'danger', scope: 'current', count: null,
+    });
+
+    data.syntheticProbeCollection = { status: 'unsupported', observedAt: null };
+    expect(operationalFindings(data).find((entry) => entry.id === 'synthetic-availability')).toBeUndefined();
+  });
+
   it('includes evaluator rules in the authoritative overall assessment', () => {
     const data = payload();
     data.ruleEvaluation = {
@@ -226,6 +407,10 @@ describe('operational health assessment', () => {
           recoverySamples: 0,
           missingSamples: 0,
           openedAt: '2026-08-29T23:55:00Z',
+          conditionStartedAt: '2026-08-29T23:55:00Z',
+          recoveryStartedAt: null,
+          missingStartedAt: null,
+          evaluationIntervalSeconds: 60,
           changedAt: '2026-08-30T00:00:00Z',
           lastEvaluatedAt: '2026-08-30T00:00:00Z',
           lastValue: 95,
@@ -240,12 +425,24 @@ describe('operational health assessment', () => {
         level: 'caution',
         scope: 'current',
         count: 1,
+        evidence: [expect.stringContaining('CpuUsageHigh (host/node-a=95)'), expect.stringContaining('CpuUsageHigh (host/node-a=95)')],
       }),
     ]);
 
     data.ruleEvaluation.states['CpuUsageHigh:host/node-a']!.severity = 'critical';
     expect(operationalFindings(data)).toEqual([
       expect.objectContaining({ id: 'rule-evaluation', level: 'danger' }),
+    ]);
+  });
+
+  it('reports rule-transition collection coverage independently from evaluator health', () => {
+    const data = payload();
+    data.ruleAlerts = { status: 'collection_error', events: [] };
+    expect(operationalFindings(data)).toEqual([
+      expect.objectContaining({
+        id: 'rule-evaluation', level: 'caution', scope: 'current', count: 1,
+        evidence: [expect.stringContaining('전환 기록 collection_error'), expect.stringContaining('transition log collection_error')],
+      }),
     ]);
   });
 
@@ -723,7 +920,29 @@ describe('operational health presentation', () => {
     expect(markup).toContain('전체 진단 보기');
     expect(markup).not.toContain('health-finding-grid');
     expect(markup).not.toContain('health-more-findings');
-    expect(markup).not.toContain('짧은 RCU expedited 지연');
+    expect(markup).toContain('health-overview-findings');
+    expect(markup).toContain('짧은 RCU expedited 지연');
+    expect(markup).toContain('href="/monitor/details/reliability?range=7d#issue-rcu-expedited"');
+  });
+
+  it('shows exactly the first three ordered findings while retaining full counts and the complete-assessment link', () => {
+    const data = payload();
+    data.containers = [{ name: 'service', owner: null, state: 'exited', health: 'unhealthy', cpuPercent: 1, memoryBytes: 1, memoryPercent: 1 }];
+    data.latest = latest({ cpuPercent: 95, throttledFlags: 1 });
+    data.disks[0].usedPercent = 95;
+    data.reliability.networkLinkAvailable = false;
+    data.system.kernel.panic = count(1, '2026-08-29T23:55:00Z');
+    const findings = operationalFindings(data);
+    expect(findings.length).toBeGreaterThan(3);
+
+    const markup = renderToStaticMarkup(createElement(OperationalHealthOverview, {
+      findings, locale: 'en', range: '24h', onNavigate: vi.fn(),
+    }));
+    expect(markup.match(/class="health-more-link/g)).toHaveLength(3);
+    for (const finding of findings.slice(0, 3)) expect(markup).toContain(`issue-${finding.id}`);
+    expect(markup).not.toContain(`issue-${findings[3].id}`);
+    expect(markup).toContain(`${findings.filter((finding) => finding.level === 'danger').length} danger`);
+    expect(markup).toContain('href="/monitor/details/reliability?range=24h"');
   });
 
   it('renders a linked detail guide with problem, symptoms, and resolution sections in Korean and English', () => {
@@ -781,5 +1000,20 @@ describe('operational health presentation', () => {
     expect(english).toContain('hung task · recorded');
     expect(english).toContain('nvme mitigation · enabled');
     expect(english).not.toContain('hung-task · active');
+  });
+
+  it('offers Docker and rule-transition sources without rewriting their bounded titles', () => {
+    const entries = [
+      { id: 'docker:1', timestamp: '2026-08-30T00:00:00Z', category: 'docker' as const, severity: 'critical' as const, kind: 'oom', status: 'oom', title: 'monitor · oom', message: 'project monitor', actor: null, target: 'monitor' },
+      { id: 'rule:1', timestamp: '2026-08-30T00:01:00Z', category: 'rule' as const, severity: 'warning' as const, kind: 'ContainerDown', status: 'firing · ready · ok', title: 'ContainerDown · firing', message: 'value 0', actor: null, target: 'container/monitor' },
+    ];
+    const korean = renderToStaticMarkup(createElement(OperationalLogView, { locale: 'ko', entries }));
+    const english = renderToStaticMarkup(createElement(OperationalLogView, { locale: 'en', entries }));
+    expect(korean).toContain('Docker 이벤트');
+    expect(korean).toContain('규칙 전환');
+    expect(english).toContain('Docker event');
+    expect(english).toContain('Rule transition');
+    expect(english).toContain('monitor · oom');
+    expect(english).toContain('ContainerDown · firing');
   });
 });

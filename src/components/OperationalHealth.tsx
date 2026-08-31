@@ -29,6 +29,7 @@ interface OperationalGuidanceProps {
 }
 
 const PRIMARY_FINDING_LIMIT = 4;
+const OVERVIEW_FINDING_LIMIT = 3;
 
 function t(locale: MonitorLocale, korean: string, english: string): string {
   return locale === 'ko' ? korean : english;
@@ -91,6 +92,7 @@ export function OperationalHealthOverview({ findings, locale, range, onNavigate 
   const cautionCount = findings.length - dangerCount;
   const href = `${monitorPathForPage('reliability')}?range=${encodeURIComponent(range)}`;
   const tone = dangerCount ? 'danger' : cautionCount ? 'caution' : 'nominal';
+  const primary = findings.slice(0, OVERVIEW_FINDING_LIMIT);
 
   return (
     <section className={`operational-health-overview overview-${tone}`} aria-labelledby="operational-health-overview-title">
@@ -119,6 +121,11 @@ export function OperationalHealthOverview({ findings, locale, range, onNavigate 
       >
         {t(locale, '전체 진단 보기', 'View full assessment')}<Icon name="chevron" size={15} />
       </a>
+      {primary.length > 0 && (
+        <div className="health-overview-findings" aria-label={t(locale, '우선 확인 항목', 'Priority findings')}>
+          {primary.map((finding) => <FindingLink key={finding.id} finding={finding} locale={locale} range={range} onNavigate={onNavigate} compact />)}
+        </div>
+      )}
     </section>
   );
 }

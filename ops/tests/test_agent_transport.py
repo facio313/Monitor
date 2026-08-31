@@ -15,6 +15,7 @@ from ops.agent_transport import (
     AgentTransport,
     AgentTransportError,
     ConfigError,
+    ContractError,
     HttpResponse,
     SpoolFullError,
     TransportConfig,
@@ -27,13 +28,15 @@ from ops.agent_transport.config import (
     MAX_SPOOL_ENTRIES,
 )
 from ops.agent_transport.storage import (
+    DEFAULT_LOCK_TIMEOUT_SECONDS,
     StorageError,
     atomic_private_write,
     canonical_json,
     ensure_private_directory,
+    exclusive_lock,
     fsync_directory,
 )
-from ops.agent_transport.transport import HttpsRequester
+from ops.agent_transport.transport import HttpsRequester, MAX_SAFE_INTEGER
 
 
 NOW_MS = 1_788_135_600_000  # 2026-08-31T00:20:00.000Z
@@ -62,6 +65,38 @@ def metric(observed_at="2026-08-31T00:20:00Z", value=1.0):
         "observedAt": observed_at,
         "value": value,
         "severity": None,
+    }
+
+
+def event(observed_at="2026-08-31T00:20:00Z"):
+    return {
+        "kind": "event",
+        "metric": "host.power.state",
+        "target": "host/primary",
+        "observedAt": observed_at,
+        "value": None,
+        "severity": "warning",
+    }
+
+
+def collector_binding():
+    return {
+        "hostId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        "agentId": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        "installationEpoch": "2026-08-30T00:00:00Z",
+        "identityGeneration": 1,
+    }
+
+
+def checkpoint(sequence=9):
+    binding = collector_binding()
+    return {
+        "schemaVersion": 1,
+        "hostId": binding["hostId"],
+        "agentId": binding["agentId"],
+        "identityGeneration": binding["identityGeneration"],
+        "sourceSequence": sequence,
+        "observedAt": "2026-08-31T00:20:00Z",
     }
 
 
@@ -409,6 +444,39 @@ class AgentTransportTests(unittest.TestCase):
         self.assertIn("TimeoutStartSec=4min", service)
         self.assertGreater(4 * 60, 3 * upper.request_timeout_seconds)
 
+    def test_transport_lock_contention_is_bounded_below_the_producer_deadline(self):
+        lock_path = self.root / "bounded-transport.lock"
+        with exclusive_lock(lock_path):
+            with self.assertRaisesRegex(StorageError, "timed out waiting"):
+                with exclusive_lock(lock_path, timeout_seconds=0.02):
+                    self.fail("a contended transport lock must not be acquired")
+
+        producer_service = (
+            Path(__file__).resolve().parents[1]
+            / "systemd"
+            / "monitor-agent-producer.service"
+        ).read_text(encoding="utf-8")
+        self.assertIn("TimeoutStartSec=90s", producer_service)
+        # Transport construction, producer construction/run, identity binding,
+        # and enqueue can each take one bounded lock before the checkpoint is
+        # retained for the next timer attempt.
+        self.assertGreater(90, 5 * DEFAULT_LOCK_TIMEOUT_SECONDS)
+
+    def test_sequence_exhaustion_is_rejected_before_enqueue_side_effects(self):
+        transport = self.transport()
+        state_path = transport.state_path
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["nextSequence"] = MAX_SAFE_INTEGER
+        atomic_private_write(state_path, canonical_json(state))
+
+        exhausted = self.transport()
+        with self.assertRaisesRegex(StorageError, "sequence space is exhausted"):
+            exhausted.enqueue([metric()])
+
+        self.assertFalse(exhausted.journal_path.exists())
+        self.assertEqual(list(exhausted.spool_directory.glob("*.batch")), [])
+        self.assertEqual(exhausted.status()["nextSequence"], MAX_SAFE_INTEGER)
+
     def test_enqueue_input_exact_byte_bound_and_one_byte_over(self):
         exact = b'["' + b"x" * (MAX_ENQUEUE_BYTES - 4) + b'"]'
         self.assertEqual(len(exact), MAX_ENQUEUE_BYTES)
@@ -530,6 +598,115 @@ class AgentTransportTests(unittest.TestCase):
         self.assertEqual(transport.run_once().ingest, "retry-scheduled")
         self.assertTrue((transport.spool_directory / f"{batch_id}.batch").exists())
 
+    def test_permanent_rejection_moves_batch_to_private_bounded_quarantine(self):
+        transport = self.transport()
+        self.enroll(transport)
+        batch_id = transport.enqueue([metric()])[0]
+        self.requester.queue(
+            "/agent/ingest",
+            HttpResponse(422, {}, canonical_json({"code": "DATA_TOO_OLD"})),
+        )
+
+        result = transport.run_once()
+
+        self.assertEqual(result.ingest, "quarantined")
+        self.assertFalse((transport.spool_directory / f"{batch_id}.batch").exists())
+        status = transport.status()
+        self.assertEqual(status["spoolEntries"], 0)
+        self.assertEqual(status["quarantine"]["entries"], 1)
+        self.assertEqual(status["quarantine"]["dataTooOldEntries"], 1)
+        self_metrics = json.loads(transport.self_metrics_path.read_text())
+        self.assertEqual(self_metrics["outcomes"]["ingest"], "quarantined")
+        self.assertEqual(self_metrics["quarantine"]["entries"], 1)
+        self.assertEqual(self_metrics["quarantine"]["dataTooOldEntries"], 1)
+        self.assertEqual(self_metrics["quarantine"]["oldestAgeSeconds"], 0)
+        self.assertEqual(self_metrics["quarantine"]["status"], "retained")
+        listing = transport.list_quarantine()
+        self.assertEqual(listing["batches"][0]["batchId"], batch_id)
+        self.assertEqual(listing["batches"][0]["reasonCode"], "DATA_TOO_OLD")
+        self.assertNotIn("host.cpu.percent", repr(listing))
+        quarantine_file = next(transport.quarantine_directory.iterdir())
+        self.assertEqual(stat.S_IMODE(quarantine_file.stat().st_mode), 0o600)
+
+        restarted = AgentTransport(
+            transport.config,
+            requester=self.requester,
+            now=self.clock,
+            jitter=lambda: 0.0,
+            inventory_provider=inventory,
+            uuid_factory=self.uuids,
+        )
+        self.assertEqual(restarted.status()["quarantine"]["entries"], 1)
+        self.assertTrue(restarted.purge_quarantine(batch_id))
+        self.assertFalse(restarted.purge_quarantine(batch_id))
+        self.assertEqual(restarted.status()["quarantine"]["status"], "empty")
+
+    def test_quarantine_rename_survives_crash_before_retry_state_cleanup(self):
+        transport = self.transport()
+        self.enroll(transport)
+        batch_id = transport.enqueue([metric()])[0]
+        self.requester.queue(
+            "/agent/ingest",
+            AgentTransportError("temporary failure"),
+        )
+        self.assertEqual(transport.run_once().ingest, "retry-scheduled")
+        self.clock.advance(500)
+        self.requester.queue(
+            "/agent/ingest",
+            HttpResponse(422, {}, canonical_json({"code": "BATCH_TOO_OLD"})),
+        )
+        with mock.patch(
+            "ops.agent_transport.transport.fsync_directory",
+            side_effect=StorageError("simulated crash after quarantine rename"),
+        ):
+            with self.assertRaisesRegex(StorageError, "simulated crash"):
+                transport.run_once()
+
+        self.assertFalse((transport.spool_directory / f"{batch_id}.batch").exists())
+        self.assertEqual(len(list(transport.quarantine_directory.iterdir())), 1)
+        recovered = AgentTransport(
+            transport.config,
+            requester=self.requester,
+            now=self.clock,
+            jitter=lambda: 0.0,
+            inventory_provider=inventory,
+            uuid_factory=self.uuids,
+        )
+        self.assertEqual(recovered.status()["quarantine"]["batchTooOldEntries"], 1)
+        state = json.loads(recovered.state_path.read_text())
+        self.assertNotIn(batch_id, state["retries"])
+
+    def test_quarantine_shares_spool_bounds_until_explicit_purge(self):
+        transport = self.transport(
+            maxBatchBytes=1024,
+            maxSpoolEntries=1,
+            maxSpoolBytes=4096,
+            gzipMinimumBytes=0,
+        )
+        self.enroll(transport)
+        batch_id = transport.enqueue([metric()])[0]
+        self.requester.queue(
+            "/agent/ingest",
+            HttpResponse(422, {}, canonical_json({"code": "DATA_TOO_OLD"})),
+        )
+        self.assertEqual(transport.run_once().ingest, "quarantined")
+        with self.assertRaisesRegex(SpoolFullError, "spool/quarantine entry limit"):
+            transport.enqueue([metric(value=2.0)])
+        self.assertTrue(transport.purge_quarantine(batch_id))
+        self.assertEqual(len(transport.enqueue([metric(value=2.0)])), 1)
+
+    def test_unknown_422_is_retryable_and_not_silently_quarantined(self):
+        transport = self.transport()
+        self.enroll(transport)
+        batch_id = transport.enqueue([metric()])[0]
+        self.requester.queue(
+            "/agent/ingest",
+            HttpResponse(422, {}, canonical_json({"code": "CLOCK_SKEW"})),
+        )
+        self.assertEqual(transport.run_once().ingest, "retry-scheduled")
+        self.assertTrue((transport.spool_directory / f"{batch_id}.batch").exists())
+        self.assertEqual(transport.status()["quarantine"]["entries"], 0)
+
     def test_gzip_is_selected_only_when_it_reduces_the_immutable_body(self):
         transport = self.transport(gzipMinimumBytes=0)
         batch_id = transport.enqueue([metric(value=1.25) for _ in range(20)])[0]
@@ -626,12 +803,153 @@ class AgentTransportTests(unittest.TestCase):
         self.assertEqual(recovered.status()["spoolEntries"], 1)
         self.assertEqual(json.loads(batch_path.read_text()), envelope)
 
+    def test_collector_identity_seeds_only_pristine_state_and_then_mismatch_fails(self):
+        transport = self.transport()
+        bound = transport.bind_collector_identity(collector_binding())
+        status = transport.status()
+        self.assertEqual(status["hostId"], collector_binding()["hostId"])
+        self.assertEqual(status["agentId"], collector_binding()["agentId"])
+        self.assertTrue(status["collectorIdentityBound"])
+        self.assertEqual(bound["identityGeneration"], 1)
+
+        transport.enqueue([metric()], checkpoint=checkpoint())
+        changed = {**collector_binding(), "agentId": "cccccccc-cccc-4ccc-8ccc-cccccccccccc"}
+        with self.assertRaisesRegex(ContractError, "conflict"):
+            transport.bind_collector_identity(changed)
+
+    def test_checkpoint_replay_returns_original_ids_without_new_sequences_and_conflicts(self):
+        transport = self.transport()
+        transport.bind_collector_identity(collector_binding())
+        batch_ids = transport.enqueue([metric()], checkpoint=checkpoint(9))
+        next_sequence = transport.status()["nextSequence"]
+        uuid_cursor = self.uuids.value
+
+        self.assertEqual(
+            transport.enqueue([metric()], checkpoint=checkpoint(9)), batch_ids
+        )
+        self.assertEqual(transport.status()["nextSequence"], next_sequence)
+        self.assertEqual(self.uuids.value, uuid_cursor)
+        with self.assertRaisesRegex(ContractError, "different records"):
+            transport.enqueue([metric(value=2.0)], checkpoint=checkpoint(9))
+        changed_checkpoint = {
+            **checkpoint(9),
+            "observedAt": "2026-08-31T00:20:01Z",
+        }
+        with self.assertRaisesRegex(ContractError, "checkpoint content"):
+            transport.enqueue([metric()], checkpoint=changed_checkpoint)
+
+        transport.enqueue([metric(value=3.0)], checkpoint=checkpoint(10))
+        with self.assertRaisesRegex(ContractError, "older"):
+            transport.enqueue([metric()], checkpoint=checkpoint(9))
+
+    def test_checkpoint_journal_recovery_persists_original_receipt_without_allocation(self):
+        transport = self.transport()
+        transport.bind_collector_identity(collector_binding())
+        batch_id = transport.enqueue([metric()], checkpoint=checkpoint(9))[0]
+        next_sequence = transport.status()["nextSequence"]
+        uuid_cursor = self.uuids.value
+        batch_path = transport.spool_directory / f"{batch_id}.batch"
+        envelope = json.loads(batch_path.read_text())
+        receipt = json.loads(transport.checkpoint_path.read_text())
+        batch_path.unlink()
+        transport.checkpoint_path.unlink()
+        fsync_directory(transport.spool_directory)
+        fsync_directory(transport.config.state_directory)
+        atomic_private_write(
+            transport.journal_path,
+            canonical_json({
+                "schemaVersion": 2,
+                "checkpoint": receipt["checkpoint"],
+                "recordsSha256": receipt["recordsSha256"],
+                "entries": [envelope],
+            }),
+            replace=False,
+        )
+
+        recovered = AgentTransport(
+            transport.config,
+            requester=self.requester,
+            now=self.clock,
+            jitter=lambda: 0.0,
+            inventory_provider=inventory,
+            uuid_factory=self.uuids,
+        )
+        self.assertEqual(
+            recovered.enqueue([metric()], checkpoint=checkpoint(9)), [batch_id]
+        )
+        self.assertEqual(recovered.status()["nextSequence"], next_sequence)
+        self.assertEqual(self.uuids.value, uuid_cursor)
+
+    def test_mixed_input_is_spooled_as_homogeneous_metric_and_event_batches(self):
+        transport = self.transport()
+        batch_ids = transport.enqueue([metric(), event(), metric(value=2.0)])
+        self.assertEqual(len(batch_ids), 2)
+        kinds = []
+        for batch_id in batch_ids:
+            envelope = json.loads(
+                (transport.spool_directory / f"{batch_id}.batch").read_text()
+            )
+            wire = base64.b64decode(envelope["wireBodyBase64"])
+            if envelope["contentEncoding"] == "gzip":
+                wire = gzip.decompress(wire)
+            body = json.loads(wire)
+            batch_kinds = {record["kind"] for record in body["records"]}
+            self.assertEqual(len(batch_kinds), 1)
+            kinds.append(batch_kinds.pop())
+        self.assertEqual(kinds, ["metric", "event"])
+
+    def test_self_metrics_are_exact_nonblocking_and_track_ack_age(self):
+        transport = AgentTransport(
+            TransportConfig.from_mapping(self.mapping()),
+            requester=self.requester,
+            now=self.clock,
+            jitter=lambda: 0.0,
+            inventory_provider=inventory,
+            uuid_factory=self.uuids,
+            proc_self_io_path=self.root / "missing-proc-io",
+        )
+        result = transport.run_once()
+        self.assertEqual(result.heartbeat, "not-enrolled")
+        first = json.loads(transport.self_metrics_path.read_text())
+        self.assertEqual(first["procIoStatus"], "missing")
+        self.assertEqual(first["priorStateStatus"], "missing")
+        self.assertIsInstance(first["runDurationSeconds"], float)
+        self.assertEqual(first["resourceUsageStatus"], "available")
+        self.assertIsInstance(first["userCpuSeconds"], float)
+        self.assertIsInstance(first["systemCpuSeconds"], float)
+        self.assertIsInstance(first["maxRssBytes"], int)
+        self.assertIsNone(first["heartbeatAckAgeSeconds"])
+        self.assertEqual(transport.status()["selfMetricsStatus"], "valid")
+
+        transport.self_metrics_path.write_text("{}")
+        transport.self_metrics_path.chmod(0o600)
+        self.assertEqual(transport.run_once().heartbeat, "not-enrolled")
+        second = json.loads(transport.self_metrics_path.read_text())
+        self.assertEqual(second["priorStateStatus"], "corrupt")
+
+        self.enroll(transport)
+        acknowledged = transport.run_once()
+        self.assertEqual(acknowledged.heartbeat, "acknowledged")
+        third = json.loads(transport.self_metrics_path.read_text())
+        self.assertEqual(third["outcomes"]["heartbeat"], "acknowledged")
+        self.assertEqual(third["heartbeatAckAgeSeconds"], 0)
+        self.assertEqual(third["spool"]["entries"], 0)
+        self.assertEqual(third["quarantine"]["status"], "empty")
+        self.clock.advance(10_000)
+        self.assertEqual(transport.run_once().heartbeat, "not-due")
+        fourth = json.loads(transport.self_metrics_path.read_text())
+        self.assertEqual(fourth["heartbeatAckAgeSeconds"], 10)
+        transport.self_metrics_path.chmod(0o644)
+        self.assertEqual(transport.run_once().heartbeat, "not-due")
+        self.assertEqual(transport.status()["selfMetricsStatus"], "corrupt")
+
     def test_every_durable_state_object_is_private(self):
         transport = self.transport()
         transport.enqueue([metric()])
         for path in [
             transport.config.state_directory,
             transport.spool_directory,
+            transport.quarantine_directory,
         ]:
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o700)
         for path in transport.config.state_directory.rglob("*"):

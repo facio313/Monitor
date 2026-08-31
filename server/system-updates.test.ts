@@ -130,6 +130,7 @@ describe('system update API authorization', () => {
     const directory = directoryWithStatus();
     const app = createApp({
       dataDir: directory,
+      securityStateDir: directory,
       now: () => NOW,
       ssoEnabled: true,
       edgeSecret: EDGE_SECRET,
@@ -202,8 +203,10 @@ describe('system update API authorization', () => {
       requestId: 'update-123e4567-e89b-42d3-a456-426614174001',
       state: 'queued',
     });
+    const directory = directoryWithStatus();
     const app = createApp({
-      dataDir: directoryWithStatus(),
+      dataDir: directory,
+      securityStateDir: directory,
       now: () => NOW,
       ssoEnabled: true,
       edgeSecret: EDGE_SECRET,
@@ -252,8 +255,10 @@ describe('system update API authorization', () => {
       requestId: 'update-123e4567-e89b-42d3-a456-426614174002',
       state: 'queued',
     });
+    const directory = directoryWithStatus();
     const app = createApp({
-      dataDir: directoryWithStatus(),
+      dataDir: directory,
+      securityStateDir: directory,
       now: () => NOW,
       ssoEnabled: true,
       edgeSecret: EDGE_SECRET,

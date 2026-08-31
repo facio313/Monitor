@@ -338,6 +338,24 @@ class LinuxTelemetryTests(unittest.TestCase):
             )
             self.assertEqual(root_filesystem["readOnlyTransition"], "became_read_only")
 
+    def test_hwmon_under_voltage_bit_does_not_claim_throttle_history(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = self.create_fixture(Path(temporary))
+            thermal = telemetry.collect_thermal(paths["sys"], {
+                "throttledFlags": 0x1,
+                "_throttledFlagsSource": "hwmon-current-only",
+            })
+            raspberry_pi = thermal["raspberryPi"]
+            self.assertEqual(raspberry_pi["flagSource"], "hwmon-current-only")
+            self.assertTrue(raspberry_pi["currentUnderVoltage"])
+            for field in (
+                "currentFrequencyCapped", "currentThrottled",
+                "currentSoftTemperatureLimit", "underVoltageOccurred",
+                "frequencyCapOccurred", "throttlingOccurred",
+                "softTemperatureLimitOccurred",
+            ):
+                self.assertIsNone(raspberry_pi[field])
+
     def test_remote_and_triggerable_filesystems_are_never_synchronously_probed(self):
         with tempfile.TemporaryDirectory() as temporary:
             paths = self.create_fixture(Path(temporary))

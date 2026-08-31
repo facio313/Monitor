@@ -54,12 +54,18 @@ def run(arguments: Sequence[str] | None = None) -> None:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
 
         prior = collector.load_json(state_path)
+        now = dt.datetime.now(dt.timezone.utc)
         previous_containers: list[dict[str, object]] = []
         previous_observed_at: str | None = None
         try:
-            previous_containers, previous_collection = collector.load_container_snapshot_state(
+            (
+                previous_containers,
+                previous_collection,
+                _previous_event_collection,
+                _previous_events,
+            ) = collector.load_container_snapshot_document(
                 output_path,
-                dt.datetime.now(dt.timezone.utc),
+                now,
                 expected_uid=EXPECTED_UID,
                 expected_gid=EXPECTED_UID,
             )
@@ -67,59 +73,55 @@ def run(arguments: Sequence[str] | None = None) -> None:
         except (OSError, RuntimeError, ValueError):
             pass
 
+        event_collection, docker_events, docker_event_state = collector.collect_docker_events(
+            socket_path, values.curl, values.timeout, prior.get("dockerEvents"), now,
+        )
+        previous_private_containers = collector.normalize_private_container_state_map(
+            prior.get("containers")
+        )
+        container_collection: dict[str, str | None]
+        next_cpu_state = previous_private_containers
         try:
             containers, next_cpu_state = collector.collect_containers(
                 {"cks": socket_path}, values.curl, values.timeout, prior.get("containers")
             )
+            container_collection = {
+                "status": "fresh",
+                "observedAt": collector.iso_timestamp(now),
+            }
         except PermissionError:
-            generated_at = collector.iso_timestamp(dt.datetime.now(dt.timezone.utc))
-            collector.atomic_write_json(
-                output_path,
-                {
-                    "generatedAt": generated_at,
-                    "containerCollection": {
-                        "status": "permission-denied",
-                        "observedAt": previous_observed_at,
-                    },
-                    "containers": previous_containers if previous_observed_at is not None else [],
-                },
-                0o640,
-            )
-            return
+            containers = previous_containers if previous_observed_at is not None else []
+            container_collection = {
+                "status": "permission-denied", "observedAt": previous_observed_at,
+            }
         except (collector.ContainerSourceUnavailable, RuntimeError):
-            generated_at = collector.iso_timestamp(dt.datetime.now(dt.timezone.utc))
-            collector.atomic_write_json(
-                output_path,
-                {
-                    "generatedAt": generated_at,
-                    "containerCollection": {
-                        "status": "last-known" if previous_observed_at is not None else "unavailable",
-                        "observedAt": previous_observed_at,
-                    },
-                    "containers": previous_containers if previous_observed_at is not None else [],
-                },
-                0o640,
-            )
-            return
+            containers = previous_containers if previous_observed_at is not None else []
+            container_collection = {
+                "status": "last-known" if previous_observed_at is not None else "unavailable",
+                "observedAt": previous_observed_at,
+            }
         if any(value.get("owner") != "cks" for value in containers):
             raise ValueError("unexpected container owner")
 
-        generated_at = collector.iso_timestamp(dt.datetime.now(dt.timezone.utc))
+        generated_at = collector.iso_timestamp(now)
         collector.atomic_write_json(
             output_path,
             {
                 "generatedAt": generated_at,
-                "containerCollection": {
-                    "status": "fresh",
-                    "observedAt": generated_at,
-                },
+                "containerCollection": container_collection,
                 "containers": containers,
+                "dockerEventCollection": event_collection,
+                "dockerEvents": docker_events,
             },
             0o640,
         )
         collector.atomic_write_json(
             state_path,
-            {"generatedAt": generated_at, "containers": next_cpu_state},
+            {
+                "generatedAt": generated_at,
+                "containers": next_cpu_state,
+                "dockerEvents": docker_event_state,
+            },
             0o600,
         )
 

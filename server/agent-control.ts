@@ -483,7 +483,11 @@ function parseIngestRecord(value: unknown): NormalizedIngestRecord | null {
   };
 }
 
-function parseBatch(value: unknown, maxRecords: number): NormalizedBatch | null {
+function parseBatch(
+  value: unknown,
+  maxRecords: number,
+  allowLegacyMixed = false,
+): NormalizedBatch | null {
   const record = exactRecord(value, [
     'schemaVersion',
     'agentId',
@@ -514,6 +518,10 @@ function parseBatch(value: unknown, maxRecords: number): NormalizedBatch | null 
     Math.min(...sequences) !== record.firstSequence
     || Math.max(...sequences) !== record.lastSequence
     || sequences.some((sequence, index) => index > 0 && sequence < sequences[index - 1]!)
+    || (
+      !allowLegacyMixed
+      && new Set(normalizedRecords.map((entry) => entry.kind)).size !== 1
+    )
   ) return null;
   return {
     schemaVersion: 1,
@@ -526,7 +534,11 @@ function parseBatch(value: unknown, maxRecords: number): NormalizedBatch | null 
   };
 }
 
-function parseQueuedBatch(value: unknown, maxRecords: number): ValidatedQueuedBatch | null {
+function parseQueuedBatch(
+  value: unknown,
+  maxRecords: number,
+  allowLegacyMixed = false,
+): ValidatedQueuedBatch | null {
   const record = exactRecord(value, [
     'schemaVersion',
     'agentId',
@@ -559,10 +571,14 @@ function parseQueuedBatch(value: unknown, maxRecords: number): ValidatedQueuedBa
   ) return null;
   const normalizedRecords = records as NormalizedIngestRecord[];
   const sequences = normalizedRecords.map((entry) => entry.sequence);
+  const kinds = new Set(normalizedRecords.map((entry) => entry.kind));
+  const expectedPriority: QueuePriority = kinds.has('event') ? 'priority' : 'normal';
   if (
     Math.min(...sequences) !== record.firstSequence
     || Math.max(...sequences) !== record.lastSequence
     || sequences.some((sequence, index) => index > 0 && sequence < sequences[index - 1]!)
+    || (!allowLegacyMixed && kinds.size !== 1)
+    || record.priority !== expectedPriority
   ) return null;
   return {
     schemaVersion: 1,
@@ -1005,7 +1021,11 @@ export class AgentControlPlane {
       'ingest-batch',
       this.config.maxBatchBytes * 4,
     );
-    const queued = parseQueuedBatch(decoded, this.config.maxRecordsPerBatch);
+    // Releases before homogeneous admission stored mixed accepted records as
+    // one priority entry.  Keep those authenticated, receipt-bound files
+    // readable until retention/downstream drain removes them; new requests and
+    // all newly written queue entries still use the strict parser.
+    const queued = parseQueuedBatch(decoded, this.config.maxRecordsPerBatch, true);
     if (
       !queued
       || queued.agentId !== receipt.agentId
@@ -1465,8 +1485,22 @@ export class AgentControlPlane {
   }
 
   ingest(value: unknown, certificate: TrustedAgentCertificate) {
-    const batch = parseBatch(value, this.config.maxRecordsPerBatch);
+    const batch = parseBatch(value, this.config.maxRecordsPerBatch, true);
     if (!batch) throw new AgentControlError(400, 'INVALID_INGEST_BATCH', 'Ingest batch contract is invalid');
+    const homogeneous = new Set(batch.records.map((record) => record.kind)).size === 1;
+    if (!homogeneous) {
+      const legacyDigest = sha256(JSON.stringify(batch));
+      const legacyReceipt = this.state.receipts.find((receipt) => (
+        receipt.agentId === batch.agentId && receipt.batchId === batch.batchId
+      ));
+      // Mixed input can cross the parser only when it is byte-equivalent after
+      // normalization to a receipt created by the pre-homogeneous release.
+      // Unknown or changed mixed batches are rejected before authentication or
+      // any queue/state mutation and can never consume priority reserve.
+      if (!legacyReceipt || !safeEqual(legacyReceipt.digest, legacyDigest)) {
+        throw new AgentControlError(400, 'INVALID_INGEST_BATCH', 'Ingest batch contract is invalid');
+      }
+    }
     const at = this.now();
     this.pruneExpired(at);
     const next = this.copyState();
@@ -1490,6 +1524,9 @@ export class AgentControlPlane {
         duplicateRecords: existingReceipt.duplicateRecordCount,
         serverTime: new Date(at).toISOString(),
       };
+    }
+    if (!homogeneous) {
+      throw new AgentControlError(400, 'INVALID_INGEST_BATCH', 'Ingest batch contract is invalid');
     }
     if (batch.sentAt > at + this.config.maxClockSkewMs) {
       agent.rejectedClockSkewCount += 1;
@@ -1584,7 +1621,7 @@ export class AgentControlPlane {
       throw new AgentControlError(429, 'IDEMPOTENCY_BACKPRESSURE', 'Idempotency window is full', 30);
     }
 
-    const priority: QueuePriority = accepted.some((record) => record.kind === 'event')
+    const priority: QueuePriority = batch.records[0]!.kind === 'event'
       ? 'priority'
       : 'normal';
     let queueFile: string | null = null;

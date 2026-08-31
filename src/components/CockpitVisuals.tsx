@@ -57,8 +57,10 @@ import {
   safeText,
 } from '../utils';
 import { Icon, type IconName } from './Icon';
+import { LinuxDiagnosticsPanel } from './LinuxDiagnostics';
 import { useAdaptiveGridDetailVisibility } from './AdaptiveGrid';
 import { ContainerList } from './Dashboard';
+import { DockerDiagnosticsPanel } from './DockerDiagnostics';
 import { OperationalGuidance, OperationalHealthSummary } from './OperationalHealth';
 import { OperationalLogView } from './OperationalLogView';
 import { Pagination, paginateItems, usePagination } from './Pagination';
@@ -203,15 +205,17 @@ interface PanelProps {
   icon: IconName;
   badge?: string;
   detailPage?: MonitorDetailPage;
-  onOpen?: (page: MonitorDetailPage) => void;
+  detailAnchor?: string;
+  anchorId?: string;
+  onOpen?: (page: MonitorDetailPage, anchor?: string) => void;
   locale: MonitorLocale;
   children: ReactNode;
   className?: string;
 }
 
-export function CockpitPanel({ title, description, icon, badge, detailPage, onOpen, locale, children, className = '' }: PanelProps) {
+export function CockpitPanel({ title, description, icon, badge, detailPage, detailAnchor, anchorId, onOpen, locale, children, className = '' }: PanelProps) {
   return (
-    <article className={`cockpit-panel ${className}`}>
+    <article id={anchorId} tabIndex={anchorId ? -1 : undefined} className={`cockpit-panel ${className}`}>
       <header className="cockpit-panel-header">
         <span className="cockpit-panel-icon"><Icon name={icon} size={19} /></span>
         <div>
@@ -220,7 +224,7 @@ export function CockpitPanel({ title, description, icon, badge, detailPage, onOp
         </div>
         {badge && <span className="cockpit-panel-badge">{badge}</span>}
         {detailPage && onOpen && (
-          <button className="cockpit-detail-link" type="button" onClick={() => onOpen(detailPage)}>
+          <button className="cockpit-detail-link" type="button" onClick={() => onOpen(detailPage, detailAnchor)}>
             {t(locale, '상세', 'Details')}<Icon name="chevron" size={14} />
           </button>
         )}
@@ -942,7 +946,7 @@ export function EventsWidget({ data, locale, onOpen }: Omit<VisualProps, 'range'
     label: formatTime(bucket.label, undefined, locale),
   })), [logs]);
   return (
-    <CockpitPanel title={t(locale, '운영 이벤트', 'Operational events')} description={t(locale, '경고·신뢰성·전원·권한 기록을 한 시간축으로 통합', 'Alerts, reliability, power, and privilege records on one timeline')} icon="clock" badge={`${logs.length}`} detailPage="logs" onOpen={onOpen} locale={locale}>
+    <CockpitPanel title={t(locale, '운영 이벤트', 'Operational events')} description={t(locale, '경고·신뢰성·전원·권한·Docker·규칙 전환을 한 시간축으로 통합', 'Alerts, reliability, power, privilege, Docker, and rule transitions on one timeline')} icon="clock" badge={`${logs.length}`} detailPage="reliability" detailAnchor="operational-events" onOpen={onOpen} locale={locale}>
       {!timelineVisible && !logVisible ? <SelectionEmpty locale={locale} /> : <div className={`event-widget-layout${timelineVisible !== logVisible ? ' event-widget-layout-single' : ''}`}>
         {timelineVisible && <div className="cockpit-chart event-histogram">
           {!buckets.length ? <ChartEmpty locale={locale} /> : (
@@ -1094,7 +1098,7 @@ export function DetailPage({ page, data, findings, range, locale, onOpen }: Visu
   const logs = useMemo(() => operationalLogs(data), [data]);
   const relevant = useMemo(() => relatedLogs(logs, page), [logs, page]);
   const commonLogs = (
-    <CockpitPanel title={t(locale, '관련 이벤트 로그', 'Related event log')} description={t(locale, '수집 단계에서 비밀과 명령 인자를 제거한 구조화 기록', 'Structured records with secrets and command arguments removed at collection')} icon="clock" badge={`${relevant.length}`} locale={locale}>
+    <CockpitPanel anchorId={page === 'reliability' ? 'operational-events' : undefined} title={t(locale, page === 'reliability' ? '통합 운영 이벤트' : '관련 이벤트 로그', page === 'reliability' ? 'Unified operational events' : 'Related event log')} description={t(locale, '수집 단계에서 비밀과 명령 인자를 제거한 구조화 기록', 'Structured records with secrets and command arguments removed at collection')} icon="clock" badge={`${relevant.length}`} locale={locale}>
       <OperationalLogView entries={relevant} locale={locale} />
     </CockpitPanel>
   );
@@ -1103,18 +1107,18 @@ export function DetailPage({ page, data, findings, range, locale, onOpen }: Visu
   let targetClass = 'detail-system-target detail-dashboard';
   if (page === 'resources') {
     targetClass += ' detail-two-column';
-    content = <><VitalSignsWidget data={data} locale={locale} onOpen={onOpen} /><ResourceWidget data={data} range={range} locale={locale} onOpen={onOpen} /><LoadWidget data={data} range={range} locale={locale} onOpen={onOpen} />{commonLogs}</>;
+    content = <><VitalSignsWidget data={data} locale={locale} onOpen={onOpen} /><ResourceWidget data={data} range={range} locale={locale} onOpen={onOpen} /><LoadWidget data={data} range={range} locale={locale} onOpen={onOpen} /><LinuxDiagnosticsPanel linux={data.linux} page="resources" locale={locale} />{commonLogs}</>;
   } else if (page === 'network') {
     targetClass += ' detail-two-column';
-    content = <><NetworkWidget data={data} range={range} locale={locale} onOpen={onOpen} /><TrafficEvidence data={data} locale={locale} /><CurrentTrafficWidget data={data} locale={locale} />{commonLogs}</>;
+    content = <><NetworkWidget data={data} range={range} locale={locale} onOpen={onOpen} /><TrafficEvidence data={data} locale={locale} /><CurrentTrafficWidget data={data} locale={locale} /><LinuxDiagnosticsPanel linux={data.linux} page="network" locale={locale} />{commonLogs}</>;
   } else if (page === 'storage') {
-    content = <><StorageWidget data={data} range={range} locale={locale} onOpen={onOpen} />{commonLogs}</>;
+    content = <><StorageWidget data={data} range={range} locale={locale} onOpen={onOpen} /><LinuxDiagnosticsPanel linux={data.linux} page="storage" locale={locale} />{commonLogs}</>;
   } else if (page === 'containers') {
-    content = <><ContainersWidget data={data} locale={locale} onOpen={onOpen} /><ContainerStatusTable data={data} locale={locale} />{commonLogs}</>;
+    content = <><ContainersWidget data={data} locale={locale} onOpen={onOpen} /><DockerDiagnosticsPanel data={data} locale={locale} /><ContainerStatusTable data={data} locale={locale} />{commonLogs}</>;
   } else if (page === 'reliability') {
-    content = <><ReliabilityWidget data={data} locale={locale} onOpen={onOpen} detailed /><PcieStatusPanel pcie={data.system.pcie} locale={locale} />{commonLogs}</>;
+    content = <><ReliabilityWidget data={data} locale={locale} onOpen={onOpen} detailed /><PcieStatusPanel pcie={data.system.pcie} locale={locale} /><LinuxDiagnosticsPanel linux={data.linux} page="reliability" locale={locale} />{commonLogs}</>;
   } else if (page === 'power') {
-    content = <><PowerWidget data={data} range={range} locale={locale} onOpen={onOpen} />{commonLogs}</>;
+    content = <><PowerWidget data={data} range={range} locale={locale} onOpen={onOpen} /><LinuxDiagnosticsPanel linux={data.linux} page="power" locale={locale} />{commonLogs}</>;
   } else {
     content = <><IncidentsWidget data={data} locale={locale} onOpen={onOpen} /><IncidentDetail data={data} locale={locale} /><TrafficEvidence data={data} locale={locale} />{commonLogs}</>;
   }

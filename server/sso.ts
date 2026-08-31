@@ -43,6 +43,18 @@ function safeEqual(left: string, right: string): boolean {
   return leftBuffer.length === rightBuffer.length && timingSafeEqual(leftBuffer, rightBuffer);
 }
 
+export function requestHasTrustedEdgeSecret(
+  request: Request,
+  edgeSecret: string | null,
+): boolean {
+  const suppliedEdgeSecret = request.get('x-portfolio-edge-secret');
+  return Boolean(
+    edgeSecret
+    && suppliedEdgeSecret
+    && safeEqual(suppliedEdgeSecret, edgeSecret),
+  );
+}
+
 function safeIdentityHeader(value: string | undefined, maximumLength: number): string | null {
   if (!value) return null;
   const normalized = value.trim();
@@ -121,8 +133,7 @@ export function trustedSsoIdentity(
   request: Request,
   edgeSecret: string | null,
 ): TrustedSsoIdentity | null {
-  const suppliedEdgeSecret = request.get('x-portfolio-edge-secret');
-  if (!edgeSecret || !suppliedEdgeSecret || !safeEqual(suppliedEdgeSecret, edgeSecret)) return null;
+  if (!requestHasTrustedEdgeSecret(request, edgeSecret)) return null;
   const subject = safeIdentityHeader(request.get('remote-user'), 255);
   const email = safeIdentityHeader(request.get('remote-email'), 320);
   const rawGroups = request.get('remote-groups');

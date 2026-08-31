@@ -283,11 +283,18 @@ describe('collector to server contract', () => {
         status: 'fresh' | 'last-known' | 'unavailable' | 'permission-denied';
         observedAt: string | null;
       };
+      syntheticProbeCollection: {
+        status: 'fresh' | 'stale' | 'unsupported' | 'permission-denied' | 'unavailable' | 'collection-error';
+        observedAt: string | null;
+      };
+      syntheticProbes: unknown[];
       containers: unknown[];
       currentTraffic: unknown[];
       latest: Record<string, unknown>;
     };
     expect(current.containerCollection).toEqual({ status: 'unavailable', observedAt: null });
+    expect(current.syntheticProbeCollection).toEqual({ status: 'unsupported', observedAt: null });
+    expect(current.syntheticProbes).toEqual([]);
     const expectedTraffic = [{
       app: 'blog', requestCount: 1, status2xx: 1, status3xx: 0, status4xx: 0,
       status5xx: 0, slowCount: 0, avgResponseMs: 400, maxResponseMs: 400,
@@ -382,6 +389,10 @@ describe('collector to server contract', () => {
     expect(dashboard.series).toHaveLength(1);
     expect(Object.keys(dashboard.series[0]!)).toEqual(LATEST_FIELDS);
     expect(dashboard.host.logicalCpuCount).toBe(2);
+    expect(dashboard.linux.schemaVersion).toBe(1);
+    expect(dashboard.linux.status).not.toBe('collection_error');
+    expect(dashboard.linux.resources.processCount).not.toBeNull();
+    expect(dashboard.linux.network.tcp.status).not.toBe('collection_error');
     expect(dashboard.system.versions).toEqual({
       kernelRunning: release(),
       kernelLatestInstalled: release(),
@@ -435,8 +446,12 @@ describe('collector to server contract', () => {
       status: 'fresh',
       observedAt: new Date(current.generatedAt).toISOString(),
     });
+    expect(dashboard.syntheticProbeCollection).toEqual({
+      status: 'unsupported', observedAt: null,
+    });
+    expect(dashboard.syntheticProbes).toEqual([]);
     expect(dashboard.ruleEvaluation.status).toBe('ok');
-    expect(dashboard.ruleEvaluation.rulePackVersion).toBe('2026.08.30.1');
+    expect(dashboard.ruleEvaluation.rulePackVersion).toBe('2026.08.31.2');
     expect(Object.keys(dashboard.ruleEvaluation.states).length).toBeGreaterThanOrEqual(82);
     expect(Object.values(dashboard.ruleEvaluation.states).some(
       (state) => state.ruleId === 'CpuUsageHigh' && state.metric === 'host.cpu.percent',

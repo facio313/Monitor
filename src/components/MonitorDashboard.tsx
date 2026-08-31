@@ -1,10 +1,9 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from 'react';
 import type { SessionInfo } from '../api';
 import { agentHeartbeatLabel, containerCollectionLabel } from '../collection-status';
 import { chooseInitialLocale, localized, MONITOR_STALE_AFTER_MS, monitorPathForPage, monitorRangeFromSearch, monitorSnapshotIsStale, operationalAssessmentPresentation } from '../dashboard-model';
 import { useDashboard } from '../hooks/useDashboard';
-import { operationalFindings, operationalServiceState } from '../operational-health';
-import { deriveSystemEmotion } from '../system-emotion';
+import { operationalFindings, operationalServiceStates } from '../operational-health';
 import type { DashboardPayload, MonitorDetailPage, MonitorLocale, MonitorPage, TimeRange } from '../types';
 import { formatDateTime, safeText } from '../utils';
 import { AdaptiveGrid, type AdaptiveGridItem } from './AdaptiveGrid';
@@ -32,7 +31,6 @@ import { OperationalHeadroom } from './OperationalHeadroom';
 import { PasswordChangeDialog } from './PasswordChangeDialog';
 import { RuleHealthSummary } from './RuleHealthSummary';
 import { SystemMaintenance } from './SystemMaintenance';
-import { SystemEmotionEngine } from './SystemEmotionEngine';
 import { SystemUpdateControls } from './SystemUpdateControls';
 
 const LOCALE_STORAGE_KEY = 'monitor.locale.v2';
@@ -287,7 +285,7 @@ export function MonitorDashboard({
     danger: findings.filter((finding) => finding.level === 'danger').length,
     caution: findings.filter((finding) => finding.level === 'caution').length,
   };
-  const serviceStates = data?.containers.map(operationalServiceState) ?? [];
+  const serviceStates = data ? operationalServiceStates(data) : [];
   const serviceDangerCount = serviceStates.filter((state) => state === 'danger').length;
   const serviceCautionCount = serviceStates.filter((state) => state === 'caution').length;
   const overall = !data
@@ -297,13 +295,6 @@ export function MonitorDashboard({
     : counts.caution
       ? 'caution'
       : 'nominal';
-  const emotionModel = useMemo(() => deriveSystemEmotion({
-    data: assessedData ?? null,
-    stale: effectiveStale,
-    dangerCount: counts.danger,
-    cautionCount: counts.caution,
-    primaryFinding: findings[0] ?? null,
-  }), [assessedData, counts.caution, counts.danger, effectiveStale, findings]);
   const selectedRange = RANGES.find((item) => item.value === range)!;
   const serviceCollectionNotCurrent = Boolean(data && data.containerCollection.status !== 'fresh');
   const storageSubject = viewer?.user ?? 'local';
@@ -446,18 +437,10 @@ export function MonitorDashboard({
           )}
 
           {data && assessmentPresentation === 'overview' && (
-            <RuleHealthSummary evaluation={data.ruleEvaluation} alerts={data.ruleAlerts} locale={locale} stale={effectiveStale} />
+            <RuleHealthSummary evaluation={data.ruleEvaluation} alerts={data.ruleAlerts} locale={locale} stale={effectiveStale} compactWhenNominal />
           )}
 
           {error && normalizedPage !== 'logs' && <div className="control-notice" role="alert"><Icon name="alert" size={19} /><div><strong>{t(locale, '원격 측정 갱신 실패', 'Telemetry refresh failed')}</strong><span>{safeText(error)} {data ? t(locale, '마지막 정상 화면을 유지합니다.', 'The last good snapshot remains visible.') : ''}</span></div><button type="button" onClick={() => void refresh()}>{t(locale, '재시도', 'Retry')}</button></div>}
-
-          {normalizedPage === 'overview' && (
-            <SystemEmotionEngine
-              locale={locale}
-              model={emotionModel}
-              paused={passwordDialogOpen || helpOpen}
-            />
-          )}
 
           {normalizedPage === 'infrastructure'
             ? <InfrastructureLedger locale={locale} onUnauthorized={onUnauthorized} />
@@ -501,13 +484,41 @@ function ControlSkeleton({ locale }: { locale: MonitorLocale }) {
 }
 
 function TerminologyDialog({ locale, onClose }: { locale: MonitorLocale; onClose: () => void }) {
+  const dialogRef = useRef<HTMLElement>(null);
   const closeRef = useRef<HTMLButtonElement>(null);
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
   useEffect(() => {
-    closeRef.current?.focus();
-    const onKey = (event: KeyboardEvent) => { if (event.key === 'Escape') onClose(); };
+    const previouslyFocused = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const focusFrame = window.requestAnimationFrame(() => closeRef.current?.focus());
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      event.preventDefault();
+      onCloseRef.current();
+    };
     document.addEventListener('keydown', onKey);
-    return () => document.removeEventListener('keydown', onKey);
-  }, [onClose]);
+    return () => {
+      window.cancelAnimationFrame(focusFrame);
+      document.removeEventListener('keydown', onKey);
+      previouslyFocused?.focus();
+    };
+  }, []);
+  function handleDialogKeyDown(event: ReactKeyboardEvent<HTMLElement>) {
+    if (event.key !== 'Tab') return;
+    const focusable = Array.from(
+      dialogRef.current?.querySelectorAll<HTMLElement>('button:not(:disabled), a[href], input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex]:not([tabindex="-1"])') ?? [],
+    );
+    if (!focusable.length) return;
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  }
   const terms = [
     [t(locale, '시스템 부하 (Load)', 'System load'), t(locale, 'CPU를 사용 중이거나 사용 차례를 기다리는 작업의 평균 개수입니다. CPU 사용률과 다른 값이며, CPU 코어 수와 함께 판단합니다.', 'Average work running or waiting for CPU. It differs from CPU percentage and should be read alongside the CPU count.')],
     [t(locale, '처리량 (Throughput)', 'Throughput'), t(locale, '1초 동안 네트워크나 저장장치가 처리한 데이터 양입니다. 순간 최대치보다 지속적인 변화가 더 중요할 수 있습니다.', 'Data handled by a network or storage device each second. Sustained change can matter more than a brief peak.')],
@@ -517,5 +528,5 @@ function TerminologyDialog({ locale, onClose }: { locale: MonitorLocale; onClose
     [t(locale, 'PCIe 협상 링크', 'Negotiated PCIe link'), t(locale, '호스트 설정과 SSD가 실제로 합의한 세대·속도·레인 폭입니다. SSD의 최대 능력보다 낮아도 호스트 설정과 같으면 정상입니다.', 'The generation, speed, and lane width agreed by the host and SSD. A value below the SSD maximum is nominal when it matches the host configuration.')],
     [t(locale, 'AER', 'AER'), t(locale, 'PCIe가 보고하는 교정 가능·비치명·치명 오류 계수입니다. 교정 가능 오류도 반복되면 링크 품질을 확인해야 합니다.', 'PCIe counters for correctable, non-fatal, and fatal errors. Repeated correctable errors can still indicate link-quality trouble.')],
   ];
-  return <div className="control-dialog-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><section className="terms-dialog" role="dialog" aria-modal="true" aria-labelledby="terms-title"><header><div><span className="control-eyebrow">{t(locale, '계기판 도움말', 'INSTRUMENT GUIDE')}</span><h2 id="terms-title">{t(locale, '운영 용어 설명', 'Operational terminology')}</h2></div><button ref={closeRef} type="button" onClick={onClose} aria-label={t(locale, '용어 설명 닫기', 'Close terminology guide')}>×</button></header><dl>{terms.map(([term, description]) => <div key={term}><dt>{term}</dt><dd>{description}</dd></div>)}</dl><footer><button type="button" onClick={onClose}>{t(locale, '계기판으로 돌아가기', 'Return to instruments')}</button></footer></section></div>;
+  return <div className="control-dialog-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><section ref={dialogRef} className="terms-dialog" role="dialog" aria-modal="true" aria-labelledby="terms-title" onKeyDown={handleDialogKeyDown}><header><div><span className="control-eyebrow">{t(locale, '계기판 도움말', 'INSTRUMENT GUIDE')}</span><h2 id="terms-title">{t(locale, '운영 용어 설명', 'Operational terminology')}</h2></div><button ref={closeRef} type="button" onClick={onClose} aria-label={t(locale, '용어 설명 닫기', 'Close terminology guide')}>×</button></header><dl>{terms.map(([term, description]) => <div key={term}><dt>{term}</dt><dd>{description}</dd></div>)}</dl><footer><button type="button" onClick={onClose}>{t(locale, '계기판으로 돌아가기', 'Return to instruments')}</button></footer></section></div>;
 }

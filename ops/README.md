@@ -14,8 +14,9 @@ The default output root is `/var/lib/monitor-export`:
 
 - `current.json`: atomically replaced schema-version-2 snapshot with exactly the
   public keys `schemaVersion`, `generatedAt`, `identity`, `heartbeat`, `host`,
-  `latest`, `disks`, `containers`, `containerCollection`, `currentTraffic`,
-  `reliability`, and `system`.
+  `latest`, `disks`, `containers`, `containerCollection`,
+  `dockerEventCollection`, `dockerEvents`, `syntheticProbeCollection`,
+  `syntheticProbes`, `currentTraffic`, `reliability`, `system`, and `linux`.
   `identity` contains only random UUIDv4 `hostId` and `agentId`, their
   `installationEpoch`, an `identityGeneration`, `machineIdentityStatus`, and a
   nullable 32-hex `bootId`. The IDs remain stable across ordinary collector and
@@ -34,6 +35,18 @@ The default output root is `/var/lib/monitor-export`:
   `containerCollection` distinguishes a fresh Docker observation from a
   bounded last-known snapshot, source unavailability, or permission denial;
   stale workloads are never presented as current evidence.
+  `dockerEventCollection` independently records the bounded event cursor,
+  last successful poll, reconnect and gap counts, and whether the current
+  interval was reconciled after a possible gap. `dockerEvents` retains at most
+  128 privacy-reduced, deduplicated allow-listed Compose lifecycle events. Raw
+  Docker IDs and Actor attributes never enter either object. Docker
+  stdout/stderr collection is explicitly `unsupported`; it is not silently
+  represented as an empty log stream.
+  `syntheticProbeCollection` explicitly distinguishes unsupported, fresh,
+  stale, unavailable, permission-denied, and collection-error input. The
+  bounded `syntheticProbes` rows contain only stable operator IDs, timestamps,
+  result classes, latency, HTTP status, and reduced TLS validity/expiry
+  evidence; configured URLs and resolved addresses never enter this export.
   `host` includes the online logical-CPU count derived from aggregate
   `/proc/stat`. `latest` includes memory and swap byte totals/usage, swap
   percentage, all three load averages, current CPU/memory/I/O PSI `some` and
@@ -47,11 +60,17 @@ The default output root is `/var/lib/monitor-export`:
   Each disk is exactly `mount`, `totalBytes`, `usedBytes`, `availableBytes`,
   `usedPercent`, `inodeUsedPercent`, and `readOnly`. Inode usage is aggregate;
   filenames and inode identities are never collected.
-  Each current `containers` row is the exact 17-field reduced contract:
+  Each new current `containers` row is the exact 56-field reduced v3 contract.
+  Its first 17 fields preserve the v2 migration prefix:
   `name`, `project`, `owner`, `state`, `health`,
   `healthcheckConfigured`, `cpuPercent`, `memoryBytes`, `memoryPercent`,
   `memoryLimitBytes`, `cpuLimitCores`, `pidLimit`, `restartCount`,
   `restartCountDelta`, `oomKilled`, `startedAt`, and `finishedAt`.
+  The v3 suffix is the opaque `instanceId`; current PID and CPU-throttle
+  readings; block-I/O and network totals/rates; writable-layer bytes and
+  volume/bind/tmpfs/network/published-port counts; fixed security booleans and
+  capability counts; and validated image name, tag, content digest/source,
+  latest-tag, current-replica drift, and same-reference digest-change state.
   Health, restart/OOM state, lifecycle timestamps, and configured limits come
   from an identity-bound Docker inspect response; an unavailable detail stays
   `null` and is never inferred from presentation text. Container IDs remain
@@ -215,10 +234,13 @@ Short-lived host-rate and hashed process counters live in
 `/run/monitor-collector/delta-state.json`; each run atomically replaces that
 mode-`0600` file rather than appending it. PID/start-time material never leaves
 that private file, while public process evidence uses fixed classes such as
-`node`, `python`, `web-server`, or `other`. Container IDs and CPU baselines stay
+`node`, `python`, `web-server`, or `other`. Container IDs and
+CPU/I/O/network/throttle baselines stay
 only in `/run/monitor-container-exporter/cpu-state.json`, owned by `cks` mode
-`0600`; the root collector is bind-mounted only the separate reduced
-`containers.json` file. Neither PID nor container ID enters a public export.
+`0600`; a domain-separated 128-bit instance digest is the only public
+container-instance identity. The root collector is bind-mounted only the
+separate reduced `containers.json` file. Neither a raw PID nor a raw container
+ID enters a public export.
 
 When `vcgencmd` exists, the collector reads GPU temperature, allocated memory,
 core clock, core voltage, and on Raspberry Pi 5
@@ -249,16 +271,23 @@ value is clamped to at most 16 MiB. The ordinary event/privilege input bound
 remains separately controlled by `MONITOR_MAX_INPUT_BYTES`.
 
 The unprivileged Docker helper reduces each workload immediately to the fixed
-17-field current contract documented above. It never exports a container ID,
-raw image reference, command, environment, mount, network address, or Docker
-inspect document.
+v3 current contract documented above. It never exports a container ID,
+command, environment, raw mount path, network address, Docker Actor attribute,
+or Docker inspect document. A validated image repository/tag and SHA-256
+content identifier are exported because they are required deployment evidence;
+credential-like or malformed references fail to `null`.
+Latest-tag evidence is derived from the requested reference even when a content
+digest is also available. An explicitly pinned digest participates in the
+private reference fingerprint, so an intentional pin update is not reported as
+a same-reference mutable-image change.
 Each Docker list request is filtered to one explicitly reviewed Compose
 project. A result is admitted only when its returned project/service labels
 match one exact pair in the fixed map, and it receives that pair's distinct
 public name. Unknown pairs are dropped before any stats request. New exports
 never use the old app-level labels or generic `cks-workload` label; both remain
-accepted only so retained snapshots and incident history can be read safely. Raw container names,
-environment, mounts, images, commands, IDs, and socket paths never persist.
+accepted only so retained snapshots and incident history can be read safely.
+Raw container names, environment, raw mount paths, commands, IDs, network
+addresses, and socket paths never persist.
 The reviewed Blog pairs are exported as `blog-frontend` for `blog/blogWeb` and
 `blog-backend` for `blog/blogServer`; no mutable Docker name reaches Monitor.
 The retired `pongdang-multtara/db` pair is handled the same way: a live Docker
@@ -379,6 +408,17 @@ systemctl status monitor-collector.timer monitor-container-exporter.service moni
 sudo journalctl -u monitor-collector.service -n 50 --no-pager
 ```
 
+The transaction also installs the unprivileged synthetic HTTP/TLS worker,
+five-minute timer, example, and `synthetic-probes.md`, while preserving the
+timer's prior enabled/active state on upgrade. A first install leaves it
+disabled and does not create `/etc/monitor-synthetic-probe` or a live probe
+configuration. Provision the reviewed `cks:cks` mode-`0600` config and opt in
+explicitly; the exact commands and SSRF boundary are in
+`/usr/local/share/doc/monitor-collector/synthetic-probes.md`. The worker owns
+`/var/lib/monitor-synthetic` as `cks:cks` mode `0750` and publishes
+`results.json` as `cks:cks` mode `0640`. The root collector sees only that exact
+file through a read-only bind and cannot write the producer directory.
+
 Install the privacy-preserving Nginx aggregate input separately, then validate
 that both services remain healthy:
 
@@ -485,7 +525,7 @@ is a no-op. Production SSO must not mount the active state or its recovery
 snapshots; restoring one is a deliberate return to local mode and creates a
 fresh session epoch.
 
-Docker list and per-container stats calls use a 2-second curl timeout. The
+Docker list, per-container detail, and event-poll calls use a 2-second curl timeout. The
 helper issues only project-filtered list requests for the fixed project map and
 fails without replacing its previous snapshot if any of those queries is
 unavailable or malformed. Admitted running workloads then use the fast
@@ -496,7 +536,15 @@ calculated from the protected previous-run counters described above; the first
 observation is `null`. Memory is available immediately from the one-shot
 response. If the stats deadline is reached, every admitted container remains
 present but unavailable stats fields are `null`, never misleading zeroes. The
-helper has a 35-second outer timeout and the dependent root collector has 45
+private counter state resets rates to `null` on container recreation, counter
+decrease, invalid sample time, or gaps over one day. Event polls replay from a
+durable cursor with a one-second dedup overlap and a ten-minute maximum replay
+window; a missing or older cursor increments the persistent gap count and is
+shown as `gap` while the current container list remains independently fresh.
+A successful poll after any source failure is also marked as a possible gap:
+Docker exposes no boot epoch that could prove event continuity across a daemon
+restart, even when bounded replay succeeds. The helper has a 35-second outer
+timeout and the dependent root collector has 45
 seconds.
 
 ## Fixture run and tests
@@ -532,11 +580,14 @@ sudo sh ./uninstall-traffic-logging.sh
 ```
 
 Uninstall deliberately preserves `/var/lib/monitor-export`,
-`/etc/default/monitor-collector`, `/home/cks/.local/state/monitor-auth`, and
+`/etc/default/monitor-collector`, `/etc/monitor-synthetic-probe/probes.json`,
+`/var/lib/monitor-synthetic/results.json`,
+`/home/cks/.local/state/monitor-auth`, and
 `/home/cks/backups/monitor-auth`. Remove those separately only after deciding
-the retained telemetry, authentication recovery, and configuration value is no
-longer needed. The retained export includes the private collector identity, so
-an ordinary reinstall keeps the same host/agent UUIDs and sequence continuity.
+the retained telemetry, probe target configuration/results, authentication
+recovery, and configuration value are no longer needed. The retained export
+includes the private collector identity, so an ordinary reinstall keeps the
+same host/agent UUIDs and sequence continuity.
 
 The traffic uninstaller first enables the independent retention timer, then
 removes and reloads the Nginx request-log configuration and disables the

@@ -26,6 +26,7 @@ InaccessiblePaths=/home /root
 TemporaryFileSystem=/run:ro
 BindPaths=/run/monitor-collector
 BindReadOnlyPaths=-/run/monitor-container-exporter/containers.json
+BindReadOnlyPaths=-/var/lib/monitor-synthetic/results.json
 # Read-only observation surfaces only; the systemd control sockets remain
 # outside this service's private /run namespace.
 BindReadOnlyPaths=-/run/systemd/units -/run/systemd/timesync

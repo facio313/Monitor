@@ -46,6 +46,7 @@ function appFor(directory: string) {
     authStateFile: join(directory, 'auth-state.json'),
     sessionSecret: SECRET,
     dataDir: directory,
+    securityStateDir: directory,
     now: () => NOW,
     ssoEnabled: false,
   });
@@ -176,17 +177,17 @@ describe('authentication', () => {
   it('keeps health public and dashboard protected', async () => {
     const directory = dataDirectory();
     const app = appFor(directory);
-    await request(app).get('/healthz').expect(200, { status: 'ok' });
-    await request(app).get('/readyz').expect(503, { status: 'not_ready' });
+    await request(app).get('/healthz').expect('Cache-Control', 'no-store').expect(200, { status: 'ok' });
+    await request(app).get('/readyz').expect('Cache-Control', 'no-store').expect(503, { status: 'not_ready' });
     writeFileSync(join(directory, 'current.json'), JSON.stringify({
       latest: { timestamp: '2026-08-19T11:54:59Z', cpuPercent: 1 },
     }));
-    await request(app).get('/readyz').expect(503, { status: 'not_ready' });
-    await request(app).get('/healthz').expect(200, { status: 'ok' });
+    await request(app).get('/readyz').expect('Cache-Control', 'no-store').expect(503, { status: 'not_ready' });
+    await request(app).get('/healthz').expect('Cache-Control', 'no-store').expect(200, { status: 'ok' });
     writeFileSync(join(directory, 'current.json'), JSON.stringify({
       latest: { timestamp: '2026-08-19T12:00:00Z', cpuPercent: 1 },
     }));
-    await request(app).get('/readyz').expect(200, { status: 'ready' });
+    await request(app).get('/readyz').expect('Cache-Control', 'no-store').expect(200, { status: 'ready' });
     await request(app).get('/monitor/api/dashboard?range=1h').expect(401);
   });
 
@@ -195,6 +196,7 @@ describe('authentication', () => {
     const absentState = join(directory, 'auth-state.json');
     const app = createApp({
       dataDir: directory,
+      securityStateDir: directory,
       now: () => NOW,
       ssoEnabled: true,
       edgeSecret: EDGE_SECRET,
@@ -263,6 +265,7 @@ describe('authentication', () => {
     const app = createApp({
       authStateFile,
       dataDir: directory,
+      securityStateDir: directory,
       now: () => NOW,
       ssoEnabled: true,
       edgeSecret: EDGE_SECRET,
@@ -394,13 +397,26 @@ describe('authentication', () => {
     const cookie = await loginCookie(app);
     await request(app)
       .get('/monitor/api/dashboard?range=1h')
+      .set('Authorization', `Bearer mon_${'A'.repeat(43)}`)
+      .set('X-Forwarded-For', '203.0.113.7')
+      .expect(403, {
+        error: 'API key requests require the trusted edge proxy',
+        code: 'API_KEY_PROXY_REQUIRED',
+      });
+    await request(app)
+      .get('/monitor/api/dashboard?range=1h')
       .set('Cookie', `${cookie}tampered`)
       .expect(401);
     for (let attempt = 0; attempt < 5; attempt += 1) {
-      await request(app).post('/monitor/api/auth/login').send({ password: 'wrong' }).expect(401);
+      await request(app)
+        .post('/monitor/api/auth/login')
+        .set('X-Forwarded-For', `198.51.100.${attempt + 1}`)
+        .send({ password: 'wrong' })
+        .expect(401);
     }
     const limited = await request(app)
       .post('/monitor/api/auth/login')
+      .set('X-Forwarded-For', '198.51.100.6')
       .send({ password: 'wrong' })
       .expect(429);
     expect(limited.body).toEqual({ error: 'Too many login attempts', code: 'RATE_LIMITED' });
@@ -508,6 +524,7 @@ describe('authentication', () => {
         authStateFile: join(directory, 'auth-state.json'),
         sessionSecret: SECRET,
         dataDir: directory,
+        securityStateDir: directory,
         now: () => NOW,
         ssoEnabled: false,
       });
@@ -529,6 +546,7 @@ describe('authentication', () => {
         authStateFile: join(directory, 'auth-state.json'),
         sessionSecret: SECRET,
         dataDir: directory,
+        securityStateDir: directory,
         now: () => NOW,
         ssoEnabled: false,
       })).toThrow(/bootstrap password is not configured/);
@@ -757,6 +775,7 @@ describe('authentication', () => {
       authStateFile: join(linkedParent, 'auth-state.json'),
       sessionSecret: SECRET,
       dataDir: realParent,
+      securityStateDir: realParent,
       now: () => NOW,
       ssoEnabled: false,
     })).toThrow(/real directory/);
@@ -1806,6 +1825,7 @@ describe('dashboard ingestion', () => {
       authStateFile: join(directory, 'auth-state.json'),
       sessionSecret: SECRET,
       dataDir: directory,
+      securityStateDir: directory,
       publicDir: publicDirectory,
       now: () => NOW,
       ssoEnabled: false,

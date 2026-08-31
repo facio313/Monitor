@@ -1,0 +1,12 @@
+[Unit]
+Description=Retry the opt-in Monitor central agent producer
+
+[Timer]
+OnBootSec=30s
+OnUnitInactiveSec=15s
+AccuracySec=2s
+RandomizedDelaySec=2s
+Unit=monitor-agent-producer.service
+
+[Install]
+WantedBy=timers.target

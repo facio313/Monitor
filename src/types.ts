@@ -76,6 +76,166 @@ export interface TelemetrySample {
   diskWriteBytesPerSecond: number | null;
 }
 
+export type LinuxCollectionStatus =
+  | 'supported'
+  | 'partial'
+  | 'unsupported'
+  | 'permission_error'
+  | 'unavailable'
+  | 'invalid'
+  | 'collection_error';
+
+export type LinuxRateStatus =
+  | 'ok'
+  | 'warmup'
+  | 'counter_reset'
+  | LinuxCollectionStatus;
+
+export interface LinuxCapacityEvidence {
+  status: LinuxCollectionStatus;
+  current: number | null;
+  maximum: number | null;
+  usedPercent: number | null;
+}
+
+export interface LinuxDiagnostics {
+  schemaVersion: 1 | null;
+  collectedAt: string | null;
+  status: LinuxCollectionStatus;
+  resources: {
+    status: LinuxCollectionStatus;
+    processCount: number | null;
+    processCountIsLowerBound: boolean;
+    observedProcessCount: number | null;
+    zombieCount: number | null;
+    threadCount: number | null;
+    scanTruncated: boolean;
+    deadlineReached: boolean;
+    pid: LinuxCapacityEvidence;
+    systemFileDescriptors: LinuxCapacityEvidence;
+    cgroupPids: LinuxCapacityEvidence & { version: 1 | 2 | null };
+  };
+  storage: {
+    status: LinuxCollectionStatus;
+    truncated: boolean;
+    devices: Array<{
+      name: string;
+      type: string;
+      rotational: boolean | null;
+      rateStatus: LinuxRateStatus;
+      queueDepth: number | null;
+      readLatencyMilliseconds: number | null;
+      writeLatencyMilliseconds: number | null;
+      averageLatencyMilliseconds: number | null;
+      utilizationPercent: number | null;
+      averageQueueDepth: number | null;
+      smartStatus: LinuxCollectionStatus;
+      raidStatus: LinuxCollectionStatus;
+      raidDegradedDevices: number | null;
+      raidArrayState: string | null;
+    }>;
+  };
+  network: {
+    status: LinuxCollectionStatus;
+    tcp: {
+      status: LinuxCollectionStatus;
+      rateStatus: LinuxRateStatus;
+      outgoingSegmentsPerSecond: number | null;
+      retransmittedSegmentsPerSecond: number | null;
+      retransmissionPercent: number | null;
+      states: {
+        established: number;
+        synSent: number;
+        synRecv: number;
+        finWait1: number;
+        finWait2: number;
+        timeWait: number;
+        close: number;
+        closeWait: number;
+        lastAck: number;
+        listen: number;
+        closing: number;
+        newSynRecv: number;
+      };
+      socketScanStatus: LinuxCollectionStatus;
+      socketScanTruncated: boolean;
+      ephemeralPorts: LinuxCapacityEvidence & {
+        rangeStart: number | null;
+        rangeEnd: number | null;
+      };
+      conntrack: LinuxCapacityEvidence;
+    };
+  };
+  reliability: {
+    status: LinuxCollectionStatus;
+    clock: {
+      status: LinuxCollectionStatus;
+      uptimeSeconds: number | null;
+      bootTime: string | null;
+      rebootDetectedSincePreviousSample: boolean | null;
+      unexpectedReboot: boolean | null;
+      unexpectedRebootStatus: string;
+      timeSync: {
+        status: LinuxCollectionStatus;
+        reason: string | null;
+        synchronized: boolean | null;
+        ntpEnabled: boolean | null;
+        ntpSupported: boolean | null;
+        clockDriftMilliseconds: number | null;
+        clockDriftStatus: LinuxCollectionStatus;
+      };
+    };
+    systemd: {
+      status: LinuxCollectionStatus;
+      reason: string | null;
+      truncated: boolean;
+      units: Array<{
+        unit: string;
+        loadState: string;
+        activeState: string;
+        subState: string;
+        restartCount: number | null;
+        restartCountStatus: 'systemd_manager' | 'observed_invocation_changes';
+        result: string;
+        execMainStatus: number | null;
+        invocationStatus: LinuxCollectionStatus | null;
+      }>;
+    };
+  };
+  power: {
+    status: LinuxCollectionStatus;
+    truncated: boolean;
+    maximumTemperatureCelsius: number | null;
+    sensors: Array<{
+      source: 'thermal-zone' | 'hwmon';
+      name: string;
+      status: LinuxCollectionStatus;
+      temperatureCelsius: number | null;
+    }>;
+    fans: Array<{
+      name: string;
+      status: LinuxCollectionStatus;
+      rpm: number | null;
+    }>;
+    raspberryPi: {
+      status: LinuxCollectionStatus;
+      detected: boolean;
+      temperatureCelsius: number | null;
+      supplyVoltageVolts: number | null;
+      throttledFlags: number | null;
+      currentUnderVoltage: boolean | null;
+      currentFrequencyCapped: boolean | null;
+      currentThrottled: boolean | null;
+      currentSoftTemperatureLimit: boolean | null;
+      underVoltageOccurred: boolean | null;
+      frequencyCapOccurred: boolean | null;
+      throttlingOccurred: boolean | null;
+      softTemperatureLimitOccurred: boolean | null;
+      flagSource: 'vcgencmd' | 'hwmon-current-only' | null;
+    };
+  };
+}
+
 export interface DashboardPayload {
   generatedAt: string;
   range: TimeRange;
@@ -90,6 +250,7 @@ export interface DashboardPayload {
     uptimeSeconds: number | null;
   };
   reliability: ReliabilitySummary;
+  linux: LinuxDiagnostics;
   latest: TelemetrySample | null;
   series: TelemetrySample[];
   telemetrySummary: TelemetrySummary;
@@ -99,6 +260,10 @@ export interface DashboardPayload {
     status: 'fresh' | 'last-known' | 'unavailable' | 'permission-denied';
     observedAt: string | null;
   };
+  dockerEventCollection?: DockerEventCollection;
+  dockerEvents?: DockerContainerEvent[];
+  syntheticProbeCollection?: SyntheticProbeCollection;
+  syntheticProbes?: SyntheticProbeResult[];
   containers: ContainerStatus[];
   currentTraffic: IncidentTraffic[];
   alerts: AlertEvent[];
@@ -194,6 +359,10 @@ export interface RuleEvaluationState {
   recoverySamples: number;
   missingSamples: number;
   openedAt: string | null;
+  conditionStartedAt: string | null;
+  recoveryStartedAt: string | null;
+  missingStartedAt: string | null;
+  evaluationIntervalSeconds: number;
   changedAt: string;
   lastEvaluatedAt: string;
   lastValue: number | null;
@@ -388,6 +557,82 @@ export interface ContainerStatus {
   oomKilled?: boolean | null;
   startedAt?: string | null;
   finishedAt?: string | null;
+  instanceId?: string | null;
+  pidCount?: number | null;
+  cpuThrottledPercent?: number | null;
+  cpuThrottledPeriods?: number | null;
+  cpuThrottledSeconds?: number | null;
+  blockReadBytes?: number | null;
+  blockWriteBytes?: number | null;
+  blockReadBytesPerSecond?: number | null;
+  blockWriteBytesPerSecond?: number | null;
+  networkRxBytes?: number | null;
+  networkTxBytes?: number | null;
+  networkRxBytesPerSecond?: number | null;
+  networkTxBytesPerSecond?: number | null;
+  networkErrors?: number | null;
+  networkErrorsPerSecond?: number | null;
+  writableLayerBytes?: number | null;
+  volumeCount?: number | null;
+  bindMountCount?: number | null;
+  tmpfsMountCount?: number | null;
+  networkAttachmentCount?: number | null;
+  publishedPortCount?: number | null;
+  privileged?: boolean | null;
+  hostPid?: boolean | null;
+  hostIpc?: boolean | null;
+  hostNetwork?: boolean | null;
+  dockerSocketMounted?: boolean | null;
+  sensitiveBindMounted?: boolean | null;
+  rootUser?: boolean | null;
+  readOnlyRootFilesystem?: boolean | null;
+  addedCapabilityCount?: number | null;
+  dangerousCapabilityCount?: number | null;
+  excessiveCapabilities?: boolean | null;
+  imageName?: string | null;
+  imageTag?: string | null;
+  imageDigest?: string | null;
+  imageDigestSource?: 'repo-digest' | 'local-image-id' | null;
+  usesLatestTag?: boolean | null;
+  imageDigestDrift?: boolean | null;
+  imageDigestChanged?: boolean | null;
+}
+
+export interface DockerEventCollection {
+  status: 'fresh' | 'gap' | 'unavailable' | 'permission-denied';
+  observedAt: string | null;
+  cursorAt: string | null;
+  reconnectCount: number;
+  gapCount: number;
+  gapDetected: boolean;
+  logCollectionStatus: 'unsupported';
+}
+
+export interface DockerContainerEvent {
+  id: string;
+  occurredAt: string;
+  action: 'create' | 'start' | 'stop' | 'die' | 'kill' | 'pause' | 'unpause' | 'restart' | 'oom' | 'health_status' | 'destroy';
+  containerName: string;
+  project: string;
+  instanceId: string;
+  exitCode: number | null;
+  healthStatus: 'healthy' | 'unhealthy' | 'starting' | null;
+}
+
+export interface SyntheticProbeCollection {
+  status: 'fresh' | 'stale' | 'unsupported' | 'permission-denied' | 'unavailable' | 'collection-error';
+  observedAt: string | null;
+}
+
+export interface SyntheticProbeResult {
+  id: string;
+  status: 'ok' | 'dns' | 'permission' | 'timeout' | 'tls' | 'http' | 'invalid' | 'unsupported';
+  checkedAt: string;
+  httpStatus: number | null;
+  redirectCount: number;
+  latencyMilliseconds: number;
+  certificateExpiresAt: string | null;
+  certificateDaysRemaining: number | null;
 }
 
 export interface AlertEvent {

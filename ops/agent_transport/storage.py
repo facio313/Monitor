@@ -7,6 +7,7 @@ import fcntl
 import json
 import os
 import stat
+import time
 import uuid
 from collections.abc import Iterator
 from pathlib import Path
@@ -19,6 +20,8 @@ class StorageError(RuntimeError):
 
 
 DirectoryIdentity = tuple[int, int]
+DEFAULT_LOCK_TIMEOUT_SECONDS = 5.0
+LOCK_POLL_SECONDS = 0.05
 
 
 def canonical_json(value: object) -> bytes:
@@ -243,7 +246,17 @@ def erase_private_file(path: Path, *, expected: tuple[int, int, int] | None = No
 
 
 @contextlib.contextmanager
-def exclusive_lock(path: Path) -> Iterator[None]:
+def exclusive_lock(
+    path: Path,
+    *,
+    timeout_seconds: float = DEFAULT_LOCK_TIMEOUT_SECONDS,
+) -> Iterator[None]:
+    if (
+        isinstance(timeout_seconds, bool)
+        or not isinstance(timeout_seconds, (int, float))
+        or not 0 < timeout_seconds <= 60
+    ):
+        raise StorageError("transport lock timeout is invalid")
     flags = (
         os.O_RDWR
         | os.O_CREAT
@@ -251,6 +264,7 @@ def exclusive_lock(path: Path) -> Iterator[None]:
         | getattr(os, "O_NOFOLLOW", 0)
     )
     descriptor = os.open(path, flags, 0o600)
+    locked = False
     try:
         status = os.fstat(descriptor)
         if (
@@ -260,10 +274,23 @@ def exclusive_lock(path: Path) -> Iterator[None]:
             or stat.S_IMODE(status.st_mode) != 0o600
         ):
             raise StorageError(f"{path} is not a safe transport lock")
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                locked = True
+                break
+            except BlockingIOError as error:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise StorageError(
+                        "timed out waiting for the private transport lock"
+                    ) from error
+                time.sleep(min(LOCK_POLL_SECONDS, remaining))
         yield
     finally:
-        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        if locked:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
         os.close(descriptor)
 
 
@@ -279,6 +306,7 @@ def decode_exact_json(encoded: bytes, keys: set[str], description: str) -> dict[
 
 __all__ = [
     "DirectoryIdentity",
+    "DEFAULT_LOCK_TIMEOUT_SECONDS",
     "StorageError",
     "atomic_private_write",
     "canonical_json",

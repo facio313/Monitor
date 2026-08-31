@@ -16,6 +16,7 @@ interface RuleHealthSummaryProps {
   alerts: RuleAlertCollection;
   locale: MonitorLocale;
   stale: boolean;
+  compactWhenNominal?: boolean;
 }
 
 const ACTIVE_RULE_LIMIT = 5;
@@ -50,6 +51,21 @@ export function rulePhaseCounts(evaluation: RuleEvaluation): Record<RuleEvaluati
   const counts = Object.fromEntries(RULE_PHASES.map((phase) => [phase, 0])) as Record<RuleEvaluationPhase, number>;
   for (const state of Object.values(evaluation.states)) counts[state.phase] += 1;
   return counts;
+}
+
+export function ruleSummaryNeedsAttention(
+  evaluation: RuleEvaluation,
+  alerts: RuleAlertCollection,
+  stale: boolean,
+): boolean {
+  if (stale || evaluation.status !== 'ok' || alerts.status !== 'ok') return true;
+  const counts = rulePhaseCounts(evaluation);
+  return counts.pending > 0
+    || counts.firing > 0
+    || counts.recovering > 0
+    || counts.no_data > 0
+    || counts.permission_denied > 0
+    || counts.collection_error > 0;
 }
 
 export function selectFiringRules(evaluation: RuleEvaluation, limit = ACTIVE_RULE_LIMIT): RuleEvaluationState[] {
@@ -211,7 +227,7 @@ function TransitionList({ events, locale }: { events: RuleAlertEvent[]; locale: 
   );
 }
 
-export function RuleHealthSummary({ evaluation, alerts, locale, stale }: RuleHealthSummaryProps) {
+export function RuleHealthSummary({ evaluation, alerts, locale, stale, compactWhenNominal = false }: RuleHealthSummaryProps) {
   const counts = rulePhaseCounts(evaluation);
   const evaluationStale = stale || evaluation.status === 'last-known';
   const activeRules = selectActiveRules(evaluation);
@@ -222,21 +238,27 @@ export function RuleHealthSummary({ evaluation, alerts, locale, stale }: RuleHea
   const transitions = selectRecentRuleTransitions(alerts);
   const copy = evaluatorCopy(evaluation, evaluationStale, counts, locale);
   const evaluatedAt = evaluation.evaluatedAt ? formatDateTime(evaluation.evaluatedAt, locale) : t(locale, '기록 없음', 'Not recorded');
+  const compact = compactWhenNominal && !ruleSummaryNeedsAttention(evaluation, alerts, stale);
+  const compactDetail = t(
+    locale,
+    `${totalRules.toLocaleString()}개 규칙 평가 · 비적용 ${counts.unsupported.toLocaleString()}개 · ${evaluatedAt}`,
+    `${totalRules.toLocaleString()} rules evaluated · ${counts.unsupported.toLocaleString()} unsupported · ${evaluatedAt}`,
+  );
 
   return (
-    <section className={`rule-health-summary rule-health-${copy.tone}`} aria-labelledby="rule-health-title" data-evaluator-status={evaluation.status}>
+    <section className={`rule-health-summary rule-health-${copy.tone}${compact ? ' rule-health-compact' : ''}`} aria-labelledby="rule-health-title" data-evaluator-status={evaluation.status}>
       <p className="sr-only" aria-live="polite" aria-atomic="true">{copy.title}</p>
       <header className="rule-health-header">
         <span className="rule-health-icon"><Icon name={copy.tone === 'nominal' ? 'check' : copy.tone === 'firing' || copy.tone === 'error' ? 'alert' : 'info'} size={19} /></span>
         <div>
           <span>{t(locale, '지속 규칙 평가', 'RULE EVALUATOR')}</span>
           <h2 id="rule-health-title">{copy.title}</h2>
-          <p>{copy.detail}</p>
+          <p>{compact ? compactDetail : copy.detail}</p>
         </div>
         <strong className="rule-evaluator-badge">{copy.badge}</strong>
       </header>
 
-      {(evaluation.status === 'ok' || evaluation.status === 'last-known') && (
+      {!compact && (evaluation.status === 'ok' || evaluation.status === 'last-known') && (
         <>
           <div className="rule-lifecycle-summary" role="list" aria-label={t(locale, '규칙 수명주기 요약', 'Rule lifecycle summary')}>
             <span className="lifecycle-firing" role="listitem"><b>{counts.firing}</b>{phaseLabel('firing', locale)}</span>
@@ -273,13 +295,13 @@ export function RuleHealthSummary({ evaluation, alerts, locale, stale }: RuleHea
         </>
       )}
 
-      {(transitions.length > 0 || alerts.status === 'collection_error') && (
+      {!compact && (transitions.length > 0 || alerts.status !== 'ok') && (
         <details className="rule-transition-details">
-          <summary>{alerts.status === 'collection_error'
-            ? t(locale, '최근 전환 기록 수집 오류', 'Recent transition collection error')
+          <summary>{alerts.status !== 'ok'
+            ? t(locale, `최근 전환 기록 ${alerts.status}`, `Recent transition log ${alerts.status}`)
             : t(locale, `최근 규칙 전환 ${transitions.length}개`, `${transitions.length} recent rule ${transitions.length === 1 ? 'transition' : 'transitions'}`)}</summary>
-          {alerts.status === 'collection_error'
-            ? <p>{t(locale, '규칙 평가 상태와 별개로 전환 기록 파일을 읽지 못했습니다.', 'The transition log could not be read; this is separate from current evaluator state.')}</p>
+          {alerts.status !== 'ok'
+            ? <p>{t(locale, '규칙 평가 상태와 별개로 전환 기록 파일을 사용할 수 없습니다.', 'The transition log is unavailable separately from current evaluator state.')}</p>
             : <TransitionList events={transitions} locale={locale} />}
         </details>
       )}

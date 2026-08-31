@@ -1,0 +1,86 @@
+{
+  "schemaVersion": 2,
+  "sources": [
+    {
+      "id": "collector-identity",
+      "kind": "json",
+      "path": "/var/lib/monitor-export/.state/collector-identity.json",
+      "restorePath": "var/lib/monitor-export/.state/collector-identity.json",
+      "uid": 0,
+      "gid": 1001,
+      "mode": "0600",
+      "maxBytes": 4096
+    },
+    {
+      "id": "rule-alerts",
+      "kind": "jsonl",
+      "path": "/var/lib/monitor-export/rule-alerts.jsonl",
+      "restorePath": "var/lib/monitor-export/rule-alerts.jsonl",
+      "uid": 0,
+      "gid": 1001,
+      "mode": "0640",
+      "maxBytes": 16777216
+    },
+    {
+      "id": "alert-delivery",
+      "kind": "sqlite",
+      "path": "/var/lib/monitor-export/.state/alert-delivery/alert-delivery.sqlite",
+      "restorePath": "var/lib/monitor-export/.state/alert-delivery/alert-delivery.sqlite",
+      "uid": 0,
+      "gid": 1001,
+      "mode": "0600",
+      "maxBytes": 33554432
+    },
+    {
+      "id": "application-security",
+      "kind": "family",
+      "path": "/var/lib/monitor-security",
+      "restorePath": "var/lib/monitor-security",
+      "uid": 1001,
+      "gid": 1001,
+      "mode": "0700",
+      "members": [
+        {
+          "id": "api-keys",
+          "name": "api-keys.json",
+          "kind": "json",
+          "mode": "0600",
+          "maxBytes": 131072,
+          "required": true
+        },
+        {
+          "id": "audit-0",
+          "name": "application-audit.jsonl",
+          "kind": "jsonl",
+          "mode": "0600",
+          "maxBytes": 1048576,
+          "required": false
+        },
+        {
+          "id": "audit-1",
+          "name": "application-audit.1.jsonl",
+          "kind": "jsonl",
+          "mode": "0600",
+          "maxBytes": 1048576,
+          "required": false
+        },
+        {
+          "id": "audit-2",
+          "name": "application-audit.2.jsonl",
+          "kind": "jsonl",
+          "mode": "0600",
+          "maxBytes": 1048576,
+          "required": false
+        },
+        {
+          "id": "audit-3",
+          "name": "application-audit.3.jsonl",
+          "kind": "jsonl",
+          "mode": "0600",
+          "maxBytes": 1048576,
+          "required": false
+        }
+      ]
+    }
+  ]
+}

@@ -1,12 +1,14 @@
 import type {
   AlertEvent,
   DashboardPayload,
+  DockerContainerEvent,
   MonitorDetailPage,
   MonitorLocale,
   MonitorPage,
   PowerEvent,
   PrivilegeEvent,
   ReliabilityEvent,
+  RuleAlertEvent,
   TelemetrySample,
   TimeRange,
 } from './types';
@@ -149,7 +151,7 @@ export function rangeStatistics(series: TelemetrySample[]): RangeStatistics {
   };
 }
 
-export type OperationalLogCategory = 'alert' | 'reliability' | 'power' | 'privilege';
+export type OperationalLogCategory = 'alert' | 'reliability' | 'power' | 'privilege' | 'docker' | 'rule';
 export type OperationalLogSeverity = 'critical' | 'warning' | 'info';
 
 export interface OperationalLogEntry {
@@ -189,7 +191,7 @@ function safeLogText(value: unknown, fallback: string, maximum = 240): string {
 
 function eventEntry(
   event: AlertEvent | PowerEvent | ReliabilityEvent,
-  category: Exclude<OperationalLogCategory, 'privilege'>,
+  category: Exclude<OperationalLogCategory, 'privilege' | 'docker' | 'rule'>,
   index: number,
 ): OperationalLogEntry {
   const kind = safeLogText(event.kind, category, 64);
@@ -205,6 +207,63 @@ function eventEntry(
     message: safeLogText(event.message, 'No additional detail was recorded.'),
     actor: null,
     target: null,
+  };
+}
+
+function dockerEventEntry(event: DockerContainerEvent): OperationalLogEntry {
+  const action = safeLogText(event.action, 'event', 48);
+  const containerName = safeLogText(event.containerName, 'container', 96);
+  const project = safeLogText(event.project, 'unknown project', 96);
+  const nonZeroExit = event.action === 'die' && typeof event.exitCode === 'number' && event.exitCode !== 0;
+  const severity: OperationalLogSeverity = event.action === 'oom'
+    || event.healthStatus === 'unhealthy'
+    || nonZeroExit
+    ? 'critical'
+    : event.action === 'kill'
+      || event.action === 'restart'
+      || event.action === 'pause'
+      || event.healthStatus === 'starting'
+      || (event.action === 'die' && event.exitCode === null)
+      ? 'warning'
+      : 'info';
+  const status = event.healthStatus
+    ?? (event.exitCode !== null ? `exit-${event.exitCode}` : action);
+  const details = [
+    `project ${project}`,
+    event.healthStatus ? `health ${safeLogText(event.healthStatus, 'unknown', 32)}` : null,
+    event.exitCode !== null ? `exit ${event.exitCode}` : null,
+  ].filter((value): value is string => Boolean(value));
+  return {
+    id: `docker:${event.id}`,
+    timestamp: event.occurredAt,
+    category: 'docker',
+    severity,
+    kind: action,
+    status,
+    title: `${containerName} · ${action.replace(/[-_]+/g, ' ')}`,
+    message: details.join(' · '),
+    actor: null,
+    target: containerName,
+  };
+}
+
+function ruleAlertEntry(event: RuleAlertEvent): OperationalLogEntry {
+  const ruleId = safeLogText(event.ruleId, 'rule', 96);
+  const transition = safeLogText(event.transition, 'transition', 32);
+  const notificationState = safeLogText(event.notificationState, 'unknown', 32);
+  const observationStatus = safeLogText(event.status, 'unknown', 48);
+  const value = typeof event.value === 'number' && Number.isFinite(event.value) ? String(event.value) : '—';
+  return {
+    id: `rule:${event.idempotencyKey}`,
+    timestamp: event.observedAt,
+    category: 'rule',
+    severity: event.transition === 'resolved' ? 'info' : normalizedSeverity(event.severity, event.status),
+    kind: ruleId,
+    status: `${transition} · ${notificationState} · ${observationStatus}`,
+    title: `${ruleId} · ${transition}`,
+    message: `${safeLogText(event.description, 'No rule description was recorded.')} · value ${value} · notification ${notificationState}`,
+    actor: null,
+    target: safeLogText(event.target, 'unknown target', 160),
   };
 }
 
@@ -226,17 +285,42 @@ function privilegeEntry(event: PrivilegeEvent, index: number): OperationalLogEnt
 }
 
 export function operationalLogs(data: DashboardPayload): OperationalLogEntry[] {
-  return [
+  const generatedAt = Date.parse(data.generatedAt);
+  const rangeMilliseconds: Record<TimeRange, number> = {
+    '1h': 60 * 60_000,
+    '24h': 24 * 60 * 60_000,
+    '7d': 7 * 24 * 60 * 60_000,
+    '30d': 30 * 24 * 60 * 60_000,
+  };
+  const dockerCutoff = Number.isFinite(generatedAt) ? generatedAt - (rangeMilliseconds[data.range] ?? rangeMilliseconds['24h']) : Number.NEGATIVE_INFINITY;
+  const dockerEntries = (data.dockerEvents ?? [])
+    .filter((event) => {
+      const occurredAt = Date.parse(event.occurredAt);
+      return Number.isFinite(occurredAt)
+        && (!Number.isFinite(generatedAt) || (occurredAt >= dockerCutoff && occurredAt <= generatedAt));
+    })
+    .map(dockerEventEntry);
+  const ruleEntries = data.ruleAlerts?.status === 'ok' ? data.ruleAlerts.events.map(ruleAlertEntry) : [];
+  const entries = [
     ...data.alerts.map((event, index) => eventEntry(event, 'alert', index)),
     ...data.reliabilityEvents.map((event, index) => eventEntry(event, 'reliability', index)),
     ...data.powerEvents.map((event, index) => eventEntry(event, 'power', index)),
     ...data.privilegeEvents.map(privilegeEntry),
-  ].sort((left, right) => {
-    const leftTime = new Date(left.timestamp).getTime();
-    const rightTime = new Date(right.timestamp).getTime();
-    if (!Number.isFinite(leftTime)) return 1;
-    if (!Number.isFinite(rightTime)) return -1;
-    return rightTime - leftTime;
+    ...dockerEntries,
+    ...ruleEntries,
+  ];
+  const deduplicated = new Map<string, OperationalLogEntry>();
+  for (const entry of entries) if (!deduplicated.has(entry.id)) deduplicated.set(entry.id, entry);
+  const severityOrder: Record<OperationalLogSeverity, number> = { critical: 0, warning: 1, info: 2 };
+  return [...deduplicated.values()].sort((left, right) => {
+    const leftTime = Date.parse(left.timestamp);
+    const rightTime = Date.parse(right.timestamp);
+    const validTimeOrder = Number.isFinite(leftTime) && Number.isFinite(rightTime) ? rightTime - leftTime : 0;
+    if (validTimeOrder) return validTimeOrder;
+    if (!Number.isFinite(leftTime) && Number.isFinite(rightTime)) return 1;
+    if (Number.isFinite(leftTime) && !Number.isFinite(rightTime)) return -1;
+    return severityOrder[left.severity] - severityOrder[right.severity]
+      || left.id.localeCompare(right.id);
   });
 }
 
@@ -273,13 +357,13 @@ export function eventBuckets(entries: OperationalLogEntry[], bucketCount = 12): 
 export function relatedLogs(entries: OperationalLogEntry[], page: MonitorPage): OperationalLogEntry[] {
   if (page === 'logs' || page === 'overview' || page === 'details') return entries;
   const categories: Partial<Record<MonitorDetailPage, OperationalLogCategory[]>> = {
-    reliability: ['reliability', 'alert'],
+    reliability: ['alert', 'reliability', 'power', 'privilege', 'docker', 'rule'],
     maintenance: ['reliability', 'power', 'privilege'],
     power: ['power', 'alert'],
     resources: ['alert', 'reliability'],
     network: ['alert', 'reliability'],
     storage: ['alert', 'reliability'],
-    containers: ['alert'],
+    containers: ['alert', 'docker', 'rule'],
     incidents: ['alert', 'reliability', 'power'],
   };
   const allowed = new Set(categories[page] ?? []);

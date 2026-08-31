@@ -4,6 +4,7 @@ import io
 import json
 import os
 import signal
+import socket
 import stat
 import tempfile
 import threading
@@ -16,6 +17,66 @@ from ops import alert_delivery
 
 
 NOW = dt.datetime(2026, 8, 30, 12, 0, tzinfo=dt.timezone.utc)
+PUBLIC_IPV4 = "93.184.216.34"
+PUBLIC_IPV6 = "2606:4700:4700::1111"
+
+
+def public_resolver(host, port, family, socktype, protocol):
+    if (
+        not host
+        or family != socket.AF_UNSPEC
+        or socktype != socket.SOCK_STREAM
+        or protocol != socket.IPPROTO_TCP
+    ):
+        raise AssertionError("unexpected resolver arguments")
+    return [
+        (
+            socket.AF_INET,
+            socket.SOCK_STREAM,
+            socket.IPPROTO_TCP,
+            "",
+            (PUBLIC_IPV4, port),
+        ),
+    ]
+
+
+class HttpResponse:
+    def __init__(self, status=204, headers=None):
+        self.status = status
+        self.headers = headers or {}
+
+
+class RecordingHttpsConnection:
+    def __init__(self, response=None, request_error=None):
+        self.response = response or HttpResponse()
+        self.request_error = request_error
+        self.requests = []
+        self.closed = False
+
+    def request(self, method, target, body, headers):
+        self.requests.append((method, target, body, headers))
+        if self.request_error is not None:
+            raise self.request_error
+
+    def getresponse(self):
+        return self.response
+
+    def close(self):
+        self.closed = True
+
+
+class RecordingHttpsFactory:
+    def __init__(self, response=None, request_error=None):
+        self.response = response
+        self.request_error = request_error
+        self.calls = []
+        self.connections = []
+
+    def __call__(self, endpoint, destination, timeout):
+        self.calls.append((endpoint, destination, timeout))
+        connection = RecordingHttpsConnection(self.response, self.request_error)
+        self.connections.append(connection)
+        return connection
 
 
 def channel(
@@ -565,6 +626,296 @@ class AlertDeliveryTests(unittest.TestCase):
         self.assertEqual(alert_delivery._classify_http_status(503).outcome, "retryable")
         self.assertEqual(alert_delivery._classify_http_status(401).outcome, "permanent")
 
+    def test_https_endpoint_canonicalizes_idna_for_allowlist_host_and_sni(self):
+        endpoint = alert_delivery._parse_https_endpoint(
+            "https://BÜCHER.Example.:8443/hook?id=7",
+            frozenset({"xn--bcher-kva.example"}),
+        )
+        self.assertEqual(endpoint.hostname, "xn--bcher-kva.example")
+        self.assertEqual(endpoint.authority, "xn--bcher-kva.example:8443")
+        self.assertEqual(endpoint.request_target, "/hook?id=7")
+        self.assertEqual(
+            endpoint.url,
+            "https://xn--bcher-kva.example:8443/hook?id=7",
+        )
+        for invalid in (
+            "https://example.test/한글",
+            "https://user@example.test/hook",
+            "https://example.test/hook#secret",
+            " https://example.test/hook",
+        ):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                alert_delivery._parse_https_endpoint(invalid)
+
+    def test_dns_rejects_every_non_global_class_mapped_ipv6_and_mixed_sets(self):
+        numeric_factory = RecordingHttpsFactory()
+        for url in (
+            "https://127.0.0.1/private",
+            "https://[::1]/private",
+            "https://169.254.169.254/latest/meta-data",
+        ):
+            with self.subTest(url=url):
+                self.assertEqual(
+                    alert_delivery._http_post(
+                        url,
+                        {"ok": True},
+                        {},
+                        0.25,
+                        connection_factory=numeric_factory,
+                    ),
+                    alert_delivery.DeliveryResult.permanent(
+                        "endpoint_not_global",
+                    ),
+                )
+        self.assertEqual(numeric_factory.calls, [])
+
+        endpoint = alert_delivery._parse_https_endpoint("https://receiver.example/hook")
+        unsafe_answers = (
+            (socket.AF_INET, "10.0.0.1"),
+            (socket.AF_INET, "127.0.0.1"),
+            (socket.AF_INET, "169.254.169.254"),
+            (socket.AF_INET, "0.0.0.0"),
+            (socket.AF_INET, "224.0.0.1"),
+            (socket.AF_INET, "240.0.0.1"),
+            (socket.AF_INET, "100.64.0.1"),
+            (socket.AF_INET6, "::1"),
+            (socket.AF_INET6, "fe80::1"),
+            (socket.AF_INET6, "fc00::1"),
+            (socket.AF_INET6, "ff02::1"),
+            (socket.AF_INET6, "::"),
+            (socket.AF_INET6, "2001:db8::1"),
+            (socket.AF_INET6, "::ffff:8.8.8.8"),
+            (socket.AF_INET6, "2002:0808:0808::1"),
+            (socket.AF_INET6, f"{PUBLIC_IPV6}%1"),
+        )
+        for family, address in unsafe_answers:
+            sockaddr = (
+                (address, endpoint.port)
+                if family == socket.AF_INET
+                else (address, endpoint.port, 0, 0)
+            )
+            resolver = lambda *_args, family=family, sockaddr=sockaddr: [(
+                family,
+                socket.SOCK_STREAM,
+                socket.IPPROTO_TCP,
+                "",
+                sockaddr,
+            )]
+            with self.subTest(address=address), self.assertRaises(
+                alert_delivery._UnsafeHttpsDestination,
+            ):
+                alert_delivery._resolve_global_destinations(endpoint, resolver)
+
+        factory = RecordingHttpsFactory()
+
+        def mixed_resolver(_host, port, *_args):
+            return [
+                (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", (PUBLIC_IPV4, port)),
+                (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("127.0.0.1", port)),
+            ]
+
+        result = alert_delivery._http_post(
+            endpoint.url,
+            {"ok": True},
+            {},
+            2,
+            mixed_resolver,
+            factory,
+        )
+        self.assertEqual(
+            result,
+            alert_delivery.DeliveryResult.permanent("endpoint_not_global"),
+        )
+        self.assertEqual(factory.calls, [])
+
+        oversized = [
+            (
+                socket.AF_INET,
+                socket.SOCK_STREAM,
+                socket.IPPROTO_TCP,
+                "",
+                (PUBLIC_IPV4, endpoint.port),
+            )
+            for _index in range(alert_delivery.MAX_HTTPS_DNS_ANSWERS + 1)
+        ]
+        with self.assertRaises(alert_delivery._UnsafeHttpsDestination):
+            alert_delivery._resolve_global_destinations(
+                endpoint,
+                lambda *_args: oversized,
+            )
+
+    def test_global_ipv6_is_pinned_and_dns_is_revalidated_on_every_attempt(self):
+        ipv6_factory = RecordingHttpsFactory()
+
+        def ipv6_resolver(_host, port, *_args):
+            return [(
+                socket.AF_INET6,
+                socket.SOCK_STREAM,
+                socket.IPPROTO_TCP,
+                "",
+                (PUBLIC_IPV6, port, 0, 0),
+            )]
+
+        ipv6_result = alert_delivery._http_post(
+            "https://receiver.example/hook",
+            {"ok": True},
+            {},
+            2,
+            ipv6_resolver,
+            ipv6_factory,
+        )
+        self.assertEqual(ipv6_result, alert_delivery.DeliveryResult.success(204))
+        destination = ipv6_factory.calls[0][1]
+        self.assertEqual(destination.family, socket.AF_INET6)
+        self.assertEqual(destination.address, PUBLIC_IPV6)
+
+        answers = [PUBLIC_IPV4, "127.0.0.1"]
+        resolver_calls = []
+
+        def rebinding_resolver(_host, port, *_args):
+            address = answers[len(resolver_calls)]
+            resolver_calls.append(address)
+            return [(
+                socket.AF_INET,
+                socket.SOCK_STREAM,
+                socket.IPPROTO_TCP,
+                "",
+                (address, port),
+            )]
+
+        factory = RecordingHttpsFactory()
+        first = alert_delivery._http_post(
+            "https://receiver.example/hook", {"attempt": 1}, {}, 2,
+            rebinding_resolver, factory,
+        )
+        second = alert_delivery._http_post(
+            "https://receiver.example/hook", {"attempt": 2}, {}, 2,
+            rebinding_resolver, factory,
+        )
+        self.assertEqual(first, alert_delivery.DeliveryResult.success(204))
+        self.assertEqual(
+            second,
+            alert_delivery.DeliveryResult.permanent("endpoint_not_global"),
+        )
+        self.assertEqual(resolver_calls, [PUBLIC_IPV4, "127.0.0.1"])
+        self.assertEqual(len(factory.calls), 1)
+        self.assertEqual(factory.calls[0][1].address, PUBLIC_IPV4)
+
+    def test_pinned_connection_uses_numeric_socket_but_original_hostname_for_tls(self):
+        endpoint = alert_delivery._parse_https_endpoint(
+            "https://BÜCHER.Example/hook",
+        )
+        destination = alert_delivery._ResolvedDestination(
+            socket.AF_INET,
+            PUBLIC_IPV4,
+            (PUBLIC_IPV4, 443),
+        )
+
+        class RawSocket:
+            def __init__(self):
+                self.timeout = None
+                self.connected_to = None
+                self.closed = False
+
+            def settimeout(self, timeout):
+                self.timeout = timeout
+
+            def connect(self, sockaddr):
+                self.connected_to = sockaddr
+
+            def close(self):
+                self.closed = True
+
+        class TlsContext:
+            def __init__(self):
+                self.server_hostname = None
+
+            def wrap_socket(self, raw_socket, server_hostname):
+                self.server_hostname = server_hostname
+                return raw_socket
+
+        raw_socket = RawSocket()
+        context = TlsContext()
+        connection = alert_delivery._PinnedHTTPSConnection(
+            endpoint,
+            destination,
+            1.25,
+            context=context,
+            socket_factory=lambda *_args: raw_socket,
+        )
+        connection.connect()
+        self.assertEqual(raw_socket.timeout, 1.25)
+        self.assertEqual(raw_socket.connected_to, (PUBLIC_IPV4, 443))
+        self.assertEqual(context.server_hostname, "xn--bcher-kva.example")
+        connection.close()
+
+    def test_http_redirect_is_not_followed_and_host_header_keeps_original_authority(self):
+        factory = RecordingHttpsFactory(HttpResponse(
+            302,
+            {"Location": "https://127.0.0.1/internal"},
+        ))
+        result = alert_delivery._http_post(
+            "https://BÜCHER.Example:8443/hook",
+            {"ok": True},
+            {},
+            2,
+            public_resolver,
+            factory,
+        )
+        self.assertEqual(
+            result,
+            alert_delivery.DeliveryResult.permanent("http_permanent", 302),
+        )
+        self.assertEqual(len(factory.calls), 1)
+        request = factory.connections[0].requests[0]
+        self.assertEqual(request[3]["Host"], "xn--bcher-kva.example:8443")
+
+    def test_http_connect_and_read_share_bounded_timeout(self):
+        factory = RecordingHttpsFactory(request_error=socket.timeout("injected"))
+        result = alert_delivery._http_post(
+            "https://receiver.example/hook",
+            {"ok": True},
+            {},
+            0.75,
+            public_resolver,
+            factory,
+        )
+        self.assertEqual(result, alert_delivery.DeliveryResult.retryable("timeout"))
+        self.assertEqual(factory.calls[0][2], 0.75)
+        self.assertTrue(factory.connections[0].closed)
+
+    def test_blocking_dns_is_stopped_by_absolute_delivery_deadline(self):
+        with tempfile.TemporaryDirectory() as directory:
+            value = config_value()
+            value["channels"][0]["timeoutSeconds"] = 0.25
+            outbox, config = self.outbox(Path(directory), value)
+            alert_delivery.enqueue_test_delivery(
+                outbox, config, "ops-webhook", "dns-deadline-test",
+                "DNS deadline", NOW,
+            )
+            task = outbox.claim_due(NOW, "worker-a", 1)[0]
+
+            def blocking_resolver(*_args):
+                wall_time.sleep(5)
+                return []
+
+            started = wall_time.monotonic()
+            result = alert_delivery.dispatch_task(
+                config,
+                task,
+                secret_resolver=lambda _ref: "https://receiver.example/hook",
+                adapters={"webhook": alert_delivery.WebhookAdapter(
+                    blocking_resolver,
+                    RecordingHttpsFactory(),
+                )},
+            )
+            elapsed = wall_time.monotonic() - started
+            self.assertEqual(
+                result,
+                alert_delivery.DeliveryResult.retryable("delivery_deadline_exceeded"),
+            )
+            self.assertLess(elapsed, 1.5)
+
     def test_cli_test_and_status_are_payload_free_and_network_free(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -916,27 +1267,6 @@ class AlertDeliveryTests(unittest.TestCase):
                 self.assertFalse(client.quit_called)
 
     def test_every_channel_adapter_uses_the_common_task_without_external_network(self):
-        class Response:
-            status = 204
-            headers = {}
-
-            def read(self, _limit):
-                return b""
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *_args):
-                return False
-
-        class Opener:
-            def __init__(self):
-                self.requests = []
-
-            def open(self, request, timeout):
-                self.requests.append((request, timeout))
-                return Response()
-
         class SmtpClient:
             def __init__(self, *_args, **_kwargs):
                 self.password = None
@@ -988,14 +1318,17 @@ class AlertDeliveryTests(unittest.TestCase):
                     )
                     adapters = {kind: adapter}
                 else:
-                    opener = Opener()
+                    connection_factory = RecordingHttpsFactory()
                     adapter_type = {
                         "webhook": alert_delivery.WebhookAdapter,
                         "slack": alert_delivery.SlackAdapter,
                         "discord": alert_delivery.DiscordAdapter,
                         "telegram": alert_delivery.TelegramAdapter,
                     }[kind]
-                    adapters = {kind: adapter_type(opener)}
+                    adapters = {kind: adapter_type(
+                        public_resolver,
+                        connection_factory,
+                    )}
                 result = alert_delivery.dispatch_task(
                     config,
                     task,
@@ -1011,11 +1344,15 @@ class AlertDeliveryTests(unittest.TestCase):
                     )
                     self.assertFalse(smtp_client.quit_called)
                 else:
-                    request = opener.requests[0][0]
-                    self.assertEqual(request.get_header("Idempotency-key"), task.delivery_key)
+                    request = connection_factory.connections[0].requests[0]
+                    self.assertEqual(request[3]["Idempotency-Key"], task.delivery_key)
+                    self.assertEqual(
+                        request[3]["Host"],
+                        connection_factory.calls[0][0].authority,
+                    )
                     self.assertIn(
                         b'"test":true' if kind == "webhook" else b"TEST",
-                        request.data,
+                        request[2],
                     )
                 self.assertNotIn(secrets_by_kind[kind].encode(), outbox.path.read_bytes())
 

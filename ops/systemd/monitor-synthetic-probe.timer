@@ -1,0 +1,13 @@
+[Unit]
+Description=Run Monitor synthetic probes every five minutes
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=5min
+AccuracySec=10s
+RandomizedDelaySec=5s
+Persistent=true
+Unit=monitor-synthetic-probe.service
+
+[Install]
+WantedBy=timers.target

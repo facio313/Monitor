@@ -25,6 +25,15 @@ def _parser() -> argparse.ArgumentParser:
     )
     commands.add_parser("run-once", help="attempt due enrollment, heartbeat, and ingest work")
     commands.add_parser("status", help="print reduced local transport state")
+    commands.add_parser(
+        "quarantine-list",
+        help="print reduced metadata for permanently rejected batches",
+    )
+    purge = commands.add_parser(
+        "quarantine-purge",
+        help="explicitly abandon one inspected permanently rejected batch",
+    )
+    purge.add_argument("batch_id", help="canonical rejected batch UUID")
     commands.add_parser("enqueue", help="read a JSON array of reduced records from standard input")
     return parser
 
@@ -70,6 +79,17 @@ def main(argv: list[str] | None = None) -> int:
         if arguments.command == "status":
             print(json.dumps(transport.status(), separators=(",", ":"), sort_keys=True))
             return 0
+        if arguments.command == "quarantine-list":
+            print(json.dumps(transport.list_quarantine(), separators=(",", ":"), sort_keys=True))
+            return 0
+        if arguments.command == "quarantine-purge":
+            purged = transport.purge_quarantine(arguments.batch_id)
+            print(json.dumps(
+                {"batchId": arguments.batch_id, "purged": purged},
+                separators=(",", ":"),
+                sort_keys=True,
+            ))
+            return 0 if purged else 1
         raise AssertionError("unreachable command")
     except (ConfigError, StorageError, AgentTransportError) as error:
         # Error messages never include tokens, request/response bodies, certificate data, or telemetry.

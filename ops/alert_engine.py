@@ -53,9 +53,13 @@ class AlertRule:
     threshold: float
     recovery_threshold: float
     severity: str
+    evaluation_interval_seconds: int
+    for_seconds: int
     for_samples: int
+    recovery_seconds: int
     recovery_samples: int
     no_data_policy: str
+    no_data_seconds: int
     no_data_samples: int
     parent_rule_id: str | None
     labels: tuple[tuple[str, str], ...]
@@ -166,7 +170,9 @@ def parse_rule_pack(value: Any) -> RulePack:
 
     expected = frozenset({
         "id", "metric", "operator", "threshold", "recoveryThreshold", "severity",
-        "forSamples", "recoverySamples", "noDataPolicy", "noDataSamples",
+        "evaluationIntervalSeconds", "forSeconds", "forSamples",
+        "recoverySeconds", "recoverySamples", "noDataPolicy",
+        "noDataSeconds", "noDataSamples",
         "parentRuleId", "labels", "description", "runbook", "enabled",
     })
     rules: list[AlertRule] = []
@@ -211,9 +217,20 @@ def parse_rule_pack(value: Any) -> RulePack:
             threshold=threshold,
             recovery_threshold=recovery_threshold,
             severity=severity,
+            evaluation_interval_seconds=_bounded_count(
+                raw["evaluationIntervalSeconds"],
+                f"{field}.evaluationIntervalSeconds", 1, 86_400,
+            ),
+            for_seconds=_bounded_count(raw["forSeconds"], f"{field}.forSeconds", 0, 31_622_400),
             for_samples=_bounded_count(raw["forSamples"], f"{field}.forSamples"),
+            recovery_seconds=_bounded_count(
+                raw["recoverySeconds"], f"{field}.recoverySeconds", 0, 31_622_400,
+            ),
             recovery_samples=_bounded_count(raw["recoverySamples"], f"{field}.recoverySamples"),
             no_data_policy=no_data_policy,
+            no_data_seconds=_bounded_count(
+                raw["noDataSeconds"], f"{field}.noDataSeconds", 0, 31_622_400,
+            ),
             no_data_samples=_bounded_count(raw["noDataSamples"], f"{field}.noDataSamples"),
             parent_rule_id=parent,
             labels=_labels(raw["labels"], f"{field}.labels"),
@@ -286,13 +303,22 @@ def _prior_state(value: Any) -> dict[str, Any]:
     for key in ("breachSamples", "recoverySamples", "missingSamples"):
         item = value.get(key)
         result[key] = item if isinstance(item, int) and not isinstance(item, bool) and 0 <= item <= 10_000 else 0
-    for key in ("openedAt", "changedAt"):
+    for key in (
+        "openedAt", "changedAt", "conditionStartedAt",
+        "recoveryStartedAt", "missingStartedAt",
+    ):
         item = value.get(key)
         result[key] = item if isinstance(item, str) and STATE_TIMESTAMP.fullmatch(item) else None
     last_evaluated = value.get("lastEvaluatedAt")
     result["lastEvaluatedAt"] = (
         last_evaluated
         if isinstance(last_evaluated, str) and STATE_TIMESTAMP.fullmatch(last_evaluated)
+        else None
+    )
+    interval = value.get("evaluationIntervalSeconds")
+    result["evaluationIntervalSeconds"] = (
+        interval
+        if isinstance(interval, int) and not isinstance(interval, bool) and 1 <= interval <= 86_400
         else None
     )
     return result
@@ -305,6 +331,16 @@ def _parsed_state_timestamp(value: Any) -> dt.datetime | None:
         return dt.datetime.fromisoformat(value[:-1] + "+00:00")
     except ValueError:
         return None
+
+
+def _elapsed_at_least(started_at: Any, now: dt.datetime, seconds: int) -> bool:
+    if seconds == 0:
+        return True
+    started = _parsed_state_timestamp(started_at)
+    if started is None:
+        return False
+    elapsed = (now - started).total_seconds()
+    return 0 <= elapsed <= 366 * 86400 and elapsed >= seconds
 
 
 def evaluate_observation(
@@ -329,12 +365,19 @@ def evaluate_observation(
     previous_evaluated_at = _parsed_state_timestamp(previous_state.get("lastEvaluatedAt"))
     normalized_now = now if now.tzinfo is not None else now.replace(tzinfo=dt.timezone.utc)
     normalized_now = normalized_now.astimezone(dt.timezone.utc)
+    prior_interval = previous_state.get("evaluationIntervalSeconds")
+    interval_changed = prior_interval is not None and prior_interval != rule.evaluation_interval_seconds
     if previous_evaluated_at is not None:
         gap_seconds = (normalized_now - previous_evaluated_at).total_seconds()
-        if gap_seconds < 0 or gap_seconds > MAX_CONTINUOUS_EVALUATION_GAP_SECONDS:
+        maximum_gap = max(
+            MAX_CONTINUOUS_EVALUATION_GAP_SECONDS,
+            int(math.ceil(rule.evaluation_interval_seconds * 1.5)),
+        )
+        if gap_seconds < 0 or gap_seconds > maximum_gap or interval_changed:
             if previous_phase in {"firing", "recovering"}:
                 previous_state["phase"] = "firing"
                 previous_state["recoverySamples"] = 0
+                previous_state["recoveryStartedAt"] = None
             else:
                 previous_state = {}
             previous_phase = previous_state.get("phase", "inactive")
@@ -342,14 +385,22 @@ def evaluate_observation(
     recovery_samples = previous_state.get("recoverySamples", 0)
     missing_samples = previous_state.get("missingSamples", 0)
     opened_at = previous_state.get("openedAt")
+    condition_started_at = previous_state.get("conditionStartedAt")
+    recovery_started_at = previous_state.get("recoveryStartedAt")
+    missing_started_at = previous_state.get("missingStartedAt")
     phase = previous_phase
+    now_text = _timestamp(normalized_now)
 
     if not rule.enabled:
         phase = "inactive"
         breach_samples = recovery_samples = missing_samples = 0
         opened_at = None
+        condition_started_at = recovery_started_at = missing_started_at = None
     elif observation.status in {"unsupported", "permission_denied", "collection_error"}:
         missing_samples = min(10_000, missing_samples + 1)
+        missing_started_at = missing_started_at or now_text
+        condition_started_at = None
+        recovery_started_at = None
         if previous_phase in {"firing", "recovering"}:
             # Loss of observability is not evidence that an active condition
             # recovered. Preserve the incident identity and require a valid
@@ -362,13 +413,20 @@ def evaluate_observation(
             opened_at = None
     elif observation.status in {"no_data", "stale"} or observation.value is None:
         missing_samples = min(10_000, missing_samples + 1)
+        missing_started_at = missing_started_at or now_text
+        condition_started_at = None
+        recovery_started_at = None
         if previous_phase in {"firing", "recovering"}:
             phase = "firing"
             recovery_samples = 0
-        elif rule.no_data_policy == "alert" and missing_samples >= rule.no_data_samples:
+        elif (
+            rule.no_data_policy == "alert"
+            and missing_samples >= rule.no_data_samples
+            and _elapsed_at_least(missing_started_at, normalized_now, rule.no_data_seconds)
+        ):
             breach_samples = recovery_samples = 0
             if previous_phase != "firing":
-                opened_at = opened_at or previous_state.get("changedAt") or _timestamp(now)
+                opened_at = opened_at or missing_started_at or now_text
             phase = "firing"
         else:
             breach_samples = recovery_samples = 0
@@ -379,28 +437,48 @@ def evaluate_observation(
         if not math.isfinite(value):
             raise ValueError("observation value must be finite")
         missing_samples = 0
+        missing_started_at = None
         if previous_phase in {"firing", "recovering"}:
             if _recovered(rule, value):
+                recovery_started_at = recovery_started_at or now_text
                 recovery_samples = min(rule.recovery_samples, recovery_samples + 1)
-                phase = "inactive" if recovery_samples >= rule.recovery_samples else "recovering"
+                phase = (
+                    "inactive"
+                    if recovery_samples >= rule.recovery_samples
+                    and _elapsed_at_least(
+                        recovery_started_at, normalized_now, rule.recovery_seconds
+                    )
+                    else "recovering"
+                )
                 if phase == "inactive":
                     opened_at = None
                     breach_samples = 0
+                    condition_started_at = None
+                    recovery_started_at = None
             else:
                 phase = "firing"
                 recovery_samples = 0
+                recovery_started_at = None
         elif _condition(rule.operator, value, rule.threshold):
+            condition_started_at = condition_started_at or now_text
             breach_samples = min(rule.for_samples, breach_samples + 1)
             recovery_samples = 0
-            if breach_samples >= rule.for_samples:
+            recovery_started_at = None
+            if (
+                breach_samples >= rule.for_samples
+                and _elapsed_at_least(
+                    condition_started_at, normalized_now, rule.for_seconds
+                )
+            ):
                 phase = "firing"
-                opened_at = opened_at or previous_state.get("changedAt") or _timestamp(now)
+                opened_at = opened_at or condition_started_at or now_text
             else:
                 phase = "pending"
         else:
             phase = "inactive"
             breach_samples = recovery_samples = 0
             opened_at = None
+            condition_started_at = recovery_started_at = None
 
     transition: str | None = None
     if phase != previous_phase:
@@ -411,13 +489,16 @@ def evaluate_observation(
         else:
             transition = phase
 
-    now_text = _timestamp(now)
     state = {
         "phase": phase,
         "breachSamples": breach_samples,
         "recoverySamples": recovery_samples,
         "missingSamples": missing_samples,
         "openedAt": opened_at,
+        "conditionStartedAt": condition_started_at,
+        "recoveryStartedAt": recovery_started_at,
+        "missingStartedAt": missing_started_at,
+        "evaluationIntervalSeconds": rule.evaluation_interval_seconds,
         "changedAt": now_text if phase != previous_phase else previous_state.get("changedAt") or now_text,
         "lastEvaluatedAt": now_text,
         "lastValue": observation.value if observation.status == "ok" else None,
@@ -442,6 +523,101 @@ def _silenced(rule: AlertRule, observation: Observation, silence: Silence, now: 
         return False
     labels = dict(rule.labels) | dict(observation.labels)
     return all(labels.get(key) == value for key, value in silence_labels)
+
+
+def _notification_state(
+    rule: AlertRule,
+    observation: Observation,
+    states: Mapping[str, Mapping[str, Any]],
+    now: dt.datetime,
+    silences: Sequence[Silence],
+) -> str:
+    observation_labels = dict(_runtime_labels(observation.labels, "observation"))
+    parent_target = observation_labels.get("parent_target", observation.target)
+    parent_key = f"{rule.parent_rule_id}:{parent_target}" if rule.parent_rule_id else None
+    if parent_key and states.get(parent_key, {}).get("phase") in {"firing", "recovering"}:
+        return "suppressed"
+    if any(_silenced(rule, observation, silence, now) for silence in silences):
+        return "silenced"
+    return "ready"
+
+
+def release_notification_events(
+    pack: RulePack,
+    states: Mapping[str, Mapping[str, Any]],
+    now: dt.datetime,
+    silences: Sequence[Silence] = (),
+) -> list[dict[str, Any]]:
+    """Release active incidents whose original firing event was muted.
+
+    The persistence layer attaches private ``notificationState`` and
+    ``notificationLabels`` fields to active states.  A prior ``ready`` authority
+    is irrevocable: adding a silence later cannot rewrite or cancel an event
+    that may already be queued or delivered.  Conversely, a suppressed or
+    silenced incident receives one deterministic ready event when it is no
+    longer muted.
+    """
+
+    normalized_now = now if now.tzinfo is not None else now.replace(tzinfo=dt.timezone.utc)
+    normalized_now = normalized_now.astimezone(dt.timezone.utc)
+    rules_by_id = {rule.rule_id: rule for rule in pack.rules}
+
+    released: list[dict[str, Any]] = []
+    for state_key in sorted(states):
+        state = states[state_key]
+        if not isinstance(state, Mapping) or state.get("phase") != "firing":
+            continue
+        rule_id, separator, target = state_key.partition(":")
+        opened_at = state.get("openedAt")
+        rule = rules_by_id.get(rule_id)
+        notification_state = state.get("notificationState")
+        labels = state.get("notificationLabels")
+        if (
+            separator != ":"
+            or rule is None
+            or TARGET_ID.fullmatch(target) is None
+            or not isinstance(opened_at, str)
+            or STATE_TIMESTAMP.fullmatch(opened_at) is None
+            or notification_state not in {"suppressed", "silenced"}
+            or not isinstance(labels, Mapping)
+        ):
+            continue
+        normalized_labels = _runtime_labels(
+            tuple(labels.items()), "notification lifecycle",
+        )
+        observation_status = state.get("observationStatus")
+        if observation_status not in OBSERVATION_STATUSES:
+            raise ValueError("active alert observation status is invalid")
+        observation = Observation(
+            target=target,
+            value=state.get("lastValue"),
+            status=observation_status,
+            labels=normalized_labels,
+        )
+        if _notification_state(rule, observation, states, normalized_now, silences) != "ready":
+            continue
+        identity = (
+            f"{pack.version}\0{rule.rule_id}\0{target}\0{opened_at}"
+            "\0firing\0notification-ready"
+        )
+        released.append({
+            "schemaVersion": 1,
+            "rulePackVersion": pack.version,
+            "idempotencyKey": hashlib.sha256(identity.encode("utf-8")).hexdigest(),
+            "ruleId": rule.rule_id,
+            "target": target,
+            "transition": "firing",
+            "severity": rule.severity,
+            "notificationState": "ready",
+            "observedAt": state.get("lastEvaluatedAt") or _timestamp(normalized_now),
+            "openedAt": opened_at,
+            "value": state.get("lastValue"),
+            "status": observation_status,
+            "labels": dict(normalized_labels),
+            "description": rule.description,
+            "runbook": rule.runbook,
+        })
+    return released
 
 
 def evaluate_rule_pack(
@@ -501,16 +677,14 @@ def evaluate_rule_pack(
         states[state_key] = state
 
     events: list[dict[str, Any]] = []
+    normalized_now = now if now.tzinfo is not None else now.replace(tzinfo=dt.timezone.utc)
+    normalized_now = normalized_now.astimezone(dt.timezone.utc)
     for rule, observation, transition, state in pending_events:
         observation_labels = dict(_runtime_labels(observation.labels, "observation"))
         labels = dict(rule.labels) | observation_labels
-        notification_state = "ready"
-        parent_target = observation_labels.get("parent_target", observation.target)
-        parent_key = f"{rule.parent_rule_id}:{parent_target}" if rule.parent_rule_id else None
-        if parent_key and states.get(parent_key, {}).get("phase") in {"firing", "recovering"}:
-            notification_state = "suppressed"
-        elif any(_silenced(rule, observation, silence, now) for silence in silences):
-            notification_state = "silenced"
+        notification_state = _notification_state(
+            rule, observation, states, normalized_now, silences,
+        )
         state_key = f"{rule.rule_id}:{observation.target}"
         prior_opened_at = _prior_state(previous_states.get(state_key)).get("openedAt")
         opened_at = (

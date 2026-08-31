@@ -14,6 +14,7 @@ services:
       NODE_ENV: production
       PORT: "8080"
       MONITOR_DATA_DIR: /data
+      MONITOR_SECURITY_STATE_DIR: /var/lib/monitor-security
       MONITOR_ALLOWED_ORIGINS: ${MONITOR_ALLOWED_ORIGINS:-https://bonifacio.work}
     volumes:
       - type: bind
@@ -26,6 +27,12 @@ services:
         source: /var/lib/monitor-update-socket
         target: /run/monitor-update
         read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${MONITOR_SECURITY_STATE_PATH:-/var/lib/monitor-security}
+        target: /var/lib/monitor-security
+        read_only: false
         bind:
           create_host_path: false
     read_only: true

@@ -1,0 +1,82 @@
+name: External Monitor dead-man check
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: monitor-external-dead-man
+  cancel-in-progress: true
+
+jobs:
+  public-edge:
+    name: Verify public app readiness, TLS, and SSO from outside the host
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    steps:
+      - name: Check out the immutable probe
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22.23.2
+
+      - name: Probe the public Monitor boundary
+        id: probe
+        continue-on-error: true
+        env:
+          MONITOR_PUBLIC_URL: https://bonifacio.work/monitor/
+          MONITOR_PROBE_ATTEMPTS: "3"
+          MONITOR_PROBE_TIMEOUT_MS: "12000"
+        run: node scripts/check-public-monitor.mjs
+
+      - name: Persist one external incident while the boundary is unavailable
+        if: steps.probe.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          title='[dead-man] Monitor public boundary unavailable'
+          issue_number=$(gh issue list \
+            --repo "$GITHUB_REPOSITORY" \
+            --state open \
+            --limit 100 \
+            --search '"[dead-man] Monitor public boundary unavailable" in:title' \
+            --json number,title \
+            --jq 'map(select(.title == "[dead-man] Monitor public boundary unavailable")) | first | .number // empty')
+          if [ -z "$issue_number" ]; then
+            gh issue create \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$title" \
+              --body "The independent public Monitor probe failed. No response body, credential, or request header is retained. Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          fi
+
+      - name: Close the external incident after recovery
+        if: steps.probe.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          issue_number=$(gh issue list \
+            --repo "$GITHUB_REPOSITORY" \
+            --state open \
+            --limit 100 \
+            --search '"[dead-man] Monitor public boundary unavailable" in:title' \
+            --json number,title \
+            --jq 'map(select(.title == "[dead-man] Monitor public boundary unavailable")) | first | .number // empty')
+          if [ -n "$issue_number" ]; then
+            gh issue comment "$issue_number" \
+              --repo "$GITHUB_REPOSITORY" \
+              --body "The independent public readiness and SSO boundary probe recovered. Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            gh issue close "$issue_number" --repo "$GITHUB_REPOSITORY"
+          fi
+
+      - name: Fail the run after incident persistence
+        if: steps.probe.outcome == 'failure'
+        run: exit 1

@@ -94,7 +94,7 @@ flowchart LR
 1. Docker socket은 `User=cks` one-shot exporter만 보고 root collector와 web container는 보지 않는다(`ops/systemd/monitor-container-exporter.service:16-46`).
 2. root collector는 protected logs를 읽지만 host write는 export/runtime 경로로 제한된다(`ops/systemd/monitor-collector.service:20-57`).
 3. web container는 telemetry를 read-only로 받고 capability를 모두 drop한다(`docker-compose.yml:18-40`). update Unix socket은 의도된 유일한 host mutation capability다.
-4. SSO header는 edge secret이 일치할 때만 신뢰한다(`server/sso.ts:120-136`). 이 저장소 밖 Nginx가 client-supplied headers를 제거해야 전체 경계가 성립한다.
+4. Express의 ambient proxy trust는 꺼져 있다. SSO/API 전달 IP는 SSO edge secret이 일치한 뒤에만 신뢰하고, bearer는 IP 기반 rate limit/auth보다 먼저 이 검사를 통과한다(`server/sso.ts`, `server/app.ts`). local/direct 요청과 agent mTLS 요청의 source metadata는 socket peer만 사용하므로 `X-Forwarded-For`를 회전해 제한·감사·agent inventory를 위조할 수 없다.
 5. raw Docker metadata와 raw log line은 export 전에 fixed label/semantic event로 축약된다.
 6. raw `/etc/machine-id`, 그 private SHA-256 binding, raw Linux boot UUID는 API에
    전달되지 않는다. 공개 identity는 random UUIDv4 두 개, binding status와 별도

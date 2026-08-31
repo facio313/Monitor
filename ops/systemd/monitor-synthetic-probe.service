@@ -1,0 +1,58 @@
+[Unit]
+Description=SSRF-safe HTTP and TLS synthetic probes for Monitor
+Documentation=file:/usr/local/share/doc/monitor-collector/synthetic-probes.md
+Wants=network-online.target
+After=network-online.target local-fs.target
+
+[Service]
+Type=oneshot
+User=cks
+Group=cks
+Environment=HTTP_PROXY=
+Environment=HTTPS_PROXY=
+Environment=ALL_PROXY=
+Environment=NO_PROXY=
+Environment=http_proxy=
+Environment=https_proxy=
+Environment=all_proxy=
+Environment=no_proxy=
+ExecStart=/usr/bin/python3 /usr/local/lib/monitor-collector/synthetic_probe.py --config /etc/monitor-synthetic-probe/probes.json --output /var/lib/monitor-synthetic/results.json
+StateDirectory=monitor-synthetic
+StateDirectoryMode=0750
+UMask=0027
+
+# No privileged source, socket, proxy, or local service control path is needed.
+# DNS and direct outbound TCP/TLS are the only intended network capabilities.
+ProtectSystem=strict
+ProtectHome=true
+InaccessiblePaths=/home /root /run/user
+PrivateTmp=true
+PrivateDevices=true
+NoNewPrivileges=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+ReadOnlyPaths=/etc/monitor-synthetic-probe/probes.json /etc/ssl/certs /etc/resolv.conf /etc/hosts
+ReadWritePaths=/var/lib/monitor-synthetic
+MemoryHigh=64M
+MemoryMax=80M
+TasksMax=16
+TimeoutStartSec=40s
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+
+[Install]
+WantedBy=multi-user.target

@@ -136,19 +136,42 @@ MAX_CONTAINER_CPU_PERCENT = 1024.0
 MAX_CONTAINER_CPU_LIMIT_CORES = 1024.0
 MAX_CONTAINER_MEMORY_LIMIT_BYTES = MAX_SAFE_COUNTER
 MAX_CONTAINER_PID_LIMIT = MAX_SAFE_COUNTER
+MAX_CONTAINER_IO_BYTES = MAX_SAFE_COUNTER
+MAX_CONTAINER_IO_RATE = 1_000_000_000_000_000.0
+MAX_CONTAINER_MOUNT_COUNT = 4_096
+MAX_CONTAINER_PORT_COUNT = 65_536
+MAX_CONTAINER_CAPABILITY_COUNT = 64
 MAX_DOCKER_LIST_RESPONSE_BYTES = 1 * 1024 * 1024
 MAX_DOCKER_DETAIL_RESPONSE_BYTES = 256 * 1024
+MAX_DOCKER_EVENT_RESPONSE_BYTES = 1 * 1024 * 1024
 MAX_DOCKER_INSPECT_REQUESTS = 30
 MAX_DOCKER_STATS_REQUESTS = 30
 MAX_DOCKER_DETAIL_WORKERS = 6
 MAX_DOCKER_COLLECTION_SECONDS = 20.0
+MAX_DOCKER_EVENTS = 128
+MAX_DOCKER_EVENT_LINES = 512
+MAX_DOCKER_EVENT_LINE_BYTES = 16 * 1024
+MAX_DOCKER_EVENT_REPLAY_SECONDS = 10 * 60
 LEGACY_CONTAINER_FIELDS = (
     "name", "owner", "state", "health", "cpuPercent", "memoryBytes", "memoryPercent",
 )
-CONTAINER_FIELDS = (
+CONTAINER_V2_FIELDS = (
     "name", "project", "owner", "state", "health", "healthcheckConfigured",
     "cpuPercent", "memoryBytes", "memoryPercent", "memoryLimitBytes", "cpuLimitCores",
     "pidLimit", "restartCount", "restartCountDelta", "oomKilled", "startedAt", "finishedAt",
+)
+CONTAINER_FIELDS = CONTAINER_V2_FIELDS + (
+    "instanceId", "pidCount", "cpuThrottledPercent", "cpuThrottledPeriods",
+    "cpuThrottledSeconds", "blockReadBytes", "blockWriteBytes",
+    "blockReadBytesPerSecond", "blockWriteBytesPerSecond", "networkRxBytes",
+    "networkTxBytes", "networkRxBytesPerSecond", "networkTxBytesPerSecond",
+    "networkErrors", "networkErrorsPerSecond", "writableLayerBytes", "volumeCount",
+    "bindMountCount", "tmpfsMountCount", "networkAttachmentCount", "publishedPortCount",
+    "privileged", "hostPid", "hostIpc", "hostNetwork", "dockerSocketMounted",
+    "sensitiveBindMounted", "rootUser", "readOnlyRootFilesystem", "addedCapabilityCount",
+    "dangerousCapabilityCount", "excessiveCapabilities", "imageName", "imageTag",
+    "imageDigest", "imageDigestSource", "usesLatestTag", "imageDigestDrift",
+    "imageDigestChanged",
 )
 CONTAINER_STATES = frozenset({
     "created", "running", "paused", "restarting", "removing", "exited", "dead", "unknown",
@@ -173,9 +196,36 @@ MAX_PENDING_RELIABILITY_COMMIT_BYTES = 8 * 1024 * 1024
 MAX_SANITIZED_LOG_RECORD_BYTES = 4096
 MAX_CONTAINER_INPUT_BYTES = 1 * 1024 * 1024
 MAX_CONTAINER_INPUT_AGE_SECONDS = 180
+MAX_SYNTHETIC_INPUT_BYTES = 256 * 1024
+MAX_SYNTHETIC_INPUT_AGE_SECONDS = 10 * 60
+MAX_SYNTHETIC_PROBES = 32
+SYNTHETIC_PROBE_STATUSES = frozenset({
+    "ok", "dns", "permission", "timeout", "tls", "http", "invalid", "unsupported",
+})
+SYNTHETIC_PROBE_FIELDS = (
+    "schemaVersion", "id", "status", "checkedAt", "url", "httpStatus",
+    "redirectCount", "latencyMilliseconds", "certificateExpiresAt",
+    "certificateDaysRemaining",
+)
 CONTAINER_COLLECTION_STATUSES = frozenset({
     "fresh", "last-known", "unavailable", "permission-denied",
 })
+DOCKER_EVENT_COLLECTION_STATUSES = frozenset({
+    "fresh", "gap", "unavailable", "permission-denied",
+})
+DOCKER_EVENT_ACTIONS = frozenset({
+    "create", "start", "stop", "die", "kill", "pause", "unpause", "restart",
+    "oom", "health_status", "destroy",
+})
+DOCKER_EVENT_HEALTH_STATES = frozenset({"healthy", "unhealthy", "starting"})
+DOCKER_EVENT_FIELDS = (
+    "id", "occurredAt", "action", "containerName", "project", "instanceId",
+    "exitCode", "healthStatus",
+)
+DOCKER_EVENT_COLLECTION_FIELDS = (
+    "status", "observedAt", "cursorAt", "reconnectCount", "gapCount", "gapDetected",
+    "logCollectionStatus",
+)
 ALLOWED_COMPOSE_SERVICES = {
     ("bonifacio", "bonifacio"): "bonifacio",
     ("bonifacio", "bonifacioSso"): "sso",
@@ -227,6 +277,11 @@ LEGACY_CONTAINER_NAMES = (
 )
 SAFE_CONTAINER_NAMES = CURRENT_CONTAINER_NAMES | LEGACY_CONTAINER_NAMES
 _monotonic = time.monotonic
+# Keep the interval clock independently patchable. Replacing
+# ``time.monotonic`` on the shared stdlib module also changes subprocess and
+# other imported modules, which can make deterministic collector fixtures
+# consume the sample clock unexpectedly.
+_sample_monotonic = time.monotonic
 VIRTUAL_FILESYSTEMS = {
     "autofs", "bpf", "cgroup", "cgroup2", "configfs", "debugfs", "devpts",
     "devtmpfs", "efivarfs", "fusectl", "hugetlbfs", "mqueue", "nsfs",
@@ -1863,7 +1918,9 @@ def compose_project_list_path(project: str) -> str:
         {"label": [f"com.docker.compose.project={project}"]},
         separators=(",", ":"),
     )
-    return "/v1.41/containers/json?" + urllib.parse.urlencode({"all": "1", "filters": filters})
+    return "/v1.41/containers/json?" + urllib.parse.urlencode({
+        "all": "1", "size": "1", "filters": filters,
+    })
 
 
 def safe_container_name(raw: Mapping[str, Any], expected_project: str | None = None) -> str | None:
@@ -1917,7 +1974,7 @@ def validated_container_inspect(
 
 
 def reduce_container_inspect(value: Mapping[str, Any]) -> dict[str, Any]:
-    """Discard inspect secrets immediately, retaining only fixed lifecycle inputs."""
+    """Discard inspect secrets immediately, retaining only fixed reduced inputs."""
     reduced: dict[str, Any] = {}
     restart_count = value.get("RestartCount")
     reduced["RestartCount"] = (
@@ -1979,26 +2036,82 @@ def reduce_container_inspect(value: Mapping[str, Any]) -> dict[str, Any]:
                 config["Healthcheck"] = {"Test": ["INVALID"]}
         else:
             config["Healthcheck"] = "INVALID"
+    raw_user = raw_config.get("User")
+    if isinstance(raw_user, str) and len(raw_user) <= 128 and "\x00" not in raw_user:
+        # Docker accepts user[:group]. The group does not change effective UID,
+        # so root:staff and 0:1000 must both remain root-user evidence.
+        config["RootUser"] = raw_user == "" or raw_user.split(":", 1)[0] in {"root", "0"}
+    else:
+        config["RootUser"] = None
+    raw_image = raw_config.get("Image")
+    config["Image"] = (
+        raw_image
+        if isinstance(raw_image, str)
+        and 1 <= len(raw_image) <= 255
+        and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/:@-]{0,254}", raw_image)
+        and (
+            "@" not in raw_image
+            or (
+                raw_image.count("@") == 1
+                and re.fullmatch(r"sha256:[a-fA-F0-9]{64}", raw_image.rsplit("@", 1)[1])
+                is not None
+            )
+        )
+        else None
+    )
     reduced["Config"] = config
 
     raw_host = value.get("HostConfig") if isinstance(value.get("HostConfig"), Mapping) else None
     if raw_host is not None:
         host: dict[str, Any] = {}
-        for field_name in ("Memory", "NanoCpus", "CpuQuota", "CpuPeriod", "PidsLimit"):
+        for field_name in (
+            "Memory", "NanoCpus", "CpuQuota", "CpuPeriod", "PidsLimit", "Privileged",
+            "PidMode", "IpcMode", "NetworkMode", "ReadonlyRootfs", "CapAdd",
+        ):
             if field_name not in raw_host:
                 continue
             candidate = raw_host.get(field_name)
-            host[field_name] = (
-                candidate
-                if candidate is None or isinstance(candidate, (int, bool))
-                else True
-            )
+            if field_name in {"PidMode", "IpcMode", "NetworkMode"}:
+                host[field_name] = candidate if isinstance(candidate, str) and len(candidate) <= 64 else None
+            elif field_name == "CapAdd":
+                host[field_name] = (
+                    candidate[:MAX_CONTAINER_CAPABILITY_COUNT + 1]
+                    if isinstance(candidate, list)
+                    and all(isinstance(item, str) and len(item) <= 64 for item in candidate[:MAX_CONTAINER_CAPABILITY_COUNT + 1])
+                    else None
+                )
+            else:
+                host[field_name] = (
+                    candidate
+                    if candidate is None or isinstance(candidate, (int, bool))
+                    else None
+                )
         reduced["HostConfig"] = host
+
+    reduced["MountSummary"] = _reduce_mount_summary(value.get("Mounts"))
+
+    raw_network = value.get("NetworkSettings") if isinstance(value.get("NetworkSettings"), Mapping) else {}
+    networks = raw_network.get("Networks")
+    ports = raw_network.get("Ports")
+    reduced["NetworkSettings"] = {
+        "NetworkCount": (
+            min(len(networks), MAX_CONTAINER_MOUNT_COUNT)
+            if isinstance(networks, Mapping) else None
+        ),
+        "PublishedPortCount": _published_port_count(ports),
+    }
+    raw_image_id = value.get("Image")
+    reduced["Image"] = (
+        raw_image_id.lower()
+        if isinstance(raw_image_id, str)
+        and re.fullmatch(r"sha256:[a-fA-F0-9]{64}", raw_image_id)
+        else None
+    )
     return reduced
 
 
 def reduce_container_stats(value: Mapping[str, Any]) -> dict[str, Any]:
-    """Discard all stats fields except validated CPU counters and memory usage."""
+    """Discard raw stats after reducing fixed aggregate counters."""
     reduced: dict[str, Any] = {}
     cpu_state = docker_cpu_state(value)
     if cpu_state is not None:
@@ -2007,12 +2120,152 @@ def reduce_container_stats(value: Mapping[str, Any]) -> dict[str, Any]:
             "system_cpu_usage": cpu_state["systemTotal"],
             "online_cpus": cpu_state["onlineCpus"],
         }
+        raw_cpu = value.get("cpu_stats") if isinstance(value.get("cpu_stats"), Mapping) else {}
+        throttling = raw_cpu.get("throttling_data") if isinstance(raw_cpu.get("throttling_data"), Mapping) else {}
+        periods = bounded_integer(throttling.get("periods"), 0, MAX_SAFE_COUNTER)
+        throttled_periods = bounded_integer(throttling.get("throttled_periods"), 0, MAX_SAFE_COUNTER)
+        throttled_time = bounded_integer(throttling.get("throttled_time"), 0, MAX_SAFE_COUNTER)
+        reduced["cpu_stats"]["throttling_data"] = {
+            "periods": periods,
+            "throttled_periods": throttled_periods,
+            "throttled_time": throttled_time,
+        }
     raw_memory = value.get("memory_stats") if isinstance(value.get("memory_stats"), Mapping) else {}
     usage = bounded_integer(raw_memory.get("usage"), 0, MAX_CONTAINER_MEMORY_LIMIT_BYTES)
     limit = bounded_integer(raw_memory.get("limit"), 0, MAX_CONTAINER_MEMORY_LIMIT_BYTES)
     if usage is not None or limit is not None:
         reduced["memory_stats"] = {"usage": usage, "limit": limit}
+    raw_pids = value.get("pids_stats") if isinstance(value.get("pids_stats"), Mapping) else {}
+    reduced["pids_stats"] = {
+        "current": bounded_integer(raw_pids.get("current"), 0, MAX_CONTAINER_PID_LIMIT),
+    }
+    raw_blkio = value.get("blkio_stats") if isinstance(value.get("blkio_stats"), Mapping) else {}
+    raw_io = raw_blkio.get("io_service_bytes_recursive")
+    if raw_io is None:
+        raw_io = raw_blkio.get("io_service_bytes")
+    read_bytes, write_bytes = _reduce_block_io_bytes(raw_io)
+    reduced["blkio_stats"] = {"readBytes": read_bytes, "writeBytes": write_bytes}
+    network_totals = _reduce_network_totals(value.get("networks"))
+    reduced["networks"] = network_totals
+    raw_read = value.get("read")
+    reduced["read"] = raw_read if isinstance(raw_read, str) and len(raw_read) <= 64 else None
     return reduced
+
+
+def _published_port_count(value: Any) -> int | None:
+    if not isinstance(value, Mapping):
+        return None
+    total = 0
+    for bindings in list(value.values())[:MAX_CONTAINER_PORT_COUNT + 1]:
+        if bindings is None:
+            continue
+        if not isinstance(bindings, list):
+            return None
+        total += len(bindings)
+        if total > MAX_CONTAINER_PORT_COUNT:
+            return MAX_CONTAINER_PORT_COUNT
+    return total
+
+
+def _reduce_mount_summary(value: Any) -> dict[str, int | bool | None]:
+    result: dict[str, int | bool | None] = {
+        "volumeCount": None,
+        "bindMountCount": None,
+        "tmpfsMountCount": None,
+        "dockerSocketMounted": None,
+        "sensitiveBindMounted": None,
+    }
+    if not isinstance(value, list) or len(value) > MAX_CONTAINER_MOUNT_COUNT:
+        return result
+    counts = {"volume": 0, "bind": 0, "tmpfs": 0}
+    docker_socket = False
+    sensitive_bind = False
+    sensitive_roots = ("/", "/boot", "/dev", "/etc", "/home", "/proc", "/root", "/run", "/sys")
+
+    def normalized_path(candidate: Any) -> str | None:
+        if (
+            not isinstance(candidate, str)
+            or not candidate.startswith("/")
+            or len(candidate) > 4096
+            or "\x00" in candidate
+        ):
+            return None
+        return os.path.normpath(candidate)
+
+    for raw_mount in value:
+        if not isinstance(raw_mount, Mapping):
+            return result
+        mount_type = raw_mount.get("Type")
+        if mount_type not in counts:
+            continue
+        counts[mount_type] += 1
+        source = normalized_path(raw_mount.get("Source"))
+        destination = normalized_path(raw_mount.get("Destination"))
+        if any(
+            path is not None and (path.endswith("/docker.sock") or path == "/var/run/docker.sock")
+            for path in (source, destination)
+        ):
+            docker_socket = True
+        if mount_type == "bind":
+            for path in (source, destination):
+                if path is None:
+                    continue
+                if path == "/" or any(path == root or path.startswith(root + "/") for root in sensitive_roots[1:]):
+                    sensitive_bind = True
+                    break
+    return {
+        "volumeCount": counts["volume"],
+        "bindMountCount": counts["bind"],
+        "tmpfsMountCount": counts["tmpfs"],
+        "dockerSocketMounted": docker_socket,
+        "sensitiveBindMounted": sensitive_bind,
+    }
+
+
+def _reduce_block_io_bytes(value: Any) -> tuple[int | None, int | None]:
+    if not isinstance(value, list) or len(value) > 4096:
+        return None, None
+    totals = {"read": 0, "write": 0}
+    observed: set[str] = set()
+    for row in value:
+        if not isinstance(row, Mapping):
+            return None, None
+        operation = row.get("op")
+        amount = bounded_integer(row.get("value"), 0, MAX_CONTAINER_IO_BYTES)
+        if not isinstance(operation, str) or amount is None:
+            continue
+        normalized = operation.lower()
+        if normalized not in totals:
+            continue
+        totals[normalized] += amount
+        if totals[normalized] > MAX_CONTAINER_IO_BYTES:
+            totals[normalized] = MAX_CONTAINER_IO_BYTES
+        observed.add(normalized)
+    return (
+        totals["read"] if "read" in observed else None,
+        totals["write"] if "write" in observed else None,
+    )
+
+
+def _reduce_network_totals(value: Any) -> dict[str, int | None]:
+    fields = ("rx_bytes", "tx_bytes", "rx_errors", "tx_errors")
+    totals = {field: 0 for field in fields}
+    if not isinstance(value, Mapping) or len(value) > 256:
+        return {field: None for field in fields}
+    observed = False
+    for row in value.values():
+        if not isinstance(row, Mapping):
+            return {field: None for field in fields}
+        current: dict[str, int] = {}
+        for field in fields:
+            parsed = bounded_integer(row.get(field), 0, MAX_CONTAINER_IO_BYTES)
+            if parsed is None:
+                return {field: None for field in fields}
+            current[field] = parsed
+        observed = True
+        for field in fields:
+            totals[field] = min(MAX_CONTAINER_IO_BYTES, totals[field] + current[field])
+    return totals if observed else {field: None for field in fields}
 
 
 def bounded_integer(value: Any, minimum: int, maximum: int) -> int | None:
@@ -2127,11 +2380,161 @@ def docker_resource_limits(
     return memory_limit, cpu_limit, pid_limit
 
 
-def normalize_private_container_state(value: Any) -> dict[str, int]:
-    """Admit only bounded CPU and restart counters from the owner-only state file."""
+def opaque_container_instance_id(container_id: Any) -> str | None:
+    if not isinstance(container_id, str) or re.fullmatch(r"[a-fA-F0-9]{12,64}", container_id) is None:
+        return None
+    return hashlib.sha256(
+        b"monitor-container-instance-v1\x00" + container_id.lower().encode("ascii")
+    ).hexdigest()[:32]
+
+
+def docker_image_details(inspect: Mapping[str, Any] | None) -> tuple[
+    str | None, str | None, str | None, str | None, bool | None, str | None,
+]:
+    if not isinstance(inspect, Mapping):
+        return None, None, None, None, None, None
+    config = inspect.get("Config") if isinstance(inspect.get("Config"), Mapping) else {}
+    raw_reference = config.get("Image")
+    raw_image_id = inspect.get("Image")
+    image_id = (
+        raw_image_id.lower()
+        if isinstance(raw_image_id, str)
+        and re.fullmatch(r"sha256:[a-fA-F0-9]{64}", raw_image_id)
+        else None
+    )
+    if (
+        not isinstance(raw_reference, str)
+        or not 1 <= len(raw_reference) <= 255
+        or any(character.isspace() or ord(character) < 0x20 for character in raw_reference)
+        or "://" in raw_reference
+        or any(marker in raw_reference for marker in ("?", "#"))
+    ):
+        return None, None, image_id, "local-image-id" if image_id else None, None, None
+
+    reference = raw_reference
+    pinned_digest: str | None = None
+    tag: str | None = None
+    if "@" in reference:
+        if reference.count("@") != 1:
+            return None, None, image_id, "local-image-id" if image_id else None, None, None
+        reference, candidate_digest = reference.rsplit("@", 1)
+        if re.fullmatch(r"sha256:[a-fA-F0-9]{64}", candidate_digest) is None:
+            return None, None, image_id, "local-image-id" if image_id else None, None, None
+        pinned_digest = candidate_digest.lower()
+    repository = reference
+    final_slash = repository.rfind("/")
+    final_colon = repository.rfind(":")
+    if final_colon > final_slash:
+        tag = repository[final_colon + 1:]
+        repository = repository[:final_colon]
+    elif pinned_digest is None:
+        tag = "latest"
+    if (
+        not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,191}", repository)
+        or repository.startswith("/")
+        or repository.endswith("/")
+        or "//" in repository
+        or (tag is not None and re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}", tag) is None)
+    ):
+        return None, None, image_id, "local-image-id" if image_id else None, None, None
+    digest = pinned_digest or image_id
+    digest_source = "repo-digest" if pinned_digest is not None else "local-image-id" if image_id else None
+    # Mutability is a property of the requested reference, not of whether the
+    # daemon also resolved that reference to a local content digest.
+    uses_latest = tag == "latest"
+    # A pinned digest is part of the requested reference. Include it in the
+    # fingerprint so an intentional pin update is not reported as a mutable
+    # same-reference digest change. Mutable tag references deliberately omit
+    # the resolved local image ID from this fingerprint.
+    fingerprint_suffix = (
+        f"tag:{tag}\x00digest:{pinned_digest}"
+        if pinned_digest is not None
+        else f"tag:{tag}"
+    )
+    reference_fingerprint = hashlib.sha256(
+        (repository + "\x00" + fingerprint_suffix).encode("utf-8")
+    ).hexdigest()
+    return repository, tag, digest, digest_source, uses_latest, reference_fingerprint
+
+
+def docker_security_details(inspect: Mapping[str, Any] | None) -> dict[str, int | bool | None]:
+    result: dict[str, int | bool | None] = {
+        "privileged": None,
+        "hostPid": None,
+        "hostIpc": None,
+        "hostNetwork": None,
+        "dockerSocketMounted": None,
+        "sensitiveBindMounted": None,
+        "rootUser": None,
+        "readOnlyRootFilesystem": None,
+        "addedCapabilityCount": None,
+        "dangerousCapabilityCount": None,
+        "excessiveCapabilities": None,
+    }
+    if not isinstance(inspect, Mapping):
+        return result
+    host = inspect.get("HostConfig") if isinstance(inspect.get("HostConfig"), Mapping) else {}
+    config = inspect.get("Config") if isinstance(inspect.get("Config"), Mapping) else {}
+    mounts = inspect.get("MountSummary") if isinstance(inspect.get("MountSummary"), Mapping) else {}
+    privileged = host.get("Privileged") if isinstance(host.get("Privileged"), bool) else None
+    read_only = host.get("ReadonlyRootfs") if isinstance(host.get("ReadonlyRootfs"), bool) else None
+    pid_mode = host.get("PidMode")
+    ipc_mode = host.get("IpcMode")
+    network_mode = host.get("NetworkMode")
+    root_user = config.get("RootUser") if isinstance(config.get("RootUser"), bool) else None
+    raw_capabilities = host.get("CapAdd")
+    capability_count: int | None = None
+    dangerous_count: int | None = None
+    excessive: bool | None = None
+    if raw_capabilities is None and "CapAdd" in host:
+        capability_count = 0
+        dangerous_count = 0
+        excessive = False
+    elif isinstance(raw_capabilities, list):
+        normalized_capabilities = {
+            candidate.upper().removeprefix("CAP_")
+            for candidate in raw_capabilities[:MAX_CONTAINER_CAPABILITY_COUNT]
+            if isinstance(candidate, str) and re.fullmatch(r"(?:CAP_)?[A-Za-z0-9_]{1,64}", candidate)
+        }
+        dangerous = {
+            "ALL", "SYS_ADMIN", "SYS_MODULE", "SYS_PTRACE", "SYS_RAWIO", "NET_ADMIN",
+            "DAC_READ_SEARCH", "BPF", "PERFMON", "CHECKPOINT_RESTORE",
+        }
+        capability_count = min(len(raw_capabilities), MAX_CONTAINER_CAPABILITY_COUNT)
+        dangerous_count = len(normalized_capabilities & dangerous)
+        excessive = (
+            len(raw_capabilities) > 12
+            or len(raw_capabilities) > MAX_CONTAINER_CAPABILITY_COUNT
+            or dangerous_count > 0
+        )
+    result.update({
+        "privileged": privileged,
+        "hostPid": pid_mode == "host" if isinstance(pid_mode, str) else None,
+        "hostIpc": ipc_mode == "host" if isinstance(ipc_mode, str) else None,
+        "hostNetwork": network_mode == "host" if isinstance(network_mode, str) else None,
+        "dockerSocketMounted": mounts.get("dockerSocketMounted") if isinstance(mounts.get("dockerSocketMounted"), bool) else None,
+        "sensitiveBindMounted": mounts.get("sensitiveBindMounted") if isinstance(mounts.get("sensitiveBindMounted"), bool) else None,
+        "rootUser": root_user,
+        "readOnlyRootFilesystem": read_only,
+        "addedCapabilityCount": capability_count,
+        "dangerousCapabilityCount": dangerous_count,
+        "excessiveCapabilities": excessive,
+    })
+    return result
+
+
+def _container_counter_rate(current: int | None, previous: Any, elapsed: float | None) -> float | None:
+    prior = bounded_integer(previous, 0, MAX_CONTAINER_IO_BYTES)
+    if current is None or prior is None or elapsed is None or elapsed <= 0 or current < prior:
+        return None
+    return round(min(MAX_CONTAINER_IO_RATE, (current - prior) / elapsed), 3)
+
+
+def normalize_private_container_state(value: Any) -> dict[str, int | str]:
+    """Admit only bounded counters and image fingerprints from owner-only state."""
     if not isinstance(value, Mapping):
         return {}
-    result: dict[str, int] = {}
+    result: dict[str, int | str] = {}
     cpu_total = bounded_integer(value.get("cpuTotal"), 0, (1 << 63) - 1)
     system_total = bounded_integer(value.get("systemTotal"), 0, (1 << 63) - 1)
     online_cpus = bounded_integer(value.get("onlineCpus"), 1, 4096)
@@ -2144,13 +2547,100 @@ def normalize_private_container_state(value: Any) -> dict[str, int]:
     restart_count = bounded_integer(value.get("restartCount"), 0, MAX_SAFE_COUNTER)
     if restart_count is not None:
         result["restartCount"] = restart_count
+    for field_name in (
+        "sampleAtUnixMs", "cpuPeriods", "cpuThrottledPeriods", "blockReadBytes",
+        "blockWriteBytes", "networkRxBytes", "networkTxBytes", "networkErrors",
+    ):
+        parsed = bounded_integer(value.get(field_name), 0, MAX_SAFE_COUNTER)
+        if parsed is not None:
+            result[field_name] = parsed
+    image_digest = value.get("imageDigest")
+    if isinstance(image_digest, str) and re.fullmatch(r"sha256:[a-f0-9]{64}", image_digest):
+        result["imageDigest"] = image_digest
+    fingerprint = value.get("imageReferenceFingerprint")
+    if isinstance(fingerprint, str) and re.fullmatch(r"[a-f0-9]{64}", fingerprint):
+        result["imageReferenceFingerprint"] = fingerprint
     return result
+
+
+def normalize_private_container_state_map(value: Any) -> dict[str, dict[str, int | str]]:
+    if not isinstance(value, Mapping) or len(value) > 400:
+        return {}
+    result: dict[str, dict[str, int | str]] = {}
+    allowed_service_keys = {
+        f"service:{project}:{public_name}"
+        for (project, _service), public_name in ALLOWED_COMPOSE_SERVICES.items()
+    }
+    for key, candidate in value.items():
+        if not isinstance(key, str) or (
+            re.fullmatch(r"cks:[a-fA-F0-9]{12,64}", key) is None
+            and key not in allowed_service_keys
+        ):
+            continue
+        normalized = normalize_private_container_state(candidate)
+        if normalized:
+            result[key] = normalized
+    return result
+
+
+def private_container_counters(stats: Mapping[str, Any] | None) -> dict[str, int]:
+    if not isinstance(stats, Mapping):
+        return {}
+    result: dict[str, int] = {}
+    sample_time = parse_iso_timestamp(stats.get("read"))
+    if sample_time is not None:
+        sample_ms = int(sample_time.timestamp() * 1000)
+        if 0 <= sample_ms <= MAX_SAFE_COUNTER:
+            result["sampleAtUnixMs"] = sample_ms
+    cpu = stats.get("cpu_stats") if isinstance(stats.get("cpu_stats"), Mapping) else {}
+    throttle = cpu.get("throttling_data") if isinstance(cpu.get("throttling_data"), Mapping) else {}
+    sources = {
+        "cpuPeriods": throttle.get("periods"),
+        "cpuThrottledPeriods": throttle.get("throttled_periods"),
+    }
+    block = stats.get("blkio_stats") if isinstance(stats.get("blkio_stats"), Mapping) else {}
+    sources.update({
+        "blockReadBytes": block.get("readBytes"),
+        "blockWriteBytes": block.get("writeBytes"),
+    })
+    networks = stats.get("networks") if isinstance(stats.get("networks"), Mapping) else {}
+    rx_errors = bounded_integer(networks.get("rx_errors"), 0, MAX_CONTAINER_IO_BYTES)
+    tx_errors = bounded_integer(networks.get("tx_errors"), 0, MAX_CONTAINER_IO_BYTES)
+    sources.update({
+        "networkRxBytes": networks.get("rx_bytes"),
+        "networkTxBytes": networks.get("tx_bytes"),
+        "networkErrors": (
+            min(MAX_CONTAINER_IO_BYTES, rx_errors + tx_errors)
+            if rx_errors is not None and tx_errors is not None else None
+        ),
+    })
+    for field_name, candidate in sources.items():
+        parsed = bounded_integer(candidate, 0, MAX_SAFE_COUNTER)
+        if parsed is not None:
+            result[field_name] = parsed
+    return result
+
+
+def apply_container_image_drift(containers: Sequence[dict[str, Any]]) -> None:
+    grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for row in containers:
+        project = row.get("project")
+        name = row.get("name")
+        if isinstance(project, str) and isinstance(name, str):
+            grouped.setdefault((project, name), []).append(row)
+    for rows in grouped.values():
+        all_known = all(isinstance(row.get("imageDigest"), str) for row in rows)
+        digests = {row["imageDigest"] for row in rows if isinstance(row.get("imageDigest"), str)}
+        drift = len(digests) > 1 if all_known else None
+        for row in rows:
+            row["imageDigestDrift"] = drift
 
 
 def container_from_api(
     raw: Mapping[str, Any], owner: str, stats: Mapping[str, Any] | None,
     previous_state: Any = None, public_name: str | None = None,
     inspect: Mapping[str, Any] | None = None,
+    previous_service_state: Any = None,
 ) -> dict[str, Any]:
     name = safe_container_name(raw)
     if name is None:
@@ -2213,6 +2703,106 @@ def container_from_api(
     finished_at = docker_container_timestamp(inspect_state.get("FinishedAt")) if inspect_state else None
     memory_limit, cpu_limit, pid_limit = docker_resource_limits(inspect)
 
+    pid_count: int | None = None
+    cpu_throttled_percent: float | None = None
+    cpu_throttled_periods: int | None = None
+    cpu_throttled_seconds: float | None = None
+    block_read_bytes: int | None = None
+    block_write_bytes: int | None = None
+    network_rx_bytes: int | None = None
+    network_tx_bytes: int | None = None
+    network_errors: int | None = None
+    sample_at_unix_ms: int | None = None
+    if isinstance(stats, Mapping):
+        raw_pids = stats.get("pids_stats") if isinstance(stats.get("pids_stats"), Mapping) else {}
+        pid_count = bounded_integer(raw_pids.get("current"), 0, MAX_CONTAINER_PID_LIMIT)
+        raw_cpu = stats.get("cpu_stats") if isinstance(stats.get("cpu_stats"), Mapping) else {}
+        throttle = raw_cpu.get("throttling_data") if isinstance(raw_cpu.get("throttling_data"), Mapping) else {}
+        periods = bounded_integer(throttle.get("periods"), 0, MAX_SAFE_COUNTER)
+        throttled = bounded_integer(throttle.get("throttled_periods"), 0, MAX_SAFE_COUNTER)
+        throttled_time = bounded_integer(throttle.get("throttled_time"), 0, MAX_SAFE_COUNTER)
+        cpu_throttled_periods = throttled
+        cpu_throttled_seconds = (
+            round(throttled_time / 1_000_000_000, 6) if throttled_time is not None else None
+        )
+        previous_periods = bounded_integer(normalized_previous.get("cpuPeriods"), 0, MAX_SAFE_COUNTER)
+        previous_throttled = bounded_integer(
+            normalized_previous.get("cpuThrottledPeriods"), 0, MAX_SAFE_COUNTER
+        )
+        if (
+            periods is not None and throttled is not None
+            and previous_periods is not None and previous_throttled is not None
+            and periods >= previous_periods and throttled >= previous_throttled
+            and periods > previous_periods
+        ):
+            cpu_throttled_percent = round(min(
+                100.0,
+                100.0 * (throttled - previous_throttled) / (periods - previous_periods),
+            ), 2)
+        raw_block = stats.get("blkio_stats") if isinstance(stats.get("blkio_stats"), Mapping) else {}
+        block_read_bytes = bounded_integer(raw_block.get("readBytes"), 0, MAX_CONTAINER_IO_BYTES)
+        block_write_bytes = bounded_integer(raw_block.get("writeBytes"), 0, MAX_CONTAINER_IO_BYTES)
+        raw_networks = stats.get("networks") if isinstance(stats.get("networks"), Mapping) else {}
+        network_rx_bytes = bounded_integer(raw_networks.get("rx_bytes"), 0, MAX_CONTAINER_IO_BYTES)
+        network_tx_bytes = bounded_integer(raw_networks.get("tx_bytes"), 0, MAX_CONTAINER_IO_BYTES)
+        network_rx_errors = bounded_integer(raw_networks.get("rx_errors"), 0, MAX_CONTAINER_IO_BYTES)
+        network_tx_errors = bounded_integer(raw_networks.get("tx_errors"), 0, MAX_CONTAINER_IO_BYTES)
+        if network_rx_errors is not None and network_tx_errors is not None:
+            network_errors = min(MAX_CONTAINER_IO_BYTES, network_rx_errors + network_tx_errors)
+        sample_time = parse_iso_timestamp(stats.get("read"))
+        if sample_time is not None:
+            sample_at_unix_ms = int(sample_time.timestamp() * 1000)
+    previous_sample_ms = bounded_integer(normalized_previous.get("sampleAtUnixMs"), 0, MAX_SAFE_COUNTER)
+    elapsed_seconds = (
+        (sample_at_unix_ms - previous_sample_ms) / 1000
+        if sample_at_unix_ms is not None
+        and previous_sample_ms is not None
+        and 0 < sample_at_unix_ms - previous_sample_ms <= 86_400_000
+        else None
+    )
+    block_read_rate = _container_counter_rate(
+        block_read_bytes, normalized_previous.get("blockReadBytes"), elapsed_seconds
+    )
+    block_write_rate = _container_counter_rate(
+        block_write_bytes, normalized_previous.get("blockWriteBytes"), elapsed_seconds
+    )
+    network_rx_rate = _container_counter_rate(
+        network_rx_bytes, normalized_previous.get("networkRxBytes"), elapsed_seconds
+    )
+    network_tx_rate = _container_counter_rate(
+        network_tx_bytes, normalized_previous.get("networkTxBytes"), elapsed_seconds
+    )
+    network_error_rate = _container_counter_rate(
+        network_errors, normalized_previous.get("networkErrors"), elapsed_seconds
+    )
+
+    mount_summary = (
+        inspect.get("MountSummary")
+        if isinstance(inspect, Mapping) and isinstance(inspect.get("MountSummary"), Mapping)
+        else {}
+    )
+    network_summary = (
+        inspect.get("NetworkSettings")
+        if isinstance(inspect, Mapping) and isinstance(inspect.get("NetworkSettings"), Mapping)
+        else {}
+    )
+    security = docker_security_details(inspect)
+    image_name, image_tag, image_digest, digest_source, uses_latest, image_fingerprint = (
+        docker_image_details(inspect)
+    )
+    normalized_service_previous = normalize_private_container_state(previous_service_state)
+    previous_digest = normalized_service_previous.get("imageDigest")
+    previous_fingerprint = normalized_service_previous.get("imageReferenceFingerprint")
+    image_digest_changed = (
+        image_digest != previous_digest
+        if image_digest is not None
+        and isinstance(previous_digest, str)
+        and image_fingerprint is not None
+        and previous_fingerprint == image_fingerprint
+        else None
+    )
+    writable_layer_bytes = bounded_integer(raw.get("SizeRw"), 0, MAX_CONTAINER_IO_BYTES)
+
     return {
         "name": name,
         "project": project,
@@ -2231,12 +2821,51 @@ def container_from_api(
         "oomKilled": oom_killed,
         "startedAt": started_at,
         "finishedAt": finished_at,
+        "instanceId": opaque_container_instance_id(raw.get("Id")),
+        "pidCount": pid_count,
+        "cpuThrottledPercent": cpu_throttled_percent,
+        "cpuThrottledPeriods": cpu_throttled_periods,
+        "cpuThrottledSeconds": cpu_throttled_seconds,
+        "blockReadBytes": block_read_bytes,
+        "blockWriteBytes": block_write_bytes,
+        "blockReadBytesPerSecond": block_read_rate,
+        "blockWriteBytesPerSecond": block_write_rate,
+        "networkRxBytes": network_rx_bytes,
+        "networkTxBytes": network_tx_bytes,
+        "networkRxBytesPerSecond": network_rx_rate,
+        "networkTxBytesPerSecond": network_tx_rate,
+        "networkErrors": network_errors,
+        "networkErrorsPerSecond": network_error_rate,
+        "writableLayerBytes": writable_layer_bytes,
+        "volumeCount": bounded_integer(mount_summary.get("volumeCount"), 0, MAX_CONTAINER_MOUNT_COUNT),
+        "bindMountCount": bounded_integer(mount_summary.get("bindMountCount"), 0, MAX_CONTAINER_MOUNT_COUNT),
+        "tmpfsMountCount": bounded_integer(mount_summary.get("tmpfsMountCount"), 0, MAX_CONTAINER_MOUNT_COUNT),
+        "networkAttachmentCount": bounded_integer(network_summary.get("NetworkCount"), 0, MAX_CONTAINER_MOUNT_COUNT),
+        "publishedPortCount": bounded_integer(network_summary.get("PublishedPortCount"), 0, MAX_CONTAINER_PORT_COUNT),
+        "privileged": security["privileged"],
+        "hostPid": security["hostPid"],
+        "hostIpc": security["hostIpc"],
+        "hostNetwork": security["hostNetwork"],
+        "dockerSocketMounted": security["dockerSocketMounted"],
+        "sensitiveBindMounted": security["sensitiveBindMounted"],
+        "rootUser": security["rootUser"],
+        "readOnlyRootFilesystem": security["readOnlyRootFilesystem"],
+        "addedCapabilityCount": security["addedCapabilityCount"],
+        "dangerousCapabilityCount": security["dangerousCapabilityCount"],
+        "excessiveCapabilities": security["excessiveCapabilities"],
+        "imageName": image_name,
+        "imageTag": image_tag,
+        "imageDigest": image_digest,
+        "imageDigestSource": digest_source,
+        "usesLatestTag": uses_latest,
+        "imageDigestDrift": False if image_digest is not None else None,
+        "imageDigestChanged": image_digest_changed,
     }
 
 
 def collect_containers(
     sockets: Mapping[str, Path], curl: str, timeout: float, previous_cpu: Any = None
-) -> tuple[list[dict[str, Any]], dict[str, dict[str, int]]]:
+) -> tuple[list[dict[str, Any]], dict[str, dict[str, int | str]]]:
     sockets = {"cks": sockets["cks"]} if isinstance(sockets.get("cks"), Path) else {}
     if not sockets:
         raise ContainerSourceUnavailable("cks container telemetry source unavailable")
@@ -2306,6 +2935,7 @@ def collect_containers(
                             "com.docker.compose.service": service,
                         },
                         "State": raw.get("State") if isinstance(raw.get("State"), str) else "unknown",
+                        "SizeRw": bounded_integer(raw.get("SizeRw"), 0, MAX_CONTAINER_IO_BYTES),
                     })
                 lists_by_project[project] = reduced_list
             # Drop Future-held raw Docker responses (including labels, image,
@@ -2413,7 +3043,7 @@ def collect_containers(
             future = None
             response = None
 
-    next_cpu_state: dict[str, dict[str, int]] = {}
+    next_cpu_state: dict[str, dict[str, int | str]] = {}
     # Retain only validated private counters for containers still listed. This
     # lets a temporary inspect/stats miss bridge to the next observation without
     # admitting arbitrary state-file keys or exposing the raw-ID map publicly.
@@ -2428,21 +3058,330 @@ def collect_containers(
         container_id = str(raw.get("Id", ""))
         inspect = inspect_by_index.get(index)
         state_key = f"{owner}:{container_id}"
+        service_key = f"service:{CURRENT_CONTAINER_PROJECTS[public_name]}:{public_name}"
         current_cpu = docker_cpu_state(stats) if isinstance(stats, Mapping) else None
         reduced = container_from_api(
             raw, owner, stats if isinstance(stats, dict) else None,
             previous_state.get(state_key), public_name, inspect,
+            previous_state.get(service_key),
         )
         containers.append(reduced)
         if state_key in retained_keys:
             next_entry = dict(next_cpu_state.get(state_key, {}))
             if current_cpu is not None:
                 next_entry.update(current_cpu)
+            next_entry.update(private_container_counters(stats))
             if isinstance(reduced.get("restartCount"), int):
                 next_entry["restartCount"] = reduced["restartCount"]
             if next_entry:
                 next_cpu_state[state_key] = next_entry
+    service_rows: dict[str, list[dict[str, Any]]] = {}
+    for row in containers:
+        service_key = f"service:{row['project']}:{row['name']}"
+        service_rows.setdefault(service_key, []).append(row)
+    apply_container_image_drift(containers)
+    for service_key, rows in service_rows.items():
+        digests = {
+            row["imageDigest"] for row in rows if isinstance(row.get("imageDigest"), str)
+        }
+        all_digests_known = len(digests) > 0 and len(digests) == 1 and all(
+            isinstance(row.get("imageDigest"), str) for row in rows
+        )
+        fingerprints: set[str] = set()
+        for index, row in enumerate(rows):
+            # Recompute only from already reduced inspect data; raw image refs
+            # and container IDs are never persisted in the public snapshot.
+            matching_index = next((
+                candidate_index for candidate_index, (_owner, _socket, _raw, candidate_name)
+                in enumerate(entries)
+                if candidate_name == row["name"]
+                and opaque_container_instance_id(_raw.get("Id")) == row["instanceId"]
+            ), None)
+            if matching_index is None:
+                continue
+            details = docker_image_details(inspect_by_index.get(matching_index))
+            if isinstance(details[5], str):
+                fingerprints.add(details[5])
+        if all_digests_known and len(fingerprints) == 1:
+            next_cpu_state[service_key] = {
+                "imageDigest": next(iter(digests)),
+                "imageReferenceFingerprint": next(iter(fingerprints)),
+            }
     return sorted(containers, key=lambda item: (item["owner"], item["name"])), next_cpu_state
+
+
+def docker_event_request_path(since: dt.datetime, until: dt.datetime) -> str:
+    filters = json.dumps(
+        {
+            "type": ["container"],
+            "label": [
+                f"com.docker.compose.project={project}"
+                for project in ALLOWED_COMPOSE_PROJECTS
+            ],
+        },
+        separators=(",", ":"),
+    )
+    return "/v1.41/events?" + urllib.parse.urlencode({
+        "since": max(0, int(since.timestamp())),
+        "until": max(0, int(until.timestamp())),
+        "filters": filters,
+    })
+
+
+def docker_get_events(socket_path: Path, request_path: str, curl: str, timeout: float) -> bytes | None:
+    if not request_path.startswith("/v1.41/events?") or len(request_path) > 8192:
+        raise ValueError("invalid Docker event request")
+    try:
+        metadata = socket_path.stat()
+    except PermissionError:
+        raise
+    except OSError:
+        return None
+    if not stat.S_ISSOCK(metadata.st_mode):
+        return None
+    try:
+        completed = subprocess.run(
+            [
+                curl, "--silent", "--show-error", "--fail", "--no-buffer",
+                "--max-time", str(timeout), "--max-filesize", str(MAX_DOCKER_EVENT_RESPONSE_BYTES),
+                "--unix-socket", str(socket_path), "http://localhost" + request_path,
+            ],
+            capture_output=True,
+            timeout=timeout + 0.5,
+            check=False,
+        )
+    except PermissionError:
+        raise
+    except (OSError, subprocess.SubprocessError):
+        return None
+    stdout = completed.stdout if isinstance(completed.stdout, bytes) else bytes(str(completed.stdout), "utf-8")
+    stderr = completed.stderr if isinstance(completed.stderr, bytes) else bytes(str(completed.stderr), "utf-8")
+    if completed.returncode != 0:
+        bounded_error = stderr[:256].lower()
+        if b"permission denied" in bounded_error or b"403" in bounded_error:
+            raise PermissionError("container event source denied access")
+        return None
+    if len(stdout) > MAX_DOCKER_EVENT_RESPONSE_BYTES:
+        return None
+    return stdout
+
+
+def normalize_docker_event(value: Any, not_after: dt.datetime) -> dict[str, Any] | None:
+    if not isinstance(value, Mapping):
+        return None
+    raw_type = value.get("Type")
+    raw_action = value.get("Action")
+    actor = value.get("Actor") if isinstance(value.get("Actor"), Mapping) else {}
+    attributes = actor.get("Attributes") if isinstance(actor.get("Attributes"), Mapping) else {}
+    container_id = actor.get("ID")
+    if not isinstance(container_id, str):
+        container_id = value.get("id")
+    instance_id = opaque_container_instance_id(container_id)
+    project = attributes.get("com.docker.compose.project")
+    service = attributes.get("com.docker.compose.service")
+    public_name = (
+        ALLOWED_COMPOSE_SERVICES.get((project, service))
+        if isinstance(project, str) and isinstance(service, str) else None
+    )
+    if raw_type != "container" or instance_id is None or public_name is None or not isinstance(raw_action, str):
+        return None
+    health_status: str | None = None
+    action = raw_action.lower()
+    if action.startswith("health_status:"):
+        candidate = action.split(":", 1)[1].strip()
+        if candidate not in DOCKER_EVENT_HEALTH_STATES:
+            return None
+        action = "health_status"
+        health_status = candidate
+    elif action == "health_status":
+        candidate = attributes.get("healthStatus")
+        if candidate not in DOCKER_EVENT_HEALTH_STATES:
+            return None
+        health_status = str(candidate)
+    if action not in DOCKER_EVENT_ACTIONS:
+        return None
+    time_nano = bounded_integer(value.get("timeNano"), 1, (1 << 63) - 1)
+    raw_time = bounded_integer(value.get("time"), 1, MAX_SAFE_COUNTER)
+    try:
+        occurred = (
+            dt.datetime.fromtimestamp(time_nano / 1_000_000_000, tz=dt.timezone.utc)
+            if time_nano is not None
+            else dt.datetime.fromtimestamp(raw_time, tz=dt.timezone.utc)
+            if raw_time is not None else None
+        )
+    except (OSError, OverflowError, ValueError):
+        return None
+    if occurred is None or occurred > not_after + dt.timedelta(seconds=60):
+        return None
+    exit_code: int | None = None
+    raw_exit = attributes.get("exitCode")
+    if isinstance(raw_exit, str) and re.fullmatch(r"[0-9]{1,10}", raw_exit):
+        candidate_exit = int(raw_exit)
+        exit_code = candidate_exit if candidate_exit <= 2_147_483_647 else None
+    event_id = hashlib.sha256(
+        b"monitor-docker-event-v1\x00"
+        + str(time_nano if time_nano is not None else raw_time).encode("ascii")
+        + b"\x00" + str(container_id).lower().encode("ascii")
+        + b"\x00" + action.encode("ascii")
+        + b"\x00" + (health_status or "").encode("ascii")
+    ).hexdigest()[:32]
+    return {
+        "id": event_id,
+        "occurredAt": iso_event_timestamp(occurred),
+        "action": action,
+        "containerName": public_name,
+        "project": project,
+        "instanceId": instance_id,
+        "exitCode": exit_code,
+        "healthStatus": health_status,
+    }
+
+
+def normalize_public_docker_event(value: Any, not_after: dt.datetime) -> dict[str, Any] | None:
+    if not isinstance(value, Mapping) or set(value) != set(DOCKER_EVENT_FIELDS):
+        return None
+    event_id = value.get("id")
+    occurred = parse_iso_timestamp(value.get("occurredAt"))
+    action = value.get("action")
+    name = value.get("containerName")
+    project = value.get("project")
+    instance_id = value.get("instanceId")
+    exit_code = value.get("exitCode")
+    health = value.get("healthStatus")
+    if (
+        not isinstance(event_id, str) or re.fullmatch(r"[a-f0-9]{32}", event_id) is None
+        or occurred is None or occurred > not_after + dt.timedelta(seconds=60)
+        or action not in DOCKER_EVENT_ACTIONS
+        or name not in CURRENT_CONTAINER_NAMES
+        or project != CURRENT_CONTAINER_PROJECTS.get(str(name))
+        or not isinstance(instance_id, str) or re.fullmatch(r"[a-f0-9]{32}", instance_id) is None
+        or (exit_code is not None and bounded_integer(exit_code, 0, 2_147_483_647) is None)
+        or (health is not None and health not in DOCKER_EVENT_HEALTH_STATES)
+        or (action == "health_status") != (health is not None)
+    ):
+        return None
+    return {
+        "id": event_id,
+        "occurredAt": iso_event_timestamp(occurred),
+        "action": action,
+        "containerName": name,
+        "project": project,
+        "instanceId": instance_id,
+        "exitCode": exit_code,
+        "healthStatus": health,
+    }
+
+
+def normalize_docker_event_state(value: Any, now: dt.datetime) -> dict[str, Any]:
+    source = value if isinstance(value, Mapping) else {}
+    status = source.get("status")
+    cursor = parse_iso_timestamp(source.get("cursorAt"))
+    observed = parse_iso_timestamp(source.get("observedAt"))
+    reconnect_count = bounded_integer(source.get("reconnectCount"), 0, MAX_SAFE_COUNTER) or 0
+    gap_count = bounded_integer(source.get("gapCount"), 0, MAX_SAFE_COUNTER) or 0
+    raw_events = source.get("events") if isinstance(source.get("events"), list) else []
+    events_by_id: dict[str, dict[str, Any]] = {}
+    for candidate in raw_events[-MAX_DOCKER_EVENTS:]:
+        normalized = normalize_public_docker_event(candidate, now)
+        if normalized is not None:
+            events_by_id[normalized["id"]] = normalized
+    return {
+        "status": status if status in DOCKER_EVENT_COLLECTION_STATUSES else "unavailable",
+        "observedAt": iso_timestamp(observed) if observed is not None and observed <= now + dt.timedelta(seconds=60) else None,
+        "cursorAt": iso_timestamp(cursor) if cursor is not None and cursor <= now + dt.timedelta(seconds=60) else None,
+        "reconnectCount": reconnect_count,
+        "gapCount": gap_count,
+        "gapDetected": source.get("gapDetected") is True,
+        "events": sorted(events_by_id.values(), key=lambda item: (item["occurredAt"], item["id"]))[-MAX_DOCKER_EVENTS:],
+    }
+
+
+def docker_event_failure_state(
+    previous: Any,
+    now: dt.datetime,
+    status: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    prior = normalize_docker_event_state(previous, now)
+    cursor = parse_iso_timestamp(prior["cursorAt"])
+    gap = cursor is None or (now - cursor).total_seconds() > MAX_DOCKER_EVENT_REPLAY_SECONDS
+    gap_count = min(MAX_SAFE_COUNTER, prior["gapCount"] + (1 if gap and not prior["gapDetected"] else 0))
+    public = {
+        "status": status,
+        "observedAt": prior["observedAt"],
+        "cursorAt": prior["cursorAt"],
+        "reconnectCount": prior["reconnectCount"],
+        "gapCount": gap_count,
+        "gapDetected": gap,
+        "logCollectionStatus": "unsupported",
+    }
+    private = {**public, "events": prior["events"]}
+    return public, private
+
+
+def collect_docker_events(
+    socket_path: Path,
+    curl: str,
+    timeout: float,
+    previous: Any,
+    now: dt.datetime,
+) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
+    prior = normalize_docker_event_state(previous, now)
+    cursor = parse_iso_timestamp(prior["cursorAt"])
+    reconnecting = prior["status"] in {"unavailable", "permission-denied"} and cursor is not None
+    # Docker does not expose a daemon boot epoch. After a failed poll, replay
+    # is attempted but continuity cannot be proved across a daemon restart, so
+    # the recovery snapshot explicitly carries a possible gap.
+    gap = (
+        cursor is None
+        or cursor > now
+        or (now - cursor).total_seconds() > MAX_DOCKER_EVENT_REPLAY_SECONDS
+        or reconnecting
+    )
+    since = max(
+        now - dt.timedelta(seconds=MAX_DOCKER_EVENT_REPLAY_SECONDS),
+        (cursor - dt.timedelta(seconds=1)) if cursor is not None and cursor <= now else now,
+    )
+    request_path = docker_event_request_path(since, now)
+    try:
+        payload = docker_get_events(socket_path, request_path, curl, timeout)
+    except PermissionError:
+        public, private = docker_event_failure_state(previous, now, "permission-denied")
+        return public, private["events"], private
+    if payload is None:
+        public, private = docker_event_failure_state(previous, now, "unavailable")
+        return public, private["events"], private
+
+    lines = payload.splitlines()
+    if len(lines) > MAX_DOCKER_EVENT_LINES or any(len(line) > MAX_DOCKER_EVENT_LINE_BYTES for line in lines):
+        public, private = docker_event_failure_state(previous, now, "unavailable")
+        return public, private["events"], private
+    events_by_id = {event["id"]: event for event in prior["events"]}
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            decoded = json.loads(line)
+        except (UnicodeError, json.JSONDecodeError):
+            public, private = docker_event_failure_state(previous, now, "unavailable")
+            return public, private["events"], private
+        normalized = normalize_docker_event(decoded, now)
+        if normalized is not None:
+            events_by_id[normalized["id"]] = normalized
+    events = sorted(events_by_id.values(), key=lambda item: (item["occurredAt"], item["id"]))[-MAX_DOCKER_EVENTS:]
+    reconnect_count = min(MAX_SAFE_COUNTER, prior["reconnectCount"] + (1 if reconnecting else 0))
+    gap_count = min(MAX_SAFE_COUNTER, prior["gapCount"] + (1 if gap and not prior["gapDetected"] else 0))
+    now_text = iso_timestamp(now)
+    public = {
+        "status": "gap" if gap else "fresh",
+        "observedAt": now_text,
+        "cursorAt": now_text,
+        "reconnectCount": reconnect_count,
+        "gapCount": gap_count,
+        "gapDetected": gap,
+        "logCollectionStatus": "unsupported",
+    }
+    private = {**public, "events": events}
+    return public, events, private
 
 
 def normalize_container_values(
@@ -2459,7 +3398,9 @@ def normalize_container_values(
             raise ValueError("container telemetry workload has unexpected fields")
         fields = set(value)
         legacy = fields == set(LEGACY_CONTAINER_FIELDS)
-        if not legacy and fields != set(CONTAINER_FIELDS):
+        v2 = fields == set(CONTAINER_V2_FIELDS)
+        v3 = fields == set(CONTAINER_FIELDS)
+        if not legacy and not v2 and not v3:
             raise ValueError("container telemetry workload has unexpected fields")
         name = value.get("name")
         state = value.get("state")
@@ -2552,7 +3493,7 @@ def normalize_container_values(
             ):
                 raise ValueError("container telemetry workload has an invalid lifecycle timestamp")
             normalized_times[field_name] = iso_event_timestamp(parsed) if parsed is not None else None
-        normalized = {
+        normalized: dict[str, Any] = {
             "name": name,
             "project": project,
             "owner": "cks",
@@ -2571,7 +3512,161 @@ def normalize_container_values(
             "startedAt": normalized_times["startedAt"],
             "finishedAt": normalized_times["finishedAt"],
         }
-        assert tuple(normalized) == CONTAINER_FIELDS
+        if v3:
+            def optional_integer(field_name: str, maximum: int) -> int | None:
+                source = value.get(field_name)
+                parsed = bounded_integer(source, 0, maximum)
+                if source is not None and parsed is None:
+                    raise ValueError(f"container telemetry workload has an invalid {field_name}")
+                return parsed
+
+            def optional_number(field_name: str, maximum: float) -> float | None:
+                source = value.get(field_name)
+                parsed = normalized_bounded_number(source, 0, maximum)
+                if source is not None and parsed is None:
+                    raise ValueError(f"container telemetry workload has an invalid {field_name}")
+                return parsed
+
+            def optional_boolean(field_name: str) -> bool | None:
+                source = value.get(field_name)
+                if source is not None and not isinstance(source, bool):
+                    raise ValueError(f"container telemetry workload has an invalid {field_name}")
+                return source
+
+            instance_id = value.get("instanceId")
+            if not isinstance(instance_id, str) or re.fullmatch(r"[a-f0-9]{32}", instance_id) is None:
+                raise ValueError("container telemetry workload has an invalid instance ID")
+            integer_fields = {
+                "pidCount": MAX_CONTAINER_PID_LIMIT,
+                "cpuThrottledPeriods": MAX_SAFE_COUNTER,
+                "blockReadBytes": MAX_CONTAINER_IO_BYTES,
+                "blockWriteBytes": MAX_CONTAINER_IO_BYTES,
+                "networkRxBytes": MAX_CONTAINER_IO_BYTES,
+                "networkTxBytes": MAX_CONTAINER_IO_BYTES,
+                "networkErrors": MAX_CONTAINER_IO_BYTES,
+                "writableLayerBytes": MAX_CONTAINER_IO_BYTES,
+                "volumeCount": MAX_CONTAINER_MOUNT_COUNT,
+                "bindMountCount": MAX_CONTAINER_MOUNT_COUNT,
+                "tmpfsMountCount": MAX_CONTAINER_MOUNT_COUNT,
+                "networkAttachmentCount": MAX_CONTAINER_MOUNT_COUNT,
+                "publishedPortCount": MAX_CONTAINER_PORT_COUNT,
+                "addedCapabilityCount": MAX_CONTAINER_CAPABILITY_COUNT,
+                "dangerousCapabilityCount": MAX_CONTAINER_CAPABILITY_COUNT,
+            }
+            number_fields = {
+                "cpuThrottledPercent": 100.0,
+                "cpuThrottledSeconds": float(MAX_SAFE_COUNTER),
+                "blockReadBytesPerSecond": MAX_CONTAINER_IO_RATE,
+                "blockWriteBytesPerSecond": MAX_CONTAINER_IO_RATE,
+                "networkRxBytesPerSecond": MAX_CONTAINER_IO_RATE,
+                "networkTxBytesPerSecond": MAX_CONTAINER_IO_RATE,
+                "networkErrorsPerSecond": MAX_CONTAINER_IO_RATE,
+            }
+            boolean_fields = (
+                "privileged", "hostPid", "hostIpc", "hostNetwork", "dockerSocketMounted",
+                "sensitiveBindMounted", "rootUser", "readOnlyRootFilesystem",
+                "excessiveCapabilities", "usesLatestTag", "imageDigestDrift", "imageDigestChanged",
+            )
+            normalized.update({"instanceId": instance_id})
+            normalized.update({
+                field_name: optional_integer(field_name, maximum)
+                for field_name, maximum in integer_fields.items()
+            })
+            normalized.update({
+                field_name: optional_number(field_name, maximum)
+                for field_name, maximum in number_fields.items()
+            })
+            normalized.update({field_name: optional_boolean(field_name) for field_name in boolean_fields})
+            image_name = value.get("imageName")
+            image_tag = value.get("imageTag")
+            image_digest = value.get("imageDigest")
+            image_digest_source = value.get("imageDigestSource")
+            if image_name is not None and (
+                not isinstance(image_name, str)
+                or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,191}", image_name) is None
+                or image_name.startswith("/") or image_name.endswith("/") or "//" in image_name
+            ):
+                raise ValueError("container telemetry workload has an invalid image name")
+            if image_tag is not None and (
+                not isinstance(image_tag, str)
+                or re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}", image_tag) is None
+            ):
+                raise ValueError("container telemetry workload has an invalid image tag")
+            if image_digest is not None and (
+                not isinstance(image_digest, str)
+                or re.fullmatch(r"sha256:[a-f0-9]{64}", image_digest) is None
+            ):
+                raise ValueError("container telemetry workload has an invalid image digest")
+            if image_digest_source not in {None, "repo-digest", "local-image-id"}:
+                raise ValueError("container telemetry workload has an invalid image digest source")
+            if (image_digest is None) != (image_digest_source is None):
+                raise ValueError("container telemetry workload has inconsistent image digest fields")
+            uses_latest = normalized["usesLatestTag"]
+            if image_name is None and uses_latest is not None:
+                raise ValueError("container telemetry workload has inconsistent latest-tag state")
+            if image_name is None and image_tag is not None:
+                raise ValueError("container telemetry workload has an image tag without a name")
+            if image_name is not None and uses_latest is not (image_tag == "latest"):
+                raise ValueError("container telemetry workload has inconsistent latest-tag state")
+            if image_digest_source == "repo-digest" and image_name is None:
+                raise ValueError("container telemetry workload has an unbound repository digest")
+            if image_digest is None and (
+                normalized["imageDigestDrift"] is not None
+                or normalized["imageDigestChanged"] is not None
+            ):
+                raise ValueError("container telemetry workload has digest state without a digest")
+            if image_digest is not None and normalized["imageDigestDrift"] is None:
+                raise ValueError("container telemetry workload is missing replica digest state")
+            for total_field, rate_field in (
+                ("blockReadBytes", "blockReadBytesPerSecond"),
+                ("blockWriteBytes", "blockWriteBytesPerSecond"),
+                ("networkRxBytes", "networkRxBytesPerSecond"),
+                ("networkTxBytes", "networkTxBytesPerSecond"),
+                ("networkErrors", "networkErrorsPerSecond"),
+            ):
+                if normalized[rate_field] is not None and normalized[total_field] is None:
+                    raise ValueError("container telemetry workload has a rate without its counter")
+            if (
+                normalized["cpuThrottledPercent"] is not None
+                and normalized["cpuThrottledPeriods"] is None
+            ):
+                raise ValueError("container telemetry workload has throttling rate without a counter")
+            capability_state = (
+                normalized["addedCapabilityCount"],
+                normalized["dangerousCapabilityCount"],
+                normalized["excessiveCapabilities"],
+            )
+            if any(candidate is None for candidate in capability_state) and not all(
+                candidate is None for candidate in capability_state
+            ):
+                raise ValueError("container telemetry workload has partial capability state")
+            if (
+                normalized["dangerousCapabilityCount"] is not None
+                and normalized["addedCapabilityCount"] is not None
+                and normalized["dangerousCapabilityCount"] > normalized["addedCapabilityCount"]
+            ):
+                raise ValueError("container telemetry workload has inconsistent capability counts")
+            if (
+                normalized["addedCapabilityCount"] is not None
+                and normalized["dangerousCapabilityCount"] is not None
+                and normalized["excessiveCapabilities"]
+                is not (
+                    normalized["addedCapabilityCount"] > 12
+                    or normalized["dangerousCapabilityCount"] > 0
+                )
+            ):
+                raise ValueError("container telemetry workload has inconsistent capability state")
+            normalized.update({
+                "imageName": image_name,
+                "imageTag": image_tag,
+                "imageDigest": image_digest,
+                "imageDigestSource": image_digest_source,
+            })
+            # Restore the declared field order after group-wise validation.
+            normalized = {field_name: normalized[field_name] for field_name in CONTAINER_FIELDS}
+            assert tuple(normalized) == CONTAINER_FIELDS
+        else:
+            assert tuple(normalized) == CONTAINER_V2_FIELDS
         result.append(normalized)
     return sorted(result, key=lambda item: item["name"])
 
@@ -2605,12 +3700,64 @@ def normalize_container_collection(
     }
 
 
-def load_container_snapshot_state(
+def unavailable_docker_event_collection() -> dict[str, Any]:
+    return {
+        "status": "unavailable",
+        "observedAt": None,
+        "cursorAt": None,
+        "reconnectCount": 0,
+        "gapCount": 0,
+        "gapDetected": True,
+        "logCollectionStatus": "unsupported",
+    }
+
+
+def normalize_docker_event_collection(
+    value: Any,
+    generated: dt.datetime,
+    now: dt.datetime,
+) -> dict[str, Any]:
+    if not isinstance(value, Mapping) or set(value) != set(DOCKER_EVENT_COLLECTION_FIELDS):
+        raise ValueError("Docker event collection has unexpected fields")
+    status = value.get("status")
+    observed = parse_iso_timestamp(value.get("observedAt"))
+    cursor = parse_iso_timestamp(value.get("cursorAt"))
+    reconnect_count = bounded_integer(value.get("reconnectCount"), 0, MAX_SAFE_COUNTER)
+    gap_count = bounded_integer(value.get("gapCount"), 0, MAX_SAFE_COUNTER)
+    gap_detected = value.get("gapDetected")
+    if (
+        status not in DOCKER_EVENT_COLLECTION_STATUSES
+        or (value.get("observedAt") is not None and observed is None)
+        or (value.get("cursorAt") is not None and cursor is None)
+        or reconnect_count is None
+        or gap_count is None
+        or not isinstance(gap_detected, bool)
+        or value.get("logCollectionStatus") != "unsupported"
+        or (observed is not None and observed > now + dt.timedelta(seconds=60))
+        or (cursor is not None and cursor > now + dt.timedelta(seconds=60))
+        or (status in {"fresh", "gap"} and (observed != generated or cursor != generated))
+        or (status == "gap" and not gap_detected)
+        or (status == "fresh" and gap_detected)
+        or ((observed is None) != (cursor is None))
+    ):
+        raise ValueError("Docker event collection is invalid")
+    return {
+        "status": status,
+        "observedAt": iso_timestamp(observed) if observed is not None else None,
+        "cursorAt": iso_timestamp(cursor) if cursor is not None else None,
+        "reconnectCount": reconnect_count,
+        "gapCount": gap_count,
+        "gapDetected": gap_detected,
+        "logCollectionStatus": "unsupported",
+    }
+
+
+def load_container_snapshot_document(
     path: Path,
     now: dt.datetime,
     expected_uid: int | None = 1001,
     expected_gid: int | None = 1001,
-) -> tuple[list[dict[str, Any]], dict[str, str | None]]:
+) -> tuple[list[dict[str, Any]], dict[str, str | None], dict[str, Any], list[dict[str, Any]]]:
     """Validate the unprivileged export before admitting it to root-owned output."""
     try:
         metadata = path.lstat()
@@ -2652,6 +3799,10 @@ def load_container_snapshot_state(
     if not isinstance(raw, dict) or set(raw) not in (
         {"generatedAt", "containers"},
         {"generatedAt", "containerCollection", "containers"},
+        {
+            "generatedAt", "containerCollection", "containers",
+            "dockerEventCollection", "dockerEvents",
+        },
     ):
         raise ValueError("container telemetry snapshot has unexpected fields")
     generated = parse_iso_timestamp(raw.get("generatedAt"))
@@ -2675,12 +3826,198 @@ def load_container_snapshot_state(
         raise ValueError("unavailable container telemetry cannot contain workloads")
     if collection["observedAt"] is None and containers:
         raise ValueError("container telemetry workloads require an observation timestamp")
+    if "dockerEventCollection" in raw:
+        event_collection = normalize_docker_event_collection(
+            raw["dockerEventCollection"], generated, now
+        )
+        raw_events = raw.get("dockerEvents")
+        if not isinstance(raw_events, list) or len(raw_events) > MAX_DOCKER_EVENTS:
+            raise ValueError("Docker event list is invalid")
+        docker_events: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
+        for candidate in raw_events:
+            event = normalize_public_docker_event(candidate, generated)
+            if event is None or event["id"] in seen_ids:
+                raise ValueError("Docker event list is invalid")
+            seen_ids.add(event["id"])
+            docker_events.append(event)
+        docker_events.sort(key=lambda item: (item["occurredAt"], item["id"]))
+        if event_collection["cursorAt"] is None and docker_events:
+            raise ValueError("Docker events require a cursor")
+    else:
+        event_collection = unavailable_docker_event_collection()
+        docker_events = []
+    return containers, collection, event_collection, docker_events
+
+
+def load_container_snapshot_state(
+    path: Path,
+    now: dt.datetime,
+    expected_uid: int | None = 1001,
+    expected_gid: int | None = 1001,
+) -> tuple[list[dict[str, Any]], dict[str, str | None]]:
+    containers, collection, _event_collection, _events = load_container_snapshot_document(
+        path, now, expected_uid=expected_uid, expected_gid=expected_gid,
+    )
     return containers, collection
 
 
 def load_container_snapshot(path: Path, now: dt.datetime) -> list[dict[str, Any]]:
     """Backward-compatible list-only view of the reduced container snapshot."""
     return load_container_snapshot_state(path, now)[0]
+
+
+def load_synthetic_probe_document(
+    path: Path,
+    now: dt.datetime,
+    expected_uid: int | None = 1001,
+    expected_gid: int | None = 1001,
+) -> tuple[dict[str, str | None], list[dict[str, Any]]]:
+    """Admit the unprivileged probe result while discarding reviewed URLs.
+
+    The worker pins DNS and performs network I/O.  The root collector only
+    validates its fixed evidence document and never receives a general URL
+    fetch capability.  Query strings and endpoint paths remain in the private
+    worker file and are not copied into the public collector snapshot.
+    """
+
+    metadata = path.lstat()
+
+    def valid_metadata(value: os.stat_result) -> bool:
+        return (
+            stat.S_ISREG(value.st_mode)
+            and (expected_uid is None or value.st_uid == expected_uid)
+            and (expected_gid is None or value.st_gid == expected_gid)
+            and value.st_nlink == 1
+            and stat.S_IMODE(value.st_mode) == 0o640
+            and 0 < value.st_size <= MAX_SYNTHETIC_INPUT_BYTES
+        )
+
+    if not valid_metadata(metadata):
+        raise ValueError("synthetic probe result failed file validation")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino)
+            or not valid_metadata(opened)
+        ):
+            raise ValueError("synthetic probe result changed during validation")
+        chunks: list[bytes] = []
+        remaining = MAX_SYNTHETIC_INPUT_BYTES + 1
+        while remaining:
+            chunk = os.read(descriptor, min(64 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        payload = b"".join(chunks)
+    finally:
+        os.close(descriptor)
+    if len(payload) > MAX_SYNTHETIC_INPUT_BYTES:
+        raise ValueError("synthetic probe result exceeds the byte limit")
+    try:
+        raw = json.loads(payload.decode("utf-8"), object_pairs_hook=_reject_duplicate_json_pairs)
+    except (UnicodeError, json.JSONDecodeError, ValueError) as error:
+        raise ValueError("synthetic probe result is invalid JSON") from error
+    if (
+        not isinstance(raw, Mapping)
+        or set(raw) != {"schemaVersion", "generatedAt", "results"}
+        or raw.get("schemaVersion") != 1
+        or not isinstance(raw.get("results"), list)
+        or not 1 <= len(raw["results"]) <= MAX_SYNTHETIC_PROBES
+    ):
+        raise ValueError("synthetic probe result has an invalid exact schema")
+    generated = parse_iso_timestamp(raw.get("generatedAt"))
+    if generated is None or generated > now + dt.timedelta(seconds=60):
+        raise ValueError("synthetic probe result has an invalid generation timestamp")
+    reduced: list[dict[str, Any]] = []
+    identifiers: set[str] = set()
+    for value in raw["results"]:
+        # The worker intentionally serializes with ``sort_keys=True``.  Exactness
+        # is therefore a set property here; duplicate members were already
+        # rejected by ``_reject_duplicate_json_pairs`` while decoding.
+        if not isinstance(value, Mapping) or set(value) != set(SYNTHETIC_PROBE_FIELDS):
+            raise ValueError("synthetic probe result row has unexpected fields")
+        probe_id = value.get("id")
+        status_value = value.get("status")
+        checked = parse_iso_timestamp(value.get("checkedAt"))
+        url = value.get("url")
+        http_status = bounded_integer(value.get("httpStatus"), 100, 599)
+        redirect_count = bounded_integer(value.get("redirectCount"), 0, 5)
+        latency = bounded_integer(value.get("latencyMilliseconds"), 0, 60_000)
+        expires = parse_iso_timestamp(value.get("certificateExpiresAt"))
+        days_remaining = bounded_integer(
+            value.get("certificateDaysRemaining"), -36_600, 36_600
+        )
+        if (
+            value.get("schemaVersion") != 1
+            or not isinstance(probe_id, str)
+            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", probe_id) is None
+            or probe_id in identifiers
+            or status_value not in SYNTHETIC_PROBE_STATUSES
+            or checked is None
+            or checked > generated + dt.timedelta(seconds=60)
+            or (url is not None and (
+                not isinstance(url, str)
+                or not 1 <= len(url.encode("utf-8")) <= 4096
+                or "\r" in url or "\n" in url
+            ))
+            or (value.get("httpStatus") is not None and http_status is None)
+            or redirect_count is None
+            or latency is None
+            or (value.get("certificateExpiresAt") is not None and expires is None)
+            or (value.get("certificateDaysRemaining") is not None and days_remaining is None)
+            or ((expires is None) != (days_remaining is None))
+            or (status_value == "ok" and (url is None or http_status is None))
+        ):
+            raise ValueError("synthetic probe result row is invalid")
+        identifiers.add(probe_id)
+        reduced.append({
+            "id": probe_id,
+            "status": status_value,
+            "checkedAt": iso_timestamp(checked),
+            "httpStatus": http_status,
+            "redirectCount": redirect_count,
+            "latencyMilliseconds": latency,
+            "certificateExpiresAt": iso_timestamp(expires) if expires is not None else None,
+            "certificateDaysRemaining": days_remaining,
+        })
+    reduced.sort(key=lambda item: item["id"])
+    age = (now - generated).total_seconds()
+    return ({
+        "status": "fresh" if age <= MAX_SYNTHETIC_INPUT_AGE_SECONDS else "stale",
+        "observedAt": iso_timestamp(generated),
+    }, reduced)
+
+
+def _reject_duplicate_json_pairs(items: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in items:
+        if key in result:
+            raise ValueError("duplicate JSON member")
+        result[key] = value
+    return result
+
+
+def collect_synthetic_probes(
+    path: Path | None,
+    now: dt.datetime,
+) -> tuple[dict[str, str | None], list[dict[str, Any]]]:
+    if path is None:
+        return {"status": "unsupported", "observedAt": None}, []
+    try:
+        return load_synthetic_probe_document(path, now)
+    except FileNotFoundError:
+        status_value = "unsupported"
+    except PermissionError:
+        status_value = "permission-denied"
+    except OSError:
+        status_value = "unavailable"
+    except (TypeError, ValueError, OverflowError, RecursionError):
+        status_value = "collection-error"
+    return {"status": status_value, "observedAt": None}, []
 
 
 def previous_container_observation(
@@ -2726,15 +4063,21 @@ def collect_container_telemetry(
     config: "Config",
     prior: Mapping[str, Any],
     now: dt.datetime,
-) -> tuple[list[dict[str, Any]], dict[str, str | None], dict[str, dict[str, int]]]:
+) -> tuple[
+    list[dict[str, Any]], dict[str, str | None], dict[str, dict[str, int | str]],
+    dict[str, Any], list[dict[str, Any]], dict[str, Any],
+]:
     """Collect containers without allowing a Docker-side failure to block the host sample."""
     previous_containers, previous_observed_at = previous_container_observation(
         config.output_dir, now
     )
     try:
         if config.container_input is not None:
-            containers, collection = load_container_snapshot_state(config.container_input, now)
-            container_cpu_state: dict[str, dict[str, int]] = {}
+            containers, collection, event_collection, docker_events = (
+                load_container_snapshot_document(config.container_input, now)
+            )
+            container_cpu_state: dict[str, dict[str, int | str]] = {}
+            docker_event_state = {**event_collection, "events": docker_events}
         else:
             containers, container_cpu_state = collect_containers(
                 config.docker_sockets,
@@ -2743,13 +4086,26 @@ def collect_container_telemetry(
                 prior.get("containers"),
             )
             collection = {"status": "fresh", "observedAt": iso_timestamp(now)}
+            event_collection, docker_events, docker_event_state = collect_docker_events(
+                config.docker_sockets["cks"], config.curl, config.command_timeout,
+                prior.get("dockerEvents"), now,
+            )
     except PermissionError:
+        event_collection, docker_event_state = docker_event_failure_state(
+            prior.get("dockerEvents"), now, "permission-denied"
+        )
         return (
             previous_containers if previous_observed_at is not None else [],
             {"status": "permission-denied", "observedAt": previous_observed_at},
             {},
+            event_collection,
+            docker_event_state["events"],
+            docker_event_state,
         )
     except (ContainerSourceUnavailable, RuntimeError, ValueError, OSError):
+        event_collection, docker_event_state = docker_event_failure_state(
+            prior.get("dockerEvents"), now, "unavailable"
+        )
         return (
             previous_containers if previous_observed_at is not None else [],
             {
@@ -2757,6 +4113,9 @@ def collect_container_telemetry(
                 "observedAt": previous_observed_at,
             },
             {},
+            event_collection,
+            docker_event_state["events"],
+            docker_event_state,
         )
 
     # An exporter may have no retained state after a runtime-directory reset,
@@ -2767,7 +4126,10 @@ def collect_container_telemetry(
         collection["observedAt"] = collection["observedAt"] or previous_observed_at
         if collection["status"] == "unavailable":
             collection["status"] = "last-known"
-    return containers, collection, container_cpu_state
+    return (
+        containers, collection, container_cpu_state,
+        event_collection, docker_events, docker_event_state,
+    )
 
 
 TIMESTAMP_RE = re.compile(r"^(\d{4}-\d\d-\d\d[T ][0-9:.+-]+(?:Z)?)")
@@ -5316,6 +6678,7 @@ class Config:
     privilege_logs: list[Path] = field(default_factory=lambda: [Path("/var/log/privilege-events.log")])
     traffic_log: Path | None = Path("/var/log/nginx/monitor-traffic.jsonl")
     container_input: Path | None = None
+    synthetic_input: Path | None = None
     docker_sockets: dict[str, Path] = field(
         default_factory=lambda: {key: Path(value) for key, value in DEFAULT_SOCKETS.items()}
     )
@@ -5387,6 +6750,10 @@ def config_from_environment(arguments: Sequence[str] | None = None) -> Config:
         default=env.get("MONITOR_TRAFFIC_LOG", "/var/log/nginx/monitor-traffic.jsonl"),
     )
     parser.add_argument("--container-input", default=env.get("MONITOR_CONTAINER_INPUT", ""))
+    parser.add_argument(
+        "--synthetic-input",
+        default=env.get("MONITOR_SYNTHETIC_INPUT", "/var/lib/monitor-synthetic/results.json"),
+    )
     parser.add_argument("--docker-sockets", default=env.get(
         "MONITOR_DOCKER_SOCKETS", ",".join(f"{owner}={path}" for owner, path in DEFAULT_SOCKETS.items())
     ))
@@ -5531,6 +6898,10 @@ def config_from_environment(arguments: Sequence[str] | None = None) -> Config:
         privilege_logs=[Path(item) for item in values.privilege_logs.split(":") if item],
         traffic_log=Path(values.traffic_log) if values.traffic_log else None,
         container_input=Path(values.container_input) if values.container_input else None,
+        synthetic_input=(
+            safe_absolute_path(values.synthetic_input, "/var/lib/monitor-synthetic/results.json")
+            if values.synthetic_input else None
+        ),
         docker_sockets=parse_socket_map(values.docker_sockets),
         process_uids=parse_uid_set(values.process_uids),
         process_allowlist=parse_process_allowlist(values.process_allowlist),
@@ -5914,6 +7285,24 @@ def notification_delivery_signal(
             output_dir / ".state" / "alert-delivery" / "alert-delivery.sqlite",
             delivery_config.queue,
         ).status()
+        states = status.get("states")
+        max_pending = getattr(delivery_config.queue, "max_pending", None)
+        active_count: int | None = None
+        if isinstance(states, Mapping):
+            active_values = [states.get(key) for key in ("pending", "retry", "leased")]
+            if all(
+                isinstance(value, int) and not isinstance(value, bool) and value >= 0
+                for value in active_values
+            ):
+                active_count = sum(active_values)
+        queue_used_percent = (
+            round(100.0 * active_count / max_pending, 2)
+            if active_count is not None
+            and isinstance(max_pending, int)
+            and not isinstance(max_pending, bool)
+            and max_pending > 0
+            else None
+        )
         stats = status.get("stats")
         counter = stats.get("operational_final_failure", 0) if isinstance(stats, Mapping) else None
         if isinstance(counter, bool) or not isinstance(counter, int) or counter < 0:
@@ -5922,6 +7311,8 @@ def notification_delivery_signal(
         return {
             "notificationDeliveryStatus": "ok",
             "notificationFinalFailureDelta": delta,
+            "notificationQueueActive": active_count,
+            "notificationQueueUsedPercent": queue_used_percent,
         }, counter
     except PermissionError:
         status_value = "permission_denied"
@@ -5930,7 +7321,75 @@ def notification_delivery_signal(
     return {
         "notificationDeliveryStatus": status_value,
         "notificationFinalFailureDelta": None,
+        "notificationQueueActive": None,
+        "notificationQueueUsedPercent": None,
     }, retained
+
+
+def monitor_runtime_signal(
+    output_dir: Path,
+    now: dt.datetime,
+    elapsed_seconds: float,
+    expected_interval_seconds: int,
+) -> dict[str, Any]:
+    """Collect bounded health signals for Monitor's own local runtime.
+
+    Unsupported central components remain explicit instead of being reported as
+    healthy zeroes.  A completed local write interval is positive evidence for
+    the write-failure delta; a collector crash is detected by the independent
+    heartbeat/dead-man paths because no new evaluation can be published.
+    """
+
+    filesystem_status = "ok"
+    filesystem_used_percent: float | None = None
+    try:
+        usage = shutil.disk_usage(output_dir)
+        if usage.total <= 0 or usage.used < 0 or usage.used > usage.total:
+            raise ValueError("invalid filesystem usage")
+        filesystem_used_percent = round(100.0 * usage.used / usage.total, 2)
+    except PermissionError:
+        filesystem_status = "permission_denied"
+    except (OSError, OverflowError, TypeError, ValueError):
+        filesystem_status = "collection_error"
+
+    cadence_status = "no_data"
+    cadence_delay: float | None = None
+    if math.isfinite(elapsed_seconds) and elapsed_seconds > 0:
+        cadence_status = "ok"
+        cadence_delay = round(
+            max(0.0, elapsed_seconds - max(1, expected_interval_seconds)), 3
+        )
+
+    prior_evaluation = load_json(output_dir / "rule-evaluation.json")
+    prior_evaluated_at = parse_iso_timestamp(prior_evaluation.get("evaluatedAt"))
+    if prior_evaluated_at is not None:
+        normalized_now = (
+            now if now.tzinfo is not None else now.replace(tzinfo=dt.timezone.utc)
+        ).astimezone(dt.timezone.utc)
+        age = (normalized_now - prior_evaluated_at).total_seconds()
+        if -60 <= age <= MAX_RELIABILITY_DURATION_SECONDS:
+            evaluation_delay = max(0.0, age - max(1, expected_interval_seconds))
+            cadence_delay = round(
+                max(cadence_delay or 0.0, evaluation_delay), 3
+            )
+            cadence_status = "ok"
+
+    return {
+        "ingestStatus": "unsupported",
+        "ingestLagSeconds": None,
+        "metricsQueueStatus": "unsupported",
+        "metricsQueueUsedPercent": None,
+        "logsQueueStatus": "unsupported",
+        "logsQueueUsedPercent": None,
+        "storageWriteStatus": "ok",
+        "storageWriteFailureDelta": 0,
+        "alertEvaluationStatus": cadence_status,
+        "alertEvaluationDelaySeconds": cadence_delay,
+        "monitoringFilesystemStatus": filesystem_status,
+        "monitoringFilesystemUsedPercent": filesystem_used_percent,
+        "externalHeartbeatStatus": "unsupported",
+        "externalHeartbeatAvailable": None,
+    }
 
 
 def run(config: Config, now: dt.datetime | None = None) -> dict[str, Any]:
@@ -5951,7 +7410,7 @@ def run(config: Config, now: dt.datetime | None = None) -> dict[str, Any]:
         incident_lifecycle_path = config.output_dir / ".state" / "incident-lifecycle.json"
         durable_incident_state = load_json(incident_lifecycle_path)
         previous_incident_state = durable_incident_state or prior.get("incident")
-        monotonic = time.monotonic()
+        monotonic = _sample_monotonic()
         elapsed = monotonic - (finite_number(prior.get("monotonic"), monotonic) or monotonic)
 
         proc_stat = read_text(config.proc_root / "stat")
@@ -6038,9 +7497,10 @@ def run(config: Config, now: dt.datetime | None = None) -> dict[str, Any]:
             "logicalCpuCount": parse_logical_cpu_count(proc_stat),
             "uptimeSeconds": uptime_seconds,
         }
-        containers, container_collection, container_cpu_state = collect_container_telemetry(
-            config, prior, now
-        )
+        (
+            containers, container_collection, container_cpu_state,
+            docker_event_collection, docker_events, docker_event_state,
+        ) = collect_container_telemetry(config, prior, now)
         processes, process_cpu_state = collect_processes(
             config.proc_root, prior.get("processes"), host_cpu_delta, config.process_uids
         )
@@ -6072,6 +7532,9 @@ def run(config: Config, now: dt.datetime | None = None) -> dict[str, Any]:
             rpi_data=gpu,
         )
         identity, heartbeat = prepare_identity(config, now)
+        synthetic_probe_collection, synthetic_probes = collect_synthetic_probes(
+            config.synthetic_input, now
+        )
         current = {
             "schemaVersion": CURRENT_SCHEMA_VERSION,
             "generatedAt": now_text,
@@ -6082,6 +7545,10 @@ def run(config: Config, now: dt.datetime | None = None) -> dict[str, Any]:
             "disks": collect_filesystems(read_text(config.mountinfo_path), config.mount_root),
             "containers": containers,
             "containerCollection": container_collection,
+            "dockerEventCollection": docker_event_collection,
+            "dockerEvents": docker_events,
+            "syntheticProbeCollection": synthetic_probe_collection,
+            "syntheticProbes": synthetic_probes,
             "currentTraffic": traffic,
             "reliability": reliability,
             "system": system,
@@ -6136,12 +7603,20 @@ def run(config: Config, now: dt.datetime | None = None) -> dict[str, Any]:
         notification_signal, notification_counter = notification_delivery_signal(
             config.output_dir, prior_notification_counter
         )
+        monitor_signal = monitor_runtime_signal(
+            config.output_dir,
+            now,
+            elapsed,
+            config.expected_interval_seconds,
+        )
+        monitor_signal.update(notification_signal)
         delta_state = {
             "monotonic": monotonic,
             "cpu": list(cpu) if cpu else None,
             "network": list(network) if network is not None else None,
             "disk": list(disk) if disk is not None else None,
             "containers": container_cpu_state,
+            "dockerEvents": docker_event_state,
             "processes": process_cpu_state,
             "linux": linux_delta_state,
             "notificationFinalFailures": prior_notification_counter,
@@ -6152,7 +7627,7 @@ def run(config: Config, now: dt.datetime | None = None) -> dict[str, Any]:
             config,
             current,
             now,
-            notification_signal,
+            monitor_signal,
             delta_path,
             delta_state,
             notification_counter,

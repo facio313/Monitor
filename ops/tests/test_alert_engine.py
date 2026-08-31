@@ -14,6 +14,7 @@ from ops.alert_engine import (
     evaluate_rule_pack,
     load_rule_pack,
     parse_rule_pack,
+    release_notification_events,
 )
 
 
@@ -60,6 +61,14 @@ def rule(**overrides):
         "enabled": True,
     }
     values.update(overrides)
+    values.setdefault("evaluation_interval_seconds", 60)
+    values.setdefault("for_seconds", max(0, (values["for_samples"] - 1) * 60))
+    values.setdefault(
+        "recovery_seconds", max(0, (values["recovery_samples"] - 1) * 60)
+    )
+    values.setdefault(
+        "no_data_seconds", max(0, (values["no_data_samples"] - 1) * 60)
+    )
     return AlertRule(**values)
 
 
@@ -82,6 +91,14 @@ def raw_rule(**overrides):
         "enabled": True,
     }
     values.update(overrides)
+    values.setdefault("evaluationIntervalSeconds", 60)
+    values.setdefault("forSeconds", max(0, (values["forSamples"] - 1) * 60))
+    values.setdefault(
+        "recoverySeconds", max(0, (values["recoverySamples"] - 1) * 60)
+    )
+    values.setdefault(
+        "noDataSeconds", max(0, (values["noDataSamples"] - 1) * 60)
+    )
     return values
 
 
@@ -91,6 +108,9 @@ class AlertEngineTests(unittest.TestCase):
         pack = load_rule_pack(path)
         self.assertEqual([item.rule_id for item in pack.rules], EXPECTED_DEFAULT_RULES)
         self.assertEqual(len(pack.rules), 82)
+        self.assertTrue(all(item.evaluation_interval_seconds == 60 for item in pack.rules))
+        self.assertTrue(all(item.for_seconds >= 0 for item in pack.rules))
+        self.assertTrue(all(item.recovery_seconds >= 0 for item in pack.rules))
 
     def test_rule_pack_is_strict_and_rejects_unknown_keys(self):
         value = {"schemaVersion": 1, "version": "2026.08.1", "rules": [raw_rule(extra=True)]}
@@ -101,6 +121,20 @@ class AlertEngineTests(unittest.TestCase):
         value = {"schemaVersion": 1, "version": "2026.08.1", "rules": [raw_rule(recoveryThreshold=95)]}
         with self.assertRaisesRegex(RulePackError, "must not exceed"):
             parse_rule_pack(value)
+
+    def test_rule_pack_rejects_invalid_duration_and_interval(self):
+        for invalid in (
+            raw_rule(forSeconds=-1),
+            raw_rule(recoverySeconds=-1),
+            raw_rule(noDataSeconds=-1),
+            raw_rule(evaluationIntervalSeconds=0),
+        ):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(
+                RulePackError, "must be an integer"
+            ):
+                parse_rule_pack({
+                    "schemaVersion": 1, "version": "2026.08.1", "rules": [invalid],
+                })
 
     def test_rule_pack_rejects_version_not_accepted_by_persistence(self):
         value = {"schemaVersion": 1, "version": "bad version", "rules": [raw_rule()]}
@@ -144,6 +178,66 @@ class AlertEngineTests(unittest.TestCase):
         self.assertEqual(phases, ["pending", "pending", "firing"])
         self.assertEqual(transitions, ["pending", None, "firing"])
         self.assertEqual(state["openedAt"], "2026-08-30T12:00:00Z")
+
+    def test_elapsed_duration_prevents_fast_evaluation_from_firing_early(self):
+        alert_rule = rule(for_samples=2, for_seconds=120)
+        state = None
+        for seconds in (0, 30, 60, 90):
+            state, _ = evaluate_observation(
+                alert_rule,
+                Observation("host-a", 95),
+                state,
+                NOW + dt.timedelta(seconds=seconds),
+            )
+            self.assertEqual(state["phase"], "pending")
+        state, transition = evaluate_observation(
+            alert_rule,
+            Observation("host-a", 95),
+            state,
+            NOW + dt.timedelta(seconds=120),
+        )
+        self.assertEqual((state["phase"], transition), ("firing", "firing"))
+        self.assertEqual(state["conditionStartedAt"], "2026-08-30T12:00:00Z")
+
+    def test_evaluation_interval_change_resets_pending_duration(self):
+        original = rule(for_samples=2, for_seconds=120, evaluation_interval_seconds=60)
+        changed = rule(for_samples=2, for_seconds=120, evaluation_interval_seconds=30)
+        state, _ = evaluate_observation(original, Observation("host-a", 95), None, NOW)
+        state, _ = evaluate_observation(
+            original, Observation("host-a", 95), state, NOW + dt.timedelta(seconds=60)
+        )
+        state, transition = evaluate_observation(
+            changed, Observation("host-a", 95), state, NOW + dt.timedelta(seconds=90)
+        )
+        self.assertEqual((state["phase"], transition), ("pending", "pending"))
+        self.assertEqual(state["breachSamples"], 1)
+        self.assertEqual(state["conditionStartedAt"], "2026-08-30T12:01:30Z")
+
+    def test_recovery_requires_elapsed_duration_as_well_as_samples(self):
+        alert_rule = rule(
+            for_samples=1,
+            for_seconds=0,
+            recovery_samples=2,
+            recovery_seconds=120,
+        )
+        state, _ = evaluate_observation(
+            alert_rule, Observation("host-a", 95), None, NOW
+        )
+        for seconds in (30, 60, 90):
+            state, _ = evaluate_observation(
+                alert_rule,
+                Observation("host-a", 75),
+                state,
+                NOW + dt.timedelta(seconds=seconds),
+            )
+            self.assertEqual(state["phase"], "recovering")
+        state, transition = evaluate_observation(
+            alert_rule,
+            Observation("host-a", 75),
+            state,
+            NOW + dt.timedelta(seconds=150),
+        )
+        self.assertEqual((state["phase"], transition), ("inactive", "resolved"))
 
     def test_missing_sample_does_not_advance_pending_breach(self):
         state, _ = evaluate_observation(rule(), Observation("host-a", 95), None, NOW)
@@ -352,6 +446,68 @@ class AlertEngineTests(unittest.TestCase):
         }, {}, NOW)
         by_rule = {event["ruleId"]: event for event in events}
         self.assertEqual(by_rule["ContainerDown"]["notificationState"], "suppressed")
+
+    def test_parent_recovery_releases_still_firing_child_exactly_once(self):
+        parent = rule(
+            rule_id="HostDown", metric="host.heartbeat.age",
+            for_samples=1, recovery_samples=1,
+        )
+        child = rule(
+            rule_id="ContainerDown", metric="container.running", operator="lte",
+            threshold=0, recovery_threshold=1, for_samples=1,
+            parent_rule_id="HostDown",
+        )
+        pack = RulePack(1, "2026.08.1", (parent, child))
+        states, firing_events = evaluate_rule_pack(pack, {
+            "HostDown": [Observation("host-a", 120)],
+            "ContainerDown": [Observation("host-a", 0)],
+        }, {}, NOW)
+        suppressed = next(
+            event for event in firing_events if event["ruleId"] == "ContainerDown"
+        )
+        self.assertEqual(suppressed["notificationState"], "suppressed")
+
+        states, recovery_events = evaluate_rule_pack(
+            pack,
+            {
+                "HostDown": [Observation("host-a", 0)],
+                "ContainerDown": [Observation("host-a", 0)],
+            },
+            states,
+            NOW + dt.timedelta(minutes=1),
+        )
+        states_with_lifecycle = {
+            **states,
+            "ContainerDown:host-a": {
+                **states["ContainerDown:host-a"],
+                "notificationState": "suppressed",
+                "notificationLabels": suppressed["labels"],
+            },
+        }
+        recovery_events.extend(release_notification_events(
+            pack,
+            states_with_lifecycle,
+            NOW + dt.timedelta(minutes=1),
+        ))
+        child_releases = [
+            event for event in recovery_events
+            if event["ruleId"] == "ContainerDown"
+        ]
+        self.assertEqual(len(child_releases), 1)
+        self.assertEqual(
+            (child_releases[0]["transition"], child_releases[0]["notificationState"]),
+            ("firing", "ready"),
+        )
+        self.assertEqual(child_releases[0]["openedAt"], suppressed["openedAt"])
+        self.assertNotEqual(
+            child_releases[0]["idempotencyKey"], suppressed["idempotencyKey"]
+        )
+
+        states_with_lifecycle["ContainerDown:host-a"]["notificationState"] = "ready"
+        repeated_events = release_notification_events(
+            pack, states_with_lifecycle, NOW + dt.timedelta(minutes=2),
+        )
+        self.assertEqual(repeated_events, [])
 
     def test_runtime_labels_are_bounded(self):
         pack = RulePack(1, "2026.08.1", (rule(for_samples=1),))

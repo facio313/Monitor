@@ -10,6 +10,7 @@ import type {
 import {
   rulePhaseCounts,
   RuleHealthSummary,
+  ruleSummaryNeedsAttention,
   selectActiveRules,
   selectFiringRules,
   selectRecentRuleTransitions,
@@ -28,6 +29,10 @@ function state(ruleId: string, overrides: Partial<RuleEvaluationState> = {}): Ru
     recoverySamples: 0,
     missingSamples: 0,
     openedAt: null,
+    conditionStartedAt: null,
+    recoveryStartedAt: null,
+    missingStartedAt: null,
+    evaluationIntervalSeconds: 60,
     changedAt: '2026-08-30T11:59:00Z',
     lastEvaluatedAt: '2026-08-30T12:00:00Z',
     lastValue: null,
@@ -71,6 +76,34 @@ function transition(index: number, overrides: Partial<RuleAlertEvent> = {}): Rul
 const noAlerts: RuleAlertCollection = { status: 'ok', events: [] };
 
 describe('rule health overview', () => {
+  it('collapses only a truly nominal overview while retaining attention states', () => {
+    const nominal = evaluation([state('Inactive'), state('Unsupported', { phase: 'unsupported', observationStatus: 'unsupported' })]);
+    expect(ruleSummaryNeedsAttention(nominal, noAlerts, false)).toBe(false);
+    const compact = renderToStaticMarkup(createElement(RuleHealthSummary, {
+      evaluation: nominal, alerts: noAlerts, locale: 'en', stale: false, compactWhenNominal: true,
+    }));
+    expect(compact).toContain('rule-health-compact');
+    expect(compact).toContain('2 rules evaluated · 1 unsupported');
+    expect(compact).not.toContain('rule-lifecycle-summary');
+    expect(compact).not.toContain('rule-coverage-details');
+
+    const pending = evaluation([state('Pending', { phase: 'pending' })]);
+    expect(ruleSummaryNeedsAttention(pending, noAlerts, false)).toBe(true);
+    const expanded = renderToStaticMarkup(createElement(RuleHealthSummary, {
+      evaluation: pending, alerts: noAlerts, locale: 'en', stale: false, compactWhenNominal: true,
+    }));
+    expect(expanded).not.toContain('rule-health-compact');
+    expect(expanded).toContain('rule-lifecycle-summary');
+
+    const unavailableAlerts: RuleAlertCollection = { status: 'unavailable', events: [] };
+    expect(ruleSummaryNeedsAttention(evaluation(), unavailableAlerts, false)).toBe(true);
+    const unavailable = renderToStaticMarkup(createElement(RuleHealthSummary, {
+      evaluation: evaluation(), alerts: unavailableAlerts, locale: 'en', stale: false, compactWhenNominal: true,
+    }));
+    expect(unavailable).not.toContain('rule-health-compact');
+    expect(unavailable).toContain('Recent transition log unavailable');
+  });
+
   it('orders firing rules by severity, caps them at five, and renders safe operator context', () => {
     const rules = [
       state('InfoOld', { phase: 'firing', severity: 'info', openedAt: '2026-08-30T01:00:00Z' }),

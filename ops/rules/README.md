@@ -8,8 +8,9 @@ refactor.
 The pack is declarative data, not executable Python or an expression language.
 `ops/alert_engine.py` accepts only a bounded fixed schema, finite thresholds,
 known comparison operators, explicit recovery thresholds, minimum breach and
-recovery sample counts, a no-data policy, optional parent suppression, bounded
-labels, and fixed-length operator guidance. Unknown fields, duplicate IDs,
+recovery sample counts, explicit evaluation/breach/recovery/no-data durations,
+a no-data policy, optional parent suppression, bounded labels, and fixed-length
+operator guidance. Unknown fields, duplicate IDs,
 invalid hysteresis, parent cycles, symlinks, and oversized files fail closed.
 
 ## Honest support status
@@ -20,31 +21,54 @@ emits an explicit `unsupported`, `permission_denied`, `collection_error`,
 value. Unsupported rules must never appear healthy and must not send fault
 notifications.
 
-The current single-host collector can directly evaluate only the subset backed
-by its reduced snapshot: aggregate CPU, load per core, CPU and memory PSI,
-available memory, swap usage, filesystem capacity/inodes/read-only state,
-aggregate network errors/drops, temperature, authoritative Raspberry Pi
-throttle flags, and the reduced Docker v2 running state, restart delta,
+The current single-host collector evaluates the subset backed by its reduced
+snapshot: aggregate/per-mode CPU, load per core, CPU and memory PSI, available
+memory, swap usage and churn, filesystem capacity/inodes/read-only state,
+block latency, network errors/drops, TCP retransmission and conntrack pressure,
+system FD/PID/zombie pressure, allow-listed systemd state, clock/reboot evidence,
+temperature, authoritative Raspberry Pi throttle flags, local Monitor cadence
+and filesystem health, notification final failures, and the reduced Docker v3
+running state, restart delta,
 OOM state, authoritative healthcheck state, configured CPU/memory limits, and
-CPU/memory percentage of those limits. PID-limit saturation remains
-unsupported because only the configured limit—not current PID usage—is
-collected; security, image, writable-layer, and container-network rules are
-also still unsupported. The remaining rules stay visibly unsupported until
+CPU/memory percentage of those limits. Current PID saturation, CPU throttle
+periods, network errors, writable-layer bytes, privileged/socket-mount state,
+image digest drift/latest-tag use, and Docker event-poll continuity are also
+mapped. `ContainerWritableLayerHigh` uses an absolute 1 GiB default because
+Docker `SizeRw` does not expose a truthful per-container capacity denominator;
+the Docker data-root filesystem is evaluated separately. Missing detail stays
+explicitly unsupported rather than becoming a healthy zero. The remaining rules stay visibly unsupported until
 their collector, agent, central ingest, or synthetic source is implemented and
 tested.
 
 ## Evaluation semantics
 
-- Gauge rules require every configured `forSamples`; missing evaluations never
-  advance a pending breach. At the one-minute cadence, a gap over 90 seconds
-  resets pending/no-data streaks instead of counting elapsed wall time as a
-  continuous condition.
-- Recovery requires `recoverySamples` at the separate recovery threshold.
-- No-data has its own policy and counter.
+- Gauge rules require both `forSamples` and `forSeconds`; repeated fast calls
+  cannot satisfy wall-clock persistence early. Missing evaluations never
+  advance a pending breach. A gap beyond the cadence tolerance resets pending
+  and no-data duration instead of counting the gap as a continuous condition.
+- Recovery requires both `recoverySamples` and `recoverySeconds` at the separate
+  recovery threshold.
+- No-data has its own policy, counter, and `noDataSeconds` duration.
+- Each state records the configured `evaluationIntervalSeconds` and the breach,
+  recovery, and missing start timestamps. A cadence change resets a pending
+  duration; an already firing incident remains open and must recover on valid
+  evidence.
 - Missing, stale, permission-denied, or failed observations never resolve an
   already firing condition; a valid recovery observation is required.
-- Silence suppresses delivery, not evaluation history.
-- A firing parent suppresses child delivery while preserving child state.
+- Silence suppresses delivery, not evaluation history. If the incident remains
+  firing when the silence expires, one deterministic ready event retains the
+  original incident `openedAt`; a silence added after ready authority exists is
+  non-retroactive.
+- Optional persistent silences are loaded from the owner-only mode-`0600`
+  `/etc/monitor/alert-silences.json` file (or the absolute
+  `MONITOR_ALERT_SILENCES` path). The schema is exact and bounded to 256
+  one-shot UTC intervals of at most 366 days; duplicate keys/IDs, links,
+  hardlinks, broad permissions, invalid selectors, and malformed intervals
+  fail rule evaluation closed. See `alert-silences.example.v1.json`.
+- A firing parent suppresses child delivery while preserving child state. If
+  the child remains firing when the parent recovers, private lifecycle state
+  emits one ready event even if the bounded log no longer retains the opening
+  suppressed row.
 - A transition carries a deterministic SHA-256 idempotency key.
 - The engine performs no delivery and no file mutation itself. The collector
   persists returned state and a bounded transition log. When an explicit
@@ -58,8 +82,6 @@ tested.
 - Delivery tests use a separate `purpose=test` identity and counters. They do
   not mutate evaluator state, the transition log, or incident statistics.
 
-The default cadence is one minute. A future remote-agent path may use elapsed
-duration in addition to sample counts, but it must preserve the rule-pack
-version and these no-data and hysteresis guarantees. Changing cadence requires
-a new pack version; the store intentionally resets pending streaks when the
-pack version changes.
+The default cadence is one minute. Changing the declared cadence or pack
+version intentionally resets pending streaks while preserving active incident
+identity.

@@ -51,6 +51,7 @@ function localApp(directory: string) {
     authStateFile: join(directory, 'auth-state.json'),
     sessionSecret: SESSION_SECRET,
     dataDir: directory,
+    securityStateDir: directory,
     now: () => NOW,
     ssoEnabled: false,
   });
@@ -105,7 +106,14 @@ describe('infrastructure ledger API', () => {
   });
 
   it('restricts SSO access to admin and chief-admin roles', async () => {
-    const app = createApp({ dataDir: dataDirectory(), now: () => NOW, ssoEnabled: true, edgeSecret: EDGE_SECRET });
+    const directory = dataDirectory();
+    const app = createApp({
+      dataDir: directory,
+      securityStateDir: directory,
+      now: () => NOW,
+      ssoEnabled: true,
+      edgeSecret: EDGE_SECRET,
+    });
     await request(app).get('/monitor/api/infrastructure-ledger').expect(401);
     await request(app)
       .get('/monitor/api/infrastructure-ledger')

@@ -5,7 +5,15 @@ collector writes normalized, deterministic transition events first. When
 `/etc/monitor/alert-delivery.json` exists, `alert_store.py` routes recent
 `notificationState=ready` events and inserts one SQLite row per event/channel.
 It never opens a network connection. `suppressed` and `silenced` transitions
-remain in `rule-alerts.jsonl` but are not queued.
+remain in `rule-alerts.jsonl` but are not queued. While the incident remains
+firing, parent recovery or silence expiry creates one deterministic
+`notificationState=ready` firing event with the original `openedAt`; that event
+is then queued normally. The private evaluator state retains this notification
+authority even after the bounded transition log drops the opening row. Event
+publication precedes the state replacement, so crash replay treats a durable
+ready event as irrevocable and does not enqueue it twice. For the same reason,
+adding a silence after a ready event was already recorded is deliberately
+non-retroactive: it cannot retract a row that may already be queued or delivered.
 
 `alert_delivery.py drain`, normally invoked only by
 `monitor-alert-delivery.service`, is the network-capable path. It atomically
@@ -102,6 +110,28 @@ Secrets are resolved only after a row is leased. They are never written to the
 outbox, delivery log, test output, or exception text. This is a reference-based
 fail-closed design because the repository has no encryption-key lifecycle or
 KMS integration; it does not claim application-managed encryption at rest.
+
+## HTTPS egress boundary
+
+Webhook, Slack, Discord, and Telegram deliveries permit HTTPS only. On every
+delivery attempt the worker canonicalizes the endpoint hostname to its ASCII
+IDNA form, resolves A and AAAA records, and validates the complete answer set
+before opening a socket. An empty, malformed, or oversized answer set fails
+closed. Any private, loopback, link-local, multicast, unspecified, reserved,
+shared, IPv4-mapped IPv6, IPv6 transition, scoped, or otherwise non-global
+address rejects the complete set; a public/private mixed answer never falls
+back to its public member.
+
+After validation, the worker connects directly to one validated numeric address
+and does not resolve the hostname again during that connection. The canonical
+original hostname remains the TLS SNI/certificate-verification name and HTTP
+`Host` authority. HTTP redirects are never followed, including redirects to
+another HTTPS origin. A later outbox retry performs a fresh full resolution and
+validation, preventing DNS rebinding between validation and use. The channel
+socket timeout bounds connect, TLS, request, and response-header inactivity;
+the lease-safe absolute delivery deadline also covers credential lookup and a
+blocking system resolver. SMTP retains its independently documented TLS and
+deadline behavior and is not routed through the webhook egress policy.
 
 ## Routing and commands
 

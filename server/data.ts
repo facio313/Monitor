@@ -39,6 +39,7 @@ const MAX_INCIDENT_PROCESSES = 32;
 const MAX_INCIDENT_CONTAINERS = 256;
 const MAX_INCIDENT_TRAFFIC = 64;
 const MAX_CURRENT_TRAFFIC = 16;
+const MAX_SYNTHETIC_PROBES = 32;
 const MAX_POWER_CORRELATION_MS = 2 * 60 * 1_000;
 const MAX_UINT32 = 0xffff_ffff;
 const MAX_INCIDENT_DURATION_SECONDS = 366 * 24 * 60 * 60;
@@ -47,6 +48,37 @@ const MAX_INCIDENT_COUNT = 1_000_000_000;
 const MAX_RELIABILITY_DURATION_SECONDS = 366 * 24 * 60 * 60;
 const MAX_CONTAINER_CPU_PERCENT = 1024;
 const MAX_TELEMETRY_RATE = 1_000_000_000_000;
+const MAX_LINUX_COUNTER = Number.MAX_SAFE_INTEGER;
+const MAX_LINUX_RATE = 1_000_000_000_000_000;
+const MAX_LINUX_REDUCED_DEVICES = 16;
+const MAX_LINUX_REDUCED_THERMAL_ITEMS = 8;
+const LINUX_RAW_STATUSES = new Set([
+  'supported', 'partial', 'unsupported', 'permission_error', 'unavailable',
+  'invalid', 'too_large', 'timeout',
+]);
+const LINUX_RATE_STATUSES = new Set([
+  'ok', 'warmup', 'counter_reset', ...LINUX_RAW_STATUSES,
+]);
+const LINUX_CPU_MODES = [
+  'user', 'nice', 'system', 'idle', 'iowait', 'irq', 'softirq', 'steal',
+] as const;
+const LINUX_DISK_COUNTER_FIELDS = [
+  'reads', 'readsMerged', 'sectorsRead', 'readMilliseconds',
+  'writes', 'writesMerged', 'sectorsWritten', 'writeMilliseconds',
+  'inFlight', 'ioMilliseconds', 'weightedIoMilliseconds',
+  'discards', 'discardsMerged', 'sectorsDiscarded', 'discardMilliseconds',
+  'flushes', 'flushMilliseconds',
+] as const;
+const LINUX_NETWORK_COUNTER_FIELDS = [
+  'rxBytes', 'rxPackets', 'rxErrors', 'rxDropped', 'rxFifo',
+  'rxFrame', 'rxCompressed', 'rxMulticast', 'txBytes', 'txPackets',
+  'txErrors', 'txDropped', 'txFifo', 'txCollisions', 'txCarrier',
+  'txCompressed',
+] as const;
+const LINUX_TCP_STATE_FIELDS = [
+  'established', 'synSent', 'synRecv', 'finWait1', 'finWait2', 'timeWait',
+  'close', 'closeWait', 'lastAck', 'listen', 'closing', 'newSynRecv',
+] as const;
 const RULE_PHASES = new Set<RuleEvaluationPhase>([
   'inactive', 'pending', 'firing', 'recovering', 'no_data', 'unsupported',
   'permission_denied', 'collection_error',
@@ -230,6 +262,16 @@ function own(record: JsonRecord | undefined, key: string): unknown {
 function exactKeys(record: JsonRecord, expected: readonly string[]): boolean {
   const actual = Object.keys(record);
   return actual.length === expected.length && expected.every((key) => Object.prototype.hasOwnProperty.call(record, key));
+}
+
+function exactKnownKeys(
+  record: JsonRecord,
+  required: readonly string[],
+  optional: readonly string[] = [],
+): boolean {
+  const allowed = new Set([...required, ...optional]);
+  return required.every((key) => Object.prototype.hasOwnProperty.call(record, key))
+    && Object.keys(record).every((key) => allowed.has(key));
 }
 
 function recordAt(record: JsonRecord | undefined, ...keys: string[]): JsonRecord | undefined {
@@ -1104,6 +1146,141 @@ const CONTAINER_V2_ONLY_FIELDS = [
   'project', 'healthcheckConfigured', 'memoryLimitBytes', 'cpuLimitCores', 'pidLimit',
   'restartCount', 'restartCountDelta', 'oomKilled', 'startedAt', 'finishedAt',
 ] as const;
+const CONTAINER_V3_ONLY_FIELDS = [
+  'instanceId', 'pidCount', 'cpuThrottledPercent', 'cpuThrottledPeriods',
+  'cpuThrottledSeconds', 'blockReadBytes', 'blockWriteBytes',
+  'blockReadBytesPerSecond', 'blockWriteBytesPerSecond', 'networkRxBytes',
+  'networkTxBytes', 'networkRxBytesPerSecond', 'networkTxBytesPerSecond',
+  'networkErrors', 'networkErrorsPerSecond', 'writableLayerBytes', 'volumeCount',
+  'bindMountCount', 'tmpfsMountCount', 'networkAttachmentCount', 'publishedPortCount',
+  'privileged', 'hostPid', 'hostIpc', 'hostNetwork', 'dockerSocketMounted',
+  'sensitiveBindMounted', 'rootUser', 'readOnlyRootFilesystem', 'addedCapabilityCount',
+  'dangerousCapabilityCount', 'excessiveCapabilities', 'imageName', 'imageTag',
+  'imageDigest', 'imageDigestSource', 'usesLatestTag', 'imageDigestDrift',
+  'imageDigestChanged',
+] as const;
+const CONTAINER_V3_FIELDS = [...CONTAINER_V2_FIELDS, ...CONTAINER_V3_ONLY_FIELDS] as const;
+type ContainerRow = DashboardResponse['containers'][number];
+type ContainerV3Extras = Pick<ContainerRow, (typeof CONTAINER_V3_ONLY_FIELDS)[number]>;
+const EMPTY_CONTAINER_V3_EXTRAS: ContainerV3Extras = {};
+
+function nullableContainerInteger(record: JsonRecord, field: string, maximum: number): number | null | undefined {
+  const value = own(record, field);
+  if (value === null) return null;
+  return integer(value, 0, maximum) ?? undefined;
+}
+
+function nullableContainerNumber(record: JsonRecord, field: string, maximum: number): number | null | undefined {
+  const value = own(record, field);
+  if (value === null) return null;
+  return finite(value, 0, maximum) ?? undefined;
+}
+
+function nullableContainerBoolean(record: JsonRecord, field: string): boolean | null | undefined {
+  const value = own(record, field);
+  return value === null ? null : typeof value === 'boolean' ? value : undefined;
+}
+
+function normalizeContainerV3Extras(record: JsonRecord): ContainerV3Extras | null {
+  const instanceId = own(record, 'instanceId');
+  if (typeof instanceId !== 'string' || !/^[a-f0-9]{32}$/.test(instanceId)) return null;
+  const integers = {
+    pidCount: nullableContainerInteger(record, 'pidCount', Number.MAX_SAFE_INTEGER),
+    cpuThrottledPeriods: nullableContainerInteger(record, 'cpuThrottledPeriods', Number.MAX_SAFE_INTEGER),
+    blockReadBytes: nullableContainerInteger(record, 'blockReadBytes', Number.MAX_SAFE_INTEGER),
+    blockWriteBytes: nullableContainerInteger(record, 'blockWriteBytes', Number.MAX_SAFE_INTEGER),
+    networkRxBytes: nullableContainerInteger(record, 'networkRxBytes', Number.MAX_SAFE_INTEGER),
+    networkTxBytes: nullableContainerInteger(record, 'networkTxBytes', Number.MAX_SAFE_INTEGER),
+    networkErrors: nullableContainerInteger(record, 'networkErrors', Number.MAX_SAFE_INTEGER),
+    writableLayerBytes: nullableContainerInteger(record, 'writableLayerBytes', Number.MAX_SAFE_INTEGER),
+    volumeCount: nullableContainerInteger(record, 'volumeCount', 4096),
+    bindMountCount: nullableContainerInteger(record, 'bindMountCount', 4096),
+    tmpfsMountCount: nullableContainerInteger(record, 'tmpfsMountCount', 4096),
+    networkAttachmentCount: nullableContainerInteger(record, 'networkAttachmentCount', 4096),
+    publishedPortCount: nullableContainerInteger(record, 'publishedPortCount', 65_536),
+    addedCapabilityCount: nullableContainerInteger(record, 'addedCapabilityCount', 64),
+    dangerousCapabilityCount: nullableContainerInteger(record, 'dangerousCapabilityCount', 64),
+  };
+  const numbers = {
+    cpuThrottledPercent: nullableContainerNumber(record, 'cpuThrottledPercent', 100),
+    cpuThrottledSeconds: nullableContainerNumber(record, 'cpuThrottledSeconds', Number.MAX_SAFE_INTEGER),
+    blockReadBytesPerSecond: nullableContainerNumber(record, 'blockReadBytesPerSecond', 1e15),
+    blockWriteBytesPerSecond: nullableContainerNumber(record, 'blockWriteBytesPerSecond', 1e15),
+    networkRxBytesPerSecond: nullableContainerNumber(record, 'networkRxBytesPerSecond', 1e15),
+    networkTxBytesPerSecond: nullableContainerNumber(record, 'networkTxBytesPerSecond', 1e15),
+    networkErrorsPerSecond: nullableContainerNumber(record, 'networkErrorsPerSecond', 1e15),
+  };
+  const booleans = {
+    privileged: nullableContainerBoolean(record, 'privileged'),
+    hostPid: nullableContainerBoolean(record, 'hostPid'),
+    hostIpc: nullableContainerBoolean(record, 'hostIpc'),
+    hostNetwork: nullableContainerBoolean(record, 'hostNetwork'),
+    dockerSocketMounted: nullableContainerBoolean(record, 'dockerSocketMounted'),
+    sensitiveBindMounted: nullableContainerBoolean(record, 'sensitiveBindMounted'),
+    rootUser: nullableContainerBoolean(record, 'rootUser'),
+    readOnlyRootFilesystem: nullableContainerBoolean(record, 'readOnlyRootFilesystem'),
+    excessiveCapabilities: nullableContainerBoolean(record, 'excessiveCapabilities'),
+    usesLatestTag: nullableContainerBoolean(record, 'usesLatestTag'),
+    imageDigestDrift: nullableContainerBoolean(record, 'imageDigestDrift'),
+    imageDigestChanged: nullableContainerBoolean(record, 'imageDigestChanged'),
+  };
+  if (
+    Object.values(integers).some((value) => value === undefined)
+    || Object.values(numbers).some((value) => value === undefined)
+    || Object.values(booleans).some((value) => value === undefined)
+  ) return null;
+  const imageName = own(record, 'imageName');
+  const imageTag = own(record, 'imageTag');
+  const imageDigest = own(record, 'imageDigest');
+  const imageDigestSource = own(record, 'imageDigestSource');
+  if (
+    (imageName !== null && (typeof imageName !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,191}$/.test(imageName) || imageName.startsWith('/') || imageName.endsWith('/') || imageName.includes('//')))
+    || (imageTag !== null && (typeof imageTag !== 'string' || !/^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$/.test(imageTag)))
+    || (imageDigest !== null && (typeof imageDigest !== 'string' || !/^sha256:[a-f0-9]{64}$/.test(imageDigest)))
+    || ![null, 'repo-digest', 'local-image-id'].includes(imageDigestSource as null | string)
+    || ((imageDigest === null) !== (imageDigestSource === null))
+    || (imageName === null && imageTag !== null)
+    || (imageName === null && booleans.usesLatestTag !== null)
+    || (imageName !== null && booleans.usesLatestTag !== (imageTag === 'latest'))
+    || (imageDigestSource === 'repo-digest' && imageName === null)
+    || (imageDigest === null && (booleans.imageDigestDrift !== null || booleans.imageDigestChanged !== null))
+    || (imageDigest !== null && booleans.imageDigestDrift === null)
+    || (numbers.blockReadBytesPerSecond !== null && integers.blockReadBytes === null)
+    || (numbers.blockWriteBytesPerSecond !== null && integers.blockWriteBytes === null)
+    || (numbers.networkRxBytesPerSecond !== null && integers.networkRxBytes === null)
+    || (numbers.networkTxBytesPerSecond !== null && integers.networkTxBytes === null)
+    || (numbers.networkErrorsPerSecond !== null && integers.networkErrors === null)
+    || (numbers.cpuThrottledPercent !== null && integers.cpuThrottledPeriods === null)
+    || (
+      [integers.addedCapabilityCount, integers.dangerousCapabilityCount, booleans.excessiveCapabilities]
+        .some((value) => value === null)
+      && ![integers.addedCapabilityCount, integers.dangerousCapabilityCount, booleans.excessiveCapabilities]
+        .every((value) => value === null)
+    )
+    || (
+      integers.addedCapabilityCount !== null
+      && integers.dangerousCapabilityCount !== null
+      && integers.dangerousCapabilityCount! > integers.addedCapabilityCount!
+    )
+    || (
+      integers.addedCapabilityCount !== null
+      && integers.dangerousCapabilityCount !== null
+      && booleans.excessiveCapabilities !== (
+        integers.addedCapabilityCount! > 12 || integers.dangerousCapabilityCount! > 0
+      )
+    )
+  ) return null;
+  return {
+    instanceId,
+    ...integers,
+    ...numbers,
+    ...booleans,
+    imageName: imageName as string | null,
+    imageTag: imageTag as string | null,
+    imageDigest: imageDigest as string | null,
+    imageDigestSource: imageDigestSource as ContainerRow['imageDigestSource'],
+  } as ContainerV3Extras;
+}
 
 function containerLifecycleTimestamp(value: unknown, nowMs: number): string | null | undefined {
   if (value === null) return null;
@@ -1124,23 +1301,28 @@ function normalizeContainerList(
   return input.slice(0, maximum).flatMap((value) => {
     if (!isRecord(value)) return [];
     if (own(value, 'owner') !== 'cks') return [];
-    const v2 = CONTAINER_V2_ONLY_FIELDS.some((field) => Object.prototype.hasOwnProperty.call(value, field));
-    if (v2 && !CONTAINER_V2_FIELDS.every((field) => Object.prototype.hasOwnProperty.call(value, field))) {
+    const v3 = CONTAINER_V3_ONLY_FIELDS.some((field) => Object.prototype.hasOwnProperty.call(value, field));
+    const v2 = !v3 && CONTAINER_V2_ONLY_FIELDS.some((field) => Object.prototype.hasOwnProperty.call(value, field));
+    const modern = v2 || v3;
+    if (
+      (v3 && !exactKeys(value, CONTAINER_V3_FIELDS))
+      || (v2 && !exactKeys(value, CONTAINER_V2_FIELDS))
+    ) {
       return [];
     }
     const rawName = cleanText(own(value, 'name'), 128)?.toLowerCase() ?? null;
     const name = safeContainerName(first(value, ['name']));
     const expectedProject = rawName === null ? undefined : CURRENT_CONTAINER_PROJECTS[rawName];
-    const project = v2 ? own(value, 'project') : null;
-    const migratedV2 = v2
+    const project = modern ? own(value, 'project') : null;
+    const migratedV2 = modern
       && project === null
       && own(value, 'health') === null
       && CONTAINER_V2_ONLY_FIELDS
         .filter((field) => field !== 'project')
         .every((field) => own(value, field) === null);
     if (
-      (!v2 && !allowMigratedLegacy)
-      || (v2 && (
+      (!modern && !allowMigratedLegacy)
+      || (modern && (
         name !== rawName
         || expectedProject === undefined
         || (project !== expectedProject && !(allowMigratedLegacy && migratedV2))
@@ -1150,34 +1332,34 @@ function normalizeContainerList(
     }
     const rawHealth = own(value, 'health');
     const rawState = own(value, 'state');
-    const health = !v2 || rawHealth === null
+    const health = !modern || rawHealth === null
       ? null
       : safeContainerHealth(first(value, ['health', 'healthStatus']));
-    const healthcheckConfigured = v2 ? own(value, 'healthcheckConfigured') : null;
-    const oomKilled = v2 ? own(value, 'oomKilled') : null;
-    const memoryBytes = v2
+    const healthcheckConfigured = modern ? own(value, 'healthcheckConfigured') : null;
+    const oomKilled = modern ? own(value, 'oomKilled') : null;
+    const memoryBytes = modern
       ? (own(value, 'memoryBytes') === null ? null : integer(own(value, 'memoryBytes')))
       : finite(first(value, ['memoryBytes', 'memoryUsageBytes']));
-    const memoryLimitBytes = v2
+    const memoryLimitBytes = modern
       ? (own(value, 'memoryLimitBytes') === null ? null : integer(own(value, 'memoryLimitBytes')))
       : null;
-    const cpuLimitCores = v2
+    const cpuLimitCores = modern
       ? (own(value, 'cpuLimitCores') === null ? null : finite(own(value, 'cpuLimitCores'), 0, 1024))
       : null;
-    const pidLimit = v2
+    const pidLimit = modern
       ? (own(value, 'pidLimit') === null ? null : integer(own(value, 'pidLimit')))
       : null;
-    const restartCount = v2
+    const restartCount = modern
       ? (own(value, 'restartCount') === null ? null : integer(own(value, 'restartCount')))
       : null;
-    const restartCountDelta = v2
+    const restartCountDelta = modern
       ? (own(value, 'restartCountDelta') === null ? null : integer(own(value, 'restartCountDelta')))
       : null;
-    const startedAt = v2 ? containerLifecycleTimestamp(own(value, 'startedAt'), nowMs) : null;
-    const finishedAt = v2 ? containerLifecycleTimestamp(own(value, 'finishedAt'), nowMs) : null;
+    const startedAt = modern ? containerLifecycleTimestamp(own(value, 'startedAt'), nowMs) : null;
+    const finishedAt = modern ? containerLifecycleTimestamp(own(value, 'finishedAt'), nowMs) : null;
     const cpuPercent = containerCpuPercent(first(value, ['cpuPercent', 'cpu']));
     const memoryPercent = percent(first(value, ['memoryPercent']));
-    if (v2 && (
+    if (modern && (
       (healthcheckConfigured !== null && typeof healthcheckConfigured !== 'boolean')
       || (oomKilled !== null && typeof oomKilled !== 'boolean')
       || (own(value, 'memoryBytes') !== null && memoryBytes === null)
@@ -1198,6 +1380,8 @@ function normalizeContainerList(
       || (healthcheckConfigured === true && !['healthy', 'unhealthy', 'starting'].includes(health ?? ''))
       || (healthcheckConfigured === null && health !== null)
     )) return [];
+    const v3Extras = v3 ? normalizeContainerV3Extras(value) : EMPTY_CONTAINER_V3_EXTRAS;
+    if (v3Extras === null) return [];
     return [{
       name,
       project: typeof project === 'string' ? project : null,
@@ -1216,6 +1400,7 @@ function normalizeContainerList(
       oomKilled: typeof oomKilled === 'boolean' ? oomKilled : null,
       startedAt: startedAt ?? null,
       finishedAt: finishedAt ?? null,
+      ...v3Extras,
     }];
   });
 }
@@ -1314,6 +1499,244 @@ function normalizeContainerTelemetry(
   return { containerCollection: { status, observedAt }, containers };
 }
 
+const DOCKER_EVENT_STATUSES = new Set<DashboardResponse['dockerEventCollection']['status']>([
+  'fresh', 'gap', 'unavailable', 'permission-denied',
+]);
+const DOCKER_EVENT_ACTIONS = new Set<DashboardResponse['dockerEvents'][number]['action']>([
+  'create', 'start', 'stop', 'die', 'kill', 'pause', 'unpause', 'restart', 'oom',
+  'health_status', 'destroy',
+]);
+const DOCKER_EVENT_COLLECTION_FIELDS = [
+  'status', 'observedAt', 'cursorAt', 'reconnectCount', 'gapCount', 'gapDetected',
+  'logCollectionStatus',
+] as const;
+const DOCKER_EVENT_FIELDS = [
+  'id', 'occurredAt', 'action', 'containerName', 'project', 'instanceId', 'exitCode',
+  'healthStatus',
+] as const;
+
+function unavailableDockerEvents(): Pick<DashboardResponse, 'dockerEventCollection' | 'dockerEvents'> {
+  return {
+    dockerEventCollection: {
+      status: 'unavailable',
+      observedAt: null,
+      cursorAt: null,
+      reconnectCount: 0,
+      gapCount: 0,
+      gapDetected: true,
+      logCollectionStatus: 'unsupported',
+    },
+    dockerEvents: [],
+  };
+}
+
+function normalizeDockerEventTelemetry(
+  current: JsonRecord | null,
+  nowMs: number,
+  staleAfterMs: number,
+  cutoff: number,
+): Pick<DashboardResponse, 'dockerEventCollection' | 'dockerEvents'> {
+  if (!current) return unavailableDockerEvents();
+  const rawCollection = own(current, 'dockerEventCollection');
+  const rawEvents = own(current, 'dockerEvents');
+  if (!isRecord(rawCollection) || !Array.isArray(rawEvents) || rawEvents.length > 128) {
+    return unavailableDockerEvents();
+  }
+  if (!exactKeys(rawCollection, DOCKER_EVENT_COLLECTION_FIELDS)) return unavailableDockerEvents();
+  const rawStatus = own(rawCollection, 'status');
+  const rawObservedAt = own(rawCollection, 'observedAt');
+  const rawCursorAt = own(rawCollection, 'cursorAt');
+  const observedAt = rawObservedAt === null ? null : isoTimestamp(rawObservedAt);
+  const cursorAt = rawCursorAt === null ? null : isoTimestamp(rawCursorAt);
+  const reconnectCount = integer(own(rawCollection, 'reconnectCount'), 0, Number.MAX_SAFE_INTEGER);
+  const gapCount = integer(own(rawCollection, 'gapCount'), 0, Number.MAX_SAFE_INTEGER);
+  const gapDetected = own(rawCollection, 'gapDetected');
+  if (
+    typeof rawStatus !== 'string'
+    || !DOCKER_EVENT_STATUSES.has(rawStatus as DashboardResponse['dockerEventCollection']['status'])
+    || (rawObservedAt !== null && observedAt === null)
+    || (rawCursorAt !== null && cursorAt === null)
+    || reconnectCount === null
+    || gapCount === null
+    || typeof gapDetected !== 'boolean'
+    || own(rawCollection, 'logCollectionStatus') !== 'unsupported'
+    || ((observedAt === null) !== (cursorAt === null))
+    || (observedAt !== null && new Date(observedAt).getTime() > nowMs + 60_000)
+    || (cursorAt !== null && new Date(cursorAt).getTime() > nowMs + 60_000)
+    || (rawStatus === 'fresh' && gapDetected)
+    || (rawStatus === 'gap' && !gapDetected)
+    || (['fresh', 'gap'].includes(rawStatus) && (observedAt === null || cursorAt === null))
+  ) return unavailableDockerEvents();
+
+  let status = rawStatus as DashboardResponse['dockerEventCollection']['status'];
+  let effectiveGap = gapDetected;
+  if (
+    (status === 'fresh' || status === 'gap')
+    && observedAt !== null
+    && nowMs - new Date(observedAt).getTime() > staleAfterMs
+  ) {
+    status = 'unavailable';
+    effectiveGap = true;
+  }
+  const events: DashboardResponse['dockerEvents'] = [];
+  const seen = new Set<string>();
+  for (const candidate of rawEvents) {
+    if (!isRecord(candidate) || !exactKeys(candidate, DOCKER_EVENT_FIELDS)) return unavailableDockerEvents();
+    const id = own(candidate, 'id');
+    const occurredAt = isoTimestamp(own(candidate, 'occurredAt'));
+    const action = own(candidate, 'action');
+    const containerName = own(candidate, 'containerName');
+    const project = own(candidate, 'project');
+    const instanceId = own(candidate, 'instanceId');
+    const rawExitCode = own(candidate, 'exitCode');
+    const exitCode = rawExitCode === null ? null : integer(rawExitCode, 0, 2_147_483_647);
+    const healthStatus = own(candidate, 'healthStatus');
+    if (
+      typeof id !== 'string' || !/^[a-f0-9]{32}$/.test(id) || seen.has(id)
+      || occurredAt === null || new Date(occurredAt).getTime() > nowMs + 60_000
+      || typeof action !== 'string'
+      || !DOCKER_EVENT_ACTIONS.has(action as DashboardResponse['dockerEvents'][number]['action'])
+      || typeof containerName !== 'string' || safeContainerName(containerName) !== containerName
+      || typeof project !== 'string' || CURRENT_CONTAINER_PROJECTS[containerName] !== project
+      || typeof instanceId !== 'string' || !/^[a-f0-9]{32}$/.test(instanceId)
+      || (rawExitCode !== null && exitCode === null)
+      || ![null, 'healthy', 'unhealthy', 'starting'].includes(healthStatus as null | string)
+      || ((action === 'health_status') !== (healthStatus !== null))
+    ) return unavailableDockerEvents();
+    seen.add(id);
+    if (new Date(occurredAt).getTime() >= cutoff) {
+      events.push({
+        id,
+        occurredAt,
+        action: action as DashboardResponse['dockerEvents'][number]['action'],
+        containerName,
+        project,
+        instanceId,
+        exitCode,
+        healthStatus: healthStatus as DashboardResponse['dockerEvents'][number]['healthStatus'],
+      });
+    }
+  }
+  events.sort((left, right) => left.occurredAt.localeCompare(right.occurredAt) || left.id.localeCompare(right.id));
+  return {
+    dockerEventCollection: {
+      status,
+      observedAt,
+      cursorAt,
+      reconnectCount,
+      gapCount,
+      gapDetected: effectiveGap,
+      logCollectionStatus: 'unsupported',
+    },
+    dockerEvents: events,
+  };
+}
+
+const SYNTHETIC_COLLECTION_STATUSES = new Set<DashboardResponse['syntheticProbeCollection']['status']>([
+  'fresh', 'stale', 'unsupported', 'permission-denied', 'unavailable', 'collection-error',
+]);
+const SYNTHETIC_PROBE_STATUSES = new Set<DashboardResponse['syntheticProbes'][number]['status']>([
+  'ok', 'dns', 'permission', 'timeout', 'tls', 'http', 'invalid', 'unsupported',
+]);
+const SYNTHETIC_COLLECTION_FIELDS = ['status', 'observedAt'] as const;
+const SYNTHETIC_PROBE_FIELDS = [
+  'id', 'status', 'checkedAt', 'httpStatus', 'redirectCount',
+  'latencyMilliseconds', 'certificateExpiresAt', 'certificateDaysRemaining',
+] as const;
+
+function syntheticFallback(
+  status: DashboardResponse['syntheticProbeCollection']['status'],
+): Pick<DashboardResponse, 'syntheticProbeCollection' | 'syntheticProbes'> {
+  return { syntheticProbeCollection: { status, observedAt: null }, syntheticProbes: [] };
+}
+
+function normalizeSyntheticProbeTelemetry(
+  current: JsonRecord | null,
+  nowMs: number,
+  staleAfterMs: number,
+): Pick<DashboardResponse, 'syntheticProbeCollection' | 'syntheticProbes'> {
+  if (!current) return syntheticFallback('unsupported');
+  const rawCollection = own(current, 'syntheticProbeCollection');
+  const rawProbes = own(current, 'syntheticProbes');
+  if (rawCollection === undefined && rawProbes === undefined) return syntheticFallback('unsupported');
+  if (
+    !isRecord(rawCollection)
+    || !exactKeys(rawCollection, SYNTHETIC_COLLECTION_FIELDS)
+    || !Array.isArray(rawProbes)
+    || rawProbes.length > MAX_SYNTHETIC_PROBES
+  ) return syntheticFallback('collection-error');
+  const rawStatus = own(rawCollection, 'status');
+  const rawObservedAt = own(rawCollection, 'observedAt');
+  const observedAt = rawObservedAt === null ? null : contractTimestamp(rawObservedAt, nowMs);
+  if (
+    typeof rawStatus !== 'string'
+    || !SYNTHETIC_COLLECTION_STATUSES.has(rawStatus as DashboardResponse['syntheticProbeCollection']['status'])
+    || (rawObservedAt !== null && observedAt === null)
+    || ((rawStatus === 'fresh' || rawStatus === 'stale') !== (observedAt !== null))
+    || (!(rawStatus === 'fresh' || rawStatus === 'stale') && rawProbes.length !== 0)
+    || (rawStatus === 'fresh' && rawProbes.length === 0)
+  ) return syntheticFallback('collection-error');
+
+  let status = rawStatus as DashboardResponse['syntheticProbeCollection']['status'];
+  if (
+    status === 'fresh'
+    && observedAt !== null
+    && nowMs - new Date(observedAt).getTime() > staleAfterMs
+  ) status = 'stale';
+
+  const probes: DashboardResponse['syntheticProbes'] = [];
+  const identifiers = new Set<string>();
+  for (const candidate of rawProbes) {
+    if (!isRecord(candidate) || !exactKeys(candidate, SYNTHETIC_PROBE_FIELDS)) {
+      return syntheticFallback('collection-error');
+    }
+    const id = own(candidate, 'id');
+    const probeStatus = own(candidate, 'status');
+    const checkedAt = contractTimestamp(own(candidate, 'checkedAt'), nowMs);
+    const rawHttpStatus = own(candidate, 'httpStatus');
+    const httpStatus = rawHttpStatus === null ? null : integer(rawHttpStatus, 100, 599);
+    const redirectCount = integer(own(candidate, 'redirectCount'), 0, 5);
+    const latencyMilliseconds = integer(own(candidate, 'latencyMilliseconds'), 0, 60_000);
+    const rawCertificateExpiresAt = own(candidate, 'certificateExpiresAt');
+    const certificateExpiresAt = rawCertificateExpiresAt === null
+      ? null
+      : contractTimestamp(rawCertificateExpiresAt, nowMs + 36600 * 86400 * 1000);
+    const rawDaysRemaining = own(candidate, 'certificateDaysRemaining');
+    const certificateDaysRemaining = rawDaysRemaining === null
+      ? null
+      : integer(rawDaysRemaining, -36_600, 36_600);
+    if (
+      typeof id !== 'string'
+      || !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/.test(id)
+      || identifiers.has(id)
+      || typeof probeStatus !== 'string'
+      || !SYNTHETIC_PROBE_STATUSES.has(probeStatus as DashboardResponse['syntheticProbes'][number]['status'])
+      || checkedAt === null
+      || (observedAt !== null && new Date(checkedAt).getTime() > new Date(observedAt).getTime() + 60_000)
+      || (rawHttpStatus !== null && httpStatus === null)
+      || redirectCount === null
+      || latencyMilliseconds === null
+      || (rawCertificateExpiresAt !== null && certificateExpiresAt === null)
+      || (rawDaysRemaining !== null && certificateDaysRemaining === null)
+      || ((certificateExpiresAt === null) !== (certificateDaysRemaining === null))
+      || (probeStatus === 'ok' && httpStatus === null)
+    ) return syntheticFallback('collection-error');
+    identifiers.add(id);
+    probes.push({
+      id,
+      status: probeStatus as DashboardResponse['syntheticProbes'][number]['status'],
+      checkedAt,
+      httpStatus,
+      redirectCount,
+      latencyMilliseconds,
+      certificateExpiresAt,
+      certificateDaysRemaining,
+    });
+  }
+  probes.sort((left, right) => left.id.localeCompare(right.id));
+  return { syntheticProbeCollection: { status, observedAt }, syntheticProbes: probes };
+}
+
 function contractText(value: unknown, maximumLength: number): string | null {
   if (typeof value !== 'string' || value.length < 1 || value.length > maximumLength) return null;
   const normalized = value
@@ -1363,6 +1786,10 @@ const RULE_STATE_FIELDS = [
   'recoverySamples',
   'missingSamples',
   'openedAt',
+  'conditionStartedAt',
+  'recoveryStartedAt',
+  'missingStartedAt',
+  'evaluationIntervalSeconds',
   'changedAt',
   'lastEvaluatedAt',
   'lastValue',
@@ -1407,6 +1834,19 @@ function normalizeRuleState(
   const missingSamples = integer(own(value, 'missingSamples'), 0, 10_000);
   const openedAtValue = own(value, 'openedAt');
   const openedAt = openedAtValue === null ? null : contractTimestamp(openedAtValue, nowMs);
+  const conditionStartedAtValue = own(value, 'conditionStartedAt');
+  const conditionStartedAt = conditionStartedAtValue === null
+    ? null
+    : contractTimestamp(conditionStartedAtValue, nowMs);
+  const recoveryStartedAtValue = own(value, 'recoveryStartedAt');
+  const recoveryStartedAt = recoveryStartedAtValue === null
+    ? null
+    : contractTimestamp(recoveryStartedAtValue, nowMs);
+  const missingStartedAtValue = own(value, 'missingStartedAt');
+  const missingStartedAt = missingStartedAtValue === null
+    ? null
+    : contractTimestamp(missingStartedAtValue, nowMs);
+  const evaluationIntervalSeconds = integer(own(value, 'evaluationIntervalSeconds'), 1, 86_400);
   const changedAt = contractTimestamp(own(value, 'changedAt'), nowMs);
   const lastEvaluatedAt = contractTimestamp(own(value, 'lastEvaluatedAt'), nowMs);
   const rawLastValue = own(value, 'lastValue');
@@ -1417,10 +1857,17 @@ function normalizeRuleState(
     || recoverySamples === null
     || missingSamples === null
     || (openedAtValue !== null && openedAt === null)
+    || (conditionStartedAtValue !== null && conditionStartedAt === null)
+    || (recoveryStartedAtValue !== null && recoveryStartedAt === null)
+    || (missingStartedAtValue !== null && missingStartedAt === null)
+    || evaluationIntervalSeconds === null
     || changedAt === null
     || lastEvaluatedAt !== evaluatedAt
     || new Date(changedAt).getTime() > evaluatedMs
     || (openedAt !== null && new Date(openedAt).getTime() > evaluatedMs)
+    || (conditionStartedAt !== null && new Date(conditionStartedAt).getTime() > evaluatedMs)
+    || (recoveryStartedAt !== null && new Date(recoveryStartedAt).getTime() > evaluatedMs)
+    || (missingStartedAt !== null && new Date(missingStartedAt).getTime() > evaluatedMs)
     || ((phase === 'firing' || phase === 'recovering') && openedAt === null)
     || ((phase !== 'firing' && phase !== 'recovering') && openedAt !== null)
     || (rawLastValue !== null && lastValue === null)
@@ -1439,6 +1886,10 @@ function normalizeRuleState(
     recoverySamples,
     missingSamples,
     openedAt,
+    conditionStartedAt,
+    recoveryStartedAt,
+    missingStartedAt,
+    evaluationIntervalSeconds,
     changedAt,
     lastEvaluatedAt,
     lastValue,
@@ -2299,6 +2750,954 @@ function normalizeIncidents(
     .slice(0, MAX_INCIDENTS);
 }
 
+function linuxRecord(
+  value: unknown,
+  required: readonly string[],
+  optional: readonly string[] = [],
+): JsonRecord | null {
+  return isRecord(value) && exactKnownKeys(value, required, optional) ? value : null;
+}
+
+function linuxArray(
+  value: unknown,
+  maximum: number,
+  validate: (entry: unknown) => boolean,
+): value is unknown[] {
+  return Array.isArray(value) && value.length <= maximum && value.every(validate);
+}
+
+function linuxNullableNumber(
+  value: unknown,
+  minimum = 0,
+  maximum = MAX_LINUX_RATE,
+): boolean {
+  return value === null || finite(value, minimum, maximum) !== null;
+}
+
+function linuxNullableInteger(
+  value: unknown,
+  minimum = 0,
+  maximum = MAX_LINUX_COUNTER,
+): boolean {
+  return value === null || integer(value, minimum, maximum) !== null;
+}
+
+function linuxBooleanOrNull(value: unknown): boolean {
+  return value === null || typeof value === 'boolean';
+}
+
+function linuxLabel(value: unknown, maximum: number): boolean {
+  return typeof value === 'string'
+    && value.length >= 1
+    && value.length <= maximum
+    && /^[A-Za-z0-9_.:@/+ -]+$/.test(value);
+}
+
+function linuxPrintableText(value: unknown, maximum: number): boolean {
+  return typeof value === 'string'
+    && value.length >= 1
+    && value.length <= maximum
+    && !/[\u0000-\u001f\u007f]/.test(value);
+}
+
+function linuxTimestamp(value: unknown, nowMs: number): string | null {
+  if (typeof value !== 'string' || value.length > 40 || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(value)) {
+    return null;
+  }
+  const timestamp = new Date(value).getTime();
+  return Number.isFinite(timestamp) && timestamp >= 0 && timestamp <= nowMs + 60_000
+    ? new Date(timestamp).toISOString()
+    : null;
+}
+
+function linuxRawStatus(value: unknown): boolean {
+  return typeof value === 'string' && LINUX_RAW_STATUSES.has(value);
+}
+
+function linuxRateStatusIsValid(value: unknown): boolean {
+  return typeof value === 'string' && LINUX_RATE_STATUSES.has(value);
+}
+
+function validateLinuxCpuSample(value: unknown): boolean {
+  const percentageFields = [
+    'busyPercent', 'userPercent', 'nicePercent', 'systemPercent', 'idlePercent',
+    'iowaitPercent', 'irqPercent', 'softirqPercent', 'stealPercent',
+  ] as const;
+  const record = linuxRecord(value, ['rateStatus', ...percentageFields, 'countersJiffies']);
+  const counters = record && linuxRecord(own(record, 'countersJiffies'), LINUX_CPU_MODES);
+  return Boolean(
+    record
+    && linuxRateStatusIsValid(own(record, 'rateStatus'))
+    && percentageFields.every((field) => linuxNullableNumber(own(record, field), 0, 100))
+    && counters
+    && LINUX_CPU_MODES.every((field) => integer(own(counters, field), 0, MAX_LINUX_COUNTER) !== null),
+  );
+}
+
+function validateLinuxCpu(value: unknown): boolean {
+  const record = linuxRecord(value, [
+    'status', 'total', 'cores', 'coreCount', 'onlineCoreCount',
+    'offlineCoreIds', 'truncated', 'load',
+  ]);
+  if (!record || !linuxRawStatus(own(record, 'status'))) return false;
+  const total = own(record, 'total');
+  if (total !== null && !validateLinuxCpuSample(total)) return false;
+  const cores = own(record, 'cores');
+  if (!linuxArray(cores, 512, (entry) => {
+    const core = linuxRecord(entry, [
+      'id', 'online', 'rateStatus', 'busyPercent', 'userPercent', 'nicePercent',
+      'systemPercent', 'idlePercent', 'iowaitPercent', 'irqPercent',
+      'softirqPercent', 'stealPercent', 'countersJiffies', 'frequency', 'throttling',
+    ]);
+    if (!core || integer(own(core, 'id'), 0, 4095) === null || typeof own(core, 'online') !== 'boolean') return false;
+    const sample = {
+      rateStatus: own(core, 'rateStatus'),
+      busyPercent: own(core, 'busyPercent'),
+      userPercent: own(core, 'userPercent'),
+      nicePercent: own(core, 'nicePercent'),
+      systemPercent: own(core, 'systemPercent'),
+      idlePercent: own(core, 'idlePercent'),
+      iowaitPercent: own(core, 'iowaitPercent'),
+      irqPercent: own(core, 'irqPercent'),
+      softirqPercent: own(core, 'softirqPercent'),
+      stealPercent: own(core, 'stealPercent'),
+      countersJiffies: own(core, 'countersJiffies'),
+    };
+    const frequency = linuxRecord(own(core, 'frequency'), [
+      'status', 'currentHz', 'minimumHz', 'maximumHz', 'governor',
+    ]);
+    const throttling = linuxRecord(own(core, 'throttling'), ['status', 'count']);
+    return validateLinuxCpuSample(sample)
+      && Boolean(frequency)
+      && linuxRawStatus(own(frequency ?? undefined, 'status'))
+      && ['currentHz', 'minimumHz', 'maximumHz'].every((field) => (
+        linuxNullableInteger(own(frequency ?? undefined, field), 0, 100_000_000_000)
+      ))
+      && (own(frequency ?? undefined, 'governor') === null || linuxLabel(own(frequency ?? undefined, 'governor'), 32))
+      && Boolean(throttling)
+      && linuxRawStatus(own(throttling ?? undefined, 'status'))
+      && linuxNullableInteger(own(throttling ?? undefined, 'count'));
+  })) return false;
+  const coreCount = integer(own(record, 'coreCount'), 0, 512);
+  const onlineCoreCount = own(record, 'onlineCoreCount');
+  if (coreCount === null || coreCount !== cores.length) return false;
+  if (onlineCoreCount !== null && integer(onlineCoreCount, 0, coreCount) === null) return false;
+  const offline = own(record, 'offlineCoreIds');
+  if (!linuxArray(offline, 512, (entry) => integer(entry, 0, 4095) !== null)) return false;
+  if (new Set(offline).size !== offline.length || typeof own(record, 'truncated') !== 'boolean') return false;
+  const load = linuxRecord(own(record, 'load'), [
+    'one', 'five', 'fifteen', 'onePerOnlineCpu', 'fivePerOnlineCpu', 'fifteenPerOnlineCpu',
+  ]);
+  return Boolean(load) && Object.keys(load ?? {}).every((field) => (
+    linuxNullableNumber(own(load ?? undefined, field), 0, 1_000_000)
+  ));
+}
+
+function validateLinuxPressureWindow(value: unknown): boolean {
+  const record = linuxRecord(value, ['avg10', 'avg60', 'avg300', 'totalMicroseconds']);
+  return Boolean(record)
+    && ['avg10', 'avg60', 'avg300'].every((field) => linuxNullableNumber(own(record ?? undefined, field), 0, 100))
+    && linuxNullableInteger(own(record ?? undefined, 'totalMicroseconds'));
+}
+
+function validateLinuxMemory(value: unknown): boolean {
+  const byteFields = [
+    'totalBytes', 'availableBytes', 'usedBytes', 'cachedBytes', 'buffersBytes',
+    'slabBytes', 'slabReclaimableBytes', 'slabUnreclaimableBytes', 'dirtyBytes',
+    'writebackBytes', 'swapTotalBytes', 'swapUsedBytes',
+  ] as const;
+  const rateFields = [
+    'swapInPagesPerSecond', 'swapOutPagesPerSecond', 'swapInBytesPerSecond',
+    'swapOutBytesPerSecond', 'pageFaultsPerSecond', 'majorPageFaultsPerSecond',
+  ] as const;
+  const record = linuxRecord(value, [
+    'status', ...byteFields, 'usedPercent', 'swapUsedPercent', 'vmCounters',
+    'rateStatus', ...rateFields, 'pressure', 'pressureStatus',
+  ]);
+  if (!record || !linuxRawStatus(own(record, 'status')) || !linuxRawStatus(own(record, 'pressureStatus'))) return false;
+  if (!byteFields.every((field) => linuxNullableInteger(own(record, field)))) return false;
+  if (!linuxNullableNumber(own(record, 'usedPercent'), 0, 100)
+    || !linuxNullableNumber(own(record, 'swapUsedPercent'), 0, 100)
+    || !linuxRateStatusIsValid(own(record, 'rateStatus'))
+    || !rateFields.every((field) => linuxNullableNumber(own(record, field)))) return false;
+  const vmCounters = linuxRecord(own(record, 'vmCounters'), [], [
+    'pswpin', 'pswpout', 'pgfault', 'pgmajfault', 'oom_kill',
+  ]);
+  if (!vmCounters || !Object.keys(vmCounters).every((field) => integer(own(vmCounters, field), 0, MAX_LINUX_COUNTER) !== null)) return false;
+  const pressure = linuxRecord(own(record, 'pressure'), ['cpu', 'memory', 'io']);
+  return Boolean(pressure) && ['cpu', 'memory', 'io'].every((kind) => {
+    const item = linuxRecord(own(pressure ?? undefined, kind), ['status'], ['some', 'full']);
+    return Boolean(item)
+      && linuxRawStatus(own(item ?? undefined, 'status'))
+      && ['some', 'full'].every((window) => (
+        own(item ?? undefined, window) === undefined || validateLinuxPressureWindow(own(item ?? undefined, window))
+      ));
+  });
+}
+
+function validateLinuxFilesystems(value: unknown): boolean {
+  const record = linuxRecord(value, ['status', 'truncated', 'items']);
+  return Boolean(record)
+    && linuxRawStatus(own(record ?? undefined, 'status'))
+    && typeof own(record ?? undefined, 'truncated') === 'boolean'
+    && linuxArray(own(record ?? undefined, 'items'), 256, (entry) => {
+      const item = linuxRecord(entry, [
+        'mount', 'filesystemType', 'readOnly', 'pseudo', 'remote',
+        'readOnlyTransition', 'availability', 'mounted', 'dockerDataRootFilesystem',
+        'totalBytes', 'usedBytes', 'availableBytes', 'usedPercent',
+        'inodeTotal', 'inodeUsed', 'inodeAvailable', 'inodeUsedPercent',
+      ]);
+      const transition = own(item ?? undefined, 'readOnlyTransition');
+      return Boolean(item)
+        && linuxPrintableText(own(item ?? undefined, 'mount'), 512)
+        && linuxLabel(own(item ?? undefined, 'filesystemType'), 64)
+        && ['readOnly', 'pseudo', 'remote', 'mounted', 'dockerDataRootFilesystem'].every((field) => typeof own(item ?? undefined, field) === 'boolean')
+        && (transition === null || transition === 'became_read_only' || transition === 'became_read_write')
+        && linuxRawStatus(own(item ?? undefined, 'availability'))
+        && ['totalBytes', 'usedBytes', 'availableBytes', 'inodeTotal', 'inodeUsed', 'inodeAvailable'].every((field) => linuxNullableInteger(own(item ?? undefined, field)))
+        && ['usedPercent', 'inodeUsedPercent'].every((field) => linuxNullableNumber(own(item ?? undefined, field), 0, 100));
+    });
+}
+
+function validateLinuxBlockDevices(value: unknown): boolean {
+  const rateFields = [
+    'readBytesPerSecond', 'writeBytesPerSecond', 'readIops', 'writeIops',
+    'discardBytesPerSecond', 'discardIops', 'flushIops',
+    'readLatencyMilliseconds', 'writeLatencyMilliseconds',
+    'averageLatencyMilliseconds', 'averageQueueDepth',
+  ] as const;
+  const record = linuxRecord(value, ['status', 'truncated', 'items']);
+  return Boolean(record)
+    && linuxRawStatus(own(record ?? undefined, 'status'))
+    && typeof own(record ?? undefined, 'truncated') === 'boolean'
+    && linuxArray(own(record ?? undefined, 'items'), 128, (entry) => {
+      const item = linuxRecord(entry, [
+        'name', 'major', 'minor', 'counterIdentity', 'type', 'rotational',
+        'queueDepth', 'rateStatus', 'counters', 'discardStatus', 'flushStatus',
+        'discardRateStatus', 'flushRateStatus', ...rateFields, 'utilizationPercent',
+        'ioErrorCounterStatus', 'ioErrorEvidenceSource', 'health',
+      ]);
+      const counters = item && linuxRecord(own(item, 'counters'), LINUX_DISK_COUNTER_FIELDS);
+      const health = item && linuxRecord(own(item, 'health'), [
+        'smartStatus', 'raidStatus', 'raidDegradedDevices', 'raidArrayState',
+      ]);
+      return Boolean(item)
+        && /^[A-Za-z0-9_.-]{1,64}$/.test(String(own(item ?? undefined, 'name')))
+        && integer(own(item ?? undefined, 'major'), 0, 1_048_575) !== null
+        && integer(own(item ?? undefined, 'minor'), 0, 1_048_575) !== null
+        && typeof own(item ?? undefined, 'counterIdentity') === 'string'
+        && /^[0-9a-f]{16}$/.test(own(item ?? undefined, 'counterIdentity') as string)
+        && linuxLabel(own(item ?? undefined, 'type'), 64)
+        && linuxBooleanOrNull(own(item ?? undefined, 'rotational'))
+        && linuxNullableInteger(own(item ?? undefined, 'queueDepth'))
+        && linuxRateStatusIsValid(own(item ?? undefined, 'rateStatus'))
+        && Boolean(counters)
+        && LINUX_DISK_COUNTER_FIELDS.every((field) => linuxNullableInteger(own(counters ?? undefined, field)))
+        && ['discardStatus', 'flushStatus', 'ioErrorCounterStatus'].every((field) => linuxRawStatus(own(item ?? undefined, field)))
+        && ['discardRateStatus', 'flushRateStatus'].every((field) => linuxRateStatusIsValid(own(item ?? undefined, field)))
+        && rateFields.every((field) => linuxNullableNumber(own(item ?? undefined, field)))
+        && linuxNullableNumber(own(item ?? undefined, 'utilizationPercent'), 0, 100)
+        && own(item ?? undefined, 'ioErrorEvidenceSource') === 'bounded-kernel-events'
+        && Boolean(health)
+        && linuxRawStatus(own(health ?? undefined, 'smartStatus'))
+        && linuxRawStatus(own(health ?? undefined, 'raidStatus'))
+        && linuxNullableInteger(own(health ?? undefined, 'raidDegradedDevices'), 0, 4096)
+        && (own(health ?? undefined, 'raidArrayState') === null || linuxLabel(own(health ?? undefined, 'raidArrayState'), 32));
+    });
+}
+
+function validateLinuxNetwork(value: unknown): boolean {
+  const record = linuxRecord(value, ['status', 'truncated', 'items']);
+  const classifications = new Set([
+    'loopback', 'veth', 'docker-bridge', 'wifi', 'vpn', 'tunnel',
+    'physical', 'bond', 'virtual',
+  ]);
+  const linkStates = new Set([
+    'unknown', 'notpresent', 'down', 'lowerlayerdown', 'testing', 'dormant', 'up',
+  ]);
+  return Boolean(record)
+    && linuxRawStatus(own(record ?? undefined, 'status'))
+    && typeof own(record ?? undefined, 'truncated') === 'boolean'
+    && linuxArray(own(record ?? undefined, 'items'), 256, (entry) => {
+      const rateFields = LINUX_NETWORK_COUNTER_FIELDS.map((field) => `${field}PerSecond`);
+      const item = linuxRecord(entry, [
+        'name', 'classification', 'counterIdentity', 'counterIdentityStatus',
+        'linkStateStatus', 'linkState', 'carrier', 'mtu',
+        'speedMegabitsPerSecond', 'duplex', 'rateStatus', 'counters', ...rateFields,
+      ]);
+      const counters = item && linuxRecord(own(item, 'counters'), LINUX_NETWORK_COUNTER_FIELDS);
+      const name = own(item ?? undefined, 'name');
+      const classification = own(item ?? undefined, 'classification');
+      const linkState = own(item ?? undefined, 'linkState');
+      const duplex = own(item ?? undefined, 'duplex');
+      return Boolean(item)
+        && typeof name === 'string' && /^[A-Za-z0-9_.-]{1,15}$/.test(name)
+        && typeof classification === 'string' && classifications.has(classification)
+        && typeof own(item ?? undefined, 'counterIdentity') === 'string'
+        && /^[0-9a-f]{16}$/.test(own(item ?? undefined, 'counterIdentity') as string)
+        && linuxRawStatus(own(item ?? undefined, 'counterIdentityStatus'))
+        && linuxRawStatus(own(item ?? undefined, 'linkStateStatus'))
+        && (linkState === null || (typeof linkState === 'string' && linkStates.has(linkState)))
+        && linuxBooleanOrNull(own(item ?? undefined, 'carrier'))
+        && linuxNullableInteger(own(item ?? undefined, 'mtu'), 68, 1_000_000)
+        && linuxNullableInteger(own(item ?? undefined, 'speedMegabitsPerSecond'), 0, 10_000_000)
+        && (duplex === null || duplex === 'full' || duplex === 'half' || duplex === 'unknown')
+        && linuxRateStatusIsValid(own(item ?? undefined, 'rateStatus'))
+        && Boolean(counters)
+        && LINUX_NETWORK_COUNTER_FIELDS.every((field) => integer(own(counters ?? undefined, field), 0, MAX_LINUX_COUNTER) !== null)
+        && rateFields.every((field) => linuxNullableNumber(own(item ?? undefined, field)));
+    });
+}
+
+function validateLinuxTcp(value: unknown): boolean {
+  const record = linuxRecord(value, [
+    'status', 'counters', 'rateStatus', 'outgoingSegmentsPerSecond',
+    'retransmittedSegmentsPerSecond', 'retransmissionPercent', 'states',
+    'socketScanStatus', 'socketScanTruncated', 'ephemeralPorts', 'conntrack',
+  ]);
+  if (!record || !linuxRawStatus(own(record, 'status')) || !linuxRateStatusIsValid(own(record, 'rateStatus'))) return false;
+  if (!linuxNullableNumber(own(record, 'outgoingSegmentsPerSecond'))
+    || !linuxNullableNumber(own(record, 'retransmittedSegmentsPerSecond'))
+    || !linuxNullableNumber(own(record, 'retransmissionPercent'), 0, 100)) return false;
+  const counters = linuxRecord(own(record, 'counters'), [], [
+    'ActiveOpens', 'PassiveOpens', 'AttemptFails', 'EstabResets', 'InSegs',
+    'OutSegs', 'RetransSegs', 'InErrs', 'OutRsts', 'TCPSynRetrans', 'TCPTimeouts',
+  ]);
+  if (!counters || !Object.keys(counters).every((field) => integer(own(counters, field), 0, MAX_LINUX_COUNTER) !== null)) return false;
+  const states = linuxRecord(own(record, 'states'), LINUX_TCP_STATE_FIELDS);
+  if (!states || !LINUX_TCP_STATE_FIELDS.every((field) => integer(own(states, field), 0, 65_536) !== null)) return false;
+  if (!linuxRawStatus(own(record, 'socketScanStatus')) || typeof own(record, 'socketScanTruncated') !== 'boolean') return false;
+  const ports = linuxRecord(own(record, 'ephemeralPorts'), [
+    'status', 'rangeStart', 'rangeEnd', 'capacity', 'used', 'usedPercent',
+  ]);
+  const conntrack = linuxRecord(own(record, 'conntrack'), ['status', 'count', 'maximum', 'usedPercent']);
+  return Boolean(ports)
+    && linuxRawStatus(own(ports ?? undefined, 'status'))
+    && linuxNullableInteger(own(ports ?? undefined, 'rangeStart'), 1024, 65_535)
+    && linuxNullableInteger(own(ports ?? undefined, 'rangeEnd'), 1024, 65_535)
+    && linuxNullableInteger(own(ports ?? undefined, 'capacity'), 1, 64_512)
+    && linuxNullableInteger(own(ports ?? undefined, 'used'), 0, 64_512)
+    && linuxNullableNumber(own(ports ?? undefined, 'usedPercent'), 0, 100)
+    && Boolean(conntrack)
+    && linuxRawStatus(own(conntrack ?? undefined, 'status'))
+    && linuxNullableInteger(own(conntrack ?? undefined, 'count'))
+    && linuxNullableInteger(own(conntrack ?? undefined, 'maximum'), 1)
+    && linuxNullableNumber(own(conntrack ?? undefined, 'usedPercent'), 0, 100);
+}
+
+function validateLinuxProcessGroup(value: unknown): boolean {
+  const record = linuxRecord(value, [
+    'name', 'allowlisted', 'instances', 'states', 'threads', 'cpuPercent',
+    'residentBytes', 'virtualBytes', 'readBytesPerSecond', 'writeBytesPerSecond',
+    'openFileDescriptors', 'fileDescriptorStatus',
+  ]);
+  const rawStates = record ? own(record, 'states') : undefined;
+  const states = isRecord(rawStates) ? rawStates : null;
+  return Boolean(record)
+    && linuxLabel(own(record ?? undefined, 'name'), 64)
+    && typeof own(record ?? undefined, 'allowlisted') === 'boolean'
+    && integer(own(record ?? undefined, 'instances'), 1, 8192) !== null
+    && Boolean(states)
+    && Object.keys(states ?? {}).length <= 26
+    && Object.keys(states ?? {}).every((state) => /^[A-Z]$/.test(state) && integer(own(states ?? undefined, state), 0, 8192) !== null)
+    && integer(own(record ?? undefined, 'threads'), 0, MAX_LINUX_COUNTER) !== null
+    && linuxNullableNumber(own(record ?? undefined, 'cpuPercent'), 0, 10_000)
+    && integer(own(record ?? undefined, 'residentBytes'), 0, MAX_LINUX_COUNTER) !== null
+    && integer(own(record ?? undefined, 'virtualBytes'), 0, MAX_LINUX_COUNTER) !== null
+    && linuxNullableNumber(own(record ?? undefined, 'readBytesPerSecond'))
+    && linuxNullableNumber(own(record ?? undefined, 'writeBytesPerSecond'))
+    && linuxNullableInteger(own(record ?? undefined, 'openFileDescriptors'))
+    && linuxRawStatus(own(record ?? undefined, 'fileDescriptorStatus'));
+}
+
+function validateLinuxProcesses(value: unknown): boolean {
+  const record = linuxRecord(value, [
+    'status', 'pidCount', 'pidCountLowerBound', 'pidMaximumStatus', 'pidMaximum',
+    'pidUsedPercent', 'zombieCount', 'threadCount', 'observedProcessCount',
+    'scanTruncated', 'deadlineReached', 'allowedUidCount', 'topCpu', 'topMemory',
+    'topIo', 'important', 'terminatedSincePreviousSample', 'systemFileDescriptors',
+    'allowlistedProcessOpenFileDescriptors', 'fileDescriptorScanTruncated', 'cgroupPids',
+  ]);
+  if (!record || !linuxRawStatus(own(record, 'status')) || !linuxRawStatus(own(record, 'pidMaximumStatus'))) return false;
+  if (integer(own(record, 'pidCount'), 0, 8192) === null
+    || typeof own(record, 'pidCountLowerBound') !== 'boolean'
+    || !linuxNullableInteger(own(record, 'pidMaximum'), 1)
+    || !linuxNullableNumber(own(record, 'pidUsedPercent'), 0, 100)
+    || integer(own(record, 'zombieCount'), 0, 8192) === null
+    || integer(own(record, 'threadCount'), 0, MAX_LINUX_COUNTER) === null
+    || integer(own(record, 'observedProcessCount'), 0, 8192) === null
+    || typeof own(record, 'scanTruncated') !== 'boolean'
+    || typeof own(record, 'deadlineReached') !== 'boolean'
+    || integer(own(record, 'allowedUidCount'), 0, 4096) === null
+    || integer(own(record, 'allowlistedProcessOpenFileDescriptors'), 0, MAX_LINUX_COUNTER) === null
+    || typeof own(record, 'fileDescriptorScanTruncated') !== 'boolean') return false;
+  for (const field of ['topCpu', 'topMemory', 'topIo'] as const) {
+    if (!linuxArray(own(record, field), 12, validateLinuxProcessGroup)) return false;
+  }
+  if (!linuxArray(own(record, 'important'), 64, validateLinuxProcessGroup)) return false;
+  if (!linuxArray(own(record, 'terminatedSincePreviousSample'), 12, (entry) => {
+    const terminated = linuxRecord(entry, ['name', 'allowlisted', 'instances']);
+    return Boolean(terminated)
+      && linuxLabel(own(terminated ?? undefined, 'name'), 64)
+      && typeof own(terminated ?? undefined, 'allowlisted') === 'boolean'
+      && integer(own(terminated ?? undefined, 'instances'), 1, 8192) !== null;
+  })) return false;
+  const descriptors = linuxRecord(own(record, 'systemFileDescriptors'), [
+    'status', 'allocated', 'unusedAllocated', 'used', 'maximum', 'usedPercent',
+  ]);
+  if (!descriptors || !linuxRawStatus(own(descriptors, 'status'))
+    || !['allocated', 'unusedAllocated', 'used', 'maximum'].every((field) => linuxNullableInteger(own(descriptors, field)))
+    || !linuxNullableNumber(own(descriptors, 'usedPercent'), 0, 100)) return false;
+  const cgroup = linuxRecord(own(record, 'cgroupPids'), ['status', 'version', 'current', 'maximum'], ['usedPercent']);
+  const version = own(cgroup ?? undefined, 'version');
+  return Boolean(cgroup)
+    && linuxRawStatus(own(cgroup ?? undefined, 'status'))
+    && (version === null || version === 1 || version === 2)
+    && linuxNullableInteger(own(cgroup ?? undefined, 'current'))
+    && linuxNullableInteger(own(cgroup ?? undefined, 'maximum'), 1)
+    && (own(cgroup ?? undefined, 'usedPercent') === undefined || linuxNullableNumber(own(cgroup ?? undefined, 'usedPercent'), 0, 100));
+}
+
+function validateLinuxSystemd(value: unknown): boolean {
+  const reasons = new Set([
+    'not_configured', 'systemctl_unavailable', 'execution_denied', 'deadline',
+    'execution_failed', 'query_failed', 'runtime_state_unavailable',
+    'runtime_state_denied', 'runtime_state_failed', 'runtime_state_not_directory',
+    'bounded_runtime_observation',
+  ]);
+  const record = linuxRecord(value, ['status', 'reason', 'units', 'truncated']);
+  const reason = own(record ?? undefined, 'reason');
+  return Boolean(record)
+    && linuxRawStatus(own(record ?? undefined, 'status'))
+    && (reason === null || (typeof reason === 'string' && reasons.has(reason)))
+    && typeof own(record ?? undefined, 'truncated') === 'boolean'
+    && linuxArray(own(record ?? undefined, 'units'), 32, (entry) => {
+      const unit = linuxRecord(entry, [
+        'unit', 'loadState', 'activeState', 'subState', 'restartCount',
+        'restartCountStatus', 'result', 'execMainStatus',
+      ], ['invocationStatus']);
+      const identifier = own(unit ?? undefined, 'unit');
+      const restartStatus = own(unit ?? undefined, 'restartCountStatus');
+      return Boolean(unit)
+        && typeof identifier === 'string'
+        && identifier.length <= 128
+        && /^[A-Za-z0-9_.@:-]+\.service$/.test(identifier)
+        && ['loadState', 'activeState', 'subState', 'result'].every((field) => linuxLabel(own(unit ?? undefined, field), 32))
+        && linuxNullableInteger(own(unit ?? undefined, 'restartCount'))
+        && (restartStatus === 'systemd_manager' || restartStatus === 'observed_invocation_changes')
+        && linuxNullableInteger(own(unit ?? undefined, 'execMainStatus'), 0, 2_147_483_647)
+        && (own(unit ?? undefined, 'invocationStatus') === undefined || linuxRawStatus(own(unit ?? undefined, 'invocationStatus')));
+    });
+}
+
+function validateLinuxThermal(value: unknown): boolean {
+  const record = linuxRecord(value, [
+    'status', 'sensors', 'fans', 'coolingDevices', 'truncated', 'raspberryPi',
+  ]);
+  if (!record || !linuxRawStatus(own(record, 'status')) || typeof own(record, 'truncated') !== 'boolean') return false;
+  if (!linuxArray(own(record, 'sensors'), 64, (entry) => {
+    const sensor = linuxRecord(entry, ['source', 'name', 'status', 'temperatureCelsius']);
+    const source = own(sensor ?? undefined, 'source');
+    return Boolean(sensor)
+      && (source === 'thermal-zone' || source === 'hwmon')
+      && linuxLabel(own(sensor ?? undefined, 'name'), 64)
+      && linuxRawStatus(own(sensor ?? undefined, 'status'))
+      && linuxNullableNumber(own(sensor ?? undefined, 'temperatureCelsius'), -50, 200);
+  })) return false;
+  if (!linuxArray(own(record, 'fans'), 32, (entry) => {
+    const fan = linuxRecord(entry, ['name', 'status', 'rpm']);
+    return Boolean(fan)
+      && linuxLabel(own(fan ?? undefined, 'name'), 64)
+      && linuxRawStatus(own(fan ?? undefined, 'status'))
+      && linuxNullableInteger(own(fan ?? undefined, 'rpm'), 0, 1_000_000);
+  })) return false;
+  if (!linuxArray(own(record, 'coolingDevices'), 32, (entry) => {
+    const cooling = linuxRecord(entry, ['name', 'status', 'currentState', 'maximumState']);
+    return Boolean(cooling)
+      && linuxLabel(own(cooling ?? undefined, 'name'), 64)
+      && linuxRawStatus(own(cooling ?? undefined, 'status'))
+      && linuxNullableInteger(own(cooling ?? undefined, 'currentState'))
+      && linuxNullableInteger(own(cooling ?? undefined, 'maximumState'));
+  })) return false;
+  const rpi = linuxRecord(own(record, 'raspberryPi'), [
+    'status', 'detected', 'temperatureCelsius', 'supplyVoltageVolts',
+    'throttledFlags', 'currentUnderVoltage', 'currentFrequencyCapped',
+    'currentThrottled', 'currentSoftTemperatureLimit', 'underVoltageOccurred',
+    'frequencyCapOccurred', 'throttlingOccurred', 'softTemperatureLimitOccurred',
+    'flagSource',
+  ]);
+  const source = own(rpi ?? undefined, 'flagSource');
+  return Boolean(rpi)
+    && linuxRawStatus(own(rpi ?? undefined, 'status'))
+    && typeof own(rpi ?? undefined, 'detected') === 'boolean'
+    && linuxNullableNumber(own(rpi ?? undefined, 'temperatureCelsius'), -50, 200)
+    && linuxNullableNumber(own(rpi ?? undefined, 'supplyVoltageVolts'), 0, 10)
+    && linuxNullableInteger(own(rpi ?? undefined, 'throttledFlags'), 0, MAX_UINT32)
+    && [
+      'currentUnderVoltage', 'currentFrequencyCapped', 'currentThrottled',
+      'currentSoftTemperatureLimit', 'underVoltageOccurred', 'frequencyCapOccurred',
+      'throttlingOccurred', 'softTemperatureLimitOccurred',
+    ].every((field) => linuxBooleanOrNull(own(rpi ?? undefined, field)))
+    && (source === null || source === 'vcgencmd' || source === 'hwmon-current-only');
+}
+
+function validateLinuxClock(value: unknown, nowMs: number): boolean {
+  const record = linuxRecord(value, [
+    'status', 'uptimeSeconds', 'bootTime', 'rebootDetectedSincePreviousSample',
+    'unexpectedReboot', 'unexpectedRebootStatus', 'timeSync',
+  ]);
+  if (!record || !linuxRawStatus(own(record, 'status'))
+    || !linuxNullableInteger(own(record, 'uptimeSeconds'), 0, 10_000_000_000)
+    || (own(record, 'bootTime') !== null && linuxTimestamp(own(record, 'bootTime'), nowMs) === null)
+    || !linuxBooleanOrNull(own(record, 'rebootDetectedSincePreviousSample'))
+    || !linuxBooleanOrNull(own(record, 'unexpectedReboot'))
+    || !linuxLabel(own(record, 'unexpectedRebootStatus'), 64)) return false;
+  const sync = linuxRecord(own(record, 'timeSync'), [
+    'status', 'reason', 'synchronized', 'ntpEnabled', 'ntpSupported',
+    'clockDriftMilliseconds', 'clockDriftStatus',
+  ]);
+  const reason = own(sync ?? undefined, 'reason');
+  const reasons = new Set([
+    'systemd_timesync_marker', 'timesync_marker_denied', 'timedatectl_unavailable',
+    'execution_denied', 'deadline', 'execution_failed', 'query_failed',
+  ]);
+  return Boolean(sync)
+    && linuxRawStatus(own(sync ?? undefined, 'status'))
+    && (reason === null || (typeof reason === 'string' && reasons.has(reason)))
+    && ['synchronized', 'ntpEnabled', 'ntpSupported'].every((field) => linuxBooleanOrNull(own(sync ?? undefined, field)))
+    && linuxNullableNumber(own(sync ?? undefined, 'clockDriftMilliseconds'), -86_400_000, 86_400_000)
+    && linuxRawStatus(own(sync ?? undefined, 'clockDriftStatus'));
+}
+
+function validateLinuxEventSources(value: unknown, nowMs: number): boolean {
+  const record = linuxRecord(value, ['kernelLogStatus', 'summary', 'rawMessagesExported']);
+  if (!record || !linuxRawStatus(own(record, 'kernelLogStatus')) || own(record, 'rawMessagesExported') !== false) return false;
+  const summary = linuxRecord(own(record, 'summary'), [], [
+    'warning', 'oops', 'panic', 'hungTask', 'rcuStall', 'rcuExpedited', 'oomKill',
+    'filesystemError', 'nvmeReset', 'nvmeIo', 'pcieAerCorrectable',
+    'pcieAerNonFatal', 'pcieAerFatal',
+  ]);
+  return Boolean(summary) && Object.values(summary ?? {}).every((entry) => {
+    const event = linuxRecord(entry, ['count', 'lastEventAt']);
+    return Boolean(event)
+      && linuxNullableInteger(own(event ?? undefined, 'count'), 0, 1_000_000)
+      && (own(event ?? undefined, 'lastEventAt') === null || linuxTimestamp(own(event ?? undefined, 'lastEventAt'), nowMs) !== null);
+  });
+}
+
+function validateLinuxBoundsAndPrivacy(boundsValue: unknown, privacyValue: unknown): boolean {
+  const bounds = linuxRecord(boundsValue, [
+    'maximumCpuCount', 'maximumBlockDevices', 'maximumInterfaces',
+    'maximumTcpSockets', 'maximumFilesystems', 'maximumProcesses',
+    'processDeadlineMilliseconds', 'maximumSystemdUnits',
+    'maximumThermalSensors', 'commandTimeoutMilliseconds',
+  ]);
+  const privacy = linuxRecord(privacyValue, [
+    'processCommandLinesCollected', 'processEnvironmentsCollected',
+    'rawKernelMessagesCollected',
+  ]);
+  return Boolean(bounds)
+    && own(bounds ?? undefined, 'maximumCpuCount') === 512
+    && own(bounds ?? undefined, 'maximumBlockDevices') === 128
+    && own(bounds ?? undefined, 'maximumInterfaces') === 256
+    && own(bounds ?? undefined, 'maximumTcpSockets') === 65_536
+    && own(bounds ?? undefined, 'maximumFilesystems') === 256
+    && own(bounds ?? undefined, 'maximumProcesses') === 8192
+    && own(bounds ?? undefined, 'processDeadlineMilliseconds') === 1250
+    && own(bounds ?? undefined, 'maximumSystemdUnits') === 32
+    && own(bounds ?? undefined, 'maximumThermalSensors') === 64
+    && integer(own(bounds ?? undefined, 'commandTimeoutMilliseconds'), 100, 5000) !== null
+    && Boolean(privacy)
+    && own(privacy ?? undefined, 'processCommandLinesCollected') === false
+    && own(privacy ?? undefined, 'processEnvironmentsCollected') === false
+    && own(privacy ?? undefined, 'rawKernelMessagesCollected') === false;
+}
+
+function validateLinuxV1(value: unknown, nowMs: number): value is JsonRecord {
+  const record = linuxRecord(value, [
+    'schemaVersion', 'collectedAt', 'cpu', 'memory', 'filesystems', 'blockDevices',
+    'network', 'tcp', 'processes', 'systemd', 'thermal', 'clock', 'eventSources',
+    'collectionBounds', 'privacy',
+  ]);
+  return Boolean(record)
+    && own(record ?? undefined, 'schemaVersion') === 1
+    && linuxTimestamp(own(record ?? undefined, 'collectedAt'), nowMs) !== null
+    && validateLinuxCpu(own(record ?? undefined, 'cpu'))
+    && validateLinuxMemory(own(record ?? undefined, 'memory'))
+    && validateLinuxFilesystems(own(record ?? undefined, 'filesystems'))
+    && validateLinuxBlockDevices(own(record ?? undefined, 'blockDevices'))
+    && validateLinuxNetwork(own(record ?? undefined, 'network'))
+    && validateLinuxTcp(own(record ?? undefined, 'tcp'))
+    && validateLinuxProcesses(own(record ?? undefined, 'processes'))
+    && validateLinuxSystemd(own(record ?? undefined, 'systemd'))
+    && validateLinuxThermal(own(record ?? undefined, 'thermal'))
+    && validateLinuxClock(own(record ?? undefined, 'clock'), nowMs)
+    && validateLinuxEventSources(own(record ?? undefined, 'eventSources'), nowMs)
+    && validateLinuxBoundsAndPrivacy(
+      own(record ?? undefined, 'collectionBounds'),
+      own(record ?? undefined, 'privacy'),
+    );
+}
+
+function normalizeLinuxStatus(value: unknown): DashboardResponse['linux']['status'] {
+  switch (value) {
+    case 'supported':
+    case 'partial':
+    case 'unsupported':
+    case 'permission_error':
+    case 'unavailable':
+    case 'invalid':
+      return value;
+    case 'timeout':
+      return 'unavailable';
+    case 'too_large':
+      return 'invalid';
+    default:
+      return 'collection_error';
+  }
+}
+
+function normalizeLinuxRateStatus(
+  value: unknown,
+): DashboardResponse['linux']['storage']['devices'][number]['rateStatus'] {
+  if (value === 'ok' || value === 'warmup' || value === 'counter_reset') return value;
+  return normalizeLinuxStatus(value);
+}
+
+function combinedLinuxStatus(
+  statuses: DashboardResponse['linux']['status'][],
+): DashboardResponse['linux']['status'] {
+  if (statuses.includes('collection_error')) return 'collection_error';
+  if (statuses.includes('invalid')) return 'invalid';
+  const hasObserved = statuses.some((status) => status === 'supported' || status === 'partial');
+  if (hasObserved && statuses.some((status) => status !== 'supported' && status !== 'partial')) return 'partial';
+  if (statuses.includes('partial')) return 'partial';
+  if (statuses.includes('permission_error')) return 'permission_error';
+  if (statuses.includes('unavailable')) return 'unavailable';
+  if (statuses.every((status) => status === 'unsupported')) return 'unsupported';
+  return 'supported';
+}
+
+function emptyLinuxDiagnostics(
+  status: DashboardResponse['linux']['status'],
+): DashboardResponse['linux'] {
+  const capacity = () => ({ status, current: null, maximum: null, usedPercent: null });
+  return {
+    schemaVersion: null,
+    collectedAt: null,
+    status,
+    resources: {
+      status,
+      processCount: null,
+      processCountIsLowerBound: false,
+      observedProcessCount: null,
+      zombieCount: null,
+      threadCount: null,
+      scanTruncated: false,
+      deadlineReached: false,
+      pid: capacity(),
+      systemFileDescriptors: capacity(),
+      cgroupPids: { ...capacity(), version: null },
+    },
+    storage: { status, truncated: false, devices: [] },
+    network: {
+      status,
+      tcp: {
+        status,
+        rateStatus: status,
+        outgoingSegmentsPerSecond: null,
+        retransmittedSegmentsPerSecond: null,
+        retransmissionPercent: null,
+        states: {
+          established: 0,
+          synSent: 0,
+          synRecv: 0,
+          finWait1: 0,
+          finWait2: 0,
+          timeWait: 0,
+          close: 0,
+          closeWait: 0,
+          lastAck: 0,
+          listen: 0,
+          closing: 0,
+          newSynRecv: 0,
+        },
+        socketScanStatus: status,
+        socketScanTruncated: false,
+        ephemeralPorts: { ...capacity(), rangeStart: null, rangeEnd: null },
+        conntrack: capacity(),
+      },
+    },
+    reliability: {
+      status,
+      clock: {
+        status,
+        uptimeSeconds: null,
+        bootTime: null,
+        rebootDetectedSincePreviousSample: null,
+        unexpectedReboot: null,
+        unexpectedRebootStatus: 'unavailable',
+        timeSync: {
+          status,
+          reason: null,
+          synchronized: null,
+          ntpEnabled: null,
+          ntpSupported: null,
+          clockDriftMilliseconds: null,
+          clockDriftStatus: status,
+        },
+      },
+      systemd: { status, reason: null, truncated: false, units: [] },
+    },
+    power: {
+      status,
+      truncated: false,
+      maximumTemperatureCelsius: null,
+      sensors: [],
+      fans: [],
+      raspberryPi: {
+        status,
+        detected: false,
+        temperatureCelsius: null,
+        supplyVoltageVolts: null,
+        throttledFlags: null,
+        currentUnderVoltage: null,
+        currentFrequencyCapped: null,
+        currentThrottled: null,
+        currentSoftTemperatureLimit: null,
+        underVoltageOccurred: null,
+        frequencyCapOccurred: null,
+        throttlingOccurred: null,
+        softTemperatureLimitOccurred: null,
+        flagSource: null,
+      },
+    },
+  };
+}
+
+function normalizeLinuxDiagnostics(
+  current: JsonRecord | null,
+  nowMs: number,
+): DashboardResponse['linux'] {
+  const raw = own(current ?? undefined, 'linux');
+  if (raw === undefined) return emptyLinuxDiagnostics('unsupported');
+  if (!validateLinuxV1(raw, nowMs)) return emptyLinuxDiagnostics('collection_error');
+
+  const processes = own(raw, 'processes') as JsonRecord;
+  const descriptors = own(processes, 'systemFileDescriptors') as JsonRecord;
+  const cgroup = own(processes, 'cgroupPids') as JsonRecord;
+  const pidCount = integer(own(processes, 'pidCount'), 0, 8192);
+  const resourceStatus = normalizeLinuxStatus(own(processes, 'status'));
+  const resources: DashboardResponse['linux']['resources'] = {
+    status: resourceStatus,
+    processCount: pidCount,
+    processCountIsLowerBound: own(processes, 'pidCountLowerBound') as boolean,
+    observedProcessCount: integer(own(processes, 'observedProcessCount'), 0, 8192),
+    zombieCount: integer(own(processes, 'zombieCount'), 0, 8192),
+    threadCount: integer(own(processes, 'threadCount'), 0, MAX_LINUX_COUNTER),
+    scanTruncated: own(processes, 'scanTruncated') as boolean,
+    deadlineReached: own(processes, 'deadlineReached') as boolean,
+    pid: {
+      status: normalizeLinuxStatus(own(processes, 'pidMaximumStatus')),
+      current: pidCount,
+      maximum: integer(own(processes, 'pidMaximum'), 1, MAX_LINUX_COUNTER),
+      usedPercent: percent(own(processes, 'pidUsedPercent')),
+    },
+    systemFileDescriptors: {
+      status: normalizeLinuxStatus(own(descriptors, 'status')),
+      current: integer(own(descriptors, 'used'), 0, MAX_LINUX_COUNTER),
+      maximum: integer(own(descriptors, 'maximum'), 0, MAX_LINUX_COUNTER),
+      usedPercent: percent(own(descriptors, 'usedPercent')),
+    },
+    cgroupPids: {
+      status: normalizeLinuxStatus(own(cgroup, 'status')),
+      version: own(cgroup, 'version') as 1 | 2 | null,
+      current: integer(own(cgroup, 'current'), 0, MAX_LINUX_COUNTER),
+      maximum: integer(own(cgroup, 'maximum'), 1, MAX_LINUX_COUNTER),
+      usedPercent: percent(own(cgroup, 'usedPercent')),
+    },
+  };
+
+  const blockDevices = own(raw, 'blockDevices') as JsonRecord;
+  const reducedDevices = (own(blockDevices, 'items') as JsonRecord[]).map((item) => {
+    const health = own(item, 'health') as JsonRecord;
+    return {
+      name: own(item, 'name') as string,
+      type: own(item, 'type') as string,
+      rotational: own(item, 'rotational') as boolean | null,
+      rateStatus: normalizeLinuxRateStatus(own(item, 'rateStatus')),
+      queueDepth: integer(own(item, 'queueDepth'), 0, MAX_LINUX_COUNTER),
+      readLatencyMilliseconds: finite(own(item, 'readLatencyMilliseconds'), 0, MAX_LINUX_RATE),
+      writeLatencyMilliseconds: finite(own(item, 'writeLatencyMilliseconds'), 0, MAX_LINUX_RATE),
+      averageLatencyMilliseconds: finite(own(item, 'averageLatencyMilliseconds'), 0, MAX_LINUX_RATE),
+      utilizationPercent: percent(own(item, 'utilizationPercent')),
+      averageQueueDepth: finite(own(item, 'averageQueueDepth'), 0, MAX_LINUX_RATE),
+      smartStatus: normalizeLinuxStatus(own(health, 'smartStatus')),
+      raidStatus: normalizeLinuxStatus(own(health, 'raidStatus')),
+      raidDegradedDevices: integer(own(health, 'raidDegradedDevices'), 0, 4096),
+      raidArrayState: own(health, 'raidArrayState') as string | null,
+    };
+  }).sort((left, right) => {
+    const leftRisk = (left.raidDegradedDevices ?? 0) * 1000
+      + (left.utilizationPercent ?? 0) * 10
+      + (left.averageLatencyMilliseconds ?? 0);
+    const rightRisk = (right.raidDegradedDevices ?? 0) * 1000
+      + (right.utilizationPercent ?? 0) * 10
+      + (right.averageLatencyMilliseconds ?? 0);
+    return rightRisk - leftRisk || left.name.localeCompare(right.name);
+  });
+  const storage: DashboardResponse['linux']['storage'] = {
+    status: normalizeLinuxStatus(own(blockDevices, 'status')),
+    truncated: (own(blockDevices, 'truncated') as boolean) || reducedDevices.length > MAX_LINUX_REDUCED_DEVICES,
+    devices: reducedDevices.slice(0, MAX_LINUX_REDUCED_DEVICES),
+  };
+
+  const tcp = own(raw, 'tcp') as JsonRecord;
+  const tcpStates = own(tcp, 'states') as JsonRecord;
+  const ports = own(tcp, 'ephemeralPorts') as JsonRecord;
+  const conntrack = own(tcp, 'conntrack') as JsonRecord;
+  const tcpStatus = normalizeLinuxStatus(own(tcp, 'status'));
+  const network: DashboardResponse['linux']['network'] = {
+    status: tcpStatus,
+    tcp: {
+      status: tcpStatus,
+      rateStatus: normalizeLinuxRateStatus(own(tcp, 'rateStatus')),
+      outgoingSegmentsPerSecond: finite(own(tcp, 'outgoingSegmentsPerSecond'), 0, MAX_LINUX_RATE),
+      retransmittedSegmentsPerSecond: finite(own(tcp, 'retransmittedSegmentsPerSecond'), 0, MAX_LINUX_RATE),
+      retransmissionPercent: percent(own(tcp, 'retransmissionPercent')),
+      states: {
+        established: integer(own(tcpStates, 'established'), 0, 65_536) ?? 0,
+        synSent: integer(own(tcpStates, 'synSent'), 0, 65_536) ?? 0,
+        synRecv: integer(own(tcpStates, 'synRecv'), 0, 65_536) ?? 0,
+        finWait1: integer(own(tcpStates, 'finWait1'), 0, 65_536) ?? 0,
+        finWait2: integer(own(tcpStates, 'finWait2'), 0, 65_536) ?? 0,
+        timeWait: integer(own(tcpStates, 'timeWait'), 0, 65_536) ?? 0,
+        close: integer(own(tcpStates, 'close'), 0, 65_536) ?? 0,
+        closeWait: integer(own(tcpStates, 'closeWait'), 0, 65_536) ?? 0,
+        lastAck: integer(own(tcpStates, 'lastAck'), 0, 65_536) ?? 0,
+        listen: integer(own(tcpStates, 'listen'), 0, 65_536) ?? 0,
+        closing: integer(own(tcpStates, 'closing'), 0, 65_536) ?? 0,
+        newSynRecv: integer(own(tcpStates, 'newSynRecv'), 0, 65_536) ?? 0,
+      },
+      socketScanStatus: normalizeLinuxStatus(own(tcp, 'socketScanStatus')),
+      socketScanTruncated: own(tcp, 'socketScanTruncated') as boolean,
+      ephemeralPorts: {
+        status: normalizeLinuxStatus(own(ports, 'status')),
+        current: integer(own(ports, 'used'), 0, 64_512),
+        maximum: integer(own(ports, 'capacity'), 1, 64_512),
+        usedPercent: percent(own(ports, 'usedPercent')),
+        rangeStart: integer(own(ports, 'rangeStart'), 1024, 65_535),
+        rangeEnd: integer(own(ports, 'rangeEnd'), 1024, 65_535),
+      },
+      conntrack: {
+        status: normalizeLinuxStatus(own(conntrack, 'status')),
+        current: integer(own(conntrack, 'count'), 0, MAX_LINUX_COUNTER),
+        maximum: integer(own(conntrack, 'maximum'), 1, MAX_LINUX_COUNTER),
+        usedPercent: percent(own(conntrack, 'usedPercent')),
+      },
+    },
+  };
+
+  const clock = own(raw, 'clock') as JsonRecord;
+  const timeSync = own(clock, 'timeSync') as JsonRecord;
+  const systemd = own(raw, 'systemd') as JsonRecord;
+  const clockStatus = normalizeLinuxStatus(own(clock, 'status'));
+  const systemdStatus = normalizeLinuxStatus(own(systemd, 'status'));
+  const reliability: DashboardResponse['linux']['reliability'] = {
+    status: combinedLinuxStatus([clockStatus, systemdStatus]),
+    clock: {
+      status: clockStatus,
+      uptimeSeconds: integer(own(clock, 'uptimeSeconds'), 0, 10_000_000_000),
+      bootTime: own(clock, 'bootTime') === null ? null : linuxTimestamp(own(clock, 'bootTime'), nowMs),
+      rebootDetectedSincePreviousSample: own(clock, 'rebootDetectedSincePreviousSample') as boolean | null,
+      unexpectedReboot: own(clock, 'unexpectedReboot') as boolean | null,
+      unexpectedRebootStatus: own(clock, 'unexpectedRebootStatus') as string,
+      timeSync: {
+        status: normalizeLinuxStatus(own(timeSync, 'status')),
+        reason: own(timeSync, 'reason') as string | null,
+        synchronized: own(timeSync, 'synchronized') as boolean | null,
+        ntpEnabled: own(timeSync, 'ntpEnabled') as boolean | null,
+        ntpSupported: own(timeSync, 'ntpSupported') as boolean | null,
+        clockDriftMilliseconds: finite(own(timeSync, 'clockDriftMilliseconds'), -86_400_000, 86_400_000),
+        clockDriftStatus: normalizeLinuxStatus(own(timeSync, 'clockDriftStatus')),
+      },
+    },
+    systemd: {
+      status: systemdStatus,
+      reason: own(systemd, 'reason') as string | null,
+      truncated: own(systemd, 'truncated') as boolean,
+      units: (own(systemd, 'units') as JsonRecord[]).map((unit) => ({
+        unit: own(unit, 'unit') as string,
+        loadState: own(unit, 'loadState') as string,
+        activeState: own(unit, 'activeState') as string,
+        subState: own(unit, 'subState') as string,
+        restartCount: integer(own(unit, 'restartCount'), 0, MAX_LINUX_COUNTER),
+        restartCountStatus: own(unit, 'restartCountStatus') as 'systemd_manager' | 'observed_invocation_changes',
+        result: own(unit, 'result') as string,
+        execMainStatus: integer(own(unit, 'execMainStatus'), 0, 2_147_483_647),
+        invocationStatus: own(unit, 'invocationStatus') === undefined
+          ? null
+          : normalizeLinuxStatus(own(unit, 'invocationStatus')),
+      })),
+    },
+  };
+
+  const thermal = own(raw, 'thermal') as JsonRecord;
+  const rawSensors = own(thermal, 'sensors') as JsonRecord[];
+  const rawFans = own(thermal, 'fans') as JsonRecord[];
+  const rpi = own(thermal, 'raspberryPi') as JsonRecord;
+  const temperatures = rawSensors
+    .map((sensor) => finite(own(sensor, 'temperatureCelsius'), -50, 200))
+    .filter((value): value is number => value !== null);
+  const powerStatus = normalizeLinuxStatus(own(thermal, 'status'));
+  const power: DashboardResponse['linux']['power'] = {
+    status: powerStatus,
+    truncated: (own(thermal, 'truncated') as boolean)
+      || rawSensors.length > MAX_LINUX_REDUCED_THERMAL_ITEMS
+      || rawFans.length > MAX_LINUX_REDUCED_THERMAL_ITEMS,
+    maximumTemperatureCelsius: temperatures.length ? Math.max(...temperatures) : null,
+    sensors: rawSensors.slice(0, MAX_LINUX_REDUCED_THERMAL_ITEMS).map((sensor) => ({
+      source: own(sensor, 'source') as 'thermal-zone' | 'hwmon',
+      name: own(sensor, 'name') as string,
+      status: normalizeLinuxStatus(own(sensor, 'status')),
+      temperatureCelsius: finite(own(sensor, 'temperatureCelsius'), -50, 200),
+    })),
+    fans: rawFans.slice(0, MAX_LINUX_REDUCED_THERMAL_ITEMS).map((fan) => ({
+      name: own(fan, 'name') as string,
+      status: normalizeLinuxStatus(own(fan, 'status')),
+      rpm: integer(own(fan, 'rpm'), 0, 1_000_000),
+    })),
+    raspberryPi: {
+      status: normalizeLinuxStatus(own(rpi, 'status')),
+      detected: own(rpi, 'detected') as boolean,
+      temperatureCelsius: finite(own(rpi, 'temperatureCelsius'), -50, 200),
+      supplyVoltageVolts: finite(own(rpi, 'supplyVoltageVolts'), 0, 10),
+      throttledFlags: integer(own(rpi, 'throttledFlags'), 0, MAX_UINT32),
+      currentUnderVoltage: own(rpi, 'currentUnderVoltage') as boolean | null,
+      currentFrequencyCapped: own(rpi, 'currentFrequencyCapped') as boolean | null,
+      currentThrottled: own(rpi, 'currentThrottled') as boolean | null,
+      currentSoftTemperatureLimit: own(rpi, 'currentSoftTemperatureLimit') as boolean | null,
+      underVoltageOccurred: own(rpi, 'underVoltageOccurred') as boolean | null,
+      frequencyCapOccurred: own(rpi, 'frequencyCapOccurred') as boolean | null,
+      throttlingOccurred: own(rpi, 'throttlingOccurred') as boolean | null,
+      softTemperatureLimitOccurred: own(rpi, 'softTemperatureLimitOccurred') as boolean | null,
+      flagSource: own(rpi, 'flagSource') as 'vcgencmd' | 'hwmon-current-only' | null,
+    },
+  };
+
+  const statuses = [resourceStatus, storage.status, network.status, reliability.status, powerStatus];
+  return {
+    schemaVersion: 1,
+    collectedAt: linuxTimestamp(own(raw, 'collectedAt'), nowMs),
+    status: combinedLinuxStatus(statuses),
+    resources,
+    storage,
+    network,
+    reliability,
+    power,
+  };
+}
+
 export function readDashboard(
   dataDirectory: string,
   range: DashboardRange,
@@ -2343,6 +3742,8 @@ export function readDashboard(
   const latestTime = observedLatest ? new Date(observedLatest.timestamp).getTime() : Number.NaN;
   const latest = observedLatest ?? emptySample(new Date(nowMs).toISOString());
   const containerTelemetry = normalizeContainerTelemetry(current, nowMs, staleAfterMs);
+  const dockerEventTelemetry = normalizeDockerEventTelemetry(current, nowMs, staleAfterMs, cutoff);
+  const syntheticProbeTelemetry = normalizeSyntheticProbeTelemetry(current, nowMs, staleAfterMs);
   const alerts = parseJsonLines(root, join(root, 'alerts.jsonl'), MAX_EVENT_FILE_BYTES);
   const ruleEvaluation = readRuleEvaluation(root, nowMs, staleAfterMs);
   const ruleAlerts = readRuleAlerts(root, cutoff, nowMs);
@@ -2359,6 +3760,7 @@ export function readDashboard(
     agent: normalizeAgent(current, nowMs, staleAfterMs),
     host: normalizeHost(current),
     reliability: normalizeReliability(current),
+    linux: normalizeLinuxDiagnostics(current, nowMs),
     system: normalizeSystem(current, nowMs),
     latest,
     series: downsampleTelemetry(samples, MAX_SERIES_POINTS),
@@ -2367,6 +3769,10 @@ export function readDashboard(
     disks: normalizeDisks(current),
     containerCollection: containerTelemetry.containerCollection,
     containers: containerTelemetry.containers,
+    dockerEventCollection: dockerEventTelemetry.dockerEventCollection,
+    dockerEvents: dockerEventTelemetry.dockerEvents,
+    syntheticProbeCollection: syntheticProbeTelemetry.syntheticProbeCollection,
+    syntheticProbes: syntheticProbeTelemetry.syntheticProbes,
     currentTraffic: normalizeCurrentTraffic(current),
     alerts: normalizeAlerts(alerts, cutoff, nowMs),
     ruleEvaluation,

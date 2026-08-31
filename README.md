@@ -34,15 +34,17 @@ inputs but its mount namespace contains no Docker socket. A separate one-shot
 helper runs as the same unprivileged `cks` account that already owns the sole
 rootless daemon and writes only a strictly validated, fixed-schema snapshot.
 The web container receives neither Docker sockets nor raw logs; it can read
-only the collector's reduced export. Its one non-read capability is the exact
+only the collector's reduced export. Its host-operation capability is the exact
 `/run/monitor-update/gateway.sock` Unix socket described below, supplied by a
 read-only bind of the narrow host directory
 `/var/lib/monitor-update-socket`. That socket
 accepts only bounded `check` and plan-bound `apply-safe` requests and leads to
 an unprivileged gateway, not directly to APT. In production SSO
 mode the application has no password database, session database, auth-state
-directory, or other writable user store. It consumes only the identity asserted
-by the central SSO edge, protected by a dedicated read-only edge secret.
+directory, or other writable user store. Its separate application-state write
+boundary is the exact `/var/lib/monitor-security` bind used for digest-only API
+key metadata and the audit journal. It consumes SSO user identity only from the
+central edge, protected by a dedicated read-only edge secret.
 
 Local mode is deliberately different: it creates a disposable, application-
 specific password hash and signed cookie under the worktree so the application
@@ -208,6 +210,11 @@ example and follow [Alert delivery outbox](docs/alert-delivery.md); the
 collector only enqueues, while the separate network-capable worker performs
 delivery.
 
+Encrypted state backup is also deliberately opt-in and is never scheduled by
+the installer. Review the checked-in source-map template and complete a real
+verify/clean-host restore drill before declaring an RPO; see
+[Monitor state backup and recovery](docs/backup-recovery.md).
+
 ### 2. Create the production edge credential
 
 Production needs only the shared edge-to-origin credential. It must be distinct
@@ -240,7 +247,11 @@ The host-specific production definition is
 `127.0.0.1:5181`, mounts `/var/lib/monitor-export` read-only, mounts only the
 edge secret at `/run/secrets/monitor_edge_secret`, and binds only the narrow
 `/var/lib/monitor-update-socket` read-only at the container's
-`/run/monitor-update` directory for the updater socket. It
+`/run/monitor-update` directory for the updater socket. It also binds the
+cks-owned mode-`0700` `/var/lib/monitor-security` directory read-write at the
+same container path for the digest-only API-key registry and durable
+application audit journal; the application validates that boundary before
+serving requests. It
 requires an explicit image tag. There must be no writable auth-state mount,
 local password/session secret, Docker socket, or broader host path mount in
 this definition. This baseline leaves central agent ingress disabled. A
@@ -284,12 +295,39 @@ cannot turn a `main`/ `dev` SSO image into a local-password image.
 ### 4. Publish `/monitor/` through Nginx
 
 The location must preserve the `/monitor` prefix because both the frontend and
-API are built for that base path. The production server block uses this shape:
+API are built for that base path. Install the reviewed Monitor-only snippets.
+The API-key ingress remains dormant until the origin-TLS preconditions below
+are satisfied. The peer map is an `http`-context file, while the API-key proxy
+and Cloudflare real-IP files are location fragments and must not be included
+directly at server scope:
+
+```sh
+sudo install -o root -g root -m 0644 \
+  ops/nginx/monitor-public-readiness.conf \
+  ops/nginx/monitor-api-key-ingress.conf \
+  ops/nginx/monitor-api-key-proxy.conf \
+  ops/nginx/monitor-cloudflare-real-ip.conf \
+  /etc/nginx/snippets/
+
+sudo install -o root -g root -m 0644 \
+  ops/nginx/monitor-api-key-peer-map.conf \
+  /etc/nginx/conf.d/monitor-api-key-peer-map.conf
+```
+
+The production server block uses this safe baseline. The public readiness
+include must precede the broader SSO prefix:
 
 ```nginx
 location = /monitor {
     return 308 /monitor/;
 }
+
+# One reduced readiness endpoint is public for the independent dead-man check.
+include /etc/nginx/snippets/monitor-public-readiness.conf;
+
+# Keep this absent until the origin-TLS and peer-boundary activation checklist
+# below has been completed.
+# include /etc/nginx/snippets/monitor-api-key-ingress.conf;
 
 location ^~ /monitor/ {
     include /etc/nginx/snippets/bonifacio-sso-authrequest.conf;
@@ -306,16 +344,77 @@ location ^~ /monitor/ {
 }
 ```
 
+External automation, once explicitly enabled, uses
+`/monitor/api-key/v1/...`, not `/monitor/api/...`. The alias file maps only the
+routes listed in
+[`docs/application-security-state.md`](docs/application-security-state.md) to
+the internal bearer middleware. Wrong methods return `405`; other paths remain
+under SSO or return `404`. The proxy replaces the incoming forwarding chain
+and accepts `CF-Connecting-IP` only from Cloudflare's published origin-facing
+ranges, so API-key source-address restrictions receive one connection-derived
+address. It also injects the private SSO edge credential; the application
+rejects every bearer request before rate limiting or source-address evaluation
+unless that credential matches. Express proxy trust is disabled globally; the
+application reads the proxy-controlled rightmost address only after the SSO/API
+edge credential has authenticated that hop. Agent mTLS requests deliberately
+use the socket peer for audit and registration metadata; their certificate edge
+proof does not grant trust to forwarding headers. Direct loopback calls
+therefore cannot turn a forged forwarding header into a trusted client address,
+including in local login rate limits, agent inventory, and audit metadata. Refresh
+`monitor-cloudflare-real-ip.conf` from
+<https://www.cloudflare.com/ips/> whenever Cloudflare publishes a range change,
+validate with `nginx -t`, and keep direct origin access firewall-restricted.
+The peer map is an application-layer backstop, not a replacement for that
+network policy.
+
+Do **not** activate `monitor-api-key-ingress.conf` while Cloudflare connects to
+the origin over plain HTTP (including Flexible mode). Before activation, all of
+the following must be demonstrated in the live deployment:
+
+1. Nginx itself terminates origin HTTPS with a valid origin certificate and
+   Cloudflare uses Full (strict), or an authenticated tunnel has an independently
+   reviewed equivalent transport and peer-identity gate.
+2. Non-Cloudflare direct origin access is denied by the host or upstream
+   firewall, in addition to the checked-in `$realip_remote_addr` peer map.
+3. `nginx -t` succeeds and negative tests prove that plain-HTTP and untrusted
+   peers cannot reach an alias.
+4. The high-impact `agents:write` and `system-updates:apply` aliases have
+   explicit operator approval; their keys use the minimum scope, expiry, and
+   source-IP allowlist.
+
+The current Bonifacio production origin exposes only HTTP to Nginx, so the
+API-key include is intentionally absent. Its public alias paths therefore stay
+behind SSO until the checklist is completed.
+
 After updating `/etc/nginx/sites-available/bonifacio.work`:
 
 ```sh
 sudo nginx -t
 sudo systemctl reload nginx
-curl --fail --silent --show-error https://bonifacio.work/monitor/ >/dev/null
+curl --fail --silent --show-error https://bonifacio.work/monitor/readyz
+curl --head --silent --show-error https://bonifacio.work/monitor/
+curl --silent --show-error \
+  --header 'Authorization: Bearer invalid' \
+  https://bonifacio.work/monitor/api-key/v1/dashboard
 ```
 
+With the safe baseline, the last request must follow the normal SSO boundary;
+an `INVALID_API_KEY` response is expected only after deliberate activation.
+
 Only the Nginx/TLS endpoint should be exposed publicly. Port `5181` remains
-loopback-only.
+loopback-only. The exact readiness location is currently the sole non-SSO
+path. If the activation checklist is later completed, only the exact versioned
+API-key aliases join it; the dashboard, security management, agent mTLS
+ingress, and every other API remain behind SSO and the edge secret.
+
+`.github/workflows/external-monitor.yml` checks both the exact readiness JSON
+and the SSO redirect from a GitHub-hosted runner every five minutes. A failed
+probe opens at most one fixed-title GitHub issue outside the monitored host and
+still fails the workflow; the first later success comments on and closes that
+issue. Neither path stores response bodies, credentials, or request headers.
+This external incident is deliberately independent of Monitor's local alert
+outbox, so a host, Nginx, application, or local delivery failure cannot silence
+the only dead-man signal.
 
 Install the separate privacy-preserving request counter after the site is
 working:
@@ -556,7 +655,8 @@ global permit with slow uploads.
 
 The repository Compose launcher automatically selects `docker-compose.sso.yml` or
 `docker-compose.local.yml` from the canonical mode. Common options are
-`MONITOR_IMAGE`, `MONITOR_PORT`, and `MONITOR_EXPORT_DIR`. SSO mode additionally
+`MONITOR_IMAGE`, `MONITOR_PORT`, `MONITOR_EXPORT_DIR`, and the pre-provisioned
+`MONITOR_SECURITY_STATE_PATH`. SSO mode additionally
 accepts `MONITOR_EDGE_SECRET_PATH`; local mode accepts
 `MONITOR_AUTH_STATE_PATH`, `MONITOR_PASSWORD_PATH`, and
 `MONITOR_SESSION_SECRET_PATH`. The repository baseline Compose files do not
@@ -575,6 +675,7 @@ Collector variables and defaults are:
 | `MONITOR_PRIVILEGE_LOGS` | `/var/log/privilege-events.log` |
 | `MONITOR_TRAFFIC_LOG` | `/var/log/nginx/monitor-traffic.jsonl` |
 | `MONITOR_CONTAINER_INPUT` | `/run/monitor-container-exporter/containers.json` in production |
+| `MONITOR_SYNTHETIC_INPUT` | `/var/lib/monitor-synthetic/results.json`; URL-free result handoff from the opt-in worker |
 | `MONITOR_DOCKER_SOCKETS` | empty in production; direct socket mode is fixture/development-only and rejects non-`cks` owners |
 | `MONITOR_PROCESS_UIDS` | `0,1001` (root and `cks`; other UIDs are rejected) |
 | `MONITOR_CURL` | `/usr/bin/curl` |
@@ -629,16 +730,24 @@ The default root is `/var/lib/monitor-export`:
 
 - `current.json` is schema version 2 and contains exactly `schemaVersion`,
   `generatedAt`, `identity`, `heartbeat`, `host`, `latest`, `disks`,
-  `containers`, `containerCollection`, `currentTraffic`, `reliability`, and
-  `system`. Container source status distinguishes fresh, bounded last-known,
-  unavailable, and permission-denied observations. A current container row is
-  the fixed 17-field reduced lifecycle contract: safe name/project/owner,
-  state and authoritative health support, CPU/memory usage, configured
-  memory/CPU/PID limits, restart total and interval delta, OOM state, and
-  start/finish timestamps. Missing inspect evidence remains `null`; raw IDs,
-  images, commands, environment, and mounts are never published. Legacy
-  seven-field rows are read with the new fields unknown, and incident evidence
-  intentionally remains the smaller seven-field projection.
+  `containers`, `containerCollection`, `dockerEventCollection`, `dockerEvents`,
+  `syntheticProbeCollection`, `syntheticProbes`, `currentTraffic`,
+  `reliability`, `system`, and `linux`. Container source status distinguishes
+  fresh, bounded last-known, unavailable, permission-denied, and collection
+  error observations. A new container row is the fixed 56-field reduced v3
+  contract. Its 17-field compatibility prefix covers safe identity/lifecycle,
+  health, CPU/memory, limits, restart/OOM and timestamps; the v3 suffix covers
+  opaque instance identity, PIDs/throttling, block I/O, network totals/rates,
+  writable-layer and mount/network counts, security booleans/capability counts,
+  and validated image tag/digest/drift evidence. Missing Docker evidence remains
+  `null`; raw IDs, commands, environment, raw mount paths, Actor attributes, and
+  network addresses are never published. Legacy seven-field rows are read with
+  new fields unknown, and incident evidence intentionally remains the smaller
+  seven-field projection. Docker event status and at most 128 reduced lifecycle
+  events are independent from list/stats freshness. Docker stdout/stderr is
+  explicitly `unsupported` rather than silently empty. Synthetic source status
+  and its bounded URL-free HTTP/TLS results likewise distinguish unsupported,
+  stale, permission, and collection failures.
 - `history/YYYY-MM-DD.jsonl` contains one reduced telemetry sample per line.
   Each day is capped at 2,000 rows and the default calendar retention is 30
   days.
@@ -862,9 +971,12 @@ POST   /monitor/api/agent/certificate-rotations # bound one-use token + new cert
   root-only, fsync-backed pending-reopen marker prevents a failed Nginx reopen
   from being forgotten merely because logrotate already advanced its state.
 - The production rootless container has a read-only filesystem and telemetry
-  mount, no writable user/auth store, no Linux capabilities,
+  mount, no writable local password/session store, no Linux capabilities,
   `no-new-privileges`, a small tmpfs, and CPU, memory, PID, and log-size limits.
-  Only the local Compose overlay adds a disposable writable auth-state mount.
+  Its one deliberate application-state write boundary is the cks-owned
+  mode-`0700` `/var/lib/monitor-security` bind for the digest-only API-key
+  registry and audit journal. Only the local Compose overlay adds a disposable
+  writable password auth-state mount.
 - The updater socket is a deliberate write capability. Its unprivileged gateway
   verifies peer UID 1001 and cannot invoke APT. A separate root worker revalidates
   the queue and exposes only fixed package-check and confirmed safe-apply
@@ -893,10 +1005,11 @@ POST   /monitor/api/agent/certificate-rotations # bound one-use token + new cert
 
 This is a private operations view. Keep it behind the central HTTPS SSO gate,
 do not expose port `5181`, and do not mount additional host paths into the
-container beyond the read-only telemetry export, edge secret, and the exact
+container beyond the read-only telemetry export, edge secret, the exact
 read-only `/var/lib/monitor-update-socket` host directory at
-`/run/monitor-update` in the container. Never mount broader `/var/lib` or
-`/run`, Docker, systemd, APT, or host filesystem paths.
+`/run/monitor-update`, and the exact read-write `/var/lib/monitor-security`
+application-state directory. Never mount broader `/var/lib` or `/run`, Docker,
+systemd, APT, or host filesystem paths.
 
 ## GitHub Actions deployment
 

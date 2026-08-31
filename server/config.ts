@@ -14,6 +14,7 @@ const BUILD_AUTH_CONTRACT_FILE = '/etc/portfolio-auth-build';
 
 interface CommonRuntimeConfig {
   dataDir: string;
+  securityStateDir: string;
   staleAfterMs: number;
   allowedOrigins: string[];
   legacyAuthStateFile: string;
@@ -75,6 +76,7 @@ export interface ConfigOverrides {
   authStateFile?: string;
   sessionSecret?: string;
   dataDir?: string;
+  securityStateDir?: string;
   sessionTtlMs?: number;
   staleAfterMs?: number;
   allowedOrigins?: string[];
@@ -454,8 +456,20 @@ export function loadConfig(overrides: ConfigOverrides = {}): RuntimeConfig {
   // ssoEnabled remains an explicit dependency-injection seam for unit tests.
   // Real process startup must use the repository-wide branch contract.
   const ssoEnabled = overrides.ssoEnabled ?? ssoEnabledFromPortfolioContract();
+  const configuredSecurityStateDir = overrides.securityStateDir
+    ?? process.env.MONITOR_SECURITY_STATE_DIR
+    ?? '/var/lib/monitor-security';
+  const securityStateDir = resolve(configuredSecurityStateDir);
+  if (
+    !configuredSecurityStateDir.startsWith('/')
+    || securityStateDir !== configuredSecurityStateDir
+    || securityStateDir === '/'
+  ) {
+    throw new Error('MONITOR_SECURITY_STATE_DIR must be a normalized absolute non-root path');
+  }
   const commonWithoutAgentControl = {
     dataDir: resolve(overrides.dataDir ?? process.env.MONITOR_DATA_DIR ?? '/data'),
+    securityStateDir,
     staleAfterMs: overrides.staleAfterMs
       ?? positiveInteger(process.env.MONITOR_STALE_AFTER_SECONDS, 5 * 60) * 1_000,
     allowedOrigins: overrides.allowedOrigins

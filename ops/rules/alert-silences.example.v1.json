@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "silences": [
+    {
+      "id": "planned-maintenance-2026-08-31",
+      "startsAt": "2026-08-31T13:00:00Z",
+      "endsAt": "2026-08-31T14:00:00Z",
+      "ruleId": null,
+      "target": "host/11111111-1111-4111-8111-111111111111",
+      "labels": {}
+    }
+  ]
+}

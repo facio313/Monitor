@@ -13,6 +13,9 @@ MONITOR_TRAFFIC_LOG=/var/log/nginx/monitor-traffic.jsonl
 # Production consumes only the unprivileged fixed-schema snapshot.
 MONITOR_DOCKER_SOCKETS=
 MONITOR_CONTAINER_INPUT=/run/monitor-container-exporter/containers.json
+# Optional SSRF-safe unprivileged worker handoff. A missing result remains
+# explicitly unsupported and never blocks host collection.
+MONITOR_SYNTHETIC_INPUT=/var/lib/monitor-synthetic/results.json
 MONITOR_PROCESS_UIDS=0,1001
 # Exact process comm names and system service units explicitly approved for
 # detailed status. Process argv and environment are never collected.

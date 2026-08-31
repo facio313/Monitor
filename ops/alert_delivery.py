@@ -14,6 +14,8 @@ import contextlib
 import datetime as dt
 import email.message
 import hashlib
+import http.client
+import ipaddress
 import json
 import math
 import os
@@ -28,9 +30,7 @@ import stat
 import sys
 import threading
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol, Sequence
@@ -54,6 +54,7 @@ MAX_CHANNELS = 64
 MAX_ROUTES = 128
 MAX_HEADERS = 16
 MAX_RECIPIENTS = 20
+MAX_HTTPS_DNS_ANSWERS = 32
 MAX_ENQUEUE_BATCH = 4096
 MAX_WORKER_RUNTIME_SECONDS = 300.0
 DEFAULT_WORKER_RUNTIME_SECONDS = 45.0
@@ -77,6 +78,7 @@ TELEGRAM_CHAT = re.compile(r"^-?[0-9]{1,20}$")
 TELEGRAM_TOKEN = re.compile(r"^[0-9]{6,16}:[A-Za-z0-9_-]{20,128}$")
 HTTP_HEADER = re.compile(r"^[A-Za-z][A-Za-z0-9-]{0,63}$")
 HTTP_HEADER_VALUE = re.compile(r"^[\x20-\x7e]{0,256}$")
+DNS_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 FORBIDDEN_HEADERS = frozenset({
     "authorization", "cookie", "proxy-authorization", "set-cookie",
     "host", "content-length", "transfer-encoding", "content-type",
@@ -178,6 +180,26 @@ class DeliveryResult:
         cls, error_code: str, status_code: int | None = None,
     ) -> "DeliveryResult":
         return cls("permanent", status_code, error_code)
+
+
+@dataclass(frozen=True)
+class _HttpsEndpoint:
+    hostname: str
+    port: int
+    authority: str
+    request_target: str
+    url: str
+
+
+@dataclass(frozen=True)
+class _ResolvedDestination:
+    family: int
+    address: str
+    sockaddr: tuple[Any, ...]
+
+
+class _UnsafeHttpsDestination(ValueError):
+    """The endpoint or one of its DNS answers is not safe for egress."""
 
 
 class _DeliveryDeadlineExpired(BaseException):
@@ -1319,29 +1341,241 @@ def _message_text(payload: Mapping[str, Any]) -> str:
     )[:2000]
 
 
-def _https_url(value: str, allowed_hosts: frozenset[str] | None = None) -> str:
-    if len(value) > 2048 or "\r" in value or "\n" in value:
+def _canonical_https_hostname(value: str) -> str:
+    if not value or len(value) > 255 or "%" in value:
         raise ValueError("delivery endpoint is invalid")
-    parsed = urllib.parse.urlsplit(value)
-    hostname = parsed.hostname.lower() if parsed.hostname else None
+    # A final root label is semantically equivalent but must not bypass a
+    # channel host allowlist or produce a different Host/SNI representation.
+    candidate = value[:-1] if value.endswith(".") else value
+    if not candidate:
+        raise ValueError("delivery endpoint is invalid")
+    try:
+        address = ipaddress.ip_address(candidate)
+    except ValueError:
+        try:
+            hostname = candidate.encode("idna", "strict").decode("ascii").lower()
+        except (UnicodeError, ValueError) as error:
+            raise ValueError("delivery endpoint is invalid") from error
+        labels = hostname.split(".")
+        if (
+            len(hostname) > 253
+            or any(DNS_LABEL.fullmatch(label) is None for label in labels)
+        ):
+            raise ValueError("delivery endpoint is invalid")
+        return hostname
+    return str(address)
+
+
+def _parse_https_endpoint(
+    value: str,
+    allowed_hosts: frozenset[str] | None = None,
+) -> _HttpsEndpoint:
+    if (
+        not isinstance(value, str)
+        or len(value) > 2048
+        or any(ord(character) <= 0x20 or ord(character) == 0x7f for character in value)
+    ):
+        raise ValueError("delivery endpoint is invalid")
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        raw_hostname = parsed.hostname
+        port = parsed.port
+    except (UnicodeError, ValueError) as error:
+        raise ValueError("delivery endpoint is invalid") from error
     if (
         parsed.scheme != "https"
-        or hostname is None
+        or raw_hostname is None
         or parsed.username is not None
         or parsed.password is not None
         or parsed.fragment
-        or (allowed_hosts is not None and hostname not in allowed_hosts)
     ):
         raise ValueError("delivery endpoint is invalid")
-    return value
+    try:
+        parsed.path.encode("ascii", "strict")
+        parsed.query.encode("ascii", "strict")
+    except UnicodeError as error:
+        raise ValueError("delivery endpoint is invalid") from error
+    hostname = _canonical_https_hostname(raw_hostname)
+    if allowed_hosts is not None:
+        normalized_allowed = frozenset(
+            _canonical_https_hostname(item) for item in allowed_hosts
+        )
+        if hostname not in normalized_allowed:
+            raise ValueError("delivery endpoint is invalid")
+    normalized_port = 443 if port is None else port
+    if not 1 <= normalized_port <= 65535:
+        raise ValueError("delivery endpoint is invalid")
+    try:
+        address = ipaddress.ip_address(hostname)
+    except ValueError:
+        authority_host = hostname
+    else:
+        authority_host = f"[{hostname}]" if address.version == 6 else hostname
+    authority = (
+        authority_host
+        if normalized_port == 443
+        else f"{authority_host}:{normalized_port}"
+    )
+    request_target = parsed.path or "/"
+    if parsed.query:
+        request_target = f"{request_target}?{parsed.query}"
+    return _HttpsEndpoint(
+        hostname=hostname,
+        port=normalized_port,
+        authority=authority,
+        request_target=request_target,
+        url=f"https://{authority}{request_target}",
+    )
 
 
-class _HttpsRedirectHandler(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[no-untyped-def]
-        _https_url(newurl)
-        # Webhook endpoints are expected to be final HTTPS destinations.  Do
-        # not forward payloads or secret-bearing Telegram paths across hosts.
-        return None
+def _https_url(value: str, allowed_hosts: frozenset[str] | None = None) -> str:
+    return _parse_https_endpoint(value, allowed_hosts).url
+
+
+def _address_is_global(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    if isinstance(address, ipaddress.IPv6Address):
+        # Never reinterpret an IPv4 policy decision through an IPv6 spelling.
+        # Transition formats are also unnecessary for alert receivers and can
+        # delegate routing to a gateway that interprets an embedded IPv4 value.
+        if (
+            address.ipv4_mapped is not None
+            or address.sixtofour is not None
+            or address.teredo is not None
+            or address.is_site_local
+        ):
+            return False
+    return bool(
+        address.is_global
+        and not address.is_private
+        and not address.is_loopback
+        and not address.is_link_local
+        and not address.is_multicast
+        and not address.is_unspecified
+        and not address.is_reserved
+    )
+
+
+def _resolve_global_destinations(
+    endpoint: _HttpsEndpoint,
+    resolver: Callable[..., Sequence[tuple[Any, ...]]],
+) -> tuple[_ResolvedDestination, ...]:
+    answers = resolver(
+        endpoint.hostname,
+        endpoint.port,
+        socket.AF_UNSPEC,
+        socket.SOCK_STREAM,
+        socket.IPPROTO_TCP,
+    )
+    destinations: list[_ResolvedDestination] = []
+    seen: set[tuple[int, str]] = set()
+    for answer_index, answer in enumerate(answers):
+        if answer_index >= MAX_HTTPS_DNS_ANSWERS:
+            raise _UnsafeHttpsDestination("delivery DNS answer set is too large")
+        if not isinstance(answer, tuple) or len(answer) != 5:
+            raise _UnsafeHttpsDestination("delivery DNS answer is invalid")
+        family, socktype, protocol, _canonical_name, raw_sockaddr = answer
+        if (
+            family not in {socket.AF_INET, socket.AF_INET6}
+            or socktype != socket.SOCK_STREAM
+            or protocol not in {0, socket.IPPROTO_TCP}
+            or not isinstance(raw_sockaddr, tuple)
+        ):
+            raise _UnsafeHttpsDestination("delivery DNS answer is invalid")
+        expected_length = 2 if family == socket.AF_INET else 4
+        if len(raw_sockaddr) != expected_length:
+            raise _UnsafeHttpsDestination("delivery DNS answer is invalid")
+        raw_address = raw_sockaddr[0]
+        raw_port = raw_sockaddr[1]
+        if (
+            not isinstance(raw_address, str)
+            or "%" in raw_address
+            or isinstance(raw_port, bool)
+            or not isinstance(raw_port, int)
+            or raw_port != endpoint.port
+        ):
+            raise _UnsafeHttpsDestination("delivery DNS answer is invalid")
+        try:
+            address = ipaddress.ip_address(raw_address)
+        except ValueError as error:
+            raise _UnsafeHttpsDestination("delivery DNS answer is invalid") from error
+        if (
+            (family == socket.AF_INET and address.version != 4)
+            or (family == socket.AF_INET6 and address.version != 6)
+            or not _address_is_global(address)
+        ):
+            raise _UnsafeHttpsDestination("delivery destination is not global")
+        if family == socket.AF_INET6:
+            flow_info, scope_id = raw_sockaddr[2], raw_sockaddr[3]
+            if (
+                isinstance(flow_info, bool)
+                or not isinstance(flow_info, int)
+                or isinstance(scope_id, bool)
+                or not isinstance(scope_id, int)
+                or flow_info != 0
+                or scope_id != 0
+            ):
+                raise _UnsafeHttpsDestination("delivery DNS answer is invalid")
+            sockaddr: tuple[Any, ...] = (str(address), endpoint.port, 0, 0)
+        else:
+            sockaddr = (str(address), endpoint.port)
+        identity = (family, str(address))
+        if identity not in seen:
+            seen.add(identity)
+            destinations.append(_ResolvedDestination(family, str(address), sockaddr))
+    if not destinations:
+        raise socket.gaierror(socket.EAI_NONAME, "no HTTPS address")
+    return tuple(destinations)
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    """HTTPS connection that never resolves the validated hostname again."""
+
+    def __init__(
+        self,
+        endpoint: _HttpsEndpoint,
+        destination: _ResolvedDestination,
+        timeout: float,
+        context: ssl.SSLContext | None = None,
+        socket_factory: Callable[..., socket.socket] = socket.socket,
+    ):
+        super().__init__(
+            endpoint.hostname,
+            endpoint.port,
+            timeout=timeout,
+            context=context or ssl.create_default_context(),
+        )
+        self._destination = destination
+        self._socket_factory = socket_factory
+
+    def connect(self) -> None:
+        if self._tunnel_host is not None:
+            raise OSError("HTTPS proxy tunneling is disabled")
+        raw_socket = self._socket_factory(
+            self._destination.family,
+            socket.SOCK_STREAM,
+            socket.IPPROTO_TCP,
+        )
+        try:
+            raw_socket.settimeout(self.timeout)
+            raw_socket.connect(self._destination.sockaddr)
+            # ``host`` is the canonical original URL hostname, not the pinned
+            # address.  Certificate verification and SNI therefore retain the
+            # authority the operator configured while routing cannot rebind.
+            self.sock = self._context.wrap_socket(
+                raw_socket,
+                server_hostname=self.host,
+            )
+        except BaseException:
+            raw_socket.close()
+            raise
+
+
+def _default_https_connection(
+    endpoint: _HttpsEndpoint,
+    destination: _ResolvedDestination,
+    timeout: float,
+) -> http.client.HTTPSConnection:
+    return _PinnedHTTPSConnection(endpoint, destination, timeout)
 
 
 def _retry_after(headers: Mapping[str, str]) -> float | None:
@@ -1368,31 +1602,67 @@ def _http_post(
     body: Mapping[str, Any],
     headers: Mapping[str, str],
     timeout: float,
-    opener: Any = None,
+    resolver: Callable[..., Sequence[tuple[Any, ...]]] | None = None,
+    connection_factory: Callable[
+        [_HttpsEndpoint, _ResolvedDestination, float], Any
+    ] | None = None,
 ) -> DeliveryResult:
     payload = json.dumps(body, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
     if len(payload) > MAX_PAYLOAD_BYTES:
         return DeliveryResult.permanent("payload_too_large")
-    request = urllib.request.Request(
-        url,
-        data=payload,
-        method="POST",
-        headers={"Content-Type": "application/json", "User-Agent": "Monitor-Alert-Delivery/1", **headers},
-    )
-    client = opener or urllib.request.build_opener(_HttpsRedirectHandler())
     try:
-        with client.open(request, timeout=timeout) as response:
-            return _classify_http_status(int(response.status), _retry_after(response.headers))
-    except urllib.error.HTTPError as error:
-        return _classify_http_status(int(error.code), _retry_after(error.headers or {}))
-    except urllib.error.URLError as error:
-        if isinstance(error.reason, ssl.SSLCertVerificationError):
-            return DeliveryResult.permanent("tls_verification_failed")
-        return DeliveryResult.retryable("network_error")
+        endpoint = _parse_https_endpoint(url)
+    except ValueError:
+        return DeliveryResult.permanent("endpoint_invalid")
+    try:
+        destinations = _resolve_global_destinations(
+            endpoint,
+            resolver or socket.getaddrinfo,
+        )
+    except _UnsafeHttpsDestination:
+        return DeliveryResult.permanent("endpoint_not_global")
+    except (OSError, TypeError, ValueError):
+        return DeliveryResult.retryable("dns_error")
+    if any(
+        not isinstance(key, str)
+        or HTTP_HEADER.fullmatch(key) is None
+        or key.lower() in {"host", "content-length", "transfer-encoding"}
+        or not isinstance(value, str)
+        or HTTP_HEADER_VALUE.fullmatch(value) is None
+        for key, value in headers.items()
+    ):
+        return DeliveryResult.permanent("headers_invalid")
+    request_headers = {
+        "Content-Type": "application/json",
+        "User-Agent": "Monitor-Alert-Delivery/1",
+        **headers,
+        "Host": endpoint.authority,
+    }
+    client: Any = None
+    try:
+        factory = connection_factory or _default_https_connection
+        client = factory(endpoint, destinations[0], timeout)
+        client.request(
+            "POST",
+            endpoint.request_target,
+            body=payload,
+            headers=request_headers,
+        )
+        response = client.getresponse()
+        return _classify_http_status(
+            int(response.status),
+            _retry_after(response.headers),
+        )
+    except ssl.SSLCertVerificationError:
+        return DeliveryResult.permanent("tls_verification_failed")
     except (TimeoutError, socket.timeout):
         return DeliveryResult.retryable("timeout")
-    except (OSError, ssl.SSLError):
+    except (OSError, ssl.SSLError, http.client.HTTPException):
         return DeliveryResult.retryable("transport_error")
+    finally:
+        if client is not None:
+            with contextlib.suppress(Exception):
+                client.close()
 
 
 class ChannelAdapter(Protocol):
@@ -1405,9 +1675,35 @@ class ChannelAdapter(Protocol):
     ) -> DeliveryResult: ...
 
 
-class WebhookAdapter:
-    def __init__(self, opener: Any = None):
-        self.opener = opener
+class _HttpsAdapter:
+    def __init__(
+        self,
+        resolver: Callable[..., Sequence[tuple[Any, ...]]] | None = None,
+        connection_factory: Callable[
+            [_HttpsEndpoint, _ResolvedDestination, float], Any
+        ] | None = None,
+    ):
+        self.resolver = resolver
+        self.connection_factory = connection_factory
+
+    def _post(
+        self,
+        endpoint: str,
+        body: Mapping[str, Any],
+        headers: Mapping[str, str],
+        timeout: float,
+    ) -> DeliveryResult:
+        return _http_post(
+            endpoint,
+            body,
+            headers,
+            timeout,
+            self.resolver,
+            self.connection_factory,
+        )
+
+
+class WebhookAdapter(_HttpsAdapter):
 
     def send(self, channel: ChannelConfig, task: DeliveryTask, payload: Mapping[str, Any], secret: str) -> DeliveryResult:
         endpoint = _https_url(secret)
@@ -1415,42 +1711,36 @@ class WebhookAdapter:
             **channel.settings["headers"],
             "Idempotency-Key": task.delivery_key,
         }
-        return _http_post(endpoint, payload, headers, channel.timeout_seconds, self.opener)
+        return self._post(endpoint, payload, headers, channel.timeout_seconds)
 
 
-class SlackAdapter:
-    def __init__(self, opener: Any = None):
-        self.opener = opener
+class SlackAdapter(_HttpsAdapter):
 
     def send(self, channel: ChannelConfig, task: DeliveryTask, payload: Mapping[str, Any], secret: str) -> DeliveryResult:
         endpoint = _https_url(secret, frozenset({"hooks.slack.com"}))
         body: dict[str, Any] = {"text": _message_text(payload)}
         if channel.settings["username"]:
             body["username"] = channel.settings["username"]
-        return _http_post(
+        return self._post(
             endpoint, body, {"Idempotency-Key": task.delivery_key},
-            channel.timeout_seconds, self.opener,
+            channel.timeout_seconds,
         )
 
 
-class DiscordAdapter:
-    def __init__(self, opener: Any = None):
-        self.opener = opener
+class DiscordAdapter(_HttpsAdapter):
 
     def send(self, channel: ChannelConfig, task: DeliveryTask, payload: Mapping[str, Any], secret: str) -> DeliveryResult:
         endpoint = _https_url(secret, frozenset({"discord.com", "discordapp.com"}))
         body: dict[str, Any] = {"content": _message_text(payload)}
         if channel.settings["username"]:
             body["username"] = channel.settings["username"]
-        return _http_post(
+        return self._post(
             endpoint, body, {"Idempotency-Key": task.delivery_key},
-            channel.timeout_seconds, self.opener,
+            channel.timeout_seconds,
         )
 
 
-class TelegramAdapter:
-    def __init__(self, opener: Any = None):
-        self.opener = opener
+class TelegramAdapter(_HttpsAdapter):
 
     def send(self, channel: ChannelConfig, task: DeliveryTask, payload: Mapping[str, Any], secret: str) -> DeliveryResult:
         if TELEGRAM_TOKEN.fullmatch(secret) is None:
@@ -1461,9 +1751,9 @@ class TelegramAdapter:
             "text": _message_text(payload),
             "disable_notification": channel.settings["disableNotification"],
         }
-        return _http_post(
+        return self._post(
             endpoint, body, {"Idempotency-Key": task.delivery_key},
-            channel.timeout_seconds, self.opener,
+            channel.timeout_seconds,
         )
 
 

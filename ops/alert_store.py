@@ -29,8 +29,10 @@ try:  # Package imports for tests; direct imports for the installed scripts.
         PACK_VERSION,
         RULE_ID,
         SEVERITIES,
+        Silence,
         TARGET_ID,
         load_rule_pack,
+        release_notification_events,
     )
     from .alert_runtime import evaluate_snapshot
 except ImportError:  # pragma: no cover - exercised by collector integration
@@ -42,8 +44,10 @@ except ImportError:  # pragma: no cover - exercised by collector integration
         PACK_VERSION,
         RULE_ID,
         SEVERITIES,
+        Silence,
         TARGET_ID,
         load_rule_pack,
+        release_notification_events,
     )
     from alert_runtime import evaluate_snapshot  # type: ignore[no-redef]
 
@@ -57,6 +61,10 @@ MAX_EVENT_RECORDS = 5000
 DELIVERY_CONFIG_ENV = "MONITOR_ALERT_DELIVERY_CONFIG"
 DEFAULT_DELIVERY_CONFIG_PATH = Path("/etc/monitor/alert-delivery.json")
 MAX_DELIVERY_STATUS_BYTES = 4096
+MAX_SILENCE_CONFIG_BYTES = 128 * 1024
+MAX_SILENCES = 256
+SILENCE_CONFIG_ENV = "MONITOR_ALERT_SILENCES"
+DEFAULT_SILENCE_CONFIG_PATH = Path("/etc/monitor/alert-silences.json")
 TIMESTAMP = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 PHASES = frozenset({
     "inactive", "pending", "firing", "recovering", "no_data",
@@ -67,7 +75,8 @@ TRANSITIONS = frozenset({"firing", "resolved"})
 STATE_FIELDS = frozenset({
     "ruleId", "target", "metric", "severity", "description", "runbook",
     "phase", "breachSamples", "recoverySamples", "missingSamples",
-    "openedAt", "changedAt", "lastEvaluatedAt", "lastValue",
+    "openedAt", "conditionStartedAt", "recoveryStartedAt", "missingStartedAt",
+    "evaluationIntervalSeconds", "changedAt", "lastEvaluatedAt", "lastValue",
     "observationStatus",
 })
 EVALUATION_FIELDS = frozenset({
@@ -78,10 +87,17 @@ EVENT_FIELDS = frozenset({
     "severity", "notificationState", "observedAt", "openedAt", "value",
     "status", "labels", "description", "runbook",
 })
-PRIVATE_STATE_FIELD_ORDER = (
+LEGACY_PRIVATE_STATE_FIELD_ORDER = (
     "phase", "breachSamples", "recoverySamples", "missingSamples", "openedAt",
+    "conditionStartedAt", "recoveryStartedAt", "missingStartedAt",
+    "evaluationIntervalSeconds",
     "changedAt", "lastEvaluatedAt", "lastValue", "observationStatus",
 )
+PRIVATE_STATE_FIELD_ORDER = (
+    *LEGACY_PRIVATE_STATE_FIELD_ORDER,
+    "notificationState", "notificationLabels",
+)
+LEGACY_PRIVATE_STATE_FIELDS = frozenset(LEGACY_PRIVATE_STATE_FIELD_ORDER)
 PRIVATE_STATE_FIELDS = frozenset(PRIVATE_STATE_FIELD_ORDER)
 PRIVATE_BUNDLE_FIELDS = frozenset({"schemaVersion", "rulePackVersion", "states"})
 
@@ -112,6 +128,12 @@ def _count(value: Any) -> int:
     return value
 
 
+def _interval(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 86_400:
+        raise ValueError("alert evaluation interval is invalid")
+    return value
+
+
 def _number(value: Any) -> float | None:
     if value is None:
         return None
@@ -127,6 +149,22 @@ def _text(value: Any, maximum: int) -> str:
     if not isinstance(value, str) or not value or len(value) > maximum:
         raise ValueError("alert text is invalid")
     return value
+
+
+def _notification_labels(value: Any) -> dict[str, str]:
+    if not isinstance(value, Mapping) or len(value) > 16:
+        raise ValueError("private notification labels are invalid")
+    labels: dict[str, str] = {}
+    for key, item in value.items():
+        if (
+            not isinstance(key, str)
+            or LABEL_NAME.fullmatch(key) is None
+            or not isinstance(item, str)
+            or LABEL_VALUE.fullmatch(item) is None
+        ):
+            raise ValueError("private notification labels are invalid")
+        labels[key] = item
+    return dict(sorted(labels.items()))
 
 
 def _normalize_state(state_key: Any, value: Any) -> dict[str, Any]:
@@ -160,6 +198,10 @@ def _normalize_state(state_key: Any, value: Any) -> dict[str, Any]:
         "recoverySamples": _count(value.get("recoverySamples")),
         "missingSamples": _count(value.get("missingSamples")),
         "openedAt": _timestamp(value.get("openedAt"), True),
+        "conditionStartedAt": _timestamp(value.get("conditionStartedAt"), True),
+        "recoveryStartedAt": _timestamp(value.get("recoveryStartedAt"), True),
+        "missingStartedAt": _timestamp(value.get("missingStartedAt"), True),
+        "evaluationIntervalSeconds": _interval(value.get("evaluationIntervalSeconds")),
         "changedAt": _timestamp(value.get("changedAt")),
         "lastEvaluatedAt": _timestamp(value.get("lastEvaluatedAt")),
         "lastValue": _number(value.get("lastValue")),
@@ -186,10 +228,11 @@ def _normalize_private_bundle(value: Any) -> dict[str, Any]:
         raise ValueError("private rule state is invalid")
     states: dict[str, dict[str, Any]] = {}
     for key, raw_state in raw_states.items():
+        raw_fields = frozenset(raw_state) if isinstance(raw_state, Mapping) else frozenset()
         if (
             not isinstance(key, str)
             or not isinstance(raw_state, Mapping)
-            or frozenset(raw_state) != PRIVATE_STATE_FIELDS
+            or raw_fields not in {PRIVATE_STATE_FIELDS, LEGACY_PRIVATE_STATE_FIELDS}
         ):
             raise ValueError("private rule state is invalid")
         rule_id, separator, target = key.partition(":")
@@ -203,13 +246,24 @@ def _normalize_private_bundle(value: Any) -> dict[str, Any]:
         observation_status = raw_state.get("observationStatus")
         opened_at_value = raw_state.get("openedAt")
         last_value_source = raw_state.get("lastValue")
+        notification_state = raw_state.get("notificationState")
+        notification_labels = _notification_labels(
+            raw_state.get("notificationLabels", {})
+        )
         if phase not in PHASES or observation_status not in OBSERVATION_STATUSES:
             raise ValueError("private rule state enum is invalid")
+        if notification_state is not None and notification_state not in NOTIFICATION_STATES:
+            raise ValueError("private notification state is invalid")
         opened_at = _timestamp(opened_at_value, True)
         last_value = _number(last_value_source)
         if (
             (phase in {"firing", "recovering"}) != (opened_at is not None)
             or (observation_status != "ok" and last_value is not None)
+            or (notification_state is None and notification_labels)
+            or (
+                phase not in {"firing", "recovering"}
+                and notification_state is not None
+            )
         ):
             raise ValueError("private rule state is inconsistent")
         states[key] = {
@@ -218,10 +272,18 @@ def _normalize_private_bundle(value: Any) -> dict[str, Any]:
             "recoverySamples": _count(raw_state.get("recoverySamples")),
             "missingSamples": _count(raw_state.get("missingSamples")),
             "openedAt": opened_at,
+            "conditionStartedAt": _timestamp(raw_state.get("conditionStartedAt"), True),
+            "recoveryStartedAt": _timestamp(raw_state.get("recoveryStartedAt"), True),
+            "missingStartedAt": _timestamp(raw_state.get("missingStartedAt"), True),
+            "evaluationIntervalSeconds": _interval(
+                raw_state.get("evaluationIntervalSeconds")
+            ),
             "changedAt": _timestamp(raw_state.get("changedAt")),
             "lastEvaluatedAt": _timestamp(raw_state.get("lastEvaluatedAt")),
             "lastValue": last_value,
             "observationStatus": observation_status,
+            "notificationState": notification_state,
+            "notificationLabels": notification_labels,
         }
     return {"schemaVersion": SCHEMA_VERSION, "rulePackVersion": version, "states": states}
 
@@ -358,6 +420,101 @@ def _read_file(path: Path, maximum_bytes: int, expected_mode: int | None) -> byt
     return payload
 
 
+def _reject_duplicate_object(pairs: Sequence[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("alert silence JSON contains duplicate keys")
+        result[key] = value
+    return result
+
+
+def _silence_config_path(explicit: Path | None) -> Path | None:
+    if explicit is not None:
+        candidate = explicit
+    else:
+        configured = os.environ.get(SILENCE_CONFIG_ENV)
+        if configured is not None:
+            if not configured or len(configured) > 512 or "\x00" in configured:
+                raise ValueError("alert silence configuration path is invalid")
+            candidate = Path(configured)
+        elif DEFAULT_SILENCE_CONFIG_PATH.exists():
+            candidate = DEFAULT_SILENCE_CONFIG_PATH
+        else:
+            return None
+    if not candidate.is_absolute() or ".." in candidate.parts:
+        raise ValueError("alert silence configuration path must be absolute")
+    return candidate
+
+
+def load_silences(path: Path) -> tuple[Silence, ...]:
+    payload = _read_file(path, MAX_SILENCE_CONFIG_BYTES, 0o600)
+    if payload is None:
+        raise ValueError("alert silence configuration is missing")
+    try:
+        value = json.loads(
+            payload.decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_object,
+            parse_constant=lambda _value: (_ for _ in ()).throw(
+                ValueError("alert silence JSON contains a non-finite value")
+            ),
+        )
+    except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
+        raise ValueError("alert silence configuration is invalid") from error
+    if not isinstance(value, Mapping) or frozenset(value) != {"schemaVersion", "silences"}:
+        raise ValueError("alert silence configuration does not match the schema")
+    raw_silences = value.get("silences")
+    if value.get("schemaVersion") != 1 or not isinstance(raw_silences, list) or len(raw_silences) > MAX_SILENCES:
+        raise ValueError("alert silence configuration is invalid")
+    result: list[Silence] = []
+    seen: set[str] = set()
+    fields = {"id", "startsAt", "endsAt", "ruleId", "target", "labels"}
+    for raw in raw_silences:
+        if not isinstance(raw, Mapping) or frozenset(raw) != fields:
+            raise ValueError("alert silence entry does not match the schema")
+        silence_id = raw.get("id")
+        rule_id = raw.get("ruleId")
+        target = raw.get("target")
+        labels = raw.get("labels")
+        if (
+            not isinstance(silence_id, str)
+            or TARGET_ID.fullmatch(silence_id) is None
+            or silence_id in seen
+            or (rule_id is not None and (not isinstance(rule_id, str) or RULE_ID.fullmatch(rule_id) is None))
+            or (target is not None and (not isinstance(target, str) or TARGET_ID.fullmatch(target) is None))
+            or not isinstance(labels, Mapping)
+            or len(labels) > 16
+        ):
+            raise ValueError("alert silence entry is invalid")
+        normalized_labels: list[tuple[str, str]] = []
+        for key, item in labels.items():
+            if (
+                not isinstance(key, str)
+                or LABEL_NAME.fullmatch(key) is None
+                or not isinstance(item, str)
+                or LABEL_VALUE.fullmatch(item) is None
+            ):
+                raise ValueError("alert silence labels are invalid")
+            normalized_labels.append((key, item))
+        starts_text = _timestamp(raw.get("startsAt"))
+        ends_text = _timestamp(raw.get("endsAt"))
+        assert starts_text is not None and ends_text is not None
+        starts_at = dt.datetime.fromisoformat(starts_text[:-1] + "+00:00")
+        ends_at = dt.datetime.fromisoformat(ends_text[:-1] + "+00:00")
+        if not starts_at < ends_at or (ends_at - starts_at).total_seconds() > 366 * 86400:
+            raise ValueError("alert silence interval is invalid")
+        seen.add(silence_id)
+        result.append(Silence(
+            silence_id=silence_id,
+            starts_at=starts_at,
+            ends_at=ends_at,
+            rule_id=rule_id,
+            target=target,
+            labels=tuple(sorted(normalized_labels)),
+        ))
+    return tuple(result)
+
+
 def _ensure_replaceable(path: Path) -> None:
     _safe_existing_file(path, max(MAX_EVALUATION_BYTES, MAX_EVENT_FILE_BYTES), None)
 
@@ -451,6 +608,101 @@ def _merge_events(
     return [merged[key] for key in order[-limit:]]
 
 
+def _event_notification_authorities(
+    events: Sequence[Mapping[str, Any]],
+    pack_version: str,
+) -> dict[tuple[str, str], dict[str, Any]]:
+    """Return durable firing-notification authority by incident identity."""
+
+    authorities: dict[tuple[str, str], dict[str, Any]] = {}
+    for raw in events:
+        event = normalize_event(raw)
+        if (
+            event["rulePackVersion"] != pack_version
+            or event["transition"] != "firing"
+        ):
+            continue
+        incident = (
+            f'{event["ruleId"]}:{event["target"]}',
+            event["openedAt"],
+        )
+        authority = {
+            "notificationState": event["notificationState"],
+            "notificationLabels": event["labels"],
+        }
+        prior = authorities.get(incident)
+        # Once a ready event exists, later configuration cannot revoke delivery
+        # authority. Otherwise retain the latest muted disposition and labels.
+        if prior is None or prior["notificationState"] != "ready":
+            authorities[incident] = authority
+    return authorities
+
+
+def _states_with_notification_lifecycle(
+    states: Mapping[str, Mapping[str, Any]],
+    previous: Mapping[str, Mapping[str, Any]],
+    events: Sequence[Mapping[str, Any]],
+    pack_version: str,
+) -> dict[str, dict[str, Any]]:
+    """Attach private, restart-safe notification authority to evaluator state."""
+
+    event_authorities = _event_notification_authorities(events, pack_version)
+    result: dict[str, dict[str, Any]] = {}
+    for state_key, raw_state in states.items():
+        if not isinstance(raw_state, Mapping):
+            raise ValueError("private notification lifecycle state is invalid")
+        state = dict(raw_state)
+        phase = state.get("phase")
+        opened_at = state.get("openedAt")
+        if phase not in {"firing", "recovering"} or not isinstance(opened_at, str):
+            state["notificationState"] = None
+            state["notificationLabels"] = {}
+            result[state_key] = state
+            continue
+
+        candidates: list[dict[str, Any]] = []
+        current_state = state.get("notificationState")
+        current_labels = state.get("notificationLabels")
+        if current_state in NOTIFICATION_STATES and isinstance(current_labels, Mapping):
+            candidates.append({
+                "notificationState": current_state,
+                "notificationLabels": _notification_labels(current_labels),
+            })
+        prior = previous.get(state_key)
+        if (
+            isinstance(prior, Mapping)
+            and prior.get("openedAt") == opened_at
+            and prior.get("notificationState") in NOTIFICATION_STATES
+            and isinstance(prior.get("notificationLabels"), Mapping)
+        ):
+            candidates.append({
+                "notificationState": prior["notificationState"],
+                "notificationLabels": _notification_labels(
+                    prior["notificationLabels"]
+                ),
+            })
+        event_authority = event_authorities.get((state_key, opened_at))
+        if event_authority is not None:
+            candidates.append(event_authority)
+
+        # A ready candidate is irrevocable. For a legacy active state without a
+        # lifecycle marker or retained opening event, default to ready to avoid
+        # issuing a duplicate notification during migration.
+        authority = next(
+            (item for item in candidates if item["notificationState"] == "ready"),
+            candidates[-1] if candidates else {
+                "notificationState": "ready",
+                "notificationLabels": {},
+            },
+        )
+        state["notificationState"] = authority["notificationState"]
+        state["notificationLabels"] = _notification_labels(
+            authority["notificationLabels"]
+        )
+        result[state_key] = state
+    return result
+
+
 def _rehydrate_active_states(
     previous: Mapping[str, Any],
     events: Sequence[Mapping[str, Any]],
@@ -491,6 +743,10 @@ def _rehydrate_active_states(
             "recoverySamples": 0,
             "missingSamples": 0,
             "openedAt": event["openedAt"],
+            "conditionStartedAt": event["openedAt"],
+            "recoveryStartedAt": None,
+            "missingStartedAt": None,
+            "evaluationIntervalSeconds": 60,
             "changedAt": event["observedAt"],
             "lastEvaluatedAt": event["observedAt"],
             "lastValue": event["value"] if event["status"] == "ok" else None,
@@ -606,6 +862,7 @@ def evaluate_and_persist(
     output_dir: Path,
     max_records: int = MAX_EVENT_RECORDS,
     delivery_config_path: Path | None = None,
+    silence_config_path: Path | None = None,
 ) -> dict[str, Any]:
     """Evaluate one snapshot and publish bounded state without raising.
 
@@ -623,11 +880,31 @@ def evaluate_and_persist(
         previous = _load_previous(state_path, pack.version)
         existing_events = _load_events(events_path, limit)
         previous = _rehydrate_active_states(previous, existing_events, pack.version)
-        raw_evaluation, additions = evaluate_snapshot(pack, snapshot, previous, now)
+        previous = _states_with_notification_lifecycle(
+            previous, {}, existing_events, pack.version,
+        )
+        configured_silences = _silence_config_path(silence_config_path)
+        silences = load_silences(configured_silences) if configured_silences is not None else ()
+        raw_evaluation, additions = evaluate_snapshot(
+            pack, snapshot, previous, now, silences
+        )
+        private_states = _states_with_notification_lifecycle(
+            raw_evaluation["states"],
+            previous,
+            (*existing_events, *additions),
+            pack.version,
+        )
+        releases = release_notification_events(pack, private_states, now, silences)
+        additions.extend(releases)
+        if releases:
+            private_states = _states_with_notification_lifecycle(
+                private_states, previous, releases, pack.version,
+            )
         evaluation = normalize_evaluation(raw_evaluation)
         events = _merge_events(existing_events, additions, limit)
-        # Events precede state.  The next evaluation can rehydrate an active
-        # transition if collection stops before the state replacement.
+        # Events precede state. The next evaluation can rehydrate both an active
+        # transition and ready notification authority if collection stops before
+        # the private state replacement.
         if events != existing_events or not events_path.exists():
             _write_events(events_path, events)
         private_bundle = _normalize_private_bundle({
@@ -635,7 +912,7 @@ def evaluate_and_persist(
             "rulePackVersion": pack.version,
             "states": {
                 key: _private_state(state)
-                for key, state in evaluation["states"].items()
+                for key, state in private_states.items()
             },
         })
         _atomic_write(

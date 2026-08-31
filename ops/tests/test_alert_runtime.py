@@ -25,7 +25,14 @@ class AlertRuntimeTests(unittest.TestCase):
                 "hostId": "11111111-1111-4111-8111-111111111111",
             },
             "host": {"hostname": "node-a", "logicalCpuCount": 4},
+            "generatedAt": "2026-08-30T12:00:00Z",
+            "heartbeat": {
+                "observedAt": "2026-08-30T11:59:30Z",
+                "receivedAt": "2026-08-30T11:59:40Z",
+                "lifecycle": "active",
+            },
             "latest": {
+                "timestamp": "2026-08-30T12:00:00Z",
                 "cpuPercent": 95,
                 "memoryPercent": 92,
                 "swapPercent": 5,
@@ -63,6 +70,75 @@ class AlertRuntimeTests(unittest.TestCase):
             }],
             "containerCollection": {"status": "fresh", "observedAt": "2026-08-30T12:00:00Z"},
             "system": {"kernel": {"oomKill": {"count": 0, "lastEventAt": None}}},
+            "linux": {
+                "cpu": {
+                    "status": "supported",
+                    "total": {"iowaitPercent": 21, "stealPercent": 11},
+                    "load": {"onePerOnlineCpu": 1.75},
+                },
+                "memory": {
+                    "status": "supported",
+                    "swapInBytesPerSecond": 40_000_000,
+                    "swapOutBytesPerSecond": 20_000_000,
+                },
+                "blockDevices": {
+                    "status": "supported",
+                    "items": [{"name": "nvme0n1", "averageLatencyMilliseconds": 60}],
+                },
+                "tcp": {
+                    "status": "supported",
+                    "retransmissionPercent": 6,
+                    "conntrack": {"status": "supported", "usedPercent": 81},
+                },
+                "processes": {
+                    "status": "supported",
+                    "pidUsedPercent": 82,
+                    "zombieCount": 12,
+                    "systemFileDescriptors": {"status": "supported", "usedPercent": 83},
+                },
+                "systemd": {
+                    "status": "supported",
+                    "units": [{
+                        "unit": "monitor-collector.service",
+                        "activeState": "failed",
+                        "result": "failed",
+                    }],
+                },
+                "clock": {
+                    "status": "supported",
+                    "unexpectedReboot": True,
+                    "timeSync": {
+                        "status": "supported",
+                        "clockDriftMilliseconds": -61_000,
+                    },
+                },
+                "thermal": {
+                    "status": "supported",
+                    "raspberryPi": {
+                        "status": "supported",
+                        "currentThrottled": True,
+                        "currentUnderVoltage": True,
+                    },
+                },
+            },
+            "_monitor": {
+                "ingestStatus": "unsupported",
+                "ingestLagSeconds": None,
+                "metricsQueueStatus": "unsupported",
+                "metricsQueueUsedPercent": None,
+                "logsQueueStatus": "unsupported",
+                "logsQueueUsedPercent": None,
+                "storageWriteStatus": "ok",
+                "storageWriteFailureDelta": 0,
+                "alertEvaluationStatus": "ok",
+                "alertEvaluationDelaySeconds": 61,
+                "notificationDeliveryStatus": "ok",
+                "notificationFinalFailureDelta": 0,
+                "monitoringFilesystemStatus": "ok",
+                "monitoringFilesystemUsedPercent": 86,
+                "externalHeartbeatStatus": "unsupported",
+                "externalHeartbeatAvailable": None,
+            },
         }
 
     def test_current_signals_are_extracted_without_mount_path_leak(self):
@@ -72,12 +148,98 @@ class AlertRuntimeTests(unittest.TestCase):
             observations["CpuUsageHigh"][0].target,
             "host/11111111-1111-4111-8111-111111111111",
         )
-        self.assertEqual(observations["LoadPerCoreHigh"][0].value, 2)
+        self.assertEqual(observations["LoadPerCoreHigh"][0].value, 1.75)
         self.assertEqual(observations["MemoryAvailableLow"][0].value, 8)
         self.assertTrue(observations["DiskUsageCritical"][0].target.startswith("filesystem/"))
         self.assertNotIn("private", observations["DiskUsageCritical"][0].target)
         self.assertEqual(observations["ContainerDown"][0].value, 1)
         self.assertEqual(observations["ContainerNoHealthcheck"][0].value, 0)
+        self.assertEqual(observations["HostDown"][0].value, 20)
+        self.assertEqual(observations["AgentHeartbeatMissing"][0].value, 30)
+        self.assertEqual(observations["AgentDataStale"][0].value, 0)
+        self.assertEqual(observations["AlertEvaluationDelayed"][0].value, 61)
+        self.assertEqual(observations["MonitoringDiskUsageHigh"][0].value, 86)
+        self.assertEqual(observations["IngestLagHigh"][0].status, "unsupported")
+
+    def test_synthetic_probe_evidence_feeds_http_and_tls_rules_without_deadman_aliasing(self):
+        snapshot = self.snapshot()
+        snapshot["syntheticProbeCollection"] = {
+            "status": "fresh", "observedAt": "2026-08-30T12:00:00Z",
+        }
+        snapshot["syntheticProbes"] = [
+            {
+                "id": "public-ready", "status": "ok",
+                "checkedAt": "2026-08-30T12:00:00Z", "httpStatus": 200,
+                "redirectCount": 0, "latencyMilliseconds": 1500,
+                "certificateExpiresAt": "2026-09-19T12:00:00Z",
+                "certificateDaysRemaining": 20,
+            },
+            {
+                "id": "bad-certificate", "status": "tls",
+                "checkedAt": "2026-08-30T12:00:00Z", "httpStatus": None,
+                "redirectCount": 0, "latencyMilliseconds": 25,
+                "certificateExpiresAt": None, "certificateDaysRemaining": None,
+            },
+        ]
+        observations = observations_for_snapshot(self.pack, snapshot)
+        by_rule = {
+            rule_id: {item.target: item for item in observations[rule_id]}
+            for rule_id in (
+                "HttpEndpointDown", "HttpLatencyHigh",
+                "TlsCertificateExpiring", "TlsCertificateInvalid",
+            )
+        }
+        ready = "synthetic/public-ready"
+        broken = "synthetic/bad-certificate"
+        self.assertEqual(by_rule["HttpEndpointDown"][ready].value, 1)
+        self.assertEqual(by_rule["HttpEndpointDown"][broken].value, 0)
+        self.assertEqual(by_rule["HttpLatencyHigh"][ready].value, 1500)
+        self.assertEqual(by_rule["TlsCertificateExpiring"][ready].value, 20)
+        self.assertEqual(by_rule["TlsCertificateInvalid"][ready].value, 0)
+        self.assertEqual(by_rule["TlsCertificateInvalid"][broken].value, 1)
+        self.assertEqual(by_rule["TlsCertificateExpiring"][broken].status, "no_data")
+        self.assertEqual(
+            observations["MonitoringServiceUnavailable"][0].status,
+            "unsupported",
+        )
+
+    def test_synthetic_probe_source_failures_and_unsupported_targets_stay_explicit(self):
+        for source, expected in (
+            ("stale", "stale"),
+            ("unsupported", "unsupported"),
+            ("permission-denied", "permission_denied"),
+            ("unavailable", "collection_error"),
+            ("collection-error", "collection_error"),
+        ):
+            with self.subTest(source=source):
+                snapshot = self.snapshot()
+                snapshot["syntheticProbeCollection"] = {
+                    "status": source, "observedAt": None,
+                }
+                snapshot["syntheticProbes"] = []
+                observations = observations_for_snapshot(self.pack, snapshot)
+                for rule_id in (
+                    "HttpEndpointDown", "HttpLatencyHigh",
+                    "TlsCertificateExpiring", "TlsCertificateInvalid",
+                ):
+                    self.assertEqual(observations[rule_id][0].status, expected)
+
+        snapshot = self.snapshot()
+        snapshot["syntheticProbeCollection"] = {
+            "status": "fresh", "observedAt": "2026-08-30T12:00:00Z",
+        }
+        snapshot["syntheticProbes"] = [{
+            "id": "operator-disabled", "status": "unsupported",
+            "checkedAt": "2026-08-30T12:00:00Z", "httpStatus": None,
+            "redirectCount": 0, "latencyMilliseconds": 0,
+            "certificateExpiresAt": None, "certificateDaysRemaining": None,
+        }]
+        observations = observations_for_snapshot(self.pack, snapshot)
+        for rule_id in (
+            "HttpEndpointDown", "HttpLatencyHigh",
+            "TlsCertificateExpiring", "TlsCertificateInvalid",
+        ):
+            self.assertEqual(observations[rule_id][0].status, "unsupported")
 
     def test_host_alert_identity_survives_rename_and_legacy_snapshots_fall_back(self):
         renamed = self.snapshot()
@@ -115,6 +277,54 @@ class AlertRuntimeTests(unittest.TestCase):
         self.assertEqual(observations["ContainerNoCpuLimit"][0].value, 0)
         self.assertIn(("project", "monitor"), observations["ContainerDown"][0].labels)
 
+    def test_container_v3_resources_security_image_and_event_status_feed_rules(self):
+        snapshot = self.snapshot()
+        snapshot["containers"][0].update({
+            "pidCount": 120,
+            "cpuThrottledPercent": 25,
+            "networkErrorsPerSecond": 1.5,
+            "writableLayerBytes": 1_500_000_000,
+            "privileged": True,
+            "dockerSocketMounted": True,
+            "imageDigestDrift": True,
+            "usesLatestTag": True,
+        })
+        snapshot["dockerEventCollection"] = {
+            "status": "fresh",
+            "observedAt": "2026-08-30T12:00:00Z",
+            "cursorAt": "2026-08-30T12:00:00Z",
+            "reconnectCount": 1,
+            "gapCount": 0,
+            "gapDetected": False,
+            "logCollectionStatus": "unsupported",
+        }
+        observations = observations_for_snapshot(self.pack, snapshot)
+        expected = {
+            "ContainerCpuThrottlingHigh": 25,
+            "ContainerPidNearLimit": 93.75,
+            "ContainerNetworkErrors": 1.5,
+            "ContainerWritableLayerHigh": 1_500_000_000,
+            "ContainerPrivileged": 1,
+            "ContainerDockerSocketMounted": 1,
+            "ContainerImageDigestDrift": 1,
+            "ContainerUsingLatestTag": 1,
+            "DockerEventStreamDisconnected": 1,
+        }
+        for rule_id, value in expected.items():
+            with self.subTest(rule_id=rule_id):
+                self.assertEqual(observations[rule_id][0].status, "ok")
+                self.assertEqual(observations[rule_id][0].value, value)
+
+        snapshot["dockerEventCollection"]["status"] = "unavailable"
+        disconnected = observations_for_snapshot(self.pack, snapshot)
+        self.assertEqual(disconnected["DockerEventStreamDisconnected"][0].value, 0)
+        snapshot["dockerEventCollection"]["status"] = "permission-denied"
+        denied = observations_for_snapshot(self.pack, snapshot)
+        self.assertEqual(
+            denied["DockerEventStreamDisconnected"][0].status,
+            "permission_denied",
+        )
+
     def test_explicit_missing_limits_and_healthcheck_are_configuration_signals(self):
         snapshot = self.snapshot()
         container = snapshot["containers"][0]
@@ -132,8 +342,55 @@ class AlertRuntimeTests(unittest.TestCase):
 
     def test_unimplemented_signal_is_explicitly_unsupported(self):
         observations = observations_for_snapshot(self.pack, self.snapshot())
-        self.assertEqual(observations["TcpRetransmissionHigh"][0].status, "unsupported")
+        self.assertEqual(observations["DiskIoErrors"][0].status, "unsupported")
         self.assertEqual(observations["DatabaseEndpointDown"][0].status, "unsupported")
+
+    def test_detailed_linux_signals_feed_default_host_rules(self):
+        observations = observations_for_snapshot(self.pack, self.snapshot())
+        expected = {
+            "CpuIowaitHigh": 21,
+            "CpuStealHigh": 11,
+            "LoadPerCoreHigh": 1.75,
+            "SwapThrashing": 60_000_000,
+            "DiskLatencyHigh": 60,
+            "TcpRetransmissionHigh": 6,
+            "ConntrackUsageHigh": 81,
+            "FileDescriptorUsageHigh": 83,
+            "PidUsageHigh": 82,
+            "ZombieProcessesHigh": 12,
+            "SystemdServiceFailed": 1,
+            "ClockSkewHigh": 61,
+            "UnexpectedReboot": 1,
+            "RaspberryPiThrottling": 1,
+            "RaspberryPiUnderVoltage": 1,
+        }
+        for rule_id, value in expected.items():
+            with self.subTest(rule_id=rule_id):
+                self.assertEqual(observations[rule_id][0].status, "ok")
+                self.assertEqual(observations[rule_id][0].value, value)
+
+    def test_hwmon_only_raspberry_pi_flags_do_not_create_false_throttle_normal(self):
+        snapshot = self.snapshot()
+        raspberry_pi = snapshot["linux"]["thermal"]["raspberryPi"]
+        raspberry_pi["currentThrottled"] = None
+        raspberry_pi["currentUnderVoltage"] = False
+        observations = observations_for_snapshot(self.pack, snapshot)
+        self.assertEqual(observations["RaspberryPiThrottling"][0].status, "unsupported")
+        self.assertIsNone(observations["RaspberryPiThrottling"][0].value)
+        self.assertEqual(observations["RaspberryPiUnderVoltage"][0].status, "ok")
+        self.assertEqual(observations["RaspberryPiUnderVoltage"][0].value, 0)
+
+    def test_legacy_snapshot_keeps_new_linux_rules_explicitly_unsupported(self):
+        snapshot = self.snapshot()
+        snapshot.pop("linux")
+        observations = observations_for_snapshot(self.pack, snapshot)
+        for rule_id in (
+            "CpuIowaitHigh", "SwapThrashing", "DiskLatencyHigh",
+            "TcpRetransmissionHigh", "FileDescriptorUsageHigh",
+            "SystemdServiceFailed", "ClockSkewHigh",
+        ):
+            with self.subTest(rule_id=rule_id):
+                self.assertEqual(observations[rule_id][0].status, "unsupported")
 
     def test_stale_container_source_never_reuses_last_known_as_current(self):
         snapshot = self.snapshot()

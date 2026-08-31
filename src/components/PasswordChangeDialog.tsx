@@ -253,7 +253,7 @@ export function PasswordChangeDialog({ open, onClose, onPasswordChanged, onUnaut
             <button
               className="primary-button"
               type="submit"
-              disabled={!formValid}
+              disabled={!canSubmit}
               aria-disabled={!canSubmit}
             >
               {submitting ? <span className="spinner" aria-hidden="true" /> : <Icon name="shield" size={17} />}

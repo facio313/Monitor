@@ -5,11 +5,18 @@ import {
   mkdtempSync,
   readFileSync,
   readdirSync,
+  renameSync,
   rmSync,
   statSync,
   unlinkSync,
   writeFileSync,
 } from 'node:fs';
+import {
+  createCipheriv,
+  createDecipheriv,
+  createHash,
+  randomBytes,
+} from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createServer } from 'node:http';
@@ -62,6 +69,47 @@ function keyring(activeKeyId = 'key-1', includePrevious = false): AgentStorageKe
       [activeKeyId]: Buffer.alloc(32, activeKeyId === 'key-1' ? 0x11 : 0x22).toString('base64'),
     },
   };
+}
+
+function decodeTestEncrypted<T>(path: string, purpose: string): T {
+  const envelope = JSON.parse(readFileSync(path, 'utf8')) as {
+    keyId: string;
+    iv: string;
+    ciphertext: string;
+    tag: string;
+  };
+  const key = Buffer.from(keyring().keys[envelope.keyId]!, 'base64');
+  const decipher = createDecipheriv('aes-256-gcm', key, Buffer.from(envelope.iv, 'base64url'));
+  decipher.setAAD(Buffer.from(`monitor-agent:${purpose}:v1`, 'utf8'));
+  decipher.setAuthTag(Buffer.from(envelope.tag, 'base64url'));
+  return JSON.parse(Buffer.concat([
+    decipher.update(Buffer.from(envelope.ciphertext, 'base64url')),
+    decipher.final(),
+  ]).toString('utf8')) as T;
+}
+
+function writeTestEncrypted(path: string, purpose: string, value: unknown): void {
+  const keyId = 'key-1';
+  const key = Buffer.from(keyring().keys[keyId]!, 'base64');
+  const iv = randomBytes(12);
+  const cipher = createCipheriv('aes-256-gcm', key, iv);
+  cipher.setAAD(Buffer.from(`monitor-agent:${purpose}:v1`, 'utf8'));
+  const ciphertext = Buffer.concat([
+    cipher.update(Buffer.from(JSON.stringify(value), 'utf8')),
+    cipher.final(),
+  ]);
+  writeFileSync(path, JSON.stringify({
+    schemaVersion: 1,
+    algorithm: 'aes-256-gcm',
+    keyId,
+    iv: iv.toString('base64url'),
+    ciphertext: ciphertext.toString('base64url'),
+    tag: cipher.getAuthTag().toString('base64url'),
+  }), { mode: 0o600 });
+}
+
+function testSha256(value: string): string {
+  return createHash('sha256').update(value).digest('hex');
 }
 
 function ssoHeaders(role: 'admin' | 'chief-admin' = 'chief-admin') {
@@ -190,6 +238,7 @@ function fixture(overrides: Record<string, unknown> = {}) {
     edgeSecret: EDGE_SECRET,
     allowedOrigins: [ORIGIN],
     dataDir: join(root, 'telemetry'),
+    securityStateDir: root,
     agentIngestEnabled: true,
     agentEdgeSecret: AGENT_EDGE_SECRET,
     agentStateDir: stateDir,
@@ -294,6 +343,7 @@ describe('central agent control configuration', () => {
       ssoEnabled: true,
       edgeSecret: EDGE_SECRET,
       dataDir: root,
+      securityStateDir: root,
       now: () => START,
     });
     await request(disabled).post('/monitor/api/agent/enroll').send({}).expect(404);
@@ -447,6 +497,7 @@ describe('central agent control configuration', () => {
       agentStateDir: stateDir,
       agentStorageKeyring: keyring(),
       dataDir: root,
+      securityStateDir: root,
     })).toThrow('private directory');
   });
 
@@ -466,6 +517,7 @@ describe('central agent control configuration', () => {
         agentStateDir: stateDir,
         agentStorageKeyring: keyring(),
         dataDir: root,
+        securityStateDir: root,
       })).toThrow('private directory');
     } finally {
       getEffectiveUid.mockRestore();
@@ -513,6 +565,14 @@ describe('one-time enrollment and certificate binding', () => {
       .expect(bodyContaining({ authenticated: true, mode: 'sso' }));
 
     const token = await issueToken(context.app);
+    await request(context.app)
+      .post('/monitor/api/agent/enroll')
+      .set({
+        ...agentHeaders(context.now()),
+        Authorization: `Bearer mon_${'a'.repeat(43)}`,
+      })
+      .send(registration(token))
+      .expect(403).expect(bodyContaining({ code: 'API_KEY_NOT_ALLOWED' }));
     await request(context.app)
       .post('/monitor/api/agent/enroll')
       .set(agentHeaders(context.now(), CERTIFICATE, EDGE_SECRET))
@@ -564,6 +624,28 @@ describe('one-time enrollment and certificate binding', () => {
     });
     expect(JSON.stringify(response.body)).not.toContain(CERTIFICATE);
     expect(JSON.stringify(response.body)).not.toContain(MACHINE_DIGEST);
+  });
+
+  it('ignores agent-supplied forwarding metadata in inventory and audit records', async () => {
+    const context = fixture();
+    const token = await issueToken(context.app);
+    const forgedAddress = '198.51.100.77';
+    const response = await request(context.app)
+      .post('/monitor/api/agent/enroll')
+      .set({
+        ...agentHeaders(context.now()),
+        'X-Forwarded-For': forgedAddress,
+      })
+      .send(registration(token))
+      .expect(201);
+
+    expect(response.body.inventory.ipAddresses).not.toContain(forgedAddress);
+    const forgedAddressHash = createHash('sha256')
+      .update(Buffer.from('monitor.application-security.source-ip.v1\0', 'utf8'))
+      .update(forgedAddress, 'utf8')
+      .digest('hex');
+    expect(readFileSync(join(context.root, 'application-audit.jsonl'), 'utf8'))
+      .not.toContain(`sha256:${forgedAddressHash}`);
   });
 
   it('authenticates before body parsing and bounds small and concurrent agent bodies', async () => {
@@ -693,6 +775,7 @@ describe('one-time enrollment and certificate binding', () => {
       edgeSecret: EDGE_SECRET,
       allowedOrigins: [ORIGIN],
       dataDir: join(context.root, 'telemetry'),
+      securityStateDir: context.root,
       agentIngestEnabled: true,
       agentEdgeSecret: AGENT_EDGE_SECRET,
       agentStateDir: context.stateDir,
@@ -880,13 +963,178 @@ describe('heartbeat, lifecycle, revocation, and certificate renewal', () => {
 });
 
 describe('idempotent compressed batch ingest and bounded durable backpressure', () => {
+  it('rejects mixed metric/event batches before priority admission', async () => {
+    const context = fixture();
+    const token = await issueToken(context.app);
+    await enroll(context.app, context.now(), token).expect(201);
+
+    await request(context.app)
+      .post('/monitor/api/agent/ingest')
+      .set(agentHeaders(context.now()))
+      .send(batch(context.now(), [
+        metricRecord(context.now(), 2),
+        eventRecord(context.now(), 3),
+      ]))
+      .expect(400)
+      .expect(bodyContaining({ code: 'INVALID_INGEST_BATCH' }));
+
+    const listing = await request(context.app)
+      .get('/monitor/api/agents')
+      .set(ssoHeaders('admin'))
+      .expect(200);
+    expect(listing.body.queue).toMatchObject({
+      entries: 0,
+      normalEntries: 0,
+      priorityEntries: 0,
+    });
+  });
+
+  it('loads legacy mixed queue entries while retaining idempotency and capacity', async () => {
+    const context = fixture({ agentMaxQueueEntriesPerAgent: 1 });
+    const token = await issueToken(context.app);
+    await enroll(context.app, context.now(), token).expect(201);
+    const originalMetric = metricRecord(context.now(), 2);
+    await request(context.app)
+      .post('/monitor/api/agent/ingest')
+      .set(agentHeaders(context.now()))
+      .send(batch(context.now(), [originalMetric]))
+      .expect(202);
+
+    const normalDirectory = join(context.stateDir, 'ingest-queue', 'normal');
+    const priorityDirectory = join(context.stateDir, 'ingest-queue', 'priority');
+    const queueFile = readdirSync(normalDirectory)[0]!;
+    const normalPath = join(normalDirectory, queueFile);
+    const priorityPath = join(priorityDirectory, queueFile);
+    const queued = decodeTestEncrypted<{
+      agentId: string;
+      batchId: string;
+      receivedAt: number;
+      sentAt: number;
+      firstSequence: number;
+      lastSequence: number;
+      priority: 'normal' | 'priority';
+      digest: string;
+      records: Array<Record<string, unknown>>;
+      schemaVersion: 1;
+    }>(normalPath, 'ingest-batch');
+    const normalizedMetric = { ...originalMetric, observedAt: context.now() };
+    const originalEvent = eventRecord(context.now(), 3);
+    const normalizedEvent = { ...originalEvent, observedAt: context.now() };
+    const normalizedLegacyBatch = {
+      schemaVersion: 1,
+      agentId: AGENT_ID,
+      batchId: BATCH_ID,
+      sentAt: context.now(),
+      firstSequence: 2,
+      lastSequence: 3,
+      records: [normalizedMetric, normalizedEvent],
+    };
+    const legacyDigest = testSha256(JSON.stringify(normalizedLegacyBatch));
+    queued.firstSequence = 2;
+    queued.lastSequence = 3;
+    queued.priority = 'priority';
+    queued.digest = legacyDigest;
+    queued.records = [
+      originalMetric,
+      originalEvent,
+    ];
+    renameSync(normalPath, priorityPath);
+    writeTestEncrypted(priorityPath, 'ingest-batch', queued);
+
+    const statePath = join(context.stateDir, 'control-state.json.enc');
+    const state = decodeTestEncrypted<{
+      agents: Array<{ agentId: string; maxSequence: number }>;
+      receipts: Array<{
+        agentId: string;
+        batchId: string;
+        digest: string;
+        priority: 'normal' | 'priority';
+        recordKeys: string[];
+        recordDigests: string[];
+        acceptedRecordCount: number;
+      }>;
+    } & Record<string, unknown>>(statePath, 'control-state');
+    const legacyRecords = [normalizedMetric, normalizedEvent];
+    const receipt = state.receipts[0]!;
+    receipt.digest = legacyDigest;
+    receipt.priority = 'priority';
+    receipt.recordKeys = legacyRecords.map((record) => testSha256([
+      AGENT_ID,
+      record.metric,
+      record.target,
+      new Date(record.observedAt).toISOString(),
+      String(record.sequence),
+    ].join('\0')));
+    receipt.recordDigests = legacyRecords.map((record) => (
+      testSha256(JSON.stringify(record))
+    ));
+    receipt.acceptedRecordCount = 2;
+    state.agents[0]!.maxSequence = 3;
+    writeTestEncrypted(statePath, 'control-state', state);
+
+    const restarted = createApp({
+      ssoEnabled: true,
+      edgeSecret: EDGE_SECRET,
+      allowedOrigins: [ORIGIN],
+      dataDir: join(context.root, 'telemetry'),
+      securityStateDir: context.root,
+      agentIngestEnabled: true,
+      agentEdgeSecret: AGENT_EDGE_SECRET,
+      agentStateDir: context.stateDir,
+      agentStorageKeyring: keyring(),
+      agentMaxQueueEntriesPerAgent: 1,
+      now: context.now,
+    });
+    const listing = await request(restarted)
+      .get('/monitor/api/agents')
+      .set(ssoHeaders('admin'))
+      .expect(200);
+    expect(listing.body.queue).toMatchObject({
+      entries: 1,
+      normalEntries: 0,
+      priorityEntries: 1,
+    });
+
+    await request(restarted)
+      .post('/monitor/api/agent/ingest')
+      .set(agentHeaders(context.now()))
+      .send(batch(context.now(), [originalMetric, originalEvent]))
+      .expect(200)
+      .expect(bodyContaining({
+        duplicate: true,
+        acceptedRecords: 2,
+        duplicateRecords: 0,
+      }));
+
+    await request(restarted)
+      .post('/monitor/api/agent/ingest')
+      .set(agentHeaders(context.now()))
+      .send(batch(
+        context.now(),
+        [originalMetric],
+        '66666666-6666-4666-8666-666666666666',
+      ))
+      .expect(202)
+      .expect(bodyContaining({ acceptedRecords: 0, duplicateRecords: 1 }));
+    await request(restarted)
+      .post('/monitor/api/agent/ingest')
+      .set(agentHeaders(context.now()))
+      .send(batch(
+        context.now(),
+        [metricRecord(context.now(), 4, 'host.memory.percent')],
+        '77777777-7777-4777-8777-777777777777',
+      ))
+      .expect(429)
+      .expect(bodyContaining({ code: 'AGENT_QUOTA_BACKPRESSURE' }));
+  });
+
   it('deduplicates by agent, batch, metric, target, timestamp, and sequence', async () => {
     const context = fixture();
     const token = await issueToken(context.app);
     await enroll(context.app, context.now(), token).expect(201);
     const original = batch(context.now(), [
       metricRecord(context.now() - 1_000, 20),
-      eventRecord(context.now(), 21),
+      metricRecord(context.now(), 21, 'host.load.1'),
     ]);
     await request(context.app)
       .post('/monitor/api/agent/ingest')
@@ -895,7 +1143,7 @@ describe('idempotent compressed batch ingest and bounded durable backpressure', 
       .expect(202).expect(bodyContaining({
         acceptedRecords: 2,
         duplicateRecords: 0,
-        priority: 'priority',
+        priority: 'normal',
       }));
     await request(context.app)
       .post('/monitor/api/agent/ingest')
@@ -1183,6 +1431,7 @@ describe('idempotent compressed batch ingest and bounded durable backpressure', 
       edgeSecret: EDGE_SECRET,
       allowedOrigins: [ORIGIN],
       dataDir: join(context.root, 'telemetry'),
+      securityStateDir: context.root,
       agentIngestEnabled: true,
       agentEdgeSecret: AGENT_EDGE_SECRET,
       agentStateDir: context.stateDir,
@@ -1206,6 +1455,7 @@ describe('idempotent compressed batch ingest and bounded durable backpressure', 
       edgeSecret: EDGE_SECRET,
       allowedOrigins: [ORIGIN],
       dataDir: join(context.root, 'telemetry'),
+      securityStateDir: context.root,
       agentIngestEnabled: true,
       agentEdgeSecret: AGENT_EDGE_SECRET,
       agentStateDir: context.stateDir,
@@ -1268,6 +1518,7 @@ describe('idempotent compressed batch ingest and bounded durable backpressure', 
       edgeSecret: EDGE_SECRET,
       allowedOrigins: [ORIGIN],
       dataDir: join(context.root, 'telemetry'),
+      securityStateDir: context.root,
       agentIngestEnabled: true,
       agentEdgeSecret: AGENT_EDGE_SECRET,
       agentStateDir: context.stateDir,

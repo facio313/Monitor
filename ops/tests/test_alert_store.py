@@ -8,7 +8,12 @@ from pathlib import Path
 from ops import alert_delivery
 from ops.alert_engine import load_rule_pack
 from ops.alert_runtime import observations_for_snapshot
-from ops.alert_store import evaluate_and_persist, normalize_evaluation, normalize_event
+from ops.alert_store import (
+    evaluate_and_persist,
+    load_silences,
+    normalize_evaluation,
+    normalize_event,
+)
 
 
 NOW = dt.datetime(2026, 8, 30, 12, 0, tzinfo=dt.timezone.utc)
@@ -25,9 +30,13 @@ def rule_pack(version: str = "2026.08.30.test") -> dict:
             "threshold": 90,
             "recoveryThreshold": 80,
             "severity": "warning",
+            "evaluationIntervalSeconds": 60,
+            "forSeconds": 60,
             "forSamples": 2,
+            "recoverySeconds": 0,
             "recoverySamples": 1,
             "noDataPolicy": "ignore",
+            "noDataSeconds": 60,
             "noDataSamples": 2,
             "parentRuleId": None,
             "labels": {"scope": "host"},
@@ -55,6 +64,53 @@ class AlertStoreTests(unittest.TestCase):
         path.write_text(json.dumps(rule_pack(version)), encoding="utf-8")
         return path
 
+    def create_parent_pack(self, root: Path) -> Path:
+        definition = rule_pack()
+        base = definition["rules"][0]
+        parent = {
+            **base,
+            "id": "HostDown",
+            "metric": "host.heartbeat.age",
+            "threshold": 90,
+            "recoveryThreshold": 80,
+            "forSeconds": 0,
+            "forSamples": 1,
+            "description": "Host heartbeat is missing.",
+            "runbook": "Restore host reachability.",
+        }
+        child = {
+            **base,
+            "id": "ContainerDown",
+            "metric": "container.running",
+            "operator": "lte",
+            "threshold": 0,
+            "recoveryThreshold": 1,
+            "forSeconds": 0,
+            "forSamples": 1,
+            "parentRuleId": "HostDown",
+            "labels": {"scope": "container"},
+            "description": "Container is down.",
+            "runbook": "Restore the container after the host recovers.",
+        }
+        definition["rules"] = [parent, child]
+        path = root / "parent-rules.json"
+        path.write_text(json.dumps(definition), encoding="utf-8")
+        return path
+
+    def parent_snapshot(self, host_down: bool) -> dict:
+        value = snapshot(10)
+        value["generatedAt"] = "2026-08-30T12:00:00Z"
+        value["heartbeat"] = {
+            "lifecycle": "active",
+            "receivedAt": (
+                "2026-08-30T11:58:00Z"
+                if host_down
+                else "2026-08-30T12:00:00Z"
+            ),
+        }
+        value["containers"] = [{"name": "app", "state": "exited"}]
+        return value
+
     def create_delivery_config(self, root: Path) -> Path:
         path = root / "delivery.json"
         path.write_text(json.dumps({
@@ -78,6 +134,267 @@ class AlertStoreTests(unittest.TestCase):
         }), encoding="utf-8")
         path.chmod(0o600)
         return path
+
+    def create_silence_config(
+        self,
+        root: Path,
+        ends_at: str = "2026-08-30T13:00:00Z",
+    ) -> Path:
+        path = root / "silences.json"
+        path.write_text(json.dumps({
+            "schemaVersion": 1,
+            "silences": [{
+                "id": "maintenance-1",
+                "startsAt": "2026-08-30T11:59:00Z",
+                "endsAt": ends_at,
+                "ruleId": "CpuUsageHigh",
+                "target": "host/monitor-test",
+                "labels": {"scope": "host"},
+            }],
+        }), encoding="utf-8")
+        path.chmod(0o600)
+        return path
+
+    def test_persistent_silence_config_suppresses_delivery_not_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pack = self.create_pack(root)
+            silences = self.create_silence_config(root)
+            loaded = load_silences(silences)
+            self.assertEqual((len(loaded), loaded[0].silence_id), (1, "maintenance-1"))
+
+            evaluate_and_persist(
+                snapshot(95), NOW, pack, root, silence_config_path=silences
+            )
+            evaluation = evaluate_and_persist(
+                snapshot(95), NOW + dt.timedelta(minutes=1), pack, root,
+                silence_config_path=silences,
+            )
+            self.assertEqual(evaluation["summary"], {"firing": 1})
+            event = json.loads((root / "rule-alerts.jsonl").read_text().splitlines()[0])
+            self.assertEqual(event["notificationState"], "silenced")
+
+    def test_silenced_firing_is_enqueued_once_when_silence_expires(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pack = self.create_pack(root)
+            delivery = self.create_delivery_config(root)
+            silences = self.create_silence_config(
+                root, ends_at="2026-08-30T12:02:00Z"
+            )
+
+            evaluate_and_persist(
+                snapshot(95), NOW, pack, root,
+                delivery_config_path=delivery,
+                silence_config_path=silences,
+            )
+            evaluate_and_persist(
+                snapshot(95), NOW + dt.timedelta(minutes=1), pack, root,
+                delivery_config_path=delivery,
+                silence_config_path=silences,
+            )
+            state_path = root / ".state" / "rule-state.json"
+            state_before_release = state_path.read_bytes()
+            evaluation = evaluate_and_persist(
+                snapshot(95), NOW + dt.timedelta(minutes=2), pack, root,
+                delivery_config_path=delivery,
+                silence_config_path=silences,
+            )
+
+            events = [
+                json.loads(line)
+                for line in (root / "rule-alerts.jsonl").read_text().splitlines()
+            ]
+            firing = [event for event in events if event["transition"] == "firing"]
+            self.assertEqual(evaluation["summary"], {"firing": 1})
+            self.assertEqual(
+                [event["notificationState"] for event in firing],
+                ["silenced", "ready"],
+            )
+            self.assertEqual(firing[0]["openedAt"], firing[1]["openedAt"])
+            self.assertNotEqual(firing[0]["idempotencyKey"], firing[1]["idempotencyKey"])
+
+            config = alert_delivery.load_delivery_config(delivery)
+            outbox = alert_delivery.DeliveryOutbox(
+                root / ".state" / "alert-delivery" / "alert-delivery.sqlite",
+                config.queue,
+            )
+            self.assertEqual(outbox.status()["states"]["pending"], 1)
+
+            # Simulate an event-first crash: the release event and outbox row
+            # survived, but the private evaluator state replacement did not.
+            state_path.write_bytes(state_before_release)
+            evaluate_and_persist(
+                snapshot(95), NOW + dt.timedelta(minutes=3), pack, root,
+                delivery_config_path=delivery,
+                silence_config_path=silences,
+            )
+            repeated = [
+                json.loads(line)
+                for line in (root / "rule-alerts.jsonl").read_text().splitlines()
+            ]
+            self.assertEqual(len(repeated), 2)
+            self.assertEqual(outbox.status()["states"]["pending"], 1)
+
+    def test_private_lifecycle_releases_after_muted_event_is_pruned(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pack = self.create_pack(root)
+            delivery = self.create_delivery_config(root)
+            silences = self.create_silence_config(
+                root, ends_at="2026-08-30T12:02:00Z"
+            )
+
+            evaluate_and_persist(
+                snapshot(95), NOW, pack, root, silence_config_path=silences,
+            )
+            evaluate_and_persist(
+                snapshot(95), NOW + dt.timedelta(minutes=1), pack, root,
+                silence_config_path=silences,
+            )
+            private_bundle = json.loads(
+                (root / ".state" / "rule-state.json").read_text()
+            )
+            private_state = next(iter(private_bundle["states"].values()))
+            self.assertEqual(private_state["notificationState"], "silenced")
+
+            # The bounded public event log can prune an old opening event after
+            # unrelated churn; private incident state must remain sufficient.
+            (root / "rule-alerts.jsonl").write_bytes(b"")
+            evaluate_and_persist(
+                snapshot(95), NOW + dt.timedelta(minutes=2), pack, root,
+                delivery_config_path=delivery,
+                silence_config_path=silences,
+            )
+            events = [
+                json.loads(line)
+                for line in (root / "rule-alerts.jsonl").read_text().splitlines()
+            ]
+            self.assertEqual(
+                [(event["transition"], event["notificationState"]) for event in events],
+                [("firing", "ready")],
+            )
+            config = alert_delivery.load_delivery_config(delivery)
+            outbox = alert_delivery.DeliveryOutbox(
+                root / ".state" / "alert-delivery" / "alert-delivery.sqlite",
+                config.queue,
+            )
+            self.assertEqual(outbox.status()["states"]["pending"], 1)
+
+    def test_late_silence_does_not_revoke_durable_ready_event(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pack = self.create_pack(root)
+            delivery = self.create_delivery_config(root)
+            silences = self.create_silence_config(root)
+
+            evaluate_and_persist(
+                snapshot(95), NOW, pack, root, delivery_config_path=delivery,
+            )
+            evaluate_and_persist(
+                snapshot(95), NOW + dt.timedelta(minutes=1), pack, root,
+                delivery_config_path=delivery,
+            )
+            ready_before_silence = json.loads(
+                (root / "rule-alerts.jsonl").read_text().splitlines()[0]
+            )
+            self.assertEqual(ready_before_silence["notificationState"], "ready")
+            config = alert_delivery.load_delivery_config(delivery)
+            outbox = alert_delivery.DeliveryOutbox(
+                root / ".state" / "alert-delivery" / "alert-delivery.sqlite",
+                config.queue,
+            )
+            self.assertEqual(outbox.status()["states"]["pending"], 1)
+
+            evaluate_and_persist(
+                snapshot(95), NOW + dt.timedelta(minutes=2), pack, root,
+                delivery_config_path=delivery,
+                silence_config_path=silences,
+            )
+            events = [
+                json.loads(line)
+                for line in (root / "rule-alerts.jsonl").read_text().splitlines()
+            ]
+            self.assertEqual(events, [ready_before_silence])
+            self.assertEqual(outbox.status()["states"]["pending"], 1)
+
+    def test_parent_recovery_enqueues_child_release_exactly_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pack = self.create_parent_pack(root)
+            delivery = self.create_delivery_config(root)
+
+            first = evaluate_and_persist(
+                self.parent_snapshot(True), NOW, pack, root,
+                delivery_config_path=delivery,
+            )
+            self.assertEqual(first["summary"], {"firing": 2})
+            config = alert_delivery.load_delivery_config(delivery)
+            outbox = alert_delivery.DeliveryOutbox(
+                root / ".state" / "alert-delivery" / "alert-delivery.sqlite",
+                config.queue,
+            )
+            self.assertEqual(outbox.status()["states"]["pending"], 1)
+
+            second = evaluate_and_persist(
+                self.parent_snapshot(False), NOW + dt.timedelta(minutes=1),
+                pack, root, delivery_config_path=delivery,
+            )
+            self.assertEqual(second["summary"], {"firing": 1, "inactive": 1})
+            events = [
+                json.loads(line)
+                for line in (root / "rule-alerts.jsonl").read_text().splitlines()
+            ]
+            child_events = [
+                event for event in events if event["ruleId"] == "ContainerDown"
+            ]
+            self.assertEqual(
+                [
+                    (event["transition"], event["notificationState"])
+                    for event in child_events
+                ],
+                [("firing", "suppressed"), ("firing", "ready")],
+            )
+            self.assertEqual(child_events[0]["openedAt"], child_events[1]["openedAt"])
+            self.assertEqual(outbox.status()["states"]["pending"], 3)
+            enqueue_status = json.loads(
+                (root / "alert-delivery-enqueue.json").read_text()
+            )
+            self.assertEqual(
+                {
+                    key: enqueue_status[key]
+                    for key in ("enqueued", "deduplicated", "dropped", "skipped")
+                },
+                {"enqueued": 2, "deduplicated": 1, "dropped": 0, "skipped": 1},
+            )
+
+            evaluate_and_persist(
+                self.parent_snapshot(False), NOW + dt.timedelta(minutes=2),
+                pack, root, delivery_config_path=delivery,
+            )
+            self.assertEqual(outbox.status()["states"]["pending"], 3)
+            repeated = [
+                json.loads(line)
+                for line in (root / "rule-alerts.jsonl").read_text().splitlines()
+                if json.loads(line)["ruleId"] == "ContainerDown"
+            ]
+            self.assertEqual(len(repeated), 2)
+
+    def test_silence_config_is_strict_private_and_duplicate_safe(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = self.create_silence_config(root)
+            path.chmod(0o644)
+            with self.assertRaisesRegex(ValueError, "unsafe"):
+                load_silences(path)
+
+            path.write_text(
+                '{"schemaVersion":1,"schemaVersion":1,"silences":[]}',
+                encoding="utf-8",
+            )
+            path.chmod(0o600)
+            with self.assertRaisesRegex(ValueError, "duplicate"):
+                load_silences(path)
 
     def test_notification_delivery_final_failure_is_a_real_rule_observation(self):
         pack = load_rule_pack(
@@ -131,6 +448,27 @@ class AlertStoreTests(unittest.TestCase):
             self.assertEqual(replay["status"], "ok")
             self.assertEqual(len(events), 1)
             self.assertEqual(events[0]["openedAt"], "2026-08-30T12:00:00Z")
+
+    def test_private_state_without_lifecycle_fields_is_migrated(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pack = self.create_pack(root)
+            evaluate_and_persist(snapshot(95), NOW, pack, root)
+            state_path = root / ".state" / "rule-state.json"
+            bundle = json.loads(state_path.read_text())
+            for state in bundle["states"].values():
+                state.pop("notificationState")
+                state.pop("notificationLabels")
+            state_path.write_text(json.dumps(bundle), encoding="utf-8")
+
+            evaluation = evaluate_and_persist(
+                snapshot(95), NOW + dt.timedelta(minutes=1), pack, root,
+            )
+            self.assertEqual(evaluation["summary"], {"firing": 1})
+            migrated = json.loads(state_path.read_text())
+            private_state = next(iter(migrated["states"].values()))
+            self.assertEqual(private_state["notificationState"], "ready")
+            self.assertEqual(private_state["notificationLabels"], {"scope": "host"})
 
     def test_recent_durable_event_is_enqueued_after_delivery_subsystem_recovers(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -207,6 +545,7 @@ class AlertStoreTests(unittest.TestCase):
             pack = root / "rules.json"
             definition = rule_pack()
             definition["rules"][0]["forSamples"] = 1
+            definition["rules"][0]["forSeconds"] = 0
             pack.write_text(json.dumps(definition), encoding="utf-8")
 
             first = evaluate_and_persist(snapshot(95), NOW, pack, root)

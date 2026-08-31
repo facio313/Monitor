@@ -926,7 +926,7 @@ class ParsingTests(unittest.TestCase):
                     }
                     path.write_text(json.dumps(legacy_document), encoding="utf-8")
                     loaded = collector.load_container_snapshot(path, now)
-                    self.assertEqual(tuple(loaded[0]), collector.CONTAINER_FIELDS)
+                    self.assertEqual(tuple(loaded[0]), collector.CONTAINER_V2_FIELDS)
                     self.assertEqual(loaded[0]["name"], legacy_name)
                     self.assertEqual(
                         loaded[0]["project"],
@@ -962,6 +962,119 @@ class ParsingTests(unittest.TestCase):
                  mock.patch.object(collector.os, "fstat", opened_by_cks):
                 with self.assertRaisesRegex(ValueError, "file validation"):
                     collector.load_container_snapshot(path, now)
+
+    def test_synthetic_probe_input_is_exact_bounded_and_drops_private_url_data(self):
+        now = dt.datetime(2026, 8, 31, 6, 0, tzinfo=dt.timezone.utc)
+        checked_at = collector.iso_timestamp(now - dt.timedelta(seconds=1))
+        document = {
+            "schemaVersion": 1,
+            "generatedAt": collector.iso_timestamp(now),
+            "results": [{
+                "schemaVersion": 1,
+                "id": "public-ready",
+                "status": "ok",
+                "checkedAt": checked_at,
+                "url": "https://public.example/readyz?token=must-not-leak",
+                "httpStatus": 200,
+                "redirectCount": 1,
+                "latencyMilliseconds": 17,
+                "certificateExpiresAt": "2027-08-31T06:00:00Z",
+                "certificateDaysRemaining": 365,
+            }],
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "results.json"
+            path.write_text(json.dumps(document, sort_keys=True), encoding="utf-8")
+            path.chmod(0o640)
+            collection, rows = collector.load_synthetic_probe_document(
+                path,
+                now,
+                expected_uid=os.geteuid(),
+                expected_gid=os.getegid(),
+            )
+            self.assertEqual(collection, {
+                "status": "fresh", "observedAt": collector.iso_timestamp(now),
+            })
+            self.assertEqual(rows, [{
+                "id": "public-ready",
+                "status": "ok",
+                "checkedAt": checked_at,
+                "httpStatus": 200,
+                "redirectCount": 1,
+                "latencyMilliseconds": 17,
+                "certificateExpiresAt": "2027-08-31T06:00:00Z",
+                "certificateDaysRemaining": 365,
+            }])
+            serialized = json.dumps(rows)
+            self.assertNotIn("public.example", serialized)
+            self.assertNotIn("token", serialized)
+
+            stale_at = now - dt.timedelta(seconds=collector.MAX_SYNTHETIC_INPUT_AGE_SECONDS + 1)
+            document["generatedAt"] = collector.iso_timestamp(stale_at)
+            document["results"][0]["checkedAt"] = collector.iso_timestamp(stale_at)
+            path.write_text(json.dumps(document, sort_keys=True), encoding="utf-8")
+            stale, _rows = collector.load_synthetic_probe_document(
+                path,
+                now,
+                expected_uid=os.geteuid(),
+                expected_gid=os.getegid(),
+            )
+            self.assertEqual(stale, {
+                "status": "stale", "observedAt": collector.iso_timestamp(stale_at),
+            })
+
+    def test_synthetic_probe_input_fails_closed_with_explicit_collection_statuses(self):
+        now = dt.datetime(2026, 8, 31, 6, 0, tzinfo=dt.timezone.utc)
+        missing = Path("/definitely/not/present/synthetic-results.json")
+        self.assertEqual(collector.collect_synthetic_probes(missing, now), (
+            {"status": "unsupported", "observedAt": None}, [],
+        ))
+        self.assertEqual(collector.collect_synthetic_probes(None, now), (
+            {"status": "unsupported", "observedAt": None}, [],
+        ))
+        with mock.patch.object(
+            collector, "load_synthetic_probe_document", side_effect=PermissionError,
+        ):
+            self.assertEqual(collector.collect_synthetic_probes(missing, now), (
+                {"status": "permission-denied", "observedAt": None}, [],
+            ))
+
+        valid_row = (
+            '{"schemaVersion":1,"id":"duplicate","status":"ok",'
+            '"checkedAt":"2026-08-31T06:00:00Z",'
+            '"url":"https://public.example/readyz","httpStatus":200,'
+            '"redirectCount":0,"latencyMilliseconds":1,'
+            '"certificateExpiresAt":null,"certificateDaysRemaining":null}'
+        )
+        invalid_documents = (
+            # Duplicate root member must not be silently accepted by json.loads.
+            '{"schemaVersion":1,"schemaVersion":1,'
+            '"generatedAt":"2026-08-31T06:00:00Z","results":[' + valid_row + ']}',
+            # Duplicate probe identifiers are ambiguous and therefore rejected.
+            '{"schemaVersion":1,"generatedAt":"2026-08-31T06:00:00Z",'
+            '"results":[' + valid_row + ',' + valid_row + ']}',
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "results.json"
+            for raw in invalid_documents:
+                path.write_text(raw, encoding="utf-8")
+                path.chmod(0o640)
+                with self.assertRaises(ValueError):
+                    collector.load_synthetic_probe_document(
+                        path,
+                        now,
+                        expected_uid=os.geteuid(),
+                        expected_gid=os.getegid(),
+                    )
+            path.write_text(invalid_documents[-1], encoding="utf-8")
+            path.chmod(0o660)
+            with self.assertRaisesRegex(ValueError, "file validation"):
+                collector.load_synthetic_probe_document(
+                    path,
+                    now,
+                    expected_uid=os.geteuid(),
+                    expected_gid=os.getegid(),
+                )
 
     def test_docker_stats_use_six_bounded_workers_and_redact_metadata(self):
         cks_raw = [{
@@ -1071,7 +1184,8 @@ class ParsingTests(unittest.TestCase):
         serialized = json.dumps([first, second]).lower()
         self.assertNotIn("secret", serialized)
         self.assertNotIn("token", serialized)
-        self.assertNotIn("mount", serialized)
+        self.assertNotIn("/private/secret", serialized)
+        self.assertNotIn('"binds"', serialized)
         self.assertNotIn(cks_raw[0]["Id"], serialized)
 
     def test_docker_deadline_keeps_all_lists_and_skips_stats(self):
@@ -2515,6 +2629,36 @@ class FilesystemTests(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(path.parent.stat().st_mode), 0o750)
             self.assertEqual(list(path.parent.glob(".current.json.*")), [])
 
+    def test_enospc_before_atomic_replace_preserves_prior_file_and_cleans_temp(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "current.json"
+            collector.atomic_write_json(path, {"generation": 1})
+            prior = path.read_bytes()
+            with mock.patch.object(
+                collector.os,
+                "replace",
+                side_effect=OSError(28, "No space left on device"),
+            ):
+                with self.assertRaises(OSError):
+                    collector.atomic_write_json(path, {"generation": 2})
+            self.assertEqual(path.read_bytes(), prior)
+            self.assertEqual(list(path.parent.glob(".current.json.*")), [])
+
+    def test_inode_exhaustion_before_jsonl_temp_creation_preserves_prior_file(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "history.jsonl"
+            collector.rewrite_json_lines(path, [{"generation": 1}], 10)
+            prior = path.read_bytes()
+            with mock.patch.object(
+                collector.tempfile,
+                "NamedTemporaryFile",
+                side_effect=OSError(28, "No space left on device"),
+            ):
+                with self.assertRaises(OSError):
+                    collector.rewrite_json_lines(path, [{"generation": 2}], 10)
+            self.assertEqual(path.read_bytes(), prior)
+            self.assertEqual(list(path.parent.glob(".history.jsonl.*")), [])
+
     def test_large_bounded_delta_state_round_trips_without_default_truncation(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "delta-state.json"
@@ -3221,7 +3365,7 @@ class FilesystemTests(unittest.TestCase):
             }
             with mock.patch.object(collector, "collect_gpu", return_value=gpu), \
                  mock.patch.object(collector, "docker_get", side_effect=fake_docker), \
-                 mock.patch.object(collector.time, "monotonic", side_effect=[100.0, 160.0, 220.0]):
+                 mock.patch.object(collector, "_sample_monotonic", side_effect=[100.0, 160.0, 220.0]):
                 current = collector.run(config, now)
                 first_delta_state = json.loads((runtime / "delta-state.json").read_text())
                 docker_sample[0] = 1
@@ -3235,7 +3379,9 @@ class FilesystemTests(unittest.TestCase):
             self.assertEqual(set(current), {
                 "schemaVersion", "generatedAt", "identity", "heartbeat",
                 "host", "latest", "disks", "containers",
-                "containerCollection", "currentTraffic", "reliability", "system", "linux",
+                "containerCollection", "dockerEventCollection", "dockerEvents",
+                "syntheticProbeCollection", "syntheticProbes",
+                "currentTraffic", "reliability", "system", "linux",
             })
             self.assertEqual(current["schemaVersion"], collector.CURRENT_SCHEMA_VERSION)
             self.assertEqual(set(current["identity"]), {
@@ -3341,7 +3487,7 @@ class FilesystemTests(unittest.TestCase):
             self.assertNotIn("secret", (output / "current.json").read_text())
             rule_evaluation = json.loads((output / "rule-evaluation.json").read_text())
             self.assertEqual(rule_evaluation["status"], "ok")
-            self.assertEqual(rule_evaluation["rulePackVersion"], "2026.08.30.1")
+            self.assertEqual(rule_evaluation["rulePackVersion"], "2026.08.31.2")
             self.assertEqual(
                 {state["ruleId"] for state in rule_evaluation["states"].values()},
                 {rule["id"] for rule in json.loads(collector.DEFAULT_RULE_PACK_PATH.read_text())["rules"]},
@@ -3705,6 +3851,8 @@ class FilesystemTests(unittest.TestCase):
             self.assertEqual(signal, {
                 "notificationDeliveryStatus": "ok",
                 "notificationFinalFailureDelta": 2,
+                "notificationQueueActive": None,
+                "notificationQueueUsedPercent": None,
             })
             self.assertEqual(counter, 5)
 
@@ -3717,6 +3865,33 @@ class FilesystemTests(unittest.TestCase):
             self.assertEqual(failed["notificationDeliveryStatus"], "collection_error")
             self.assertIsNone(failed["notificationFinalFailureDelta"])
             self.assertEqual(retained, 5)
+
+    def test_monitor_runtime_signal_reports_real_cadence_and_storage_evidence(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            now = dt.datetime(2026, 8, 30, 12, 2, 10, tzinfo=dt.timezone.utc)
+            collector.atomic_write_json(output / "rule-evaluation.json", {
+                "evaluatedAt": "2026-08-30T12:00:00Z",
+            })
+            usage = mock.Mock(total=1_000, used=850, free=150)
+            with mock.patch.object(collector.shutil, "disk_usage", return_value=usage):
+                signal = collector.monitor_runtime_signal(output, now, 75.0, 60)
+
+            self.assertEqual(signal["alertEvaluationStatus"], "ok")
+            self.assertEqual(signal["alertEvaluationDelaySeconds"], 70.0)
+            self.assertEqual(signal["monitoringFilesystemStatus"], "ok")
+            self.assertEqual(signal["monitoringFilesystemUsedPercent"], 85.0)
+            self.assertEqual(signal["storageWriteFailureDelta"], 0)
+            self.assertEqual(signal["ingestStatus"], "unsupported")
+            self.assertIsNone(signal["ingestLagSeconds"])
+
+            with mock.patch.object(
+                collector.shutil, "disk_usage", side_effect=PermissionError
+            ):
+                denied = collector.monitor_runtime_signal(output, now, 0.0, 60)
+            self.assertEqual(denied["monitoringFilesystemStatus"], "permission_denied")
+            self.assertIsNone(denied["monitoringFilesystemUsedPercent"])
+            self.assertEqual(denied["alertEvaluationStatus"], "ok")
 
     def test_delivery_checkpoint_waits_for_durable_rule_evaluation(self):
         with tempfile.TemporaryDirectory() as temporary:

@@ -98,6 +98,7 @@ function appFor(directory: string) {
     authStateFile: join(directory, 'auth-state.json'),
     sessionSecret: SESSION_SECRET,
     dataDir: directory,
+    securityStateDir: directory,
     now: () => NOW,
     ssoEnabled: false,
     genericLogOwnerUid: OWNER,

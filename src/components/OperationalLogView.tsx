@@ -10,7 +10,7 @@ import { formatDateTime, safeText } from '../utils';
 import { Icon } from './Icon';
 import { Pagination, paginateItems, usePagination } from './Pagination';
 
-const CATEGORIES: OperationalLogCategory[] = ['alert', 'reliability', 'power', 'privilege'];
+const CATEGORIES: OperationalLogCategory[] = ['alert', 'reliability', 'power', 'privilege', 'docker', 'rule'];
 const SEVERITIES: OperationalLogSeverity[] = ['critical', 'warning', 'info'];
 const RECORDED_KERNEL_KINDS = new Set([
   'nvme-reset', 'nvme-io', 'pcie-aer', 'pcie-link', 'rcu-stall',
@@ -24,6 +24,8 @@ function categoryLabel(category: OperationalLogCategory, locale: MonitorLocale):
     reliability: ['호스트 신뢰성', 'Host reliability'],
     power: ['전원', 'Power'],
     privilege: ['권한 감사', 'Privilege audit'],
+    docker: ['Docker 이벤트', 'Docker event'],
+    rule: ['규칙 전환', 'Rule transition'],
   };
   return localized(locale, ...labels[category]);
 }
@@ -40,6 +42,7 @@ function severityLabel(severity: OperationalLogSeverity, locale: MonitorLocale):
 function localizedEventTitle(entry: OperationalLogEntry, locale: MonitorLocale): string {
   const kindKey = entry.kind.toLowerCase();
   const statusKey = entry.status.toLowerCase();
+  if (entry.category === 'docker' || entry.category === 'rule') return entry.title;
   if (locale === 'en') {
     if (statusKey === 'active' && kindKey === 'nvme-mitigation') {
       return `${entry.kind.replace(/[-_]+/g, ' ')} · enabled`;

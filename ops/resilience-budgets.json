@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "target": {
+    "historyRowsPerDay": 1000,
+    "concurrentReaders": 8
+  },
+  "stressMultiplier": 2,
+  "budgets": {
+    "dashboardReadP95Milliseconds": 750,
+    "dashboardConcurrentP95Milliseconds": 1500,
+    "heapGrowthBytes": 134217728,
+    "maximumReturnedSeriesPoints": 360,
+    "maximumDashboardResponseBytes": 2097152
+  }
+}

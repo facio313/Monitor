@@ -27,6 +27,10 @@ function evaluationState() {
     recoverySamples: 0,
     missingSamples: 0,
     openedAt: '2026-08-30T11:58:00Z',
+    conditionStartedAt: '2026-08-30T11:58:00Z',
+    recoveryStartedAt: null,
+    missingStartedAt: null,
+    evaluationIntervalSeconds: 60,
     changedAt: '2026-08-30T12:00:00Z',
     lastEvaluatedAt: '2026-08-30T12:00:00Z',
     lastValue: 95,
@@ -109,6 +113,7 @@ describe('rule evaluation and alert API contract', () => {
         'CpuUsageHigh:host/node-a': {
           ...evaluationState(),
           openedAt: '2026-08-30T11:58:00.000Z',
+          conditionStartedAt: '2026-08-30T11:58:00.000Z',
           changedAt: '2026-08-30T12:00:00.000Z',
           lastEvaluatedAt: '2026-08-30T12:00:00.000Z',
         },
@@ -133,6 +138,7 @@ describe('rule evaluation and alert API contract', () => {
     old.states['CpuUsageHigh:host/node-a'].changedAt = '2026-08-30T11:00:00Z';
     old.states['CpuUsageHigh:host/node-a'].lastEvaluatedAt = '2026-08-30T11:00:00Z';
     old.states['CpuUsageHigh:host/node-a'].openedAt = '2026-08-30T10:58:00Z';
+    old.states['CpuUsageHigh:host/node-a'].conditionStartedAt = '2026-08-30T10:58:00Z';
     writeFileSync(join(directory, 'rule-evaluation.json'), `${JSON.stringify(old)}\n`);
 
     const dashboard = readDashboard(directory, '1h', NOW, 300_000);
@@ -194,6 +200,23 @@ describe('rule evaluation and alert API contract', () => {
       join(directory, 'rule-evaluation.json'),
       'x'.repeat(dataLimits.maximumRuleEvaluationBytes + 1),
     );
+    expect(readDashboard(directory, '1h', NOW, 300_000).ruleEvaluation.status).toBe(
+      'collection_error',
+    );
+  });
+
+  it('fails closed on invalid duration-state timing and cadence metadata', () => {
+    const directory = dataDirectory();
+    const invalidCadence = evaluationDocument();
+    invalidCadence.states['CpuUsageHigh:host/node-a'].evaluationIntervalSeconds = 0;
+    writeFileSync(join(directory, 'rule-evaluation.json'), JSON.stringify(invalidCadence));
+    expect(readDashboard(directory, '1h', NOW, 300_000).ruleEvaluation.status).toBe(
+      'collection_error',
+    );
+
+    const futureRecovery = evaluationDocument();
+    futureRecovery.states['CpuUsageHigh:host/node-a'].recoveryStartedAt = '2026-08-30T12:01:00Z';
+    writeFileSync(join(directory, 'rule-evaluation.json'), JSON.stringify(futureRecovery));
     expect(readDashboard(directory, '1h', NOW, 300_000).ruleEvaluation.status).toBe(
       'collection_error',
     );

@@ -14,14 +14,15 @@ owned by root or the effective service uid, and a group/world-writable ancestor
 is accepted only when sticky-directory semantics protect the next trusted
 child. The same rule is applied before creating the state directory, so the
 client never creates state through a foreign or replaceable parent. The client
-binds the state and spool directory identities at startup and revalidates both
+binds the state, spool, and quarantine directory identities at startup and revalidates all
 before and after acquiring the state lock; a later rename, symlink substitution,
 or real-directory rollback fails closed before state or spool traversal.
 
-The package creates only mode-`0600` lock, state, enrollment, journal, and
-immutable batch files beneath those directories. It rejects links, foreign
+The package creates only mode-`0600` lock, state, enrollment, binding,
+checkpoint, self-metrics, journal, and immutable batch files beneath those
+directories. It rejects links, foreign
 owners, broad modes, replaced directory identities, malformed envelopes,
-changed machine identity, unknown spool files, and digest mismatches instead of
+changed machine identity, unknown spool/quarantine files, and digest mismatches instead of
 resetting state.
 
 An enqueue operation first writes and fsyncs `pending-enqueue.json`, atomically
@@ -35,8 +36,27 @@ record, and includes a valid `serverTime`. A crash after the server accepts but
 before local deletion therefore produces an exact server-side duplicate, not
 a new batch.
 
-The byte/entry limits include the enqueue journal while it coexists with new
-batch files. Capacity failure does not evict an unacknowledged batch. Useful
+The server replay-window codes `BATCH_TOO_OLD` and `DATA_TOO_OLD` are permanent:
+time cannot make either batch younger. The client atomically renames that exact
+mode-`0600` immutable envelope into private quarantine instead of scheduling
+another HTTPS retry. Quarantine filenames retain only batch UUID, fixed reason
+code, and disposition time. Unknown 4xx responses and clock skew remain
+retryable so a new server version or corrected clock cannot cause silent loss.
+
+The opt-in producer additionally supplies the bound collector identity,
+identity generation, and monotonic source sequence as an enqueue checkpoint.
+The same crash journal durably publishes a receipt containing the checkpoint,
+record digest, original batch IDs, and allocated sequence range before it is
+removed. Exact replay returns those IDs without allocating a UUID or sequence;
+changed content at the same checkpoint, older checkpoints, time rollback, and
+source-identity mismatch fail closed. Only the latest monotonic receipt is
+needed because the producer cannot advance its private source cursor while a
+pending checkpoint exists.
+
+The byte/entry limits are shared by active spool and quarantined batches and
+include the enqueue journal while it coexists with new batch files. Quarantine
+therefore stays bounded and eventually requires explicit operator disposition;
+capacity failure does not evict an unacknowledged or quarantined batch. Useful
 bodies are gzip-compressed once with deterministic gzip metadata; bodies for
 which gzip is not smaller use identity encoding. Retry state uses capped
 exponential equal jitter. A valid `Retry-After` delta or HTTP date on 429 is a
@@ -79,7 +99,7 @@ client certificate/key; it does not use an ambient proxy or ambient CA set.
 
 Keep `maxBatchRecords` and `maxBatchBytes` at or below the corresponding server
 admission values. Do not reduce either limit below a currently queued body.
-`maxSpoolEntries` and `maxSpoolBytes` are local admission limits; choose them
+`maxSpoolEntries` and `maxSpoolBytes` are shared active-spool/quarantine admission limits; choose them
 within the server's offline replay window and the host's storage/endurance
 budget. The client rejects values above 64 entries or 4 MiB so whole-spool
 validation, decoded envelopes, and a coexisting crash journal remain inside the
@@ -139,12 +159,28 @@ PYTHONPATH=/usr/local/lib/monitor-agent \
 
 PYTHONPATH=/usr/local/lib/monitor-agent \
   python3 -m agent_transport --config /etc/monitor-agent/transport.json status
+
+PYTHONPATH=/usr/local/lib/monitor-agent \
+  python3 -m agent_transport --config /etc/monitor-agent/transport.json quarantine-list
 ```
 
+`quarantine-list` prints only reason, time, sequence/count/size, and batch ID;
+it never prints telemetry values or wire bodies. After recording the operational
+disposition, abandon exactly one inspected batch explicitly:
+
+```bash
+PYTHONPATH=/usr/local/lib/monitor-agent \
+  python3 -m agent_transport --config /etc/monitor-agent/transport.json \
+  quarantine-purge 00000000-0000-4000-8000-000000000001
+```
+
+There is deliberately no purge-all or automatic eviction command.
+
 Record input deliberately has no raw-message or arbitrary-label escape hatch.
-An external producer is responsible for reducing collector output to these
-fixed metric/event fields. The repository does not wire `ops/collector.py` to
-this package.
+The disabled-by-default `ops/agent_producer.py` can reduce the strict local
+collector snapshot through the fixed allowlist in `ops/agent_records.py`.
+It remains a separate unit and does not modify or implicitly wire
+`ops/collector.py`; see [`agent-producer.md`](agent-producer.md).
 
 ## Enrollment and token handling
 
@@ -197,6 +233,11 @@ Each run performs at most enrollment, one heartbeat, and one telemetry request,
 each with the configured timeout. The four-minute service deadline covers the
 accepted three-by-60-second worst case plus local recovery overhead. The
 five-second timer drives durable retry times without a long-running process.
+Every cross-process state lock has a fixed five-second acquisition deadline.
+If the network-capable transport currently owns the lock, the producer fails
+that attempt while retaining its private pending checkpoint and retries on its
+timer; systemd therefore never kills a legitimate enqueue inside an unbounded
+four-minute lock wait.
 
 ## Required external deployment work
 
@@ -208,9 +249,11 @@ all of the following as one reviewed rollout:
    replacement, and CRL/OCSP/revocation outside this package.
 2. Deploy a private TLS listener that requires that CA, validates expiry and
    revocation, strips every client `X-Portfolio-Edge-Secret` and `X-Monitor-*`
-   header, injects the dedicated agent edge secret (not the SSO secret) and
-   verified certificate metadata, and can reach only the private/loopback
-   Monitor origin.
+   header, strips client `X-Forwarded-For` as defense in depth, injects the
+   dedicated agent edge secret (not the SSO secret) and verified certificate
+   metadata, and can reach only the private/loopback Monitor origin. The server
+   independently ignores forwarded addresses on agent routes and records its
+   socket peer.
 3. Enable the server only in SSO mode with
    `MONITOR_AGENT_INGEST_ENABLED=true`, a persistent private
    `MONITOR_AGENT_STATE_DIR`, a domain-separated
@@ -218,12 +261,13 @@ all of the following as one reviewed rollout:
    mode-`0600` AES-256-GCM keyring described in
    `docs/agent-ingest-contract.md`. Align
    request, record, queue, skew, and offline-window bounds with this config.
-4. Issue the one-use enrollment token as chief-admin and pass it by stdin or a
-   private mode-`0600` token file. Confirm `status` reports `registered=true`
-   before enabling the timer/producer.
-5. Supply and validate a reduced-record producer. This change intentionally
-   does not modify `ops/collector.py` or its installer, so no telemetry is
-   enqueued until that separate integration exists.
+4. Install the opt-in reduced-record producer and run its pre-enrollment
+   `bind-identity` validation as described in `docs/agent-producer.md`. It does
+   not modify `ops/collector.py` or its installer.
+5. Issue the one-use enrollment token as chief-admin and pass it by stdin or a
+   private mode-`0600` token file. Confirm `status` reports both
+   `collectorIdentityBound=true` and `registered=true` before explicitly
+   enabling the distinct producer and transport timers.
 6. Deploy a downstream consumer with its own durable claim/ack protocol for
    the server's encrypted ingest queue. Server admission is not a long-term
    time-series database.
@@ -233,5 +277,5 @@ all of the following as one reviewed rollout:
    ready.
 
 Certificate issuance/rotation, the trusted proxy, server secret/state mounts,
-the producer adapter, and the downstream queue consumer are external
+producer deployment/enablement, and the downstream queue consumer are external
 dependencies; the repository templates cannot prove or create them.

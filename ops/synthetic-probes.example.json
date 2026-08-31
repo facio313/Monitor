@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "probes": [
+    {
+      "id": "public-monitor",
+      "url": "https://example.com/healthz",
+      "expectedStatus": 200,
+      "timeoutSeconds": 10,
+      "maxRedirects": 3
+    }
+  ]
+}

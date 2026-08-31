@@ -1,0 +1,60 @@
+[Unit]
+Description=Project the local Monitor snapshot into the central agent spool
+Documentation=file:/usr/local/share/doc/monitor-agent/agent-producer.md
+After=local-fs.target monitor-collector.service
+ConditionPathExists=/etc/monitor-agent/producer.json
+ConditionPathExists=/etc/monitor-agent/transport.json
+ConditionPathExists=/var/lib/monitor-export/current.json
+RequiresMountsFor=/var/lib/monitor-agent /var/lib/monitor-agent-producer /var/lib/monitor-export
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+Environment=PYTHONPATH=/usr/local/lib/monitor-agent
+ExecStart=/usr/bin/python3 /usr/local/lib/monitor-agent/agent_producer.py --config /etc/monitor-agent/producer.json run-once
+UMask=0077
+StateDirectory=monitor-agent-producer
+StateDirectoryMode=0700
+
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+PrivateMounts=true
+NoNewPrivileges=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RemoveIPC=true
+KeyringMode=private
+CapabilityBoundingSet=
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+ReadOnlyPaths=/etc/monitor-agent/producer.json /etc/monitor-agent/transport.json
+ReadOnlyPaths=/etc/monitor-agent/client.crt /etc/monitor-agent/client.key /etc/monitor-agent/agent-ca.crt
+ReadOnlyPaths=/etc/machine-id /var/lib/monitor-export/current.json
+ReadWritePaths=/var/lib/monitor-agent /var/lib/monitor-agent-producer
+InaccessiblePaths=/var/cache /var/log /var/spool
+
+MemoryHigh=64M
+MemoryMax=96M
+TasksMax=16
+TimeoutStartSec=90s
+TimeoutStopSec=10s
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+SyslogIdentifier=monitor-agent-producer

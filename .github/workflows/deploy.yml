@@ -51,12 +51,13 @@ jobs:
         run: |
           git diff-tree --check HEAD^ HEAD
           git ls-files -z '*.sh' | xargs -0 --no-run-if-empty bash -n
-          python3 -m py_compile \
-            ops/collector.py \
-            ops/container_exporter.py \
-            ops/alert_engine.py \
-            ops/alert_runtime.py \
-            ops/alert_store.py
+          git ls-files -z '*.py' | xargs -0 --no-run-if-empty python3 -m py_compile
+          git ls-files -z '*.json' | xargs -0 --no-run-if-empty -n 1 python3 -m json.tool >/dev/null
+          git ls-files -z 'ops/systemd/*' | xargs -0 --no-run-if-empty systemd-analyze verify
+          python3 ops/state_backup.py backup --help >/dev/null
+          python3 ops/state_backup.py verify --help >/dev/null
+          python3 ops/state_backup.py restore --help >/dev/null
+          python3 ops/state_backup.py recover --help >/dev/null
 
       - name: Resolve branch authentication contract
         id: auth

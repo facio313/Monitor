@@ -18,6 +18,8 @@ COPY src ./src
 COPY server ./server
 COPY ops ./ops
 COPY scripts ./scripts
+COPY Dockerfile docker-compose.yml ./
+COPY .github/workflows/external-monitor.yml ./.github/workflows/external-monitor.yml
 
 # The workflow's native test gate keeps Vitest's strict default timeout. The
 # amd64 stage can run through QEMU on the ARM release runner, so bound its
@@ -55,6 +57,13 @@ RUN rm -rf /usr/local/lib/node_modules/npm \
 RUN printf '%s\n%s\n' "$PORTFOLIO_BRANCH" "$PORTFOLIO_AUTH_MODE" \
       > /etc/portfolio-auth-build \
     && chmod 0444 /etc/portfolio-auth-build
+
+# Keep the image path private for image-only checks. Production runs in cks's
+# rootless Docker user namespace, where container uid 0 maps to the unprivileged
+# host account. Compose replaces this path with a reviewed cks-owned 0700 bind.
+# The application refuses a broader or foreign-owned mount at runtime.
+RUN mkdir -p /var/lib/monitor-security \
+    && chmod 0700 /var/lib/monitor-security
 
 WORKDIR /app
 

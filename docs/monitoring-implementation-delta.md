@@ -1,172 +1,138 @@
 # Monitor 구현 증분 감사 — 2026-08-31
 
 > 기준선: `3c2a0a8ae7d44154d2a5dee960315a72338c3ffc`
-> 대상: 이 문서를 포함하는 후속 커밋
-> 범위: `/home/cks/Monitor`만 해당한다. 다른 저장소나 서비스는 포함하지 않는다.
+> 대상: 이 문서를 포함하는 현재 worktree
+> 범위: `/home/cks/Monitor` 코드·설정·테스트와 명시된 Monitor 운영 readback
 
 ## 결론
 
-이번 증분은 기존 단일 호스트 Monitor의 가장 위험한 거짓 정상과 부분 실패
-경로를 줄였다. Docker 수집 실패가 호스트 표본을 막지 않게 분리했고, Docker
-관측 상태를 fresh/last-known/unavailable/permission-denied로 명시했으며,
-inspect 기반 생명주기·health·limit 증거를 축약 계약으로 연결했다. 여기에
-stable random host/agent UUID, 사설 machine-id hash binding과 clone rekey,
-축약된 공개 boot digest, monotonic heartbeat sequence/expected interval/lifecycle
-계약을 추가했다. API와 화면은 heartbeat, Docker source status, 규칙 평가를
-전체 운영 판정에 연결하며, 장식용 canvas는 overview에서 제거됐다. 82개 기본
-규칙은 versioned data, restart-safe 평가 상태, bounded
-transition log, strict API, 우선순위 UI까지 실제 production graph에 들어갔다.
-배포 CI는 amd64와 arm64를 같은 manifest로 만들고 두 플랫폼을 각각 검사한다.
+이번 증분은 기준선의 “단일 host snapshot 화면”을 action-first 운영 경로로
+확장했다. Linux 상세 telemetry와 Docker v3/event stream은 strict server 계약과
+전용 UI까지 연결됐고, generic log, versioned rule evaluator, durable notification
+outbox, SSRF-safe synthetic probe, application API key/audit, encrypted backup/restore,
+opt-in central agent producer/transport가 구현됐다. 공개 readiness와 SSO를 외부에서
+확인하는 GitHub-hosted dead-man은 반복 실패를 하나의 durable issue로 남기고 회복
+시에 닫도록 구성됐다.
 
-이는 Monitor.md 전체 완료 선언이 아니다. local-file UUID/heartbeat는 여전히
-동일-host 연속성 계약이지만, 별도의 default-off 중앙 경로에는 one-use
-enrollment, trusted-proxy mTLS fingerprint binding/rotation/revocation, network
-heartbeat, compressed batch admission, duplicate/out-of-order 정책과 encrypted
-finite disk queue가 구현됐다. 별도 agent transport package도 stable batch,
-bounded durable offline spool, mTLS/gzip/timeout/Retry-After/backoff/jitter와
-one-use token 처리를 구현했지만 기존 local collector나 production unit에는
-기본 연결하지 않았다. 외부 PKI/mTLS listener, 인증서 lifecycle 배포,
-downstream queue consumer와 fleet 화면은 아직 없다. 이번 증분에는 Linux 세부 수집과
-local export,
-privacy-first file/journald 로그 파이프라인·탐색기, 그리고 별도 systemd worker가
-drain하는 finite notification outbox까지 연결됐다. 규칙 CRUD/override, 반복
-silence, Docker raw-log adapter, 전체 backup/restore 증명과 외부 synthetic은
-여전히 구현되지 않았다. 기준선 분석 문서의 미구현 판정은 아래에서
-명시적으로 승격한 범위 외에는 유효하다.
+이는 Monitor.md 전체 완료 선언이 아니다. 중앙 agent와 synthetic timer는
+default-off이고 실제 CA/mTLS listener·downstream ingest consumer가 없다. delivery
+channel은 운영 secret/receiver가 필요하다. API-key ingress는 현재 HTTP-only 원본에서
+의도적으로 비활성이고, 원본 TLS·Cloudflare Full (strict)·firewall readback이 필요하다. backup은
+production off-host copy와 clean-host application restore가 필요하다. 현재 worktree의
+최종 전체 회귀, 원격 CI, 새 multiarch image, production deploy/rollback과 외부
+dead-man 실제 run도 최종 증거가 생기기 전까지 pending이다. 최신 50항목 판정과
+항목별 완료 조건은 [최종 감사](monitoring-final-audit.md)를 기준으로 한다.
 
-## 실제 연결된 변경
+## 구현 증분
 
-| 영역 | 이번 증거 | 현재 판정 |
+| 영역 | 현재 구현 증거 | 상태 경계 |
 | --- | --- | --- |
-| local identity | schema-v2 snapshot이 stable UUIDv4 `hostId`/`agentId`, installation epoch와 generation을 공개한다. mode-0600 private state만 domain-separated machine-id SHA-256 binding을 보관하고, 검증 가능한 machine 변경 시 두 UUID를 재발급한다. | 단일-host identity continuity 통과; central 등록은 별도 opt-in path |
-| boot/heartbeat | raw boot UUID 대신 domain-separated 128-bit digest를 공개한다. sequence state를 snapshot보다 먼저 durable하게 올리고 expected interval, observed/received time, lifecycle, `local-file` transport를 내보낸다. | local gap 관측 통과; optional central network receipt 구현, local collector 전송은 미구현 |
-| agent API | exact identity/heartbeat를 검증하고 healthy/delayed/disconnected/maintenance/inactive/unknown/collection_error를 구분한다. legacy는 unknown, malformed partial contract는 collection_error다. | single-host status API 통과 |
-| central agent control | 짧은 TTL/1회 token hash, keyed machine identity collision, proxy-verified certificate fingerprint binding/rotation/revoke, strict heartbeat/inventory와 admin fleet read를 encrypted atomic state로 구현한다. | server vertical slice 통과; PKI/proxy와 remote installer는 외부 의존 |
-| central ingest | gzip/size/record caps, agent+batch/record content idempotency, sequence reorder counter, clock-skew/backfill policy, event reserve와 heartbeat bypass를 가진 encrypted finite queue를 구현한다. | admission/backpressure 통과; downstream time-series consumer/load proof는 미구현 |
-| agent transport package | exact private config/credential 검증, one-use enrollment token stdin/private-file 처리, reduced inventory, stable immutable batch와 bounded mode-0600 spool, mTLS/gzip/timeout/Retry-After/backoff/jitter를 구현한다. | client transport vertical slice 통과; collector adapter·installer enablement·실제 PKI 상호운용은 미구현 |
-| Linux telemetry | CPU/core mode·freq, memory/swap/vmstat/PSI, filesystem/inode/RO, block I/O, NIC/TCP, bounded process/PID/FD/cgroup, allowlisted systemd, thermal/RPi, boot/time/kernel 상태를 `current.linux`와 private delta에 연결했다. | collector/export slice 통과; server API와 전용 UI는 아직 연결되지 않았고 SMART/drift 등 privileged 외부 신호는 explicit unsupported |
-| generic logs | exact root-owned allowlist의 file/journald 입력을 bounded tail/cursor로 읽고 pre-parse credential/PII redaction, priority quota, source/drop status, crash-safe record→status→cursor commit을 적용했다. 인증 API와 action-first explorer는 digest-bound pagination을 쓴다. | file/journald end-to-end 통과; Docker acquisition adapter는 미구현 |
-| notification delivery | deterministic event/channel key를 가진 finite SQLite outbox, lease/crash recovery, timeout·retry/backoff/jitter, final-failure/drop counters와 webhook/Slack/Discord/Telegram/TLS-SMTP adapter를 별도 network-capable systemd worker에 연결했다. | async delivery vertical slice 통과; 실제 channel secrets/config와 receiver idempotency는 운영 의존 |
-| Docker 부분 실패 | exporter unit은 `Wants`, reduced snapshot bind는 optional이다. 실패 원인은 typed source status가 되고 host current/history publication은 계속된다. | P0 단일-host 경로 통과 |
-| Docker v2 | current row는 정확히 17필드이며 inspect 30, stats 30, worker 6, 전체 20초, list 1 MiB/detail 256 KiB로 제한된다. | lifecycle 핵심 부분 통과 |
-| lifecycle 정확도 | restart total/delta, OOM, start/finish, healthcheck support, memory/CPU/PID limit을 identity-bound inspect에서 축약한다. raw ID는 private mode-0600 state에만 있다. | FA-13~16 부분 승격 |
-| legacy/incident | legacy 7필드는 project·health/lifecycle/limit을 추정하지 않고 null로 승격한다. incident는 의도적으로 기존 7필드 projection을 유지한다. | 호환/개인정보 경계 통과 |
-| rules | Monitor.md의 82개 ID를 고정 순서의 strict JSON pack으로 제공한다. threshold/recovery, severity, samples, no-data, parent, labels, description/runbook, enabled를 검증한다. | seed pack 부분 통과 |
-| evaluator | pending/firing/recovering/recovery, hysteresis, independent no-data, parent suppression, silence disposition, gap reset과 deterministic transition identity를 구현한다. | FA-33~37 부분 승격 |
-| persistence | event-before-private-state-before-public-evaluation 순서, replay dedup, atomic bounded files, explicit collection_error를 적용한다. | local crash safety 통과 |
-| API | identity/heartbeat, container source, evaluation과 transition을 strict schema/size/path/mode 검증 후 반환한다. rule transition은 legacy alert와 분리되고 malformed partial input은 collection_error다. | single-host read API 통과 |
-| overall 판정 | non-healthy heartbeat, non-fresh Docker collection, firing/recovering rule과 evaluator coverage failure가 operational findings와 상단 overall에 들어간다. Docker unavailable/permission-denied는 서비스 0개 정상으로 표시하지 않는다. | 거짓 nominal 핵심 경로 축소 |
-| 화면 구성 | 시스템 strip → operational health → rule evaluator → widgets 순서다. 장식용 canvas와 그 overview 공간을 제거했다. | action-first composition 부분 승격 |
-| release | pinned actions, Node 22.23.2, type/test/audit gates, amd64+arm64 manifest, provenance/SBOM, 플랫폼별 Trivy critical gate를 둔다. | source gate 통과; 실제 run은 배포 readback 필요 |
+| local identity·heartbeat | `ops/collector.py`가 owner-only state의 stable UUIDv4 host/agent ID, machine-id hash binding·clone rekey, boot digest, durable monotonic sequence와 observed/received/interval/lifecycle을 발행한다. | 기본 transport는 `local-file`; 원격 receipt가 아니다. |
+| central agent control | `server/agent-control.ts`가 one-use enrollment, certificate fingerprint binding/rotation/revoke, strict heartbeat/inventory와 encrypted finite ingest admission을 구현한다. | default-off; 외부 PKI/proxy와 downstream consumer 필요. |
+| agent producer·transport | `ops/agent_records.py`, `ops/agent_producer.py`, `ops/agent_transport/`가 fixed projection, identity-bound checkpoint, homogeneous batch, mTLS/gzip/retry와 bounded offline spool을 제공한다. | collector installer와 분리된 opt-in units. latest snapshot source라 blocked 구간의 중간 표본은 보존하지 않는다. |
+| permanent rejection | `BATCH_TOO_OLD`/`DATA_TOO_OLD`는 exact immutable batch를 private bounded quarantine로 옮기며 metadata-only inspect와 단일-ID explicit purge를 제공한다. | 자동 삭제·purge-all 없음. quarantine는 spool capacity를 계속 사용한다. |
+| agent self telemetry | wall/CPU/RSS/procfs I/O, outcome/retry, heartbeat age, spool/quarantine count·oldest/status를 fixed metrics로 투영한다. old sample은 fresh checkpoint 시각으로 위장하지 않고 age/stale로 표시해 batch 전체를 오염시키지 않는다. | opt-in path의 production 장기 budget 증거 없음. |
+| ingest compatibility | 신규 admission은 metric/event homogeneous만 허용한다. 기존 mixed queue entry는 startup에서 거부하지 않고 idempotency·capacity를 보존한 채 읽는 migration 경로가 있다. | downstream claim/ack와 시계열 materializer 없음. |
+| Linux telemetry | `ops/linux_telemetry.py`가 CPU/core/frequency, memory/swap/vmstat/PSI, filesystem/inode/RO, block latency/queue/utilization, NIC/TCP/conntrack, process/PID/FD/cgroup, allowlist systemd, thermal/RPi, boot/time/kernel source 상태를 발행한다. | privileged SMART·일부 platform event는 explicit unsupported/partial. |
+| Linux API·UI | `server/data.ts`와 `server/types.ts`가 exact bounded `linux` contract를 검증하며 `LinuxDiagnosticsPanel`이 resources/network/storage/reliability/power 화면에 연결된다. | 기준선 문서의 “server/UI 미연결” 설명은 더 이상 유효하지 않다. |
+| Docker v3 | exact 56-field row가 lifecycle, CPU/memory/PID/throttling, block/network total·rate, storage counts, security booleans/capability counts와 image digest evidence를 제공한다. raw ID는 opaque digest이고 env/command/raw mount/address는 버린다. | health output, restart 원인, cgroup memory event, volume filesystem 연결은 남음. |
+| Docker event stream | cursor/replay/reconnect/dedup/gap과 최대 128개 allowlisted lifecycle event를 발행하고 API·`DockerDiagnosticsPanel` timeline에 연결한다. stale/permission/unavailable은 container 0개 정상으로 승격되지 않는다. | daemon 자체 lifecycle 상세 모델은 부분적. |
+| Compose·image UX | project/service grouping, resource·security·image·storage diagnostics, digest drift/latest/change와 상단 action links가 연결된다. 정상 rule 목록은 compact하고 Docker/rule 운영 timeline은 함께 볼 수 있다. | desired replica/deploy intent/orphan volume은 없음. |
+| generic logs | allowlist file/journald input, bounded cursor/tail, JSON/logfmt/syslog/plain/multiline parser, pre-storage credential·PII·PEM redaction, priority quota/drop accounting과 digest-bound explorer가 연결된다. | Docker stdout/stderr acquisition은 explicit unsupported. |
+| rule evaluator | 82개 고정 ID rule pack과 duration+samples, hysteresis, no-data, parent suppression, one-shot silence, restart-safe state/transition 및 strict API/UI가 연결된다. parent 회복·silence 만료는 private lifecycle과 event-first replay를 통해 활성 사건의 ready event/outbox를 exactly-once 생성하며 late silence는 기존 ready 권위를 소급 취소하지 않는다. | editable CRUD/version history, independent stale policy, dynamic topology, recurring silence는 없음. |
+| notification delivery | finite SQLite outbox, deterministic event/channel key, lease/crash recovery, retry/backoff/jitter/Retry-After/final-failure와 webhook·Slack·Discord·Telegram·TLS-SMTP adapter가 별도 worker로 연결된다. | 실제 channel config/secret/receiver idempotency readback 없음. |
+| synthetic probe | `ops/synthetic_probe.py`가 HTTP(S)·TLS를 public-only DNS answer와 pinned address로 검사하고 redirect마다 DNS를 재검증한다. proxy env·credentials·private/mixed answer를 거부하고 body/header를 보관하지 않는다. collector/API/operational findings와 HTTP/TLS rules에 연결된다. | installer는 unit을 설치하지만 timer는 default-off; 운영 target 승인·enablement 필요. |
+| public readiness | app과 exact Nginx route가 credential-free exact JSON, no-store, body bound를 제공한다. public probe는 readiness와 same-origin SSO redirect를 함께 검사한다. | 공개 readback은 확인됐지만 최종 새 application image 배포 증거와는 별도다. |
+| external dead-man | `.github/workflows/external-monitor.yml`이 5분마다 GitHub-hosted runner에서 probe하며, 실패 시 fixed-title open issue를 하나만 만들고 회복 성공 시 comment+close한다. probe 실패 run 자체도 실패로 남는다. | 최종 remote workflow의 실제 정상 및 failure→recovery run은 pending. |
+| application API keys | 256-bit one-time token, digest-only registry, scopes/expiry/revoke/rotate, canonical source-IP allowlist, last-used coalescing, inactive tombstone compaction과 per-key/invalid-attempt limiter를 구현한다. mutation은 successful bearer auth 뒤 cookie CSRF check와 분리된다. | live edge/source-IP/rotation 운영 readback 필요. |
+| API-key Nginx ingress | future activation용 exact `/monitor/api-key/v1/...` method/path aliases가 있다. proxy는 TLS·original-peer gate 뒤 cookie/SSO/mTLS headers를 지우고 forwarding chain을 교체한다. 실행형 TLS Nginx 시험이 rewrite/header/body/cache/method/path와 HTTP·비신뢰-peer 거부를 검증한다. | 현재 HTTP-only 원본에서는 include가 제거되어 alias도 SSO 뒤다. 원본 TLS+Full (strict), Cloudflare range 갱신과 direct-origin firewall을 입증한 뒤에만 활성화한다. security management/agent mTLS는 alias에 없음. |
+| application audit | local login과 privileged mutation/API-key lifecycle에 intent-before-side-effect와 outcome audit을 적용한다. file와 directory fsync 실패는 fail closed하고 records는 raw IP/secret/header/body를 저장하지 않는다. | rule/silence/config 및 외부 SSO lifecycle 전체 audit은 남음. |
+| application state runtime | explicit host bind `create_host_path: false`, mode-0700 state와 mode-0600 files를 요구한다. rootless Docker에서 container uid 0이 host `cks`로 매핑되므로 image는 의도적으로 `USER 1001`을 사용하지 않는다. | host directory 선행 provision과 deploy readback 필요. |
+| encrypted backup | `ops/state_backup.py`가 exact source map의 JSON/JSONL, SQLite online snapshot과 fixed-member security family를 producer-signed CMS 후 AES-256-GCM AuthEnvelopedData로 암호화한다. verify, clean/replace restore, durable journal와 SIGKILL recovery를 제공한다. | 현재 map은 전체 Monitor state가 아니며 scheduling/off-host RPO 없음. production drill 필요. |
+| backup TOCTOU fix | quiesced family도 initial capture 뒤 각 member를 anchored directory FD로 다시 열어 identity/full metadata/content hash를 재검증하고 마지막 directory enumeration을 수행한다. same-length in-place mutation, rotation, link/extra member를 거부한다. | writer stop을 대체하지 않는다; `--confirm-quiesced`가 필수. |
+| resilience budget | `ops/resilience-budgets.json`이 2배 history/readers, p95, heap, response/series cap을 versioning하고 `server/load-budget.test.ts`, `scripts/run-resilience-suite.sh`, scheduled workflow가 실행 경로를 둔다. | full ingest/delivery/browser/soak와 live fault는 제한적. |
+| release hygiene | deploy workflow는 tracked Python compile, JSON parse, shell syntax, systemd verify, backup CLI, full tests, Compose, two-platform manifest, SBOM/provenance와 platform별 critical scan을 gate한다. | 현재 worktree의 원격 성공 artifact와 production readback은 pending. |
+| 화면 구성 | operational health → compact rule summary → adaptive widgets 순서이며 Linux/Docker 상세, generic logs, synthetic 상태와 top action links가 실제 components에 연결된다. 반응형 CSS와 contract rendering tests가 있다. | 최종 fresh browser screenshot/visual readback은 pending. |
 
-## 로컬 identity 및 heartbeat 공개 계약
+## 핵심 공개 계약
 
-`current.json`의 top-level은 schema version 2이며 `schemaVersion`,
-`generatedAt`, `identity`, `heartbeat`, 기존 host/telemetry/source 필드를 가진다.
+### 상태 의미
 
-```text
-identity: hostId, agentId, installationEpoch, identityGeneration,
-          machineIdentityStatus, bootId
-heartbeat: sequence, observedAt, receivedAt, expectedIntervalSeconds,
-           lifecycle, transport
-```
+- host heartbeat는 `healthy|delayed|disconnected|maintenance|inactive|unknown|collection_error`를 구분한다.
+- Linux source는 `supported|partial|unsupported|permission_error|unavailable|invalid`를 구분한다.
+- container snapshot은 `fresh|last-known|unavailable|permission-denied`, Docker event는 `fresh|gap|unavailable|permission-denied`를 구분한다.
+- synthetic source/result와 generic-log source는 stale, unsupported, permission, unavailable, collection error를 빈 성공과 분리한다.
+- rule evaluator는 관측 없음으로 active alert를 자동 resolve하지 않고 valid recovery evidence를 요구한다.
 
-- `hostId`와 `agentId`는 서로 독립적인 UUIDv4이며 보통의 collector 재시작과
-  host reboot에서 유지된다. `bootId`는 raw Linux boot UUID가 아니라 별도
-  namespace의 32-hex BLAKE2s digest다.
-- `.state/collector-identity.json`만 exact-schema mode-`0600` state, sequence와
-  domain-separated machine-id SHA-256 hash를 보관한다. raw machine-id와 그 hash는
-  공개 export/API에 없다.
-- 이전·현재 hash가 모두 유효하고 다르면 copied state로 판단해 host/agent ID를
-  모두 다시 만들고 generation을 올리며 sequence와 installation epoch를
-  재시작한다. `unavailable`은 아직 valid binding이 한 번도 생기지 않았다는
-  뜻이다. 현재 machine-id를 일시적으로 읽지 못해도 기존 binding은 보존되지만,
-  clone 비교에는 이전·현재 hash가 모두 필요하다. unsafe mode/link/size/schema는
-  조용히 재발급하지 않고 collection을 fail closed한다.
-- local sequence state는 matching snapshot 전에 기록된다. 이후 publication 실패는
-  번호 재사용 대신 gap으로 남는다. local history row에는 sequence가 없다. 별도
-  central ingest v1은 agent/batch/record sequence와 idempotency를 저장하지만 현재
-  collector가 그 API로 전송하지는 않는다.
-- 현재 transport는 `local-file`이고 `receivedAt == observedAt`이다. 이는 원격
-  receipt가 아니다. expected interval은 기본 60초, 10~86,400초로 제한된다.
-  lifecycle은 host 설정의 `active|maintenance|inactive`이며 관리 API, 승인,
-  변경 이력 또는 fleet lifecycle이 아니다.
-- active status는 age가 `max(90초, 2 × expected interval)`을 넘으면 delayed,
-  `max(application stale threshold, 5 × expected interval)`을 넘으면
-  disconnected다. 명시적 maintenance/inactive가 age보다 우선하며, legacy
-  snapshot은 unknown이고, local-file의 generated/observed/received 시각이
-  다르거나 불완전·extra-field·invalid contract이면 collection_error다.
+### Docker 개인정보 경계
 
-## Docker 공개 계약
+Docker v3의 56 fields에는 자원 total/rate, lifecycle, limit, mount/network count,
+security boolean과 image evidence만 있다. raw container ID는 domain-separated opaque
+digest가 되고 raw mount path, IP/MAC, command, environment, health/log body는 공개되지
+않는다. counter 감소·instance 변경·긴 gap의 rate는 0이 아니라 `null`이며 last-known
+source의 delta를 현재 evidence로 평가하지 않는다.
 
-현재 row의 필드 순서는 다음과 같다.
+### API-key edge 경계
 
-```text
-name, project, owner, state, health, healthcheckConfigured,
-cpuPercent, memoryBytes, memoryPercent, memoryLimitBytes, cpuLimitCores,
-pidLimit, restartCount, restartCountDelta, oomKilled, startedAt, finishedAt
-```
+애플리케이션 route allowlist와 외부 alias allowlist는 별도다. 활성화된 외부
+automation은 `/monitor/api-key/v1/...`만 사용한다. 현재는 원본 TLS가 없어 alias
+include 자체가 비활성이고 그 경로도 SSO 경계 아래 있다. 일반 `/monitor/`와
+`/monitor/api/...`, security management, agent mTLS route도 계속 SSO/전용 edge
+경계 아래 있다. source-IP 제한은 Nginx의 trusted single-hop 주소에 의존하므로 원본
+TLS, Cloudflare Full (strict), range와 direct-origin 차단을 검증하지 않고 “client IP
+제한 완료”라고 선언하지 않는다.
 
-- resource limit `0`은 명시적인 unlimited, `null`은 미확인/비지원/검증 실패다.
-- fresh가 아닌 source에서는 restart delta나 last-known 값을 현재 증거로 평가하지
-  않는다.
-- configured PID limit은 있지만 current PID usage는 없으므로
-  `ContainerPidNearLimit`은 unsupported다.
-- security, socket mount, image digest/tag, writable layer와 container network
-  신호도 아직 unsupported다.
-- 공개 stable instance ID가 없으므로 replica는 `(project, name)` multiset이며,
-  삭제·재생성 lifecycle을 장기 연결하지 못한다.
+### 백업 신뢰 경계
 
-## 규칙 시스템의 남은 경계
+backup 도구는 glob이나 임의 CLI source path를 받지 않는다. application-security
+family는 required `api-keys.json`과 optional audit generation의 존재/부재까지 signed
+manifest에 묶으며, unexpected file 하나도 전체 backup을 실패시킨다. 암호화 archive
+생성만으로 FA-40을 통과시키지 않는다. off-host copy, independent verify, empty-root
+restore, Monitor startup/API-key authentication/audit readback과 측정 RPO/RTO가 필요하다.
 
-현재 pack은 실행 가능한 표현식이나 사용자 편집 모델이 아닌 안전한 seed data다.
-Monitor.md 18장이 요구하는 가능한 원인, 확인 항목, dashboard link, 지원 환경,
-필요 권한, 사용자별 override는 아직 별도 구조 필드가 아니다. 현재 silence는
-평가 API에 전달할 수 있는 bounded one-shot model일 뿐 CRUD, 반복 일정,
-유지보수 창 UI가 없다. notification state의 ready 항목은 별도 finite outbox로
-라우팅되고 email/Slack/Discord/Telegram/webhook adapter가 retry/backoff/jitter와
-delivery log를 처리한다. suppressed/silenced는 기록만 하고 큐에 넣지 않는다.
-원격 수락 뒤 local ack 전에 worker가 중단되면 at-least-once 재전송될 수 있으므로
-transition 생성이나 enqueue 성공을 수신자 exactly-once 성공으로 해석하면 안 된다.
+## 코드·기본값·운영 상태 구분
 
-## 검증 증거와 범위
+| 기능 | 코드 경로 | 기본 상태 | 현재 운영 증거 |
+| --- | --- | --- | --- |
+| local collector/Linux/Docker/rules | production graph에 연결 | enabled | 새 worktree deploy 후 재확인 필요 |
+| synthetic probe | collector contract와 rule/UI 연결 | timer disabled | target/config/enable readback 없음 |
+| alert delivery | evaluator→outbox→worker 연결 | config 의존 | 실제 channel/receiver 없음 |
+| central agent control/ingest | server vertical slice | disabled | PKI/proxy/consumer 없음 |
+| agent producer/transport | 별도 units와 CLI | disabled | enrollment/replay 실증 없음 |
+| application API key | app route와 state 연결; external alias disabled | security state 필요 | HTTP-only 원본 때문에 SSO 뒤에 유지; origin-TLS activation pending |
+| public readiness | app+Nginx+external probe | public exact route | exact 200/no-store와 SSO redirect 확인 |
+| external dead-man issue | GitHub Actions workflow | push 후 schedule/manual | remote issue lifecycle run pending |
+| state backup | opt-in CLI | unscheduled | production off-host/clean restore pending |
+| multiarch release/deploy | GitHub Actions | main push 시 | final commit CI/deploy pending |
 
-최신 전체 worktree에서 identity/heartbeat, Linux telemetry, generic log,
-notification outbox/worker, central admission과 agent transport를 함께 포함한
-전체 회귀를 다시 실행했다.
+## 검증 상태
 
-- Python: `python3 -m unittest discover -s ops/tests -p 'test_*.py'` — 321/321
-- TypeScript/Vitest: 30 files, 250/250
-- client/server TypeScript typecheck — 통과
-- Vite client와 server production build — 통과
-- `npm audit --audit-level=critical` — 모든 severity 0 vulnerabilities
-- SSO `main`과 fixture `ci/local` Compose config — 통과
-- tracked shell syntax, Python byte compilation, JSON examples, 전체 systemd unit,
-  branch/auth contract와 `git diff --check` — 통과
-- retained Chromium evidence는 generic log 화면 추가 전 overview까지만 다룬다.
-  현재 Logs UI는 자동화된 반응형 구성·accessible-name·필터/재시도 회귀를
-  통과했으며, 새 화면의 fresh browser screenshot 검증은 별도 후속 증거로 남긴다.
+각 변경에는 focused regression이 포함된다. 특히 다음 실패 경계를 자동화했다.
 
-central 경로의 focused 검증도 별도로 실행했다.
+- Linux/Docker exact schema, counter reset, unsupported/permission/stale와 UI rendering
+- synthetic DNS rebinding·private/mixed answer·redirect·proxy·TLS/HTTP failure
+- log redaction·multiline·burst quota·rotation·crash-safe cursor
+- alert duration/hysteresis/no-data, suppression·silence 해제의 restart-safe exactly-once enqueue, outbox retry/lease/final failure
+- API-key filesystem/fsync, scope/IP/expiry/revoke/rotation, tombstone churn과 bearer mutation
+- backup ciphertext/signature tamper, clean restore, TOCTOU in-place change, SIGKILL rollback
+- agent immutable replay, homogeneous batches, stale self sample, permanent quarantine,
+  legacy mixed-queue restart와 spool bounds
+- external readiness exact body/cache/SSO contract 및 durable issue workflow shape
 
-- agent control 보안/통합 focused Vitest — 28/28
-- standalone agent transport — 21/21
-- generic log pipeline/store/collector/transport focused Python — 58/58
+이 목록은 최종 전체 gate 성공 선언이 아니다. 모든 agent 수정이 끝난 동일 worktree에서
+Python 전체 suite, TypeScript typecheck/Vitest, production build, dependency audit,
+shell/Python/JSON/systemd/Compose 검사, resilience suite와 `git diff --check`를 다시
+실행해야 한다. 그 뒤에만 원격 CI·deploy·readback 결과를 이 문서와 최종 감사의
+FA-43/44/50에 반영한다. 특정 테스트 수는 작업 중 변하므로 고정하지 않는다.
 
-로컬 Node 18에서 Vite가 Node 20.19+/22.12+ 권장 경고를 냈지만 build는
-성공했다. CI와 image build는 존재가 확인된 Node 22.23.2로 고정되어 있다.
+## 남은 우선순위
 
-## 다음 P0
-
-1. external CA/mTLS listener와 header stripping을 배포하고 인증서 폐기 readback
-2. agent transport를 collector output adapter와 systemd installer에 opt-in 연결하고 실제 CA/certificate로 enrollment·rotation·offline replay 상호운용 증명
-3. encrypted ingest queue consumer, claim/ack, time-series partition과 부하/복구 증명
-4. 관리자 agent lifecycle 승인/감사와 fleet 화면 상태 전파
-5. full rule metadata, validated CRUD/version history와 scoped override
-6. recurring silence/maintenance window, grouping/dedup과 deterministic routing
-7. production delivery channel config/secrets, receiver idempotency와 delivery readback
-8. clean-host backup restore와 immutable deployment rollback proof
-9. external dead-man synthetic와 evaluator/queue/delivery 자체 계측
-
-각 항목은 failure injection과 운영 readback이 생기기 전까지 완료로 승격하지
-않는다.
+1. 원본 TLS·Cloudflare Full (strict) 후 실제 API-key alias와 trusted real-IP/direct-origin firewall readback
+2. actual CA/mTLS listener, agent enrollment/rotation/revoke와 offline replay
+3. central ingest consumer/partition/query 및 end-to-end idempotency/backpressure
+4. production delivery channels와 receiver idempotency/final-failure escalation
+5. recurring silence, dynamic dependency suppression, rule CRUD/version/audit와 incident ack/owner/note
+6. 전체 durable state map, off-host encrypted backup과 clean-host application restore
+7. full load/soak, live network fault, ENOSPC/inode와 real clock-step recovery
+8. final two-platform CI artifact, production revision/digest/health/rollback readback
+9. GitHub-hosted dead-man 정상 run과 failure issue→recovery close 증거

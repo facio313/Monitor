@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it } from 'vitest';
@@ -11,6 +12,7 @@ import {
   highestObservedDiskUsage,
   PcieStatusPanel,
   pcieLinkTone,
+  EventsWidget,
   ReliabilitySignalGrid,
   ReliabilityWidget,
   storageCapacityChartRows,
@@ -105,6 +107,40 @@ function reliabilityPayload(): DashboardPayload {
 }
 
 describe('current-boot reliability presentation', () => {
+  it('includes Docker and rule transitions in the widget and drills into the anchored reliability timeline', () => {
+    const data = reliabilityPayload();
+    data.generatedAt = '2026-08-30T12:00:00Z';
+    data.range = '24h';
+    data.alerts = [];
+    data.powerEvents = [];
+    data.privilegeEvents = [];
+    data.ruleAlerts = {
+      status: 'ok',
+      events: [{
+        schemaVersion: 1, rulePackVersion: 'test', idempotencyKey: 'f'.repeat(64),
+        ruleId: 'ContainerDown', target: 'container/monitor', transition: 'firing', severity: 'warning',
+        notificationState: 'ready', observedAt: '2026-08-30T11:59:00Z', openedAt: '2026-08-30T11:58:00Z',
+        value: 0, status: 'ok', labels: {}, description: 'Container is down.', runbook: 'Inspect safely.',
+      }],
+    };
+    data.dockerEvents = [{
+      id: 'd'.repeat(32), occurredAt: '2026-08-30T11:59:30Z', action: 'oom',
+      containerName: 'monitor', project: 'monitor', instanceId: 'a'.repeat(32), exitCode: null, healthStatus: null,
+    }];
+    const markup = renderToStaticMarkup(createElement(EventsWidget, { data, locale: 'en', onOpen: () => undefined }));
+    expect(markup).toContain('Docker, and rule transitions');
+    expect(markup).toContain('monitor · oom');
+    expect(markup).toContain('ContainerDown · firing');
+    expect(markup).toContain('cockpit-panel-badge">2');
+
+    const source = readFileSync(new URL('./CockpitVisuals.tsx', import.meta.url), 'utf8');
+    const eventsSource = source.slice(source.indexOf('export function EventsWidget'), source.indexOf('function trafficSummary'));
+    expect(eventsSource).toContain('detailPage="reliability"');
+    expect(eventsSource).toContain('detailAnchor="operational-events"');
+    expect(eventsSource).not.toContain('detailPage="logs"');
+    expect(source).toContain("anchorId={page === 'reliability' ? 'operational-events' : undefined}");
+  });
+
   it('keeps the overview widget compact and reserves boot-event signals for details', () => {
     const data = reliabilityPayload();
     const compact = renderToStaticMarkup(createElement(ReliabilityWidget, {

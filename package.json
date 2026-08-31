@@ -30,6 +30,7 @@
     "test:watch:raw": "vitest",
     "test:collector": "./scripts/portfolio-auth-mode.sh exec -- npm run test:collector:raw",
     "test:collector:raw": "python3 -m unittest discover -s ops/tests -p 'test_*.py'",
+    "test:resilience": "./scripts/portfolio-auth-mode.sh exec -- ./scripts/run-resilience-suite.sh",
     "test:portfolio-auth": "./scripts/test-portfolio-auth-mode.sh",
     "compose": "./scripts/monitor-compose.sh"
   },

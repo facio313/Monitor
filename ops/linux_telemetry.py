@@ -1645,6 +1645,13 @@ def collect_thermal(sys_root: Path, rpi_data: Mapping[str, Any]) -> dict[str, An
         else "permission_error" if "permission_error" in {*status_candidates, power_sensor_status}
         else "unsupported"
     )
+    flag_source = (
+        rpi_data.get("_throttledFlagsSource")
+        if rpi_data.get("_throttledFlagsSource") in {"vcgencmd", "hwmon-current-only"}
+        else "hwmon-current-only" if power_sensor_status == "supported" and flags is not None
+        else None
+    )
+    full_flag_history = flag_source == "vcgencmd"
     rpi = {
         "status": rpi_status,
         "detected": is_raspberry_pi,
@@ -1652,19 +1659,18 @@ def collect_thermal(sys_root: Path, rpi_data: Mapping[str, Any]) -> dict[str, An
         "supplyVoltageVolts": round(voltage, 3) if voltage is not None else None,
         "throttledFlags": flags,
         "currentUnderVoltage": bool(flags & 0x1) if flags is not None else None,
-        "currentFrequencyCapped": bool(flags & 0x2) if flags is not None else None,
-        "currentThrottled": bool(flags & 0x4) if flags is not None else None,
-        "currentSoftTemperatureLimit": bool(flags & 0x8) if flags is not None else None,
-        "underVoltageOccurred": bool(flags & 0x10000) if flags is not None else None,
-        "frequencyCapOccurred": bool(flags & 0x20000) if flags is not None else None,
-        "throttlingOccurred": bool(flags & 0x40000) if flags is not None else None,
-        "softTemperatureLimitOccurred": bool(flags & 0x80000) if flags is not None else None,
-        "flagSource": (
-            rpi_data.get("_throttledFlagsSource")
-            if rpi_data.get("_throttledFlagsSource") in {"vcgencmd", "hwmon-current-only"}
-            else "hwmon-current-only" if power_sensor_status == "supported" and flags is not None
-            else None
-        ),
+        # A hwmon alarm supplies only the current under-voltage bit. Treating
+        # every other zero bit as an authoritative negative would create a
+        # false-normal throttle history on hosts where get_throttled is not
+        # available.
+        "currentFrequencyCapped": bool(flags & 0x2) if flags is not None and full_flag_history else None,
+        "currentThrottled": bool(flags & 0x4) if flags is not None and full_flag_history else None,
+        "currentSoftTemperatureLimit": bool(flags & 0x8) if flags is not None and full_flag_history else None,
+        "underVoltageOccurred": bool(flags & 0x10000) if flags is not None and full_flag_history else None,
+        "frequencyCapOccurred": bool(flags & 0x20000) if flags is not None and full_flag_history else None,
+        "throttlingOccurred": bool(flags & 0x40000) if flags is not None and full_flag_history else None,
+        "softTemperatureLimitOccurred": bool(flags & 0x80000) if flags is not None and full_flag_history else None,
+        "flagSource": flag_source,
     }
     overall = (
         "permission_error" if "permission_error" in status_candidates and not sensors and not fans

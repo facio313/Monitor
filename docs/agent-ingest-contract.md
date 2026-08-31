@@ -29,6 +29,11 @@ direct request, a forged marker without the edge secret, a fingerprint bound
 to another agent, an expired certificate, and a revoked agent all fail closed
 with distinct non-secret error codes.
 
+Agent requests never use `X-Forwarded-For` for inventory or audit metadata,
+even after mTLS proxy authentication. The application records only its socket
+peer for this path, so an incomplete external header-sanitization policy cannot
+let an agent forge those records.
+
 Certificate signing and CRL/OCSP enforcement belong to the external PKI and
 TLS proxy. Initial enrollment binds the already PKI-issued long-lived
 certificate presented on that request; the application does not claim to
@@ -148,7 +153,9 @@ Only identity and gzip content encoding are supported. Both compressed wire
 size and inflated JSON size are bounded, `Content-Length` is mandatory, and
 arbitrary fields/raw messages are rejected. All timestamps use RFC 3339 with
 at most millisecond precision, and records are ordered by nondecreasing
-sequence. A record contains only:
+sequence. Every batch is homogeneous: it contains metrics or events, never
+both. This prevents a priority event queue entry from carrying metric payload
+through the event reserve. A record contains only:
 
 ```text
 kind = metric | event
@@ -170,6 +177,13 @@ time only by the configured skew; batches/records older than the configured
 offline window are rejected. This leaves the agent's
 durable spool authoritative until it receives an acknowledgement.
 
+For the packaged transport, `BATCH_TOO_OLD` and `DATA_TOO_OLD` are terminal
+replay-window dispositions. The exact immutable envelope is atomically retained
+in a bounded private quarantine, remains visible through reduced local status,
+and requires an explicit batch-ID purge after operator inspection. It is never
+silently deleted or retried forever. Other invalid or unknown responses remain
+retryable.
+
 Once a batch has been durably admitted, an exact retry returns its retained
 receipt before timestamp admission is re-evaluated. Thus a lost HTTP response
 cannot turn a previously accepted batch into `BATCH_TOO_OLD`; the guarantee
@@ -183,9 +197,11 @@ gzip-compresses useful batches, keeps a bounded private disk spool, and retries
 the same batch bytes and ID with timeout, exponential jittered backoff and
 bounded `Retry-After`. Its exact configuration, enrollment handling, systemd
 template and external dependencies are documented in
-[`agent-transport.md`](agent-transport.md). The repository still does not wire
-`ops/collector.py` to that package; an opt-in reduced-record producer and the
-external PKI/mTLS deployment are required before telemetry is sent.
+[`agent-transport.md`](agent-transport.md). The repository does not modify or
+implicitly wire `ops/collector.py`; the distinct disabled-by-default producer
+in [`agent-producer.md`](agent-producer.md) and the external PKI/mTLS deployment
+must be installed, identity-bound, validated, and explicitly enabled before
+telemetry is sent.
 
 ## Backpressure and failure isolation
 
@@ -220,6 +236,14 @@ generic 503 while unrelated routes remain available; unsafe startup state or
 permissions prevent service startup. A downstream time-series consumer
 must process the encrypted queue with its own durable claim/ack contract before
 this optional queue is treated as a long-term metrics database.
+
+Deployments upgrading from the earlier mixed-batch format may retain already
+authenticated, receipt-bound mixed queue entries until normal retention or a
+downstream drain removes them. Startup validates those legacy entries against
+the original invariant (any event means priority) and their receipts. An exact
+lost-response retry may recover its retained acknowledgement, but every new or
+changed API admission and every newly written queue entry remain strictly
+homogeneous.
 
 ## Configuration limits
 

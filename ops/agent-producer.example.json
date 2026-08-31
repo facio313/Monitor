@@ -1,0 +1,7 @@
+{
+  "schemaVersion": 1,
+  "collectorCurrentFile": "/var/lib/monitor-export/current.json",
+  "transportConfigFile": "/etc/monitor-agent/transport.json",
+  "transportSelfMetricsFile": "/var/lib/monitor-agent/self-metrics.json",
+  "stateDirectory": "/var/lib/monitor-agent-producer"
+}
