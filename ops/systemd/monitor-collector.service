@@ -9,7 +9,7 @@ Type=oneshot
 User=root
 Group=cks
 EnvironmentFile=-/etc/default/monitor-collector
-ExecStart=/usr/bin/python3 /usr/local/lib/monitor-collector/collector.py --docker-sockets= --container-input=/run/monitor-container-exporter/containers.json --process-uids=0,1001 --traffic-log=/var/log/nginx/monitor-traffic.jsonl --mountinfo=/proc/1/mountinfo
+ExecStart=/usr/bin/python3 /usr/local/lib/monitor-collector/collector.py --docker-sockets= --container-input=/run/monitor-container-exporter/containers.json --process-uids=0,1001 --traffic-log=/var/log/nginx/monitor-traffic.jsonl --mountinfo=/run/monitor-collector/host-mountinfo
 RuntimeDirectory=monitor-collector
 RuntimeDirectoryMode=0750
 RuntimeDirectoryPreserve=yes
@@ -22,11 +22,14 @@ UMask=0027
 # cks-owned container snapshot. The Docker socket is outside this namespace.
 # PID 1's mountinfo is the host mount namespace; self/mountinfo would instead
 # report the read-only view intentionally created by ProtectSystem below.
+# Bind the single host file before ProtectProc hides other processes, rather
+# than granting the collector process visibility into the rest of host /proc.
 ProtectSystem=strict
 ProtectHome=read-only
 InaccessiblePaths=/home /root
 TemporaryFileSystem=/run:ro
 BindPaths=/run/monitor-collector
+BindReadOnlyPaths=/proc/1/mountinfo:/run/monitor-collector/host-mountinfo
 BindReadOnlyPaths=-/run/monitor-container-exporter/containers.json
 BindReadOnlyPaths=-/var/lib/monitor-synthetic/results.json
 # Read-only observation surfaces only; the systemd control sockets remain
