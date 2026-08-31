@@ -32,12 +32,15 @@ class DeliveryContractTests(unittest.TestCase):
         dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
         build_gate = (
             "&& npm run typecheck \\\n"
-            "    && npm run test:raw -- --maxWorkers=2 --testTimeout=30000 \\\n"
+            "    && npm run test:raw -- --exclude=server/load-budget.test.ts "
+            "--maxWorkers=2 --testTimeout=30000 \\\n"
             "    && npm run build"
         )
         self.assertIn(build_gate, dockerfile)
+        self.assertEqual(dockerfile.count("--exclude=server/load-budget.test.ts"), 1)
         workflow = (ROOT / ".github" / "workflows" / "deploy.yml").read_text(encoding="utf-8")
         self.assertIn("npm run test:raw -- --reporter=dot", workflow)
+        self.assertNotIn("--exclude=server/load-budget.test.ts", workflow)
         self.assertNotIn("testTimeout", workflow)
         production_stage = dockerfile.index(" AS production-dependencies")
         self.assertLess(dockerfile.index("npm run typecheck"), production_stage)
