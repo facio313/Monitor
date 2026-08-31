@@ -168,6 +168,11 @@ class ApiKeyIngressNginxTests(unittest.TestCase):
             directory = Path(raw_directory)
             snippets = directory / "snippets"
             snippets.mkdir()
+            # Nginx's -p flag does not relocate compile-time absolute temp
+            # paths.  Isolate every one so a root test cannot chown the live
+            # worker directories to Nginx's default test user.
+            for name in ("client-body", "proxy", "fastcgi", "uwsgi", "scgi"):
+                (directory / name).mkdir()
             for name in (
                 "monitor-api-key-ingress.conf",
                 "monitor-api-key-proxy.conf",
@@ -188,6 +193,11 @@ class ApiKeyIngressNginxTests(unittest.TestCase):
                 "events {}\n"
                 "http {\n"
                 "  access_log off;\n"
+                f"  client_body_temp_path {directory}/client-body;\n"
+                f"  proxy_temp_path {directory}/proxy;\n"
+                f"  fastcgi_temp_path {directory}/fastcgi;\n"
+                f"  uwsgi_temp_path {directory}/uwsgi;\n"
+                f"  scgi_temp_path {directory}/scgi;\n"
                 f"  include {snippets}/monitor-api-key-peer-map.conf;\n"
                 "  server {\n"
                 "    listen 127.0.0.1:8080;\n"
@@ -196,6 +206,21 @@ class ApiKeyIngressNginxTests(unittest.TestCase):
                 "  }\n"
                 "}\n",
                 encoding="utf-8",
+            )
+            configured_temp_paths = {
+                line.strip()
+                for line in configuration.read_text(encoding="utf-8").splitlines()
+                if line.strip().split(" ", 1)[0].endswith("_temp_path")
+            }
+            self.assertEqual(
+                configured_temp_paths,
+                {
+                    f"client_body_temp_path {directory}/client-body;",
+                    f"proxy_temp_path {directory}/proxy;",
+                    f"fastcgi_temp_path {directory}/fastcgi;",
+                    f"uwsgi_temp_path {directory}/uwsgi;",
+                    f"scgi_temp_path {directory}/scgi;",
+                },
             )
             completed = subprocess.run(
                 ["nginx", "-t", "-c", str(configuration), "-p", str(directory)],

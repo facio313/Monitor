@@ -356,6 +356,29 @@ class LinuxTelemetryTests(unittest.TestCase):
             ):
                 self.assertIsNone(raspberry_pi[field])
 
+    def test_file_descriptor_limit_above_json_safe_range_is_partial(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = self.create_fixture(Path(temporary))
+            (paths["proc"] / "sys" / "fs" / "file-nr").write_text(
+                "100 10 9223372036854775807\n"
+            )
+
+            result, _state = self.collect(paths)
+            descriptors = result["processes"]["systemFileDescriptors"]
+
+            self.assertEqual(descriptors, {
+                "status": "partial",
+                "allocated": 100,
+                "unusedAllocated": 10,
+                "used": 90,
+                "maximum": None,
+                "usedPercent": None,
+            })
+            self.assertEqual(
+                json.loads(json.dumps(descriptors)),
+                descriptors,
+            )
+
     def test_remote_and_triggerable_filesystems_are_never_synchronously_probed(self):
         with tempfile.TemporaryDirectory() as temporary:
             paths = self.create_fixture(Path(temporary))

@@ -131,7 +131,10 @@ class ApiKeyNginxRuntimeTests(unittest.TestCase):
         cls.directory = Path(cls._temporary_directory.name)
         cls.snippets = cls.directory / "snippets"
         cls.snippets.mkdir()
-        (cls.directory / "client-body").mkdir()
+        # Nginx's -p flag does not relocate compile-time absolute temp paths.
+        # A root integration run must never mutate the live worker directories.
+        for name in ("client-body", "proxy", "fastcgi", "uwsgi", "scgi"):
+            (cls.directory / name).mkdir()
 
         cls.echo = _EchoServer(("127.0.0.1", 0))
         cls.echo_thread = threading.Thread(target=cls.echo.serve_forever, daemon=True)
@@ -235,6 +238,10 @@ class ApiKeyNginxRuntimeTests(unittest.TestCase):
             "http {\n"
             "  access_log off;\n"
             f"  client_body_temp_path {cls.directory}/client-body;\n"
+            f"  proxy_temp_path {cls.directory}/proxy;\n"
+            f"  fastcgi_temp_path {cls.directory}/fastcgi;\n"
+            f"  uwsgi_temp_path {cls.directory}/uwsgi;\n"
+            f"  scgi_temp_path {cls.directory}/scgi;\n"
             f"  include {cls.snippets}/monitor-api-key-peer-map.conf;\n"
             "  server {\n"
             f"    listen 0.0.0.0:{cls.http_port};\n"
@@ -265,6 +272,23 @@ class ApiKeyNginxRuntimeTests(unittest.TestCase):
                 time.sleep(0.025)
         cls._cleanup_resources()
         raise AssertionError("nginx TLS listener did not become ready")
+
+    def test_all_nginx_temp_paths_are_test_local(self):
+        configured_temp_paths = {
+            line.strip()
+            for line in self.configuration.read_text(encoding="utf-8").splitlines()
+            if line.strip().split(" ", 1)[0].endswith("_temp_path")
+        }
+        self.assertEqual(
+            configured_temp_paths,
+            {
+                f"client_body_temp_path {self.directory}/client-body;",
+                f"proxy_temp_path {self.directory}/proxy;",
+                f"fastcgi_temp_path {self.directory}/fastcgi;",
+                f"uwsgi_temp_path {self.directory}/uwsgi;",
+                f"scgi_temp_path {self.directory}/scgi;",
+            },
+        )
 
     @classmethod
     def _cleanup_resources(cls):

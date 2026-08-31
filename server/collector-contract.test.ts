@@ -248,6 +248,7 @@ describe('collector to server contract', () => {
       '--privilege-logs', privilegeLog,
       '--traffic-log', trafficLog,
       '--docker-sockets', '',
+      '--synthetic-input', '',
       '--vcgencmd', vcgencmd,
       '--temperature-warn-c', '40',
       '--temperature-recover-c', '35',

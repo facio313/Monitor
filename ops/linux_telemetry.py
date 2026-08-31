@@ -38,6 +38,7 @@ MAX_THERMAL_SENSORS = 64
 MAX_FANS = 32
 MAX_FILE_BYTES = 2 * 1024 * 1024
 MAX_COUNTER = (1 << 63) - 1
+MAX_JSON_SAFE_INTEGER = (1 << 53) - 1
 PROCESS_SCAN_SECONDS = 1.25
 _monotonic = time.monotonic
 
@@ -1083,10 +1084,18 @@ def _system_file_descriptors(proc_root: Path) -> dict[str, Any]:
     fields = text.split()
     allocated = unused = maximum = None
     if status == "supported" and len(fields) >= 3:
-        allocated, unused, maximum = (_safe_integer(fields[index]) for index in range(3))
-        if allocated is None or unused is None or maximum is None or unused > allocated:
+        allocated = _safe_integer(fields[0], MAX_JSON_SAFE_INTEGER)
+        unused = _safe_integer(fields[1], MAX_JSON_SAFE_INTEGER)
+        raw_maximum = _safe_integer(fields[2])
+        if allocated is None or unused is None or raw_maximum is None or unused > allocated:
             status = "invalid"
             allocated = unused = maximum = None
+        elif raw_maximum > MAX_JSON_SAFE_INTEGER:
+            # Keep the useful exact counters, but never serialize Linux's
+            # LONG_MAX sentinel as an imprecise JavaScript number.
+            status = "partial"
+        else:
+            maximum = raw_maximum
     used = allocated - unused if allocated is not None and unused is not None else None
     return {
         "status": status,

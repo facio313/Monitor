@@ -49,6 +49,9 @@ const MAX_RELIABILITY_DURATION_SECONDS = 366 * 24 * 60 * 60;
 const MAX_CONTAINER_CPU_PERCENT = 1024;
 const MAX_TELEMETRY_RATE = 1_000_000_000_000;
 const MAX_LINUX_COUNTER = Number.MAX_SAFE_INTEGER;
+// Legacy Linux v1 producers allowed signed 64-bit counters.  Their upper
+// bound rounds to 2^63 when JSON is parsed as a JavaScript number.
+const MAX_LINUX_V1_RAW_COUNTER = 2 ** 63;
 const MAX_LINUX_RATE = 1_000_000_000_000_000;
 const MAX_LINUX_REDUCED_DEVICES = 16;
 const MAX_LINUX_REDUCED_THERMAL_ITEMS = 8;
@@ -2782,6 +2785,16 @@ function linuxNullableInteger(
   return value === null || integer(value, minimum, maximum) !== null;
 }
 
+function linuxNullableV1RawCounter(value: unknown, minimum = 0): boolean {
+  return value === null || (
+    typeof value === 'number'
+    && Number.isFinite(value)
+    && Number.isInteger(value)
+    && value >= minimum
+    && value <= MAX_LINUX_V1_RAW_COUNTER
+  );
+}
+
 function linuxBooleanOrNull(value: unknown): boolean {
   return value === null || typeof value === 'boolean';
 }
@@ -2801,7 +2814,11 @@ function linuxPrintableText(value: unknown, maximum: number): boolean {
 }
 
 function linuxTimestamp(value: unknown, nowMs: number): string | null {
-  if (typeof value !== 'string' || value.length > 40 || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(value)) {
+  if (
+    typeof value !== 'string'
+    || value.length > 40
+    || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z$/.test(value)
+  ) {
     return null;
   }
   const timestamp = new Date(value).getTime();
@@ -3146,7 +3163,12 @@ function validateLinuxProcesses(value: unknown): boolean {
     'status', 'allocated', 'unusedAllocated', 'used', 'maximum', 'usedPercent',
   ]);
   if (!descriptors || !linuxRawStatus(own(descriptors, 'status'))
-    || !['allocated', 'unusedAllocated', 'used', 'maximum'].every((field) => linuxNullableInteger(own(descriptors, field)))
+    || !['allocated', 'unusedAllocated', 'used'].every((field) => linuxNullableInteger(own(descriptors, field)))
+    // Accept the old signed-64-bit producer value at ingress so a rolling
+    // deployment does not poison the whole snapshot. Normalization below
+    // deliberately maps an unsafe maximum to null rather than exposing an
+    // imprecise capacity.
+    || !linuxNullableV1RawCounter(own(descriptors, 'maximum'))
     || !linuxNullableNumber(own(descriptors, 'usedPercent'), 0, 100)) return false;
   const cgroup = linuxRecord(own(record, 'cgroupPids'), ['status', 'version', 'current', 'maximum'], ['usedPercent']);
   const version = own(cgroup ?? undefined, 'version');
@@ -3488,6 +3510,10 @@ function normalizeLinuxDiagnostics(
   const cgroup = own(processes, 'cgroupPids') as JsonRecord;
   const pidCount = integer(own(processes, 'pidCount'), 0, 8192);
   const resourceStatus = normalizeLinuxStatus(own(processes, 'status'));
+  const descriptorMaximum = integer(own(descriptors, 'maximum'), 1, MAX_LINUX_COUNTER);
+  const descriptorStatus = descriptorMaximum === null && typeof own(descriptors, 'maximum') === 'number'
+    ? 'partial'
+    : normalizeLinuxStatus(own(descriptors, 'status'));
   const resources: DashboardResponse['linux']['resources'] = {
     status: resourceStatus,
     processCount: pidCount,
@@ -3504,10 +3530,10 @@ function normalizeLinuxDiagnostics(
       usedPercent: percent(own(processes, 'pidUsedPercent')),
     },
     systemFileDescriptors: {
-      status: normalizeLinuxStatus(own(descriptors, 'status')),
+      status: descriptorStatus,
       current: integer(own(descriptors, 'used'), 0, MAX_LINUX_COUNTER),
-      maximum: integer(own(descriptors, 'maximum'), 0, MAX_LINUX_COUNTER),
-      usedPercent: percent(own(descriptors, 'usedPercent')),
+      maximum: descriptorMaximum,
+      usedPercent: descriptorMaximum === null ? null : percent(own(descriptors, 'usedPercent')),
     },
     cgroupPids: {
       status: normalizeLinuxStatus(own(cgroup, 'status')),

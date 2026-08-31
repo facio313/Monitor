@@ -366,6 +366,26 @@ describe('Linux collector v1 API boundary', () => {
     }
   });
 
+  it('accepts microsecond event times and safely reduces a legacy 64-bit file limit', () => {
+    const fixture = linuxFixture();
+    fixture.eventSources.summary = {
+      rcuExpedited: { count: 1, lastEventAt: '2026-08-30T11:59:20.945946Z' },
+    };
+    fixture.processes.systemFileDescriptors.maximum = 9_223_372_036_854_775_807;
+    fixture.processes.systemFileDescriptors.usedPercent = 0;
+
+    const result = dashboard(fixture).linux;
+
+    expect(result.schemaVersion).toBe(1);
+    expect(result.status).not.toBe('collection_error');
+    expect(result.resources.systemFileDescriptors).toMatchObject({
+      status: 'partial',
+      current: 900,
+      maximum: null,
+      usedPercent: null,
+    });
+  });
+
   it('bounds the reduced response and rejects collector arrays beyond the v1 cap', () => {
     const reduced = linuxFixture();
     reduced.blockDevices.items = Array.from({ length: 20 }, (_, index) => blockDevice(index));
