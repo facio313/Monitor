@@ -1145,7 +1145,7 @@ export function DetailPage({ page, data, findings, range, locale, onOpen }: Visu
   } else if (page === 'containers') {
     content = <><ContainersWidget data={data} locale={locale} onOpen={onOpen} /><DockerDiagnosticsPanel data={data} locale={locale} /><ContainerStatusTable data={data} locale={locale} />{commonLogs}</>;
   } else if (page === 'reliability') {
-    content = <><ReliabilityWidget data={data} locale={locale} onOpen={onOpen} detailed /><PcieStatusPanel pcie={data.system.pcie} locale={locale} /><LinuxDiagnosticsPanel linux={data.linux} page="reliability" locale={locale} />{commonLogs}</>;
+    content = <><ReliabilityWidget data={data} locale={locale} onOpen={onOpen} detailed /><SyntheticProbePanel data={data} locale={locale} /><PcieStatusPanel pcie={data.system.pcie} locale={locale} /><LinuxDiagnosticsPanel linux={data.linux} page="reliability" locale={locale} />{commonLogs}</>;
   } else if (page === 'power') {
     content = <><PowerWidget data={data} range={range} locale={locale} onOpen={onOpen} /><LinuxDiagnosticsPanel linux={data.linux} page="power" locale={locale} />{commonLogs}</>;
   } else {

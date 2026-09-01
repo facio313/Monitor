@@ -27,6 +27,7 @@ import {
 import { Icon, type IconName } from './Icon';
 import { GenericLogExplorer } from './GenericLogExplorer';
 import { InfrastructureLedger } from './InfrastructureLedger';
+import { InfrastructureObservability } from './InfrastructureObservability';
 import { MonitoringCoverage } from './MonitoringCoverage';
 import { OperationalGuidance, OperationalHealthOverview } from './OperationalHealth';
 import { OperationalHeadroom } from './OperationalHeadroom';
@@ -285,6 +286,10 @@ export function MonitorDashboard({
       : data.generatedAt;
     return { ...data, stale: effectiveStale, generatedAt: assessmentAt };
   }, [data, effectiveStale, lastSuccessfulAt]);
+  const observabilityData = useMemo(() => {
+    if (!data || data.stale === effectiveStale) return data;
+    return { ...data, stale: effectiveStale };
+  }, [data, effectiveStale]);
   const findings = useMemo(() => assessedData ? operationalFindings(assessedData) : [], [assessedData]);
   const counts = {
     danger: findings.filter((finding) => finding.level === 'danger').length,
@@ -464,6 +469,13 @@ export function MonitorDashboard({
 
           {normalizedPage === 'infrastructure'
             ? <div className="detail-dashboard">
+                <InfrastructureObservability
+                  data={observabilityData}
+                  locale={locale}
+                  ssoEnabled={ssoEnabled}
+                  viewer={viewer}
+                  onUnauthorized={onUnauthorized}
+                />
                 <InfrastructureLedger locale={locale} onUnauthorized={onUnauthorized} />
                 <RelatedEvidencePanel page="infrastructure" data={data} range={range} locale={locale} onUnauthorized={onUnauthorized} />
               </div>

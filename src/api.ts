@@ -1,4 +1,9 @@
-import type { DashboardPayload, InfrastructureLedgerResponse, TimeRange } from './types';
+import type {
+  DashboardPayload,
+  InfrastructureLedgerResponse,
+  RemoteAgentInventoryResponse,
+  TimeRange,
+} from './types';
 
 const API_ROOT = '/monitor/api';
 
@@ -109,6 +114,10 @@ export function getDashboard(range: TimeRange, signal?: AbortSignal): Promise<Da
 
 export function getInfrastructureLedger(signal?: AbortSignal): Promise<InfrastructureLedgerResponse> {
   return apiFetch<InfrastructureLedgerResponse>('/infrastructure-ledger', { signal });
+}
+
+export function getRemoteAgents(signal?: AbortSignal): Promise<RemoteAgentInventoryResponse> {
+  return apiFetch<RemoteAgentInventoryResponse>('/agents', { signal });
 }
 
 export type GenericLogSourceKind = 'docker' | 'file' | 'journald';

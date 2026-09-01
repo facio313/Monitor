@@ -141,6 +141,32 @@ class MonitoringCatalogTests(unittest.TestCase):
             self.assertEqual(set(observation["displayName"]), {"ko", "en"})
             self.assertEqual(set(observation["description"]), {"ko", "en"})
 
+    def test_infrastructure_related_evidence_includes_monitoring_self_health_sources(self):
+        catalog = build()
+        observations = {item["id"]: item for item in catalog["observations"]}
+        self_health = observations["monitoring.self-health"]
+        self.assertIn("infrastructure", self_health["detailPages"])
+        expected_self_health_sources = {
+            "rule-evaluation-state",
+            "rule-alert-events",
+            "generic-log-source-state",
+        }
+        self.assertEqual(
+            set(self_health["evidenceSourceIds"]),
+            expected_self_health_sources,
+        )
+
+        infrastructure_source_ids = {
+            source_id
+            for observation in catalog["observations"]
+            if "infrastructure" in observation["detailPages"]
+            for source_id in observation["evidenceSourceIds"]
+        }
+        self.assertLessEqual(
+            expected_self_health_sources,
+            infrastructure_source_ids,
+        )
+
     def test_catalog_never_exports_configured_paths_or_private_values(self):
         with tempfile.TemporaryDirectory() as temporary:
             rule_copy = Path(temporary) / "private-rule-pack.json"

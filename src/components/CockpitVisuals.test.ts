@@ -3,12 +3,14 @@ import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it } from 'vitest';
 import type { ContainerStatus, DashboardPayload, DiskUsage, SystemEventCount, SystemKernelStatus, SystemPcieStatus } from '../types';
+import { formatDateTime } from '../utils';
 import {
   containerUtilizationChartRows,
   ContainersWidget,
   ContainerStatusTable,
   CurrentTrafficWidget,
   currentBootReliabilitySignals,
+  DetailPage,
   highestObservedDiskUsage,
   PcieStatusPanel,
   pcieLinkTone,
@@ -164,6 +166,86 @@ describe('current-boot reliability presentation', () => {
     expect(detailed).toContain('현재 부팅의 커널·장치 사건');
     expect(detailed).toContain('reliability-signal-grid');
     expect(detailed).toContain('3건');
+  });
+
+  it('renders every synthetic HTTP and TLS field on reliability while retaining the network surface', () => {
+    const data = reliabilityPayload();
+    data.generatedAt = '2026-09-01T12:00:00Z';
+    data.range = '24h';
+    data.alerts = [];
+    data.powerEvents = [];
+    data.privilegeEvents = [];
+    data.syntheticProbeCollection = { status: 'fresh', observedAt: '2026-09-01T11:45:00Z' };
+    data.syntheticProbes = [{
+      id: 'public-monitor-readiness',
+      status: 'ok',
+      checkedAt: '2026-09-01T11:45:33Z',
+      httpStatus: 200,
+      redirectCount: 1,
+      latencyMilliseconds: 364,
+      certificateExpiresAt: '2026-11-18T02:13:49Z',
+      certificateDaysRemaining: 77,
+    }];
+    data.linux = {
+      collectedAt: '2026-09-01T11:44:00Z',
+      reliability: {
+        status: 'supported',
+        clock: {
+          status: 'supported',
+          uptimeSeconds: 3_600,
+          bootTime: '2026-09-01T10:45:33Z',
+          rebootDetectedSincePreviousSample: false,
+          unexpectedReboot: null,
+          unexpectedRebootStatus: 'not_inferable_from_local_counters',
+          timeSync: {
+            status: 'supported',
+            reason: null,
+            synchronized: true,
+            ntpEnabled: true,
+            ntpSupported: true,
+            clockDriftMilliseconds: null,
+            clockDriftStatus: 'unsupported',
+          },
+        },
+        systemd: { status: 'supported', reason: null, truncated: false, units: [] },
+      },
+    } as unknown as DashboardPayload['linux'];
+
+    const markup = renderToStaticMarkup(createElement(DetailPage, {
+      page: 'reliability',
+      data,
+      findings: [],
+      range: '24h',
+      locale: 'en',
+      onOpen: () => undefined,
+    }));
+
+    expect(markup).toContain('id="synthetic-probes"');
+    expect(markup).toContain('External HTTP and TLS probes');
+    expect(markup).toContain('every five minutes');
+    expect(markup).toContain('latest replace-only result');
+    expect(markup).toContain('Fresh');
+    expect(markup).toContain('public-monitor-readiness');
+    expect(markup).toContain('status-ok">OK</span>');
+    expect(markup).toContain('<td>200</td>');
+    expect(markup).toContain('364 ms');
+    expect(markup).toContain('<td>1</td>');
+    expect(markup).toContain('77 d');
+    expect(markup).toContain(formatDateTime('2026-11-18T02:13:49Z', 'en'));
+    expect(markup).toContain('2026-09-01T11:45:00Z');
+    expect(markup).toContain('2026-09-01T11:45:33Z');
+
+    const source = readFileSync(new URL('./CockpitVisuals.tsx', import.meta.url), 'utf8');
+    const networkDetail = source.slice(
+      source.indexOf("} else if (page === 'network')"),
+      source.indexOf("} else if (page === 'storage')"),
+    );
+    const reliabilityDetail = source.slice(
+      source.indexOf("} else if (page === 'reliability')"),
+      source.indexOf("} else if (page === 'power')"),
+    );
+    expect(networkDetail).toContain('<SyntheticProbePanel data={data} locale={locale} />');
+    expect(reliabilityDetail).toContain('<SyntheticProbePanel data={data} locale={locale} />');
   });
 
   it('renders the restored service status table for the overview', () => {

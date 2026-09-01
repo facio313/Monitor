@@ -10,7 +10,7 @@ import type {
   MonitoringRuleDefinition,
 } from '../api';
 import type { DashboardPayload, RuleEvaluationPhase, RuleEvaluationState } from '../types';
-import { buildCoverageRows, MonitoringCoverage } from './MonitoringCoverage';
+import { buildCoverageRows, CoverageRetentionDetails, MonitoringCoverage } from './MonitoringCoverage';
 
 let hookCatalog: MonitoringCatalog | null = null;
 
@@ -283,6 +283,88 @@ describe('buildCoverageRows', () => {
     });
   });
 
+  it('keeps observation source policies separate and gives the rule event contract precedence', () => {
+    const value = catalog();
+    const stateSource = value.evidenceSources.find(({ id }) => id === 'rule-evaluation-state');
+    const eventSource = value.evidenceSources.find(({ id }) => id === 'rule-alert-events');
+    expect(stateSource).toBeDefined();
+    expect(eventSource).toBeDefined();
+    stateSource!.retention = {
+      policy: 'replace-on-collect',
+      pruneCadence: 'replace-on-collection',
+      maxAgeDays: null,
+      maxRecords: 1,
+      recordScope: 'artifact',
+      maxBytes: 4_194_304,
+    };
+    eventSource!.retention = {
+      policy: 'bounded-age-count-and-bytes',
+      pruneCadence: 'every-rule-evaluation',
+      maxAgeDays: 14,
+      maxRecords: 9_000,
+      recordScope: 'artifact',
+      maxBytes: 8_388_608,
+    };
+    value.rules = [rule('RetentionRule', {
+      eventRetention: { maxRecords: 321, maxBytes: 524_288 },
+    })];
+
+    const rows = buildCoverageRows(value, dashboard(), genericPage(), 'en');
+    const observationRow = rows.find(({ id }) => id === 'observation:alerts.transitions-delivery');
+    const ruleRow = rows.find(({ id }) => id === 'check:RetentionRule');
+
+    expect(observationRow?.retentionSources).toHaveLength(2);
+    expect(observationRow?.retentionSources.map(({ sourceId, retention }) => ({
+      sourceId,
+      maxRecords: retention?.maxRecords,
+      maxBytes: retention?.maxBytes,
+      pruneCadence: retention?.pruneCadence,
+    }))).toEqual([
+      {
+        sourceId: 'rule-evaluation-state',
+        maxRecords: 1,
+        maxBytes: 4_194_304,
+        pruneCadence: 'replace-on-collection',
+      },
+      {
+        sourceId: 'rule-alert-events',
+        maxRecords: 9_000,
+        maxBytes: 8_388_608,
+        pruneCadence: 'every-rule-evaluation',
+      },
+    ]);
+    expect(ruleRow?.retentionSources).toMatchObject([
+      {
+        sourceId: 'rule-evaluation-state',
+        role: 'state',
+        retention: { maxRecords: 1, maxBytes: 4_194_304, pruneCadence: 'replace-on-collection' },
+      },
+      {
+        sourceId: 'rule-alert-events',
+        role: 'events',
+        retention: { maxAgeDays: 14, maxRecords: 321, maxBytes: 524_288, pruneCadence: 'every-rule-evaluation' },
+      },
+    ]);
+
+    const observationDetails = renderToStaticMarkup(createElement(CoverageRetentionDetails, {
+      row: observationRow!,
+      locale: 'en',
+    }));
+    const ruleDetails = renderToStaticMarkup(createElement(CoverageRetentionDetails, {
+      row: ruleRow!,
+      locale: 'en',
+    }));
+    expect(observationDetails).toContain('rule-evaluation-state evidence');
+    expect(observationDetails).toContain('Retention cap: 1 record/artifact · 4.0 MB');
+    expect(observationDetails).toContain('rule-alert-events evidence');
+    expect(observationDetails).toContain('Retention cap: 14d · 9,000 records/artifact · 8.0 MB');
+    expect(ruleDetails).toContain('State · rule-evaluation-state evidence');
+    expect(ruleDetails).toContain('Events · rule-alert-events evidence');
+    expect(ruleDetails.match(/Cadence: 1m/g)).toHaveLength(2);
+    expect(ruleDetails).toContain('Retention cap: 14d · 321 records/artifact · 512 KB');
+    expect(ruleDetails).toContain('Pruning: each rule evaluation');
+  });
+
   it('reports the worst live rule phase and distinguishes unsupported, disabled, and missing targets', () => {
     const rows = buildCoverageRows(catalog(), dashboard([
       state('CriticalFiring', 'unsupported', 'old-target'),
@@ -409,5 +491,56 @@ describe('MonitoringCoverage', () => {
     expect(markup).toContain('2,000 records');
     expect(markup).toContain('prune each collection');
     expect(markup).not.toMatch(/\/(?:etc|home|root|run|var|proc|sys|usr)\//u);
+  });
+
+  it('renders unambiguous observation and rule retention summaries in their own rows', () => {
+    const value = catalog();
+    const stateSource = value.evidenceSources.find(({ id }) => id === 'rule-evaluation-state');
+    const eventSource = value.evidenceSources.find(({ id }) => id === 'rule-alert-events');
+    expect(stateSource).toBeDefined();
+    expect(eventSource).toBeDefined();
+    stateSource!.retention = {
+      policy: 'replace-on-collect',
+      pruneCadence: 'replace-on-collection',
+      maxAgeDays: null,
+      maxRecords: 1,
+      recordScope: 'artifact',
+      maxBytes: 4_194_304,
+    };
+    eventSource!.retention = {
+      policy: 'bounded-age-count-and-bytes',
+      pruneCadence: 'every-rule-evaluation',
+      maxAgeDays: 14,
+      maxRecords: 9_000,
+      recordScope: 'artifact',
+      maxBytes: 8_388_608,
+    };
+    value.rules = [rule('RetentionRule', {
+      eventRetention: { maxRecords: 321, maxBytes: 524_288 },
+    })];
+    hookCatalog = value;
+
+    const markup = renderToStaticMarkup(createElement(MonitoringCoverage, {
+      data: dashboard(),
+      range: '24h',
+      locale: 'en',
+      onUnauthorized: vi.fn(),
+    }));
+    const rowMarkup = (label: string) => {
+      const labelAt = markup.indexOf(label);
+      expect(labelAt).toBeGreaterThanOrEqual(0);
+      return markup.slice(markup.lastIndexOf('<tr', labelAt), markup.indexOf('</tr>', labelAt));
+    };
+    const observationMarkup = rowMarkup('alerts.transitions-delivery observation');
+    const ruleMarkup = rowMarkup('RetentionRule');
+
+    expect(observationMarkup).toContain('2 sources · distinct per-source caps');
+    expect(observationMarkup).toContain('1 record/artifact · 4.0 MB');
+    expect(observationMarkup).toContain('14d · 9,000 records/artifact · 8.0 MB');
+    expect(observationMarkup).toContain('Per-source pruning replace each collection / each rule evaluation');
+    expect(ruleMarkup).toContain('2 sources · State: 1 record/artifact · 4.0 MB');
+    expect(ruleMarkup).toContain('Events: 14d · 321 records/artifact · 512 KB');
+    expect(ruleMarkup).toContain('State: replace each collection / Events: each rule evaluation');
+    expect(ruleMarkup).not.toContain('9,000 records/artifact');
   });
 });

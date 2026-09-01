@@ -116,4 +116,43 @@ describe('monitor overview composition', () => {
     expect(markup).not.toContain('class="range-selector"');
     expect(markup).not.toContain('Loading instruments');
   });
+
+  it('connects the infrastructure page to local observability before the long-lived ledger', () => {
+    vi.stubGlobal('window', {
+      localStorage: { getItem: () => 'en', setItem: () => undefined },
+      location: { search: '?range=24h' },
+    });
+    vi.stubGlobal('navigator', { languages: ['en-US'] });
+    const viewer: SessionInfo = {
+      authenticated: true,
+      mode: 'local',
+      user: 'operator',
+      role: 'admin',
+      permissions: [],
+    };
+
+    const markup = renderToStaticMarkup(createElement(MonitorDashboard, {
+      page: 'infrastructure',
+      navigationVersion: 0,
+      onNavigate: () => undefined,
+      onLogout: async () => undefined,
+      onPasswordChanged: () => undefined,
+      onUnauthorized: () => undefined,
+      viewer,
+    }));
+
+    expect(markup).toContain('Host, agent, and self-health');
+    expect(markup).toContain('Loading host state');
+    expect(markup).toContain('Remote inventory is not used in local-auth mode');
+    expect(markup).toContain('Loading infrastructure ledger');
+    expect(markup.indexOf('Host, agent, and self-health')).toBeLessThan(markup.indexOf('Loading infrastructure ledger'));
+
+    const source = readFileSync(new URL('./MonitorDashboard.tsx', import.meta.url), 'utf8');
+    const observability = source.slice(
+      source.indexOf('<InfrastructureObservability'),
+      source.indexOf('<InfrastructureLedger'),
+    );
+    expect(observability).toContain('data={observabilityData}');
+    expect(observability).not.toContain('data={data}');
+  });
 });

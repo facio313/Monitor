@@ -277,6 +277,85 @@ export interface DashboardPayload {
   system: SystemStatus;
 }
 
+export type RemoteAgentLifecycle = 'active' | 'maintenance' | 'inactive';
+export type RemoteAgentStatus =
+  | 'healthy'
+  | 'delayed'
+  | 'disconnected'
+  | 'maintenance'
+  | 'inactive'
+  | 'revoked';
+
+export interface RemoteAgentInventory {
+  agentVersion: string;
+  hostname: string;
+  ipAddresses: string[];
+  operatingSystem: string;
+  ubuntuVersion: string | null;
+  kernelVersion: string;
+  architecture: string;
+  cpuModel: string;
+  memoryBytes: number;
+}
+
+export interface RemoteAgentSummary {
+  registered: true;
+  duplicate: boolean;
+  agentId: string;
+  hostId: string;
+  installationEpoch: string;
+  registeredAt: string;
+  lastSeenAt: string;
+  lastObservedAt: string;
+  lifecycle: RemoteAgentLifecycle;
+  status: RemoteAgentStatus;
+  expectedHeartbeatIntervalSeconds: number;
+  maxSequence: number;
+  inventory: RemoteAgentInventory;
+  certificate: {
+    expiresAt: string;
+    renewalRequired: boolean;
+  };
+  clockRejections: {
+    count: number;
+    lastRejectedAt: string | null;
+  };
+  revokedAt: string | null;
+  revokedReason: 'compromised' | 'decommissioned' | 'operator' | 'reinstalled' | null;
+  serverTime: string;
+}
+
+export interface RemoteAgentInventoryResponse {
+  serverTime: string;
+  transport: {
+    tlsTermination: 'trusted-reverse-proxy';
+    applicationVerifies: string[];
+  };
+  queue: {
+    entries: number;
+    bytes: number;
+    priorityEntries: number;
+    priorityBytes: number;
+    normalEntries: number;
+    normalBytes: number;
+    maxEntries: number;
+    maxBytes: number;
+    maxBatchReceipts: number;
+    maxQueueEntriesPerAgent: number;
+    maxQueueBytesPerAgent: number;
+    maxBatchReceiptsPerAgent: number;
+    maxIdempotencyRecordsPerAgent: number;
+    priorityReservePercent: number;
+    rejectedBatches: number;
+    rejectedRecords: number;
+    duplicateBatches: number;
+    duplicateRecords: number;
+    outOfOrderRecords: number;
+    expiredQueueBatches: number;
+  };
+  agents: RemoteAgentSummary[];
+}
+
 export interface TelemetrySummary {
   sampleCount: number;
   cpuAveragePercent: number | null;

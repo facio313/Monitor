@@ -7,6 +7,7 @@ import {
   type MonitoringCatalog,
   type MonitoringEvidenceSource,
   type MonitoringObservation,
+  type MonitoringRetention,
   type MonitoringRuleDefinition,
 } from '../api';
 import { localized, monitorPathForPage } from '../dashboard-model';
@@ -35,6 +36,19 @@ interface CoverageStatus {
   detail: string;
 }
 
+type CoverageRetentionRole = 'state' | 'events' | null;
+type CoverageRetentionPolicy = Omit<MonitoringRetention, 'pruneCadence'> & {
+  pruneCadence: MonitoringRetention['pruneCadence'] | null;
+};
+
+export interface CoverageRetentionSource {
+  sourceId: string;
+  source: MonitoringEvidenceSource | null;
+  role: CoverageRetentionRole;
+  cadenceSeconds: number | null;
+  retention: CoverageRetentionPolicy | null;
+}
+
 export interface CoverageRow {
   id: string;
   domain: string;
@@ -44,6 +58,7 @@ export interface CoverageRow {
   evidenceMode: string;
   cadenceSeconds: number | null;
   sourceIds: string[];
+  retentionSources: CoverageRetentionSource[];
   detailPages: string[];
   status: CoverageStatus;
   observation?: MonitoringObservation;
@@ -197,12 +212,55 @@ function genericSourceStatus(source: GenericLogSourceStatus, locale: MonitorLoca
   return { ...status, detail: t(locale, `허용 ${source.admittedEvents} · 탈락 ${source.droppedLines}`, `${source.admittedEvents} admitted · ${source.droppedLines} dropped`) };
 }
 
+function retentionSource(
+  sourceId: string,
+  sourceMap: Map<string, MonitoringEvidenceSource>,
+  role: CoverageRetentionRole = null,
+  ruleEventRetention?: MonitoringRuleDefinition['eventRetention'],
+): CoverageRetentionSource {
+  const source = sourceMap.get(sourceId) ?? null;
+  const retention = source
+    ? {
+        ...source.retention,
+        ...(ruleEventRetention ? {
+          maxRecords: ruleEventRetention.maxRecords,
+          maxBytes: ruleEventRetention.maxBytes,
+        } : {}),
+      }
+    : ruleEventRetention
+      ? {
+          policy: 'rule-event-contract',
+          pruneCadence: null,
+          maxAgeDays: null,
+          maxRecords: ruleEventRetention.maxRecords,
+          recordScope: 'artifact',
+          maxBytes: ruleEventRetention.maxBytes,
+        }
+      : null;
+  return {
+    sourceId,
+    source,
+    role,
+    cadenceSeconds: source?.cadenceSeconds ?? null,
+    retention,
+  };
+}
+
+function observationRetentionSources(
+  observation: MonitoringObservation,
+  sourceMap: Map<string, MonitoringEvidenceSource>,
+): CoverageRetentionSource[] {
+  return [...new Set(observation.evidenceSourceIds)]
+    .map((sourceId) => retentionSource(sourceId, sourceMap));
+}
+
 export function buildCoverageRows(
   catalog: MonitoringCatalog,
   data: DashboardPayload,
   genericPage: GenericLogPage | null,
   locale: MonitorLocale,
 ): CoverageRow[] {
+  const sourceMap = new Map(catalog.evidenceSources.map((source) => [source.id, source]));
   const statesByRule = new Map<string, RuleEvaluationState[]>();
   for (const state of Object.values(data.ruleEvaluation.states)) {
     const states = statesByRule.get(state.ruleId) ?? [];
@@ -218,6 +276,7 @@ export function buildCoverageRows(
     evidenceMode: observation.evidenceMode,
     cadenceSeconds: observation.cadenceSeconds,
     sourceIds: observation.evidenceSourceIds,
+    retentionSources: observationRetentionSources(observation, sourceMap),
     detailPages: observation.detailPages,
     status: observationStatus(observation, data, genericPage, locale),
     observation,
@@ -233,6 +292,10 @@ export function buildCoverageRows(
       evidenceMode: 'current-and-event-log',
       cadenceSeconds: rule.effectiveEvaluationIntervalSeconds,
       sourceIds: [rule.stateEvidenceSourceId, rule.eventEvidenceSourceId],
+      retentionSources: [
+        retentionSource(rule.stateEvidenceSourceId, sourceMap, 'state'),
+        retentionSource(rule.eventEvidenceSourceId, sourceMap, 'events', rule.eventRetention),
+      ],
       detailPages: rule.detailPages,
       status: ruleStatus(rule, states, data, locale),
       rule,
@@ -248,6 +311,7 @@ export function buildCoverageRows(
     evidenceMode: source.evidenceMode,
     cadenceSeconds: source.cadenceSeconds,
     sourceIds: [source.id],
+    retentionSources: [retentionSource(source.id, sourceMap)],
     detailPages: source.detailPages,
     status: evidenceStatus(source, data, genericPage, locale),
     source,
@@ -263,6 +327,7 @@ export function buildCoverageRows(
       evidenceMode: 'accumulated-log',
       cadenceSeconds: evidence?.cadenceSeconds ?? catalog.collectionIntervalSeconds,
       sourceIds: ['generic-log-events'],
+      retentionSources: [retentionSource('generic-log-events', sourceMap)],
       detailPages: ['logs'],
       status: genericSourceStatus(source, locale),
       source: evidence,
@@ -301,15 +366,33 @@ function cadenceLabel(seconds: number | null, locale: MonitorLocale): string {
   return t(locale, `${seconds / 60}분`, `${seconds / 60}m`);
 }
 
-function retention(source: MonitoringEvidenceSource, locale: MonitorLocale): string {
+function retention(policy: CoverageRetentionPolicy | null, locale: MonitorLocale): string {
+  if (!policy) return t(locale, '소스 정책 미확인', 'Source policy unavailable');
   const limits: string[] = [];
-  if (source.retention.maxAgeDays !== null) limits.push(t(locale, `${source.retention.maxAgeDays}일`, `${source.retention.maxAgeDays}d`));
-  if (source.retention.maxRecords !== null) limits.push(`${source.retention.maxRecords.toLocaleString()} ${t(locale, '건', 'records')}`);
-  if (source.retention.maxBytes !== null) limits.push(formatBytes(source.retention.maxBytes));
-  return limits.length ? limits.join(' · ') : t(locale, '외부 정책', 'External policy');
+  if (Number.isFinite(policy.maxAgeDays) && Number(policy.maxAgeDays) >= 0) {
+    limits.push(t(locale, `${policy.maxAgeDays}일`, `${policy.maxAgeDays}d`));
+  }
+  if (Number.isFinite(policy.maxRecords) && Number(policy.maxRecords) >= 0) {
+    const recordCount = Number(policy.maxRecords);
+    const records = recordCount.toLocaleString();
+    const recordUnit = recordCount === 1 ? 'record' : 'records';
+    const scope = policy.recordScope === 'daily-partition'
+      ? t(locale, `일당 ${records}건`, `${records} ${recordUnit}/day`)
+      : policy.recordScope === 'artifact'
+        ? t(locale, `파일당 ${records}건`, `${records} ${recordUnit}/artifact`)
+        : t(locale, `${records}건`, `${records} ${recordUnit}`);
+    limits.push(scope);
+  }
+  if (Number.isFinite(policy.maxBytes) && Number(policy.maxBytes) >= 0) {
+    limits.push(formatBytes(policy.maxBytes));
+  }
+  if (limits.length) return limits.join(' · ');
+  if (policy.policy.startsWith('replace-on-')) return t(locale, '최신 상태 1개', 'Latest state only');
+  return t(locale, '외부 정책', 'External policy');
 }
 
-function prune(source: MonitoringEvidenceSource, locale: MonitorLocale): string {
+function prune(cadence: MonitoringRetention['pruneCadence'] | null, locale: MonitorLocale): string {
+  if (cadence === null) return t(locale, '삭제 주기 미확인', 'Pruning unavailable');
   const labels: Record<MonitoringEvidenceSource['retention']['pruneCadence'], [string, string]> = {
     'replace-on-collection': ['매 수집 때 교체', 'replace each collection'],
     'every-collection': ['매 수집 때 정리', 'prune each collection'],
@@ -320,7 +403,58 @@ function prune(source: MonitoringEvidenceSource, locale: MonitorLocale): string 
     'replace-on-change': ['변경 시 교체', 'replace on change'],
     'external-no-auto-prune': ['외부 관리·자동 삭제 없음', 'external; no auto-prune'],
   };
-  return t(locale, ...labels[source.retention.pruneCadence]);
+  return t(locale, ...labels[cadence]);
+}
+
+function roleLabel(role: Exclude<CoverageRetentionRole, null>, locale: MonitorLocale): string {
+  return role === 'state' ? t(locale, '상태', 'State') : t(locale, '전환', 'Events');
+}
+
+function sourceCountLabel(count: number, locale: MonitorLocale): string {
+  return t(locale, `${count}개 소스`, `${count} ${count === 1 ? 'source' : 'sources'}`);
+}
+
+function distinct(values: string[]): string[] {
+  return [...new Set(values)];
+}
+
+function retentionSummary(row: CoverageRow, locale: MonitorLocale): string {
+  const entries = row.retentionSources;
+  if (!entries.length) return t(locale, '0개 소스 · 정책 미확인', '0 sources · policy unavailable');
+  if (row.rule) {
+    return `${sourceCountLabel(entries.length, locale)} · ${entries.map((entry) => {
+      const role = entry.role ? roleLabel(entry.role, locale) : safeText(entry.sourceId, '—', 64);
+      return `${role}: ${retention(entry.retention, locale)}`;
+    }).join(' / ')}`;
+  }
+  const limits = distinct(entries.map((entry) => retention(entry.retention, locale)));
+  if (entries.length === 1) return `${sourceCountLabel(1, locale)} · ${limits[0]}`;
+  if (limits.length === 1) {
+    return t(
+      locale,
+      `${entries.length}개 소스 · 소스별 공통 상한 ${limits[0]}`,
+      `${entries.length} sources · common per-source cap ${limits[0]}`,
+    );
+  }
+  return t(
+    locale,
+    `${entries.length}개 소스 · 서로 다른 소스별 상한 ${limits.join(' / ')}`,
+    `${entries.length} sources · distinct per-source caps ${limits.join(' / ')}`,
+  );
+}
+
+function pruneSummary(row: CoverageRow, locale: MonitorLocale): string {
+  const entries = row.retentionSources;
+  if (!entries.length) return t(locale, '삭제 주기 미확인', 'Pruning unavailable');
+  if (row.rule) {
+    return entries.map((entry) => {
+      const role = entry.role ? roleLabel(entry.role, locale) : safeText(entry.sourceId, '—', 64);
+      return `${role}: ${prune(entry.retention?.pruneCadence ?? null, locale)}`;
+    }).join(' / ');
+  }
+  const cadences = distinct(entries.map((entry) => prune(entry.retention?.pruneCadence ?? null, locale)));
+  if (cadences.length === 1) return cadences[0];
+  return t(locale, `소스별 정리 ${cadences.join(' / ')}`, `Per-source pruning ${cadences.join(' / ')}`);
 }
 
 function monitorDetailPage(value: string): MonitorDetailPage | null {
@@ -334,6 +468,20 @@ function sourceLogHref(range: TimeRange, sourceId?: string): string {
   return `${monitorPathForPage('logs')}?${search.toString()}`;
 }
 
+export function CoverageRetentionDetails({ row, locale }: {
+  row: CoverageRow;
+  locale: MonitorLocale;
+}) {
+  return <div className="coverage-rule-contract"><strong>{t(locale, '소스별 수집·보존 계약', 'Per-source collection and retention')}</strong><dl>{row.retentionSources.map((entry, index) => {
+    const sourceName = entry.source?.displayName[locale] ?? safeText(entry.sourceId, '—', 96);
+    const artifactLabel = entry.source?.artifactLabel ?? safeText(entry.sourceId, '—', 96);
+    const cadence = entry.source
+      ? cadenceLabel(entry.cadenceSeconds, locale)
+      : t(locale, '소스 주기 미확인', 'Source cadence unavailable');
+    return <div key={`${entry.sourceId}:${entry.role ?? index}`}><dt>{entry.role ? `${roleLabel(entry.role, locale)} · ` : ''}{safeText(sourceName, '—', 128)}</dt><dd><code>{safeText(artifactLabel, '—', 128)}</code><br />{t(locale, '수집', 'Cadence')}: {cadence}<br />{t(locale, '보존 상한', 'Retention cap')}: {retention(entry.retention, locale)}<br />{t(locale, '삭제 주기', 'Pruning')}: {prune(entry.retention?.pruneCadence ?? null, locale)}</dd></div>;
+  })}</dl></div>;
+}
+
 function RowDetail({ row, sourceMap, locale, range, onOpenSource }: {
   row: CoverageRow;
   sourceMap: Map<string, MonitoringEvidenceSource>;
@@ -345,6 +493,7 @@ function RowDetail({ row, sourceMap, locale, range, onOpenSource }: {
     <p>{row.description}</p>
     {row.rule && <div className="coverage-rule-contract"><dl><div><dt>{t(locale, '지표', 'Metric')}</dt><dd><code>{row.rule.metric}</code></dd></div><div><dt>{t(locale, '발화 조건', 'Firing')}</dt><dd>{row.rule.operator} {row.rule.threshold} · {row.rule.forSamples} samples / {row.rule.forSeconds}s</dd></div><div><dt>{t(locale, '복구 조건', 'Recovery')}</dt><dd>{row.rule.recoveryThreshold} · {row.rule.recoverySamples} samples / {row.rule.recoverySeconds}s</dd></div><div><dt>No data</dt><dd>{row.rule.noDataPolicy} · {row.rule.noDataSamples} samples / {row.rule.noDataSeconds}s</dd></div><div><dt>{t(locale, '상위 규칙', 'Parent')}</dt><dd>{row.rule.parentRuleId ?? '—'}</dd></div><div><dt>{t(locale, '규칙 팩 주기', 'Configured interval')}</dt><dd>{cadenceLabel(row.rule.configuredEvaluationIntervalSeconds, locale)}</dd></div></dl><p><strong>{t(locale, '조치 안내', 'Runbook')}</strong>{row.rule.runbook}</p></div>}
     {row.states?.length ? <details className="coverage-target-states"><summary>{t(locale, `대상별 최신 평가 ${row.states.length}개`, `${row.states.length} target evaluations`)}</summary><div className="coverage-state-table-wrap"><table><thead><tr><th>{t(locale, '대상', 'Target')}</th><th>Phase</th><th>{t(locale, '관측값', 'Value')}</th><th>{t(locale, '관측 상태', 'Observation')}</th><th>{t(locale, '평가 시각', 'Evaluated')}</th></tr></thead><tbody>{row.states.slice(0, 100).map((state) => <tr key={`${state.ruleId}:${state.target}`}><td><code>{safeText(state.target, '—', 128)}</code></td><td>{state.phase}</td><td>{state.lastValue ?? '—'}</td><td>{state.observationStatus}</td><td>{formatDateTime(state.lastEvaluatedAt, locale)}</td></tr>)}</tbody></table></div>{row.states.length > 100 && <p>{t(locale, '화면 안전 한도로 첫 100개 대상만 표시합니다.', 'Only the first 100 targets are shown in this bounded view.')}</p>}</details> : null}
+    <CoverageRetentionDetails row={row} locale={locale} />
     <div className="coverage-evidence-links"><strong>{t(locale, '판단 근거·저장 기록', 'Evidence and stored records')}</strong><div>{row.sourceIds.map((sourceId) => {
       const source = sourceMap.get(sourceId);
       if (!source) return <span key={sourceId}><code>{sourceId}</code></span>;
@@ -453,7 +602,7 @@ export function MonitoringCoverage({ data, range, locale, onUnauthorized }: {
               <td><span className={`coverage-kind kind-${row.kind}`}>{kindLabel(row.kind, locale)}</span></td>
               <td>{evidenceLabel(row.evidenceMode, locale)}</td>
               <td>{cadenceLabel(row.cadenceSeconds, locale)}</td>
-              <td>{source ? <><strong>{retention(source, locale)}</strong><small>{prune(source, locale)}</small></> : <><strong>{row.kind === 'check' ? t(locale, '최신 상태 1개', 'Latest state') : '—'}</strong><small>{row.kind === 'check' ? t(locale, '전환은 별도 누적', 'Transitions retained separately') : ''}</small></>}</td>
+              <td><strong>{retentionSummary(row, locale)}</strong><small>{pruneSummary(row, locale)}</small></td>
               <td><span className={`coverage-status status-${row.status.tone}`}><b>{row.status.tone === 'danger' ? '▲' : row.status.tone === 'caution' ? '●' : row.status.tone === 'ok' ? '✓' : '—'}</b><span><strong>{row.status.label}</strong><small>{row.status.detail}</small></span></span></td>
               <td><div className="coverage-actions">{row.genericSource ? <a href={sourceLogHref(range, row.genericSource.sourceId)} aria-label={t(locale, `${row.label} 로그 열기`, `Open ${row.label} logs`)}><Icon name="clock" size={14} /></a> : source && source.id.startsWith('generic-log') ? <a href={sourceLogHref(range)} aria-label={t(locale, '일반 로그 열기', 'Open generic logs')}><Icon name="clock" size={14} /></a> : source && !['system-update-state', 'infrastructure-ledger', 'agent-inventory'].includes(source.id) ? <button type="button" onClick={() => setSelectedSource(source)} aria-label={t(locale, `${row.label} 저장 기록 보기`, `View ${row.label} records`)}><Icon name="clock" size={14} /></button> : firstPage ? <a href={`${monitorPathForPage(firstPage)}?range=${encodeURIComponent(range)}`} aria-label={t(locale, `${row.label} 상세 열기`, `Open ${row.label} detail`)}><Icon name="chevron" size={14} /></a> : null}<button type="button" onClick={() => setExpanded(open ? null : row.id)} aria-label={open ? t(locale, '설명 접기', 'Collapse details') : t(locale, '설명 펼치기', 'Expand details')}><span>{open ? '−' : '+'}</span></button></div></td>
             </tr>

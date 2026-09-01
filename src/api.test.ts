@@ -1,5 +1,12 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { getGenericLogs, getMonitoringCatalog, type GenericLogPage, type MonitoringCatalog } from './api';
+import {
+  getGenericLogs,
+  getMonitoringCatalog,
+  getRemoteAgents,
+  type GenericLogPage,
+  type MonitoringCatalog,
+} from './api';
+import type { RemoteAgentInventoryResponse } from './types';
 
 const EMPTY_PAGE: GenericLogPage = {
   schemaVersion: 1,
@@ -83,6 +90,32 @@ describe('monitoring catalog API client', () => {
     await expect(getMonitoringCatalog(controller.signal)).resolves.toBe(catalog);
 
     expect(fetchMock).toHaveBeenCalledWith('/monitor/api/monitoring-catalog', {
+      credentials: 'same-origin',
+      headers: { Accept: 'application/json' },
+      signal: controller.signal,
+    });
+  });
+});
+
+describe('remote agent API client', () => {
+  it('uses the authenticated management endpoint and forwards cancellation', async () => {
+    const inventory = {
+      serverTime: '2026-09-01T00:00:00.000Z',
+      transport: { tlsTermination: 'trusted-reverse-proxy', applicationVerifies: [] },
+      queue: {},
+      agents: [],
+    } as unknown as RemoteAgentInventoryResponse;
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => ({
+      ok: true,
+      status: 200,
+      json: async () => inventory,
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+    const controller = new AbortController();
+
+    await expect(getRemoteAgents(controller.signal)).resolves.toBe(inventory);
+
+    expect(fetchMock).toHaveBeenCalledWith('/monitor/api/agents', {
       credentials: 'same-origin',
       headers: { Accept: 'application/json' },
       signal: controller.signal,
