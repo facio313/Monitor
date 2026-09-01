@@ -395,12 +395,13 @@ describe('operational health assessment', () => {
     expect(operationalFindings(data).find((entry) => entry.id === 'docker-event-coverage')).toMatchObject({ level: 'danger', scope: 'last-known' });
   });
 
-  it('downgrades a known read-only sensitive bind but flags writable or unknown access', () => {
+  it('preserves unmanaged sensitive-bind caution and danger semantics', () => {
     const data = payload();
     data.containers = [{
       name: 'monitor', project: 'monitor', owner: 'cks', state: 'running', health: 'healthy',
       healthcheckConfigured: true, cpuPercent: 1, memoryBytes: 100, memoryPercent: 1,
       sensitiveBindMounted: true, writableSensitiveBindMounted: false,
+      mountPolicyStatus: 'unmanaged',
     }];
 
     expect(operationalFindings(data).find((entry) => entry.id === 'container-security')).toMatchObject({
@@ -418,6 +419,93 @@ describe('operational health assessment', () => {
     expect(operationalFindings(data).find((entry) => entry.id === 'container-security')).toMatchObject({
       level: 'danger', count: 1,
       evidence: [expect.stringContaining('쓰기 권한 미확인'), expect.stringContaining('writability unverified')],
+    });
+
+    data.containerCollection = {
+      status: 'last-known', observedAt: '2026-08-29T23:59:00Z',
+    };
+    expect(operationalFindings(data).find((entry) => entry.id === 'container-security')).toMatchObject({
+      level: 'caution', scope: 'last-known', count: 1,
+    });
+  });
+
+  it('suppresses only sensitive-bind findings for a freshly approved mount policy', () => {
+    const data = payload();
+    data.containers = [{
+      name: 'monitor', project: 'monitor', owner: 'cks', state: 'running', health: 'healthy',
+      healthcheckConfigured: true, cpuPercent: 1, memoryBytes: 100, memoryPercent: 1,
+      sensitiveBindMounted: true, writableSensitiveBindMounted: true,
+      mountPolicyStatus: 'approved',
+    }];
+
+    expect(operationalFindings(data).find((entry) => entry.id === 'container-security')).toBeUndefined();
+
+    data.containers[0].privileged = true;
+    const securityFinding = operationalFindings(data).find((entry) => entry.id === 'container-security');
+    expect(securityFinding).toMatchObject({
+      level: 'danger', count: 1,
+      evidence: [expect.stringContaining('privileged'), expect.stringContaining('privileged')],
+    });
+    expect(securityFinding?.evidence.join(' ')).not.toContain('writable sensitive bind');
+  });
+
+  it('reports mount-policy drift and unknown evidence as explicit danger', () => {
+    const data = payload();
+    data.containers = [{
+      name: 'monitor', project: 'monitor', owner: 'cks', state: 'running', health: 'healthy',
+      healthcheckConfigured: true, cpuPercent: 1, memoryBytes: 100, memoryPercent: 1,
+      sensitiveBindMounted: false, writableSensitiveBindMounted: false,
+      mountPolicyStatus: 'drift',
+    }];
+
+    expect(operationalFindings(data).find((entry) => entry.id === 'container-security')).toMatchObject({
+      level: 'danger', count: 1,
+      evidence: [expect.stringContaining('마운트 정책 이탈'), expect.stringContaining('mount policy drift')],
+    });
+
+    data.containers[0].mountPolicyStatus = 'unknown';
+    expect(operationalFindings(data).find((entry) => entry.id === 'container-security')).toMatchObject({
+      level: 'danger', count: 1,
+      evidence: [expect.stringContaining('마운트 정책 확인 불가'), expect.stringContaining('mount policy unverified')],
+    });
+
+    data.containerCollection = {
+      status: 'last-known', observedAt: '2026-08-29T23:59:00Z',
+    };
+    expect(operationalFindings(data).find((entry) => entry.id === 'container-security')).toMatchObject({
+      level: 'danger', scope: 'last-known', count: 1,
+    });
+  });
+
+  it('treats a nonfresh approved mount policy as unverified danger', () => {
+    const data = payload();
+    data.containerCollection = {
+      status: 'last-known',
+      observedAt: '2026-08-29T23:59:00Z',
+    };
+    data.containers = [{
+      name: 'monitor', project: 'monitor', owner: 'cks', state: 'running', health: 'healthy',
+      healthcheckConfigured: true, cpuPercent: 1, memoryBytes: 100, memoryPercent: 1,
+      sensitiveBindMounted: true, writableSensitiveBindMounted: true,
+      mountPolicyStatus: 'approved',
+    }];
+
+    expect(operationalFindings(data).find((entry) => entry.id === 'container-security')).toMatchObject({
+      level: 'danger', scope: 'last-known', count: 1,
+      evidence: [
+        expect.stringContaining('최신 확인 불가'),
+        expect.stringContaining('not freshly verified'),
+      ],
+    });
+
+    data.containerCollection.status = 'fresh';
+    data.stale = true;
+    expect(operationalFindings(data).find((entry) => entry.id === 'container-security')).toMatchObject({
+      level: 'danger', scope: 'last-known', count: 1,
+      evidence: [
+        expect.stringContaining('최신 확인 불가'),
+        expect.stringContaining('not freshly verified'),
+      ],
     });
   });
 

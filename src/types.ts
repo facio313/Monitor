@@ -585,6 +585,7 @@ export interface ContainerStatus {
   dockerSocketMounted?: boolean | null;
   sensitiveBindMounted?: boolean | null;
   writableSensitiveBindMounted?: boolean | null;
+  mountPolicyStatus?: 'approved' | 'drift' | 'unknown' | 'unmanaged';
   rootUser?: boolean | null;
   readOnlyRootFilesystem?: boolean | null;
   addedCapabilityCount?: number | null;

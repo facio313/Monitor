@@ -60,19 +60,26 @@ The default output root is `/var/lib/monitor-export`:
   Each disk is exactly `mount`, `totalBytes`, `usedBytes`, `availableBytes`,
   `usedPercent`, `inodeUsedPercent`, and `readOnly`. Inode usage is aggregate;
   filenames and inode identities are never collected.
-  Each new current `containers` row is the exact 57-field reduced v3 contract.
+  Each new current `containers` row is the exact 58-field reduced v4 contract.
   Its first 17 fields preserve the v2 migration prefix:
   `name`, `project`, `owner`, `state`, `health`,
   `healthcheckConfigured`, `cpuPercent`, `memoryBytes`, `memoryPercent`,
   `memoryLimitBytes`, `cpuLimitCores`, `pidLimit`, `restartCount`,
   `restartCountDelta`, `oomKilled`, `startedAt`, and `finishedAt`.
-  The v3 suffix is the opaque `instanceId`; current PID and CPU-throttle
+  The v3-compatible suffix is the opaque `instanceId`; current PID and CPU-throttle
   readings; block-I/O and network totals/rates; writable-layer bytes and
   volume/bind/tmpfs/network/published-port counts; fixed security booleans,
   including whether any bind from a sensitive host source is writable;
   capability counts; and
   validated image name, tag, content digest/source,
   latest-tag, current-replica drift, and same-reference digest-change state.
+  The v4 field `mountPolicyStatus` is `approved`, `drift`, `unknown`, or
+  `unmanaged`. Approval requires a fresh identity-bound inspect whose complete
+  host-storage multiset, plus targeted named-volume metadata where applicable,
+  exactly matches a compiled reviewed profile. Missing, extra, changed,
+  duplicated, malformed, stale, or unverifiable evidence never becomes
+  approved. V3 retained rows remain readable and normalize reviewed services
+  to `unknown` rather than inheriting approval.
   `cpuThrottledPercent` is the delta of cumulative throttled time divided by
   the sample wall-clock interval; `cpuThrottledPeriods` remains a cumulative
   diagnostic counter and is not treated as a utilization percentage.
@@ -276,7 +283,7 @@ value is clamped to at most 16 MiB. The ordinary event/privilege input bound
 remains separately controlled by `MONITOR_MAX_INPUT_BYTES`.
 
 The unprivileged Docker helper reduces each workload immediately to the fixed
-v3 current contract documented above. It never exports a container ID,
+v4 current contract documented above. It never exports a container ID,
 command, environment, raw mount path, network address, Docker Actor attribute,
 or Docker inspect document. A validated image repository/tag and SHA-256
 content identifier are exported because they are required deployment evidence;

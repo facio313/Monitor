@@ -104,6 +104,177 @@ def reduced_stats(read: str = "2026-08-30T12:01:00Z") -> dict[str, object]:
 
 
 class DockerTelemetryV3Tests(unittest.TestCase):
+    def test_reviewed_mount_profile_requires_an_exact_complete_multiset(self) -> None:
+        profile = (
+            (
+                "bind", "", "/etc/reviewed/config", "/config", "",
+                False, "ro", "rprivate",
+            ),
+            (
+                "volume", "reviewed-data", "/var/lib/docker/volumes/reviewed-data/_data",
+                "/data", "local", True, "rw", "",
+            ),
+        )
+        mounts = [
+            {
+                "Type": "bind",
+                "Source": "/etc/reviewed/config",
+                "Destination": "/config",
+                "RW": False,
+                "Mode": "ro",
+                "Propagation": "rprivate",
+            },
+            {
+                "Type": "volume",
+                "Name": "reviewed-data",
+                "Source": "/var/lib/docker/volumes/reviewed-data/_data",
+                "Destination": "/data",
+                "Driver": "local",
+                "RW": True,
+                "Mode": "rw",
+                "Propagation": "",
+            },
+        ]
+        approved = collector._reduce_mount_summary(
+            list(reversed(mounts)), profile, {"reviewed-data": True},
+        )
+        self.assertEqual(approved["mountPolicyStatus"], "approved")
+        self.assertNotIn("/etc/reviewed", json.dumps(approved))
+        self.assertNotIn("reviewed-data", json.dumps(approved))
+
+        changes = (
+            mounts[:1],
+            [*mounts, mounts[0]],
+            [*mounts, {
+                "Type": "bind", "Source": "/etc/reviewed/extra",
+                "Destination": "/extra", "RW": False, "Mode": "ro",
+                "Propagation": "rprivate",
+            }],
+            [{**mounts[0], "Source": "/etc/reviewed/other"}, mounts[1]],
+            [{**mounts[0], "Destination": "/other"}, mounts[1]],
+            [{**mounts[0], "RW": True}, mounts[1]],
+            [{**mounts[0], "Mode": ""}, mounts[1]],
+            [{**mounts[0], "Propagation": "rshared"}, mounts[1]],
+        )
+        for changed in changes:
+            with self.subTest(changed=changed):
+                self.assertEqual(
+                    collector._reduce_mount_summary(
+                        changed, profile, {"reviewed-data": True},
+                    )["mountPolicyStatus"],
+                    "drift",
+                )
+
+        malformed = [{key: value for key, value in mounts[0].items() if key != "RW"}, mounts[1]]
+        self.assertEqual(
+            collector._reduce_mount_summary(
+                malformed, profile, {"reviewed-data": True},
+            )["mountPolicyStatus"],
+            "unknown",
+        )
+        for malformed_bind in (
+            [{**mounts[0], "Name": "unexpected"}, mounts[1]],
+            [{**mounts[0], "Driver": "local"}, mounts[1]],
+            [{**mounts[0], "Source": "/etc/reviewed/../reviewed/config"}, mounts[1]],
+        ):
+            with self.subTest(malformed_bind=malformed_bind):
+                self.assertEqual(
+                    collector._reduce_mount_summary(
+                        malformed_bind, profile, {"reviewed-data": True},
+                    )["mountPolicyStatus"],
+                    "unknown",
+                )
+        self.assertEqual(
+            collector._reduce_mount_summary(
+                mounts, profile, {"reviewed-data": False},
+            )["mountPolicyStatus"],
+            "drift",
+        )
+        self.assertEqual(
+            collector._reduce_mount_summary(
+                mounts, profile, {"reviewed-data": None},
+            )["mountPolicyStatus"],
+            "unknown",
+        )
+        self.assertEqual(
+            collector._reduce_mount_summary(mounts)["mountPolicyStatus"],
+            "unmanaged",
+        )
+
+    def test_reviewed_monitor_runtime_profile_is_approved_without_exporting_paths(self) -> None:
+        inspect = {
+            "Config": {"Labels": {
+                "com.docker.compose.project": "monitor",
+                "com.docker.compose.service": "monitor",
+            }},
+            "Mounts": [
+                {
+                    "Type": "bind", "Source": "/var/lib/monitor-security",
+                    "Destination": "/var/lib/monitor-security", "RW": True,
+                    "Mode": "", "Propagation": "rprivate",
+                },
+                {
+                    "Type": "bind", "Source": "/var/lib/monitor-export",
+                    "Destination": "/data", "RW": False,
+                    "Mode": "", "Propagation": "rprivate",
+                },
+                {
+                    "Type": "bind", "Source": "/home/cks/.config/monitor/edge-secret",
+                    "Destination": "/run/secrets/monitor_edge_secret", "RW": False,
+                    "Mode": "", "Propagation": "rprivate",
+                },
+                {
+                    "Type": "bind", "Source": "/var/lib/monitor-update-socket",
+                    "Destination": "/run/monitor-update", "RW": False,
+                    "Mode": "", "Propagation": "rprivate",
+                },
+            ],
+        }
+        reduced = collector.reduce_container_inspect(inspect)
+        self.assertEqual(reduced["MountSummary"]["mountPolicyStatus"], "approved")
+        serialized = json.dumps(reduced)
+        self.assertNotIn("/home/cks", serialized)
+        self.assertNotIn("/var/lib/monitor", serialized)
+
+    def test_reviewed_volume_metadata_is_bounded_and_exact(self) -> None:
+        expected_name = "bonifacio-sso-data"
+        expected = {
+            "Name": expected_name,
+            "Driver": "local",
+            "Scope": "local",
+            "Options": None,
+            "Mountpoint": "/home/cks/.local/share/docker/volumes/bonifacio-sso-data/_data",
+        }
+        self.assertTrue(collector.review_volume_metadata(expected, expected_name))
+        missing_options = dict(expected)
+        missing_options.pop("Options")
+        self.assertIsNone(collector.review_volume_metadata(missing_options, expected_name))
+        self.assertFalse(collector.review_volume_metadata(
+            {**expected, "Options": {"type": "none", "device": "/etc"}}, expected_name,
+        ))
+        self.assertFalse(collector.review_volume_metadata(
+            {**expected, "Mountpoint": "/tmp/unreviewed"}, expected_name,
+        ))
+        self.assertIsNone(collector.review_volume_metadata(
+            {
+                **expected,
+                "Mountpoint": (
+                    "/home/cks/.local/share/docker/volumes/unused/../"
+                    "bonifacio-sso-data/_data"
+                ),
+            },
+            expected_name,
+        ))
+        self.assertIsNone(collector.review_volume_metadata(
+            {**expected, "Options": {"bad": "x\x00y"}}, expected_name,
+        ))
+        self.assertEqual(
+            collector.reviewed_volume_request_path(expected_name),
+            "/v1.41/volumes/bonifacio-sso-data",
+        )
+        with self.assertRaises(ValueError):
+            collector.reviewed_volume_request_path("unreviewed")
+
     def test_sensitive_bind_writability_is_reduced_without_exporting_paths(self) -> None:
         read_only = collector.reduce_container_inspect({
             "Mounts": [{
@@ -237,12 +408,54 @@ class DockerTelemetryV3Tests(unittest.TestCase):
 
         normalized = collector.normalize_container_values([row], NOW + dt.timedelta(seconds=60))
         self.assertEqual(normalized, [row])
+        self.assertEqual(row["mountPolicyStatus"], "unknown")
+        v3_row = dict(row)
+        v3_row.pop("mountPolicyStatus")
+        v3_normalized = collector.normalize_container_values(
+            [v3_row], NOW + dt.timedelta(seconds=60)
+        )
+        self.assertEqual(v3_normalized[0]["mountPolicyStatus"], "unknown")
         legacy_row = dict(row)
+        legacy_row.pop("mountPolicyStatus")
         legacy_row.pop("writableSensitiveBindMounted")
         legacy_normalized = collector.normalize_container_values(
             [legacy_row], NOW + dt.timedelta(seconds=60)
         )
         self.assertIsNone(legacy_normalized[0]["writableSensitiveBindMounted"])
+        self.assertEqual(legacy_normalized[0]["mountPolicyStatus"], "unknown")
+        unmanaged_v3 = {
+            **v3_row,
+            "name": "blog-frontend",
+            "project": "blog",
+        }
+        self.assertEqual(
+            collector.normalize_container_values(
+                [unmanaged_v3], NOW + dt.timedelta(seconds=60)
+            )[0]["mountPolicyStatus"],
+            "unmanaged",
+        )
+        with self.assertRaises(ValueError):
+            collector.normalize_container_values(
+                [{**row, "mountPolicyStatus": "trusted"}], NOW,
+            )
+        with self.assertRaises(ValueError):
+            collector.normalize_container_values(
+                [{**row, "mountPolicyStatus": "unmanaged"}], NOW,
+            )
+        unmanaged_v4 = {
+            **row,
+            "name": "blog-frontend",
+            "project": "blog",
+            "mountPolicyStatus": "unmanaged",
+        }
+        self.assertEqual(
+            collector.normalize_container_values([unmanaged_v4], NOW)[0],
+            unmanaged_v4,
+        )
+        with self.assertRaises(ValueError):
+            collector.normalize_container_values(
+                [{**unmanaged_v4, "mountPolicyStatus": "approved"}], NOW,
+            )
         with self.assertRaises(ValueError):
             collector.normalize_container_values([{**row, "rawMount": "/secret"}], NOW)
         with self.assertRaises(ValueError):

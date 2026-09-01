@@ -43,16 +43,31 @@ function digestLabel(value: string | null | undefined): string {
   return value.length > 27 ? `${value.slice(0, 19)}…${value.slice(-7)}` : value;
 }
 
-function securityFindings(container: ContainerStatus, locale: MonitorLocale): string[] {
+function securityFindings(
+  container: ContainerStatus,
+  locale: MonitorLocale,
+  mountPolicyIsFresh: boolean,
+): string[] {
   const findings: string[] = [];
   if (container.privileged) findings.push(t(locale, 'privileged 모드', 'Privileged mode'));
   if (container.dockerSocketMounted) findings.push(t(locale, 'Docker 소켓 연결', 'Docker socket mounted'));
   if (container.hostPid) findings.push(t(locale, '호스트 PID 공유', 'Host PID namespace'));
   if (container.hostIpc) findings.push(t(locale, '호스트 IPC 공유', 'Host IPC namespace'));
   if (container.hostNetwork) findings.push(t(locale, '호스트 네트워크 공유', 'Host network'));
-  if (container.sensitiveBindMounted && container.writableSensitiveBindMounted === true) {
+  const mountPolicyStatus = container.mountPolicyStatus ?? 'unmanaged';
+  if (mountPolicyStatus === 'approved' && !mountPolicyIsFresh) {
+    findings.push(t(
+      locale,
+      '승인된 마운트 정책 최신 확인 불가',
+      'Approved mount policy is not freshly verified',
+    ));
+  } else if (mountPolicyStatus === 'drift') {
+    findings.push(t(locale, '마운트 정책 이탈', 'Mount policy drift'));
+  } else if (mountPolicyStatus === 'unknown') {
+    findings.push(t(locale, '마운트 정책 확인 불가', 'Mount policy unverified'));
+  } else if (mountPolicyStatus === 'unmanaged' && container.sensitiveBindMounted && container.writableSensitiveBindMounted === true) {
     findings.push(t(locale, '쓰기 가능한 민감 경로 bind', 'Writable sensitive bind mount'));
-  } else if (container.sensitiveBindMounted && container.writableSensitiveBindMounted !== false) {
+  } else if (mountPolicyStatus === 'unmanaged' && container.sensitiveBindMounted && container.writableSensitiveBindMounted !== false) {
     findings.push(t(locale, '민감 bind 쓰기 권한 미확인', 'Sensitive bind writability unverified'));
   }
   if (container.rootUser) findings.push(t(locale, 'root 사용자', 'Root user'));
@@ -91,7 +106,9 @@ export function DockerDiagnosticsPanel({ data, locale }: {
     ))
     .slice(-20)
     .reverse();
-  const findings = container ? securityFindings(container, locale) : [];
+  const findings = container
+    ? securityFindings(container, locale, !data.stale && containerCollection.status === 'fresh')
+    : [];
 
   return (
     <section className="docker-diagnostics" aria-labelledby="docker-diagnostics-heading">
@@ -200,6 +217,7 @@ export function DockerDiagnosticsPanel({ data, locale }: {
                 <div><dt>{t(locale, '호스트 IPC', 'Host IPC')}</dt><dd>{booleanState(container.hostIpc, locale)}</dd></div>
                 <div><dt>{t(locale, '호스트 네트워크', 'Host network')}</dt><dd>{booleanState(container.hostNetwork, locale)}</dd></div>
                 <div><dt>{t(locale, 'Docker 소켓', 'Docker socket')}</dt><dd>{booleanState(container.dockerSocketMounted, locale)}</dd></div>
+                <div><dt>{t(locale, '마운트 정책', 'Mount policy')}</dt><dd>{safeText(container.mountPolicyStatus ?? 'unmanaged', 'unmanaged', 32)}</dd></div>
                 <div><dt>{t(locale, '민감 bind', 'Sensitive bind')}</dt><dd>{booleanState(container.sensitiveBindMounted, locale)}</dd></div>
                 <div><dt>{t(locale, '쓰기 가능한 민감 bind', 'Writable sensitive bind')}</dt><dd>{booleanState(container.writableSensitiveBindMounted, locale)}</dd></div>
                 <div><dt>{t(locale, 'root 사용자', 'Root user')}</dt><dd>{booleanState(container.rootUser, locale)}</dd></div>

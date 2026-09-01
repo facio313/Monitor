@@ -549,6 +549,7 @@ interface FindingSignal {
   ko: string;
   en: string;
   entityKey?: string;
+  retainDangerWhenLastKnown?: boolean;
 }
 
 interface LinuxFindingSignals {
@@ -840,13 +841,42 @@ function projectedContainerRuntimeSignals(data: DashboardPayload): FindingSignal
 
 function projectedContainerSecuritySignals(data: DashboardPayload): FindingSignal[] {
   const signals: FindingSignal[] = [];
+  const mountPolicyIsFresh = !data.stale && data.containerCollection?.status === 'fresh';
   for (const [index, container] of data.containers.entries()) {
     const entityKey = containerIdentity(container, index);
     const label = containerLabel(container);
-    const add = (key: string, level: OperationalFindingLevel, ko: string, en: string) => signals.push({ key: `${entityKey}:${key}`, entityKey, level, ko: `${label} ${ko}`, en: `${label} ${en}` });
+    const add = (
+      key: string,
+      level: OperationalFindingLevel,
+      ko: string,
+      en: string,
+      retainDangerWhenLastKnown = false,
+    ) => signals.push({
+      key: `${entityKey}:${key}`,
+      entityKey,
+      level,
+      ko: `${label} ${ko}`,
+      en: `${label} ${en}`,
+      retainDangerWhenLastKnown,
+    });
     if (container.privileged === true) add('privileged', 'danger', 'privileged', 'privileged');
     if (container.dockerSocketMounted === true) add('docker-socket', 'danger', 'Docker 소켓', 'Docker socket');
-    if (container.sensitiveBindMounted === true && container.writableSensitiveBindMounted === true) {
+    const mountPolicyStatus = container.mountPolicyStatus ?? 'unmanaged';
+    if (mountPolicyStatus === 'approved') {
+      if (!mountPolicyIsFresh) {
+        add(
+          'approved-mount-policy-unverified',
+          'danger',
+          '승인된 마운트 정책 최신 확인 불가',
+          'approved mount policy is not freshly verified',
+          true,
+        );
+      }
+    } else if (mountPolicyStatus === 'drift') {
+      add('mount-policy-drift', 'danger', '마운트 정책 이탈', 'mount policy drift', true);
+    } else if (mountPolicyStatus === 'unknown') {
+      add('mount-policy-unknown', 'danger', '마운트 정책 확인 불가', 'mount policy unverified', true);
+    } else if (container.sensitiveBindMounted === true && container.writableSensitiveBindMounted === true) {
       add('writable-sensitive-bind', 'danger', '쓰기 가능한 민감 bind', 'writable sensitive bind');
     } else if (container.sensitiveBindMounted === true && container.writableSensitiveBindMounted === false) {
       add('read-only-sensitive-bind', 'caution', '읽기 전용 민감 bind', 'read-only sensitive bind');
@@ -1070,9 +1100,15 @@ export function operationalFindings(data: DashboardPayload): OperationalFinding[
   if (containerSecuritySignals.length) {
     const affected = new Set(containerSecuritySignals.map((signal) => signal.entityKey).filter(Boolean));
     const securityEvidenceCurrent = data.containerCollection?.status === 'fresh';
+    const retainDangerWhenLastKnown = containerSecuritySignals.some(
+      (signal) => signal.level === 'danger' && signal.retainDangerWhenLastKnown,
+    );
     findings.push(finding(
       'container-security',
-      securityEvidenceCurrent && signalLevel(containerSecuritySignals) === 'danger' ? 'danger' : 'caution',
+      signalLevel(containerSecuritySignals) === 'danger'
+        && (securityEvidenceCurrent || retainDangerWhenLastKnown)
+        ? 'danger'
+        : 'caution',
       securityEvidenceCurrent ? snapshotScope : 'last-known',
       boundedSignalEvidence(containerSecuritySignals),
       affected.size,

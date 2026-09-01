@@ -736,15 +736,20 @@ The default root is `/var/lib/monitor-export`:
   `syntheticProbeCollection`, `syntheticProbes`, `currentTraffic`,
   `reliability`, `system`, and `linux`. Container source status distinguishes
   fresh, bounded last-known, unavailable, permission-denied, and collection
-  error observations. A new container row is the fixed 57-field reduced v3
+  error observations. A new container row is the fixed 58-field reduced v4
   contract. Its 17-field compatibility prefix covers safe identity/lifecycle,
-  health, CPU/memory, limits, restart/OOM and timestamps; the v3 suffix covers
+  health, CPU/memory, limits, restart/OOM and timestamps; the v3-compatible suffix covers
   opaque instance identity, PIDs/throttling, block I/O, network totals/rates,
   writable-layer and mount/network counts, security booleans including sensitive-bind
   writability, capability counts,
-  and validated image tag/digest/drift evidence. Missing Docker evidence remains
+  and validated image tag/digest/drift evidence. V4 adds `mountPolicyStatus`:
+  a fresh exact reviewed host-storage profile is `approved`; any valid mismatch
+  is `drift`; incomplete or stale evidence is `unknown`; services without a
+  profile are `unmanaged` and keep the prior bind heuristic. Missing Docker evidence remains
   `null`; raw IDs, commands, environment, raw mount paths, Actor attributes, and
-  network addresses are never published. Legacy seven-field rows are read with
+  network addresses and reviewed profile details are never published. Exact V3
+  rows remain readable, with reviewed services normalized to `unknown` rather
+  than approved. Legacy seven-field rows are read with
   new fields unknown, and incident evidence intentionally remains the smaller
   seven-field projection. Docker event status and at most 128 reduced lifecycle
   events are independent from list/stats freshness. Docker stdout/stderr is

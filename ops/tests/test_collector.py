@@ -529,8 +529,15 @@ class ParsingTests(unittest.TestCase):
             ),
             collector.MAX_DOCKER_LIST_RESPONSE_BYTES,
         )
+        self.assertEqual(
+            collector.docker_response_byte_limit(
+                collector.reviewed_volume_request_path("bonifacio-sso-data")
+            ),
+            collector.MAX_DOCKER_DETAIL_RESPONSE_BYTES,
+        )
         self.assertEqual(collector.MAX_DOCKER_INSPECT_REQUESTS, 30)
         self.assertEqual(collector.MAX_DOCKER_STATS_REQUESTS, 30)
+        self.assertEqual(collector.MAX_DOCKER_VOLUME_INSPECT_REQUESTS, 8)
         self.assertEqual(collector.MAX_DOCKER_DETAIL_WORKERS, 6)
 
     def test_inspect_identity_health_and_limit_contracts_fail_closed(self):
@@ -678,6 +685,83 @@ class ParsingTests(unittest.TestCase):
         self.assertIsNone(containers[0]["memoryLimitBytes"])
         self.assertEqual(next_state[f"cks:{container_id}"]["restartCount"], 9)
         self.assertNotIn("secret", json.dumps([containers, next_state]))
+
+    def test_reviewed_volume_metadata_is_verified_before_profile_approval(self):
+        container_id = "a" * 64
+        pair = ("bonifacio", "bonifacioSso")
+        profile = collector.REVIEWED_HOST_STORAGE_PROFILES[pair]
+        mounts = [
+            {
+                "Type": mount_type,
+                "Source": source,
+                "Destination": destination,
+                "RW": writable,
+                "Mode": mode,
+                "Propagation": propagation,
+                **(
+                    {"Name": name, "Driver": driver}
+                    if mount_type == "volume"
+                    else {}
+                ),
+            }
+            for (
+                mount_type, name, source, destination, driver,
+                writable, mode, propagation,
+            ) in profile
+        ]
+        volume_path = collector.reviewed_volume_request_path("bonifacio-sso-data")
+        volume_metadata = {
+            "Name": "bonifacio-sso-data",
+            "Driver": "local",
+            "Scope": "local",
+            "Options": None,
+            "Mountpoint": "/home/cks/.local/share/docker/volumes/bonifacio-sso-data/_data",
+        }
+        observed_volume_paths = []
+
+        def fake_get(_socket, path, _curl, _timeout):
+            project = docker_list_project(path)
+            if project is not None:
+                return [{
+                    "Id": container_id,
+                    "Labels": {
+                        "com.docker.compose.project": pair[0],
+                        "com.docker.compose.service": pair[1],
+                    },
+                    "State": "exited",
+                }] if project == pair[0] else []
+            if path.endswith("/json"):
+                return {
+                    "Id": container_id,
+                    "Config": {"Labels": {
+                        "com.docker.compose.project": pair[0],
+                        "com.docker.compose.service": pair[1],
+                    }},
+                    "State": {},
+                    "HostConfig": {},
+                    "Mounts": mounts,
+                    "NetworkSettings": {},
+                }
+            if path == volume_path:
+                observed_volume_paths.append(path)
+                return volume_metadata
+            return None
+
+        with mock.patch.object(collector, "docker_get", side_effect=fake_get):
+            containers, _state = collector.collect_containers(
+                {"cks": Path("/cks.sock")}, "/curl", 2,
+            )
+        self.assertEqual(len(containers), 1)
+        self.assertEqual(containers[0]["mountPolicyStatus"], "approved")
+        self.assertEqual(observed_volume_paths, [volume_path])
+        self.assertNotIn("/home/cks", json.dumps(containers))
+
+        volume_metadata["Options"] = {"type": "none", "device": "/etc"}
+        with mock.patch.object(collector, "docker_get", side_effect=fake_get):
+            containers, _state = collector.collect_containers(
+                {"cks": Path("/cks.sock")}, "/curl", 2,
+            )
+        self.assertEqual(containers[0]["mountPolicyStatus"], "drift")
 
     def test_docker_transport_rejects_oversize_and_invalid_utf8(self):
         container_id = "a" * 64

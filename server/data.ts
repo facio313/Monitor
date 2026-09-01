@@ -1167,9 +1167,17 @@ const CONTAINER_V3_FIELDS = [...CONTAINER_V2_FIELDS, ...CONTAINER_V3_ONLY_FIELDS
 const CONTAINER_V3_LEGACY_FIELDS = CONTAINER_V3_FIELDS.filter(
   (field) => field !== 'writableSensitiveBindMounted',
 );
+const CONTAINER_V4_FIELDS = [...CONTAINER_V3_FIELDS, 'mountPolicyStatus'] as const;
 type ContainerRow = DashboardResponse['containers'][number];
 type ContainerV3Extras = Pick<ContainerRow, (typeof CONTAINER_V3_ONLY_FIELDS)[number]>;
+type MountPolicyStatus = NonNullable<ContainerRow['mountPolicyStatus']>;
 const EMPTY_CONTAINER_V3_EXTRAS: ContainerV3Extras = {};
+const MOUNT_POLICY_STATUSES = new Set<MountPolicyStatus>([
+  'approved', 'drift', 'unknown', 'unmanaged',
+]);
+const REVIEWED_MOUNT_POLICY_NAMES = new Set([
+  'monitor', 'feelmyrythm-backend', 'pilgrimage-backend', 'sso', 'cks-database',
+]);
 
 function nullableContainerInteger(record: JsonRecord, field: string, maximum: number): number | null | undefined {
   const value = own(record, field);
@@ -1318,14 +1326,18 @@ function normalizeContainerList(
   return input.slice(0, maximum).flatMap((value) => {
     if (!isRecord(value)) return [];
     if (own(value, 'owner') !== 'cks') return [];
-    const v3 = CONTAINER_V3_ONLY_FIELDS.some((field) => Object.prototype.hasOwnProperty.call(value, field));
-    const v2 = !v3 && CONTAINER_V2_ONLY_FIELDS.some((field) => Object.prototype.hasOwnProperty.call(value, field));
-    const modern = v2 || v3;
+    const v4 = Object.prototype.hasOwnProperty.call(value, 'mountPolicyStatus');
+    const v3 = !v4
+      && CONTAINER_V3_ONLY_FIELDS.some((field) => Object.prototype.hasOwnProperty.call(value, field));
+    const v2 = !v4 && !v3
+      && CONTAINER_V2_ONLY_FIELDS.some((field) => Object.prototype.hasOwnProperty.call(value, field));
+    const modern = v2 || v3 || v4;
     const legacyV3 = v3
       && !Object.prototype.hasOwnProperty.call(value, 'writableSensitiveBindMounted')
       && exactKeys(value, CONTAINER_V3_LEGACY_FIELDS);
     if (
-      (v3 && !legacyV3 && !exactKeys(value, CONTAINER_V3_FIELDS))
+      (v4 && !exactKeys(value, CONTAINER_V4_FIELDS))
+      || (v3 && !legacyV3 && !exactKeys(value, CONTAINER_V3_FIELDS))
       || (v2 && !exactKeys(value, CONTAINER_V2_FIELDS))
     ) {
       return [];
@@ -1350,6 +1362,17 @@ function normalizeContainerList(
     ) {
       return [];
     }
+    const rawMountPolicyStatus = v4 ? own(value, 'mountPolicyStatus') : undefined;
+    if (v4 && !MOUNT_POLICY_STATUSES.has(rawMountPolicyStatus as MountPolicyStatus)) return [];
+    if (v4 && (
+      (REVIEWED_MOUNT_POLICY_NAMES.has(name) && rawMountPolicyStatus === 'unmanaged')
+      || (!REVIEWED_MOUNT_POLICY_NAMES.has(name) && rawMountPolicyStatus !== 'unmanaged')
+    )) return [];
+    const mountPolicyStatus: MountPolicyStatus | undefined = v4
+      ? rawMountPolicyStatus as MountPolicyStatus
+      : v3
+        ? REVIEWED_MOUNT_POLICY_NAMES.has(name) ? 'unknown' : 'unmanaged'
+        : undefined;
     const rawHealth = own(value, 'health');
     const rawState = own(value, 'state');
     const health = !modern || rawHealth === null
@@ -1400,7 +1423,7 @@ function normalizeContainerList(
       || (healthcheckConfigured === true && !['healthy', 'unhealthy', 'starting'].includes(health ?? ''))
       || (healthcheckConfigured === null && health !== null)
     )) return [];
-    const v3Extras = v3
+    const v3Extras = v3 || v4
       ? normalizeContainerV3Extras(value, legacyV3)
       : EMPTY_CONTAINER_V3_EXTRAS;
     if (v3Extras === null) return [];
@@ -1423,6 +1446,7 @@ function normalizeContainerList(
       startedAt: startedAt ?? null,
       finishedAt: finishedAt ?? null,
       ...v3Extras,
+      ...(mountPolicyStatus === undefined ? {} : { mountPolicyStatus }),
     }];
   });
 }

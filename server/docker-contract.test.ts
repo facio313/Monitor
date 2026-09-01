@@ -6,6 +6,7 @@ import { readDashboard } from './data.js';
 
 const NOW = Date.parse('2026-08-30T12:01:00Z');
 const directories: string[] = [];
+type MountPolicyStatus = 'approved' | 'drift' | 'unknown' | 'unmanaged';
 
 function directory(): string {
   const path = mkdtempSync(join(tmpdir(), 'monitor-docker-contract-'));
@@ -17,7 +18,7 @@ afterEach(() => {
   while (directories.length) rmSync(directories.pop()!, { recursive: true, force: true });
 });
 
-function container() {
+function container(mountPolicyStatus: MountPolicyStatus = 'approved') {
   return {
     name: 'monitor', project: 'monitor', owner: 'cks', state: 'running', health: 'healthy',
     healthcheckConfigured: true, cpuPercent: 95, memoryBytes: 900, memoryPercent: 90,
@@ -32,6 +33,7 @@ function container() {
     tmpfsMountCount: 1, networkAttachmentCount: 1, publishedPortCount: 1,
     privileged: true, hostPid: true, hostIpc: false, hostNetwork: true,
     dockerSocketMounted: true, sensitiveBindMounted: true, writableSensitiveBindMounted: true,
+    mountPolicyStatus,
     rootUser: true,
     readOnlyRootFilesystem: false, addedCapabilityCount: 2, dangerousCapabilityCount: 2,
     excessiveCapabilities: true, imageName: 'registry.example/ops/monitor', imageTag: 'latest',
@@ -68,7 +70,7 @@ function read(current: ReturnType<typeof snapshot>, now = NOW) {
   return readDashboard(root, '1h', now, 180_000);
 }
 
-describe('Docker v3 collector contract', () => {
+describe('Docker v4 collector contract', () => {
   it('preserves every bounded resource, security, image, and event field', () => {
     const result = read(snapshot());
     expect(result.containers).toEqual([{
@@ -85,7 +87,20 @@ describe('Docker v3 collector contract', () => {
     }]);
   });
 
-  it('preserves read-only sensitive binds and migrates the prior exact v3 row as unknown', () => {
+  it('preserves only mount policy statuses valid for the service review scope', () => {
+    for (const status of ['approved', 'drift', 'unknown'] as const) {
+      const current = snapshot();
+      current.containers = [container(status)];
+      expect(read(current).containers[0]?.mountPolicyStatus).toBe(status);
+    }
+    const unmanaged = snapshot();
+    unmanaged.containers = [{
+      ...container('unmanaged'), name: 'blog-frontend', project: 'blog',
+    }];
+    expect(read(unmanaged).containers[0]?.mountPolicyStatus).toBe('unmanaged');
+  });
+
+  it('preserves read-only sensitive binds and migrates prior exact v3 rows by review scope', () => {
     const readOnly = snapshot();
     readOnly.containers = [{
       ...container(),
@@ -94,15 +109,37 @@ describe('Docker v3 collector contract', () => {
     expect(read(readOnly).containers[0]).toMatchObject({
       sensitiveBindMounted: true,
       writableSensitiveBindMounted: false,
+      mountPolicyStatus: 'approved',
     });
 
-    const legacy = snapshot();
-    const legacyContainer = { ...container() } as Record<string, unknown>;
-    delete legacyContainer.writableSensitiveBindMounted;
-    legacy.containers = [legacyContainer as ReturnType<typeof container>];
-    expect(read(legacy).containers[0]).toMatchObject({
+    const v3 = snapshot();
+    const v3Container = { ...container() } as Record<string, unknown>;
+    delete v3Container.mountPolicyStatus;
+    v3.containers = [v3Container as ReturnType<typeof container>];
+    expect(read(v3).containers[0]).toMatchObject({
+      mountPolicyStatus: 'unknown',
+    });
+
+    const legacyV3 = snapshot();
+    const legacyV3Container = { ...container() } as Record<string, unknown>;
+    delete legacyV3Container.mountPolicyStatus;
+    delete legacyV3Container.writableSensitiveBindMounted;
+    legacyV3.containers = [legacyV3Container as ReturnType<typeof container>];
+    expect(read(legacyV3).containers[0]).toMatchObject({
       sensitiveBindMounted: true,
       writableSensitiveBindMounted: null,
+      mountPolicyStatus: 'unknown',
+    });
+
+    const unreviewedV3 = snapshot();
+    const unreviewedV3Container = {
+      ...container(), name: 'blog-frontend', project: 'blog',
+    } as Record<string, unknown>;
+    delete unreviewedV3Container.mountPolicyStatus;
+    unreviewedV3.containers = [unreviewedV3Container as ReturnType<typeof container>];
+    expect(read(unreviewedV3).containers[0]).toMatchObject({
+      name: 'blog-frontend',
+      mountPolicyStatus: 'unmanaged',
     });
   });
 
@@ -130,6 +167,23 @@ describe('Docker v3 collector contract', () => {
       ...container(), sensitiveBindMounted: false, writableSensitiveBindMounted: true,
     }];
     expect(read(inconsistentSensitiveBind).containers).toEqual([]);
+
+    for (const mountPolicyStatus of ['waived', null, true]) {
+      const invalidMountPolicy = snapshot();
+      invalidMountPolicy.containers = [{
+        ...container(), mountPolicyStatus,
+      } as unknown as ReturnType<typeof container>];
+      expect(read(invalidMountPolicy).containers).toEqual([]);
+    }
+    const reviewedAsUnmanaged = snapshot();
+    reviewedAsUnmanaged.containers = [container('unmanaged')];
+    expect(read(reviewedAsUnmanaged).containers).toEqual([]);
+
+    const unreviewedAsApproved = snapshot();
+    unreviewedAsApproved.containers = [{
+      ...container('approved'), name: 'blog-frontend', project: 'blog',
+    }];
+    expect(read(unreviewedAsApproved).containers).toEqual([]);
 
     const eventExtra = snapshot();
     eventExtra.dockerEvents = [{ ...event(), rawActor: 'secret' } as ReturnType<typeof event>];

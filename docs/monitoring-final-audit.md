@@ -7,7 +7,7 @@
 ## 결론
 
 현재 판정은 **통과 14개, 부분 통과 36개, 실패 0개, 미구현 0개, 검증 불가 0개**다.
-이번 구현은 Linux 상세 진단, Docker v3 및 event stream, 합성 검사, 로그·규칙·전송,
+이번 구현은 Linux 상세 진단, Docker v4 및 event stream, 합성 검사, 로그·규칙·전송,
 애플리케이션 API key·감사, 암호화 백업, opt-in 중앙 agent 경로, 복원력 gate와
 외부 dead-man을 실제 실행 경로로 만들었다. 그러나 중앙 agent/PKI, 알림 채널,
 합성 timer는 기본 운영 경로에서 명시적으로 꺼져 있거나 운영 설정이 필요하고,
@@ -62,7 +62,7 @@ include를 의도적으로 제거했다. alias는 SSO 뒤에 있으며, 원본 T
 | FA-09 | Raspberry Pi 온도, throttling, 저전압 | **통과** | `ops/linux_telemetry.py`와 rule/UI가 firmware·hwmon의 authoritative flag와 unsupported를 보존하고 전압만으로 상태를 발명하지 않는다. |
 | FA-10 | Docker daemon 상태 | 부분 통과 | typed collection/event-source 상태와 daemon 불가 rule은 있으나 daemon lifecycle/version/복구 자체의 완전한 상태 모델은 없다. |
 | FA-11 | Docker event stream | **통과** | `ops/collector.py`의 cursor/replay/reconnect/dedup/gap과 bounded privacy-reduced event, API/UI timeline이 연결된다. |
-| FA-12 | 컨테이너 CPU, 메모리, I/O, 네트워크 | **통과** | 57-field Docker v3 row가 CPU/memory/PID/throttling/block/network total·rate와 reset semantics를 제공한다. |
+| FA-12 | 컨테이너 CPU, 메모리, I/O, 네트워크 | **통과** | 58-field Docker v4 row가 CPU/memory/PID/throttling/block/network total·rate와 reset semantics를 제공한다. |
 | FA-13 | restart loop | 부분 통과 | restart total/delta·event와 duration rule은 있으나 exit code, 생존 시간, policy, manual/automatic 원인을 함께 판정하지 않는다. |
 | FA-14 | OOMKilled | 부분 통과 | inspect OOMKilled와 `oom` event/rule은 있으나 cgroup memory event 및 OOM 직전 상관 증거 bundle이 불완전하다. |
 | FA-15 | healthcheck | 부분 통과 | configured/healthy/unhealthy/unknown과 duration/recovery rule은 있으나 연속 실패 수·bounded output·최근 성공/실패 시각은 없다. |
@@ -146,7 +146,7 @@ include를 의도적으로 제거했다. alias는 SSO 뒤에 있으며, 원본 T
 
 ### FA-13 — restart loop
 
-- **근거 코드·설정:** Docker v3 `restartCount`/`restartCountDelta`/timestamps, Docker events, `ContainerRestartLoop` rule.
+- **근거 코드·설정:** Docker v4 `restartCount`/`restartCountDelta`/timestamps, Docker events, `ContainerRestartLoop` rule.
 - **실제 위험:** 수동 재시작이나 batch restart를 crash loop로 오인하고, 짧게 살다 죽는 container를 단순 count 간격 때문에 놓칠 수 있다.
 - **재현/확인:** 같은 restart delta를 가진 manual restart와 non-zero exit/restart-policy fixture를 넣으면 현재 rule 입력이 동일한지 비교한다.
 - **수정 우선순위:** P0.
@@ -166,7 +166,7 @@ include를 의도적으로 제거했다. alias는 SSO 뒤에 있으며, 원본 T
 
 ### FA-15 — healthcheck
 
-- **근거 코드·설정:** Docker v3 `health`/`healthcheckConfigured`, event stream, `ContainerUnhealthy`/`ContainerNoHealthcheck`, `DockerDiagnosticsPanel`.
+- **근거 코드·설정:** Docker v4 `health`/`healthcheckConfigured`, event stream, `ContainerUnhealthy`/`ContainerNoHealthcheck`, `DockerDiagnosticsPanel`.
 - **실제 위험:** 상태만으로는 flapping·연속 실패 원인과 마지막 정상 시각을 알 수 없고 대응자가 raw Docker를 다시 조회해야 한다.
 - **재현/확인:** inspect fixture에 여러 health log entry를 넣어도 API row가 상태·configured만 보존하는지 확인한다.
 - **수정 우선순위:** P0.
@@ -176,7 +176,7 @@ include를 의도적으로 제거했다. alias는 SSO 뒤에 있으며, 원본 T
 
 ### FA-16 — limit 대비 사용률
 
-- **근거 코드·설정:** Docker v3 CPU/memory/PID limit와 throttling fields, `ops/alert_runtime.py`, near-limit/no-limit rules.
+- **근거 코드·설정:** Docker v4 CPU/memory/PID limit와 throttling fields, `ops/alert_runtime.py`, near-limit/no-limit rules.
 - **실제 위험:** reservation·cpuset·memory high/events와 host capacity 불일치를 놓쳐 실제 pressure나 잘못된 설정을 과소평가할 수 있다.
 - **재현/확인:** cpuset-only, memory reservation, memory.high와 host RAM 초과 limit fixture를 넣어 해당 값이 public row/rule에 없는지 확인한다.
 - **수정 우선순위:** P0.
@@ -186,7 +186,7 @@ include를 의도적으로 제거했다. alias는 SSO 뒤에 있으며, 원본 T
 
 ### FA-17 — Docker Compose 프로젝트 그룹
 
-- **근거 코드·설정:** Docker v3 project/owner/name, `src/components/Dashboard.tsx` grouping, `DockerDiagnosticsPanel`, digest drift.
+- **근거 코드·설정:** Docker v4 project/owner/name, `src/components/Dashboard.tsx` grouping, `DockerDiagnosticsPanel`, digest drift.
 - **실제 위험:** 원하는 replica 수나 배포 의도가 없으면 의도된 `compose down`과 project-wide 장애를 구분하지 못한다.
 - **재현/확인:** 같은 project의 replica 하나를 제거하거나 전체를 의도적으로 내린 fixture에서 현재 aggregate와 maintenance evidence를 비교한다.
 - **수정 우선순위:** P1.
@@ -196,7 +196,7 @@ include를 의도적으로 제거했다. alias는 SSO 뒤에 있으며, 원본 T
 
 ### FA-18 — 볼륨과 writable layer
 
-- **근거 코드·설정:** Docker v3 `writableLayerBytes`, volume/bind/tmpfs counts와 `ContainerWritableLayerHigh` rule/UI.
+- **근거 코드·설정:** Docker v4 `writableLayerBytes`, volume/bind/tmpfs counts, `mountPolicyStatus`와 `ContainerWritableLayerHigh` rule/UI.
 - **실제 위험:** 어느 filesystem이 가득 차는지, orphan volume인지, 정리 시 실제 확보량이 얼마인지 알 수 없다.
 - **재현/확인:** 동일 count이나 서로 다른 host filesystem·inode 상태와 orphan volume fixture를 비교하면 현재 API가 같은 축약값만 내보낸다.
 - **수정 우선순위:** P1.

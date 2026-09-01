@@ -146,6 +146,7 @@ MAX_DOCKER_DETAIL_RESPONSE_BYTES = 256 * 1024
 MAX_DOCKER_EVENT_RESPONSE_BYTES = 1 * 1024 * 1024
 MAX_DOCKER_INSPECT_REQUESTS = 30
 MAX_DOCKER_STATS_REQUESTS = 30
+MAX_DOCKER_VOLUME_INSPECT_REQUESTS = 8
 MAX_DOCKER_DETAIL_WORKERS = 6
 MAX_DOCKER_COLLECTION_SECONDS = 20.0
 MAX_DOCKER_EVENTS = 128
@@ -172,12 +173,17 @@ CONTAINER_FIELDS = CONTAINER_V2_FIELDS + (
     "readOnlyRootFilesystem", "addedCapabilityCount",
     "dangerousCapabilityCount", "excessiveCapabilities", "imageName", "imageTag",
     "imageDigest", "imageDigestSource", "usesLatestTag", "imageDigestDrift",
-    "imageDigestChanged",
+    "imageDigestChanged", "mountPolicyStatus",
+)
+CONTAINER_V3_FIELDS = tuple(
+    field_name for field_name in CONTAINER_FIELDS
+    if field_name != "mountPolicyStatus"
 )
 CONTAINER_V3_LEGACY_FIELDS = tuple(
-    field_name for field_name in CONTAINER_FIELDS
+    field_name for field_name in CONTAINER_V3_FIELDS
     if field_name != "writableSensitiveBindMounted"
 )
+MOUNT_POLICY_STATUSES = frozenset({"approved", "drift", "unknown", "unmanaged"})
 CONTAINER_STATES = frozenset({
     "created", "running", "paused", "restarting", "removing", "exited", "dead", "unknown",
 })
@@ -253,6 +259,52 @@ ALLOWED_COMPOSE_SERVICES = {
     ("pongdang-multtara", "collector"): "multtara-collector",
     ("pongdang-multtara", "frontend"): "multtara-frontend",
 }
+
+# These are the reviewed production host-storage contracts. Raw paths and
+# volume metadata are compared only inside the unprivileged Docker exporter and
+# are discarded before public telemetry is written. Each entry is an unordered
+# multiset member with:
+#   Type, Name, Source, Destination, Driver, RW, Mode, Propagation
+REVIEWED_HOST_STORAGE_PROFILES = {
+    ("monitor", "monitor"): (
+        ("bind", "", "/home/cks/.config/monitor/edge-secret", "/run/secrets/monitor_edge_secret", "", False, "", "rprivate"),
+        ("bind", "", "/var/lib/monitor-export", "/data", "", False, "", "rprivate"),
+        ("bind", "", "/var/lib/monitor-security", "/var/lib/monitor-security", "", True, "", "rprivate"),
+        ("bind", "", "/var/lib/monitor-update-socket", "/run/monitor-update", "", False, "", "rprivate"),
+    ),
+    ("feelmyrythm", "fmrServer"): (
+        ("bind", "", "/home/cks/.config/feelmyrythm/sso-edge-secret", "/run/secrets/fmr_sso_edge_secret", "", False, "ro", "rprivate"),
+        ("volume", "feelmyrythm-fmr-uploads", "/home/cks/.local/share/docker/volumes/feelmyrythm-fmr-uploads/_data", "/data/uploads", "local", True, "rw", ""),
+    ),
+    ("pilgrimage", "pilgrimageBackend"): (
+        ("bind", "", "/home/cks/.config/pilgrimage/edge-secret", "/run/secrets/pilgrimage_sso_edge_secret", "", False, "ro", "rprivate"),
+    ),
+    ("bonifacio", "bonifacioSso"): (
+        ("bind", "", "/home/cks/.config/portfolio-sso/configuration.yml", "/config/configuration.yml", "", False, "ro", "rprivate"),
+        ("bind", "", "/home/cks/.config/portfolio-sso/secrets/admin-edge-secret", "/run/secrets/bonifacio_sso_admin_edge_secret", "", False, "", "rprivate"),
+        ("bind", "", "/home/cks/.config/portfolio-sso/secrets/session-secret", "/run/secrets/authelia_session_secret", "", False, "", "rprivate"),
+        ("bind", "", "/home/cks/.config/portfolio-sso/secrets/storage-encryption-key", "/run/secrets/authelia_storage_encryption_key", "", False, "", "rprivate"),
+        ("bind", "", "/home/cks/.config/portfolio-sso/userdb", "/data/users", "", True, "rw", "rprivate"),
+        ("bind", "", "/home/cks/.config/portfolio-sso/userdb/current", "/config/users", "", False, "ro", "rprivate"),
+        ("volume", "bonifacio-sso-data", "/home/cks/.local/share/docker/volumes/bonifacio-sso-data/_data", "/data", "local", True, "rw", ""),
+    ),
+    ("cks-database", "cksDB"): (
+        ("bind", "", "/home/cks/cksDB/data", "/var/lib/postgresql/data", "", True, "rw", "rprivate"),
+    ),
+}
+REVIEWED_VOLUME_METADATA = {
+    "feelmyrythm-fmr-uploads": (
+        "local", "local", None,
+        "/home/cks/.local/share/docker/volumes/feelmyrythm-fmr-uploads/_data",
+    ),
+    "bonifacio-sso-data": (
+        "local", "local", None,
+        "/home/cks/.local/share/docker/volumes/bonifacio-sso-data/_data",
+    ),
+}
+REVIEWED_HOST_STORAGE_PUBLIC_NAMES = frozenset(
+    ALLOWED_COMPOSE_SERVICES[key] for key in REVIEWED_HOST_STORAGE_PROFILES
+)
 ALLOWED_COMPOSE_PROJECTS = tuple(sorted({
     project for project, _service in ALLOWED_COMPOSE_SERVICES
 }))
@@ -1838,7 +1890,7 @@ def docker_response_byte_limit(request_path: str) -> int:
         r"/v1\.41/containers/[a-fA-F0-9]{12,64}/"
         r"(?:json|stats\?stream=false&one-shot=true)",
         request_path,
-    ):
+    ) or re.fullmatch(r"/v1\.41/volumes/[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", request_path):
         return MAX_DOCKER_DETAIL_RESPONSE_BYTES
     return MAX_DOCKER_LIST_RESPONSE_BYTES
 
@@ -1978,7 +2030,10 @@ def validated_container_inspect(
     return value
 
 
-def reduce_container_inspect(value: Mapping[str, Any]) -> dict[str, Any]:
+def reduce_container_inspect(
+    value: Mapping[str, Any],
+    reviewed_volumes: Mapping[str, bool | None] | None = None,
+) -> dict[str, Any]:
     """Discard inspect secrets immediately, retaining only fixed reduced inputs."""
     reduced: dict[str, Any] = {}
     restart_count = value.get("RestartCount")
@@ -2093,7 +2148,17 @@ def reduce_container_inspect(value: Mapping[str, Any]) -> dict[str, Any]:
                 )
         reduced["HostConfig"] = host
 
-    reduced["MountSummary"] = _reduce_mount_summary(value.get("Mounts"))
+    raw_labels = raw_config.get("Labels") if isinstance(raw_config.get("Labels"), Mapping) else {}
+    project = raw_labels.get("com.docker.compose.project")
+    service = raw_labels.get("com.docker.compose.service")
+    reviewed_profile = (
+        REVIEWED_HOST_STORAGE_PROFILES.get((project, service))
+        if isinstance(project, str) and isinstance(service, str)
+        else None
+    )
+    reduced["MountSummary"] = _reduce_mount_summary(
+        value.get("Mounts"), reviewed_profile, reviewed_volumes,
+    )
 
     raw_network = value.get("NetworkSettings") if isinstance(value.get("NetworkSettings"), Mapping) else {}
     networks = raw_network.get("Networks")
@@ -2172,14 +2237,77 @@ def _published_port_count(value: Any) -> int | None:
     return total
 
 
-def _reduce_mount_summary(value: Any) -> dict[str, int | bool | None]:
-    result: dict[str, int | bool | None] = {
+def reviewed_volume_request_path(name: str) -> str:
+    if name not in REVIEWED_VOLUME_METADATA:
+        raise ValueError("Docker volume is outside the reviewed metadata allowlist")
+    return "/v1.41/volumes/" + urllib.parse.quote(name, safe="")
+
+
+def review_volume_metadata(value: Any, expected_name: str) -> bool | None:
+    """Verify one allow-listed named volume without exporting its raw options."""
+    expected = REVIEWED_VOLUME_METADATA.get(expected_name)
+    required_fields = {"Name", "Driver", "Scope", "Mountpoint", "Options"}
+    if (
+        expected is None
+        or not isinstance(value, Mapping)
+        or not required_fields.issubset(value)
+    ):
+        return None
+    name = value.get("Name")
+    driver = value.get("Driver")
+    scope = value.get("Scope")
+    mountpoint = value.get("Mountpoint")
+    options = value.get("Options")
+    if (
+        not isinstance(name, str)
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", name) is None
+        or not isinstance(driver, str)
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", driver) is None
+        or not isinstance(scope, str)
+        or scope not in {"local", "global"}
+        or not isinstance(mountpoint, str)
+        or not mountpoint.startswith("/")
+        or len(mountpoint) > 4096
+        or "\x00" in mountpoint
+        or (
+            options is not None
+            and (
+                not isinstance(options, Mapping)
+                or len(options) > 16
+                or any(
+                    not isinstance(key, str)
+                    or not isinstance(candidate, str)
+                    or len(key) > 128
+                    or len(candidate) > 4096
+                    or "\x00" in key
+                    or "\x00" in candidate
+                    for key, candidate in options.items()
+                )
+            )
+        )
+    ):
+        return None
+    if os.path.normpath(mountpoint) != mountpoint:
+        return None
+    return (
+        name == expected_name
+        and (driver, scope, options, mountpoint) == expected
+    )
+
+
+def _reduce_mount_summary(
+    value: Any,
+    reviewed_profile: Sequence[tuple[str, str, str, str, str, bool, str, str]] | None = None,
+    reviewed_volumes: Mapping[str, bool | None] | None = None,
+) -> dict[str, int | bool | str | None]:
+    result: dict[str, int | bool | str | None] = {
         "volumeCount": None,
         "bindMountCount": None,
         "tmpfsMountCount": None,
         "dockerSocketMounted": None,
         "sensitiveBindMounted": None,
         "writableSensitiveBindMounted": None,
+        "mountPolicyStatus": "unknown" if reviewed_profile is not None else "unmanaged",
     }
     if not isinstance(value, list) or len(value) > MAX_CONTAINER_MOUNT_COUNT:
         return result
@@ -2187,6 +2315,8 @@ def _reduce_mount_summary(value: Any) -> dict[str, int | bool | None]:
     docker_socket = False
     sensitive_bind = False
     writable_sensitive_bind: bool | None = False
+    actual_profile: list[tuple[str, str, str, str, str, bool, str, str]] = []
+    profile_evidence_complete = True
     sensitive_roots = ("/", "/boot", "/dev", "/etc", "/home", "/proc", "/root", "/run", "/sys")
 
     def normalized_path(candidate: Any) -> str | None:
@@ -2197,13 +2327,16 @@ def _reduce_mount_summary(value: Any) -> dict[str, int | bool | None]:
             or "\x00" in candidate
         ):
             return None
-        return os.path.normpath(candidate)
+        normalized = os.path.normpath(candidate)
+        return normalized if normalized == candidate else None
 
     for raw_mount in value:
         if not isinstance(raw_mount, Mapping):
             return result
         mount_type = raw_mount.get("Type")
         if mount_type not in counts:
+            if reviewed_profile is not None:
+                profile_evidence_complete = False
             continue
         counts[mount_type] += 1
         source = normalized_path(raw_mount.get("Source"))
@@ -2231,6 +2364,63 @@ def _reduce_mount_summary(value: Any) -> dict[str, int | bool | None]:
                     writable_sensitive_bind = True
                 elif writable is not False and writable_sensitive_bind is False:
                     writable_sensitive_bind = None
+        if reviewed_profile is not None:
+            bind_metadata_absent = (
+                mount_type != "bind"
+                or ("Name" not in raw_mount and "Driver" not in raw_mount)
+            )
+            name = raw_mount.get("Name") if mount_type == "volume" else ""
+            driver = raw_mount.get("Driver") if mount_type == "volume" else ""
+            writable = raw_mount.get("RW")
+            mode = raw_mount.get("Mode")
+            propagation = raw_mount.get("Propagation")
+            if (
+                source is None
+                or destination is None
+                or not bind_metadata_absent
+                or not isinstance(writable, bool)
+                or not isinstance(mode, str)
+                or len(mode) > 128
+                or "\x00" in mode
+                or not isinstance(propagation, str)
+                or len(propagation) > 64
+                or "\x00" in propagation
+                or (
+                    mount_type == "volume"
+                    and (
+                        not isinstance(name, str)
+                        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", name) is None
+                        or not isinstance(driver, str)
+                        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", driver) is None
+                    )
+                )
+            ):
+                profile_evidence_complete = False
+            else:
+                actual_profile.append((
+                    mount_type, name, source, destination, driver,
+                    writable, mode, propagation,
+                ))
+    mount_policy_status = "unmanaged"
+    if reviewed_profile is not None:
+        if not profile_evidence_complete:
+            mount_policy_status = "unknown"
+        elif sorted(actual_profile) != sorted(reviewed_profile):
+            mount_policy_status = "drift"
+        else:
+            expected_volume_names = {
+                entry[1] for entry in reviewed_profile if entry[0] == "volume"
+            }
+            volume_states = [
+                reviewed_volumes.get(name) if reviewed_volumes is not None else None
+                for name in expected_volume_names
+            ]
+            if any(state is False for state in volume_states):
+                mount_policy_status = "drift"
+            elif any(state is not True for state in volume_states):
+                mount_policy_status = "unknown"
+            else:
+                mount_policy_status = "approved"
     return {
         "volumeCount": counts["volume"],
         "bindMountCount": counts["bind"],
@@ -2238,6 +2428,7 @@ def _reduce_mount_summary(value: Any) -> dict[str, int | bool | None]:
         "dockerSocketMounted": docker_socket,
         "sensitiveBindMounted": sensitive_bind,
         "writableSensitiveBindMounted": writable_sensitive_bind,
+        "mountPolicyStatus": mount_policy_status,
     }
 
 
@@ -2476,8 +2667,10 @@ def docker_image_details(inspect: Mapping[str, Any] | None) -> tuple[
     return repository, tag, digest, digest_source, uses_latest, reference_fingerprint
 
 
-def docker_security_details(inspect: Mapping[str, Any] | None) -> dict[str, int | bool | None]:
-    result: dict[str, int | bool | None] = {
+def docker_security_details(
+    inspect: Mapping[str, Any] | None,
+) -> dict[str, int | bool | str | None]:
+    result: dict[str, int | bool | str | None] = {
         "privileged": None,
         "hostPid": None,
         "hostIpc": None,
@@ -2490,6 +2683,7 @@ def docker_security_details(inspect: Mapping[str, Any] | None) -> dict[str, int 
         "addedCapabilityCount": None,
         "dangerousCapabilityCount": None,
         "excessiveCapabilities": None,
+        "mountPolicyStatus": None,
     }
     if not isinstance(inspect, Mapping):
         return result
@@ -2510,6 +2704,9 @@ def docker_security_details(inspect: Mapping[str, Any] | None) -> dict[str, int 
         mounts.get("writableSensitiveBindMounted")
         if isinstance(mounts.get("writableSensitiveBindMounted"), bool) else None
     )
+    mount_policy_status = mounts.get("mountPolicyStatus")
+    if mount_policy_status not in MOUNT_POLICY_STATUSES:
+        mount_policy_status = None
     if writable_sensitive_bind is None and sensitive_bind is False:
         # A pre-field reduced MountSummary still proves that no sensitive bind
         # exists, so the derived "any writable" answer is definitively false.
@@ -2552,6 +2749,7 @@ def docker_security_details(inspect: Mapping[str, Any] | None) -> dict[str, int 
         "addedCapabilityCount": capability_count,
         "dangerousCapabilityCount": dangerous_count,
         "excessiveCapabilities": excessive,
+        "mountPolicyStatus": mount_policy_status,
     })
     return result
 
@@ -2825,6 +3023,13 @@ def container_from_api(
         else {}
     )
     security = docker_security_details(inspect)
+    mount_policy_status = security["mountPolicyStatus"]
+    if mount_policy_status not in MOUNT_POLICY_STATUSES:
+        mount_policy_status = (
+            "unknown"
+            if name in REVIEWED_HOST_STORAGE_PUBLIC_NAMES
+            else "unmanaged"
+        )
     image_name, image_tag, image_digest, digest_source, uses_latest, image_fingerprint = (
         docker_image_details(inspect)
     )
@@ -2899,6 +3104,7 @@ def container_from_api(
         "usesLatestTag": uses_latest,
         "imageDigestDrift": False if image_digest is not None else None,
         "imageDigestChanged": image_digest_changed,
+        "mountPolicyStatus": mount_policy_status,
     }
 
 
@@ -3027,6 +3233,7 @@ def collect_containers(
 
     stats_by_index: dict[int, Mapping[str, Any]] = {}
     inspect_by_index: dict[int, Mapping[str, Any]] = {}
+    validated_inspect_by_index: dict[int, Mapping[str, Any]] = {}
     remaining = max(0.0, deadline - _monotonic())
     detail_request_count = len(inspect_candidates) + len(stats_candidates)
     if detail_request_count and remaining >= 0.25:
@@ -3074,13 +3281,71 @@ def collect_containers(
                         response, requested_id, public_name
                     )
                     if validated is not None:
-                        inspect_by_index[index] = reduce_container_inspect(validated)
+                        validated_inspect_by_index[index] = validated
                 else:
                     stats_by_index[index] = reduce_container_stats(response)
             done.clear()
             futures.clear()
             future = None
             response = None
+
+    # Named volumes can hide host bind options behind the same public volume
+    # name. Query only the fixed, reviewed names discovered in already
+    # identity-validated container inspections, then discard all raw metadata.
+    volume_requests: dict[str, Path] = {}
+    for index, validated in validated_inspect_by_index.items():
+        raw_config = validated.get("Config")
+        labels = raw_config.get("Labels") if isinstance(raw_config, Mapping) else None
+        project = labels.get("com.docker.compose.project") if isinstance(labels, Mapping) else None
+        service = labels.get("com.docker.compose.service") if isinstance(labels, Mapping) else None
+        profile = REVIEWED_HOST_STORAGE_PROFILES.get((project, service))
+        if profile is None:
+            continue
+        _owner, socket_path, _raw, _public_name = entries[index]
+        for entry in profile:
+            if entry[0] == "volume" and len(volume_requests) < MAX_DOCKER_VOLUME_INSPECT_REQUESTS:
+                volume_requests.setdefault(entry[1], socket_path)
+
+    reviewed_volumes: dict[str, bool | None] = {}
+    if volume_requests:
+        remaining = max(0.0, deadline - _monotonic())
+    else:
+        remaining = 0.0
+    if remaining >= 0.25:
+        volume_timeout = min(timeout, remaining)
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(MAX_DOCKER_DETAIL_WORKERS, len(volume_requests)),
+            thread_name_prefix="docker-volume",
+        ) as executor:
+            volume_futures = {
+                executor.submit(
+                    docker_get,
+                    socket_path,
+                    reviewed_volume_request_path(name),
+                    curl,
+                    volume_timeout,
+                ): name
+                for name, socket_path in volume_requests.items()
+            }
+            done, pending = concurrent.futures.wait(volume_futures, timeout=remaining)
+            for future in pending:
+                future.cancel()
+            for future in done:
+                name = volume_futures[future]
+                try:
+                    response = future.result()
+                except Exception:
+                    reviewed_volumes[name] = None
+                    continue
+                reviewed_volumes[name] = review_volume_metadata(response, name)
+            done.clear()
+            volume_futures.clear()
+            future = None
+            response = None
+
+    for index, validated in validated_inspect_by_index.items():
+        inspect_by_index[index] = reduce_container_inspect(validated, reviewed_volumes)
+    validated_inspect_by_index.clear()
 
     next_cpu_state: dict[str, dict[str, int | str]] = {}
     # Retain only validated private counters for containers still listed. This
@@ -3439,8 +3704,10 @@ def normalize_container_values(
         legacy = fields == set(LEGACY_CONTAINER_FIELDS)
         v2 = fields == set(CONTAINER_V2_FIELDS)
         v3_legacy = fields == set(CONTAINER_V3_LEGACY_FIELDS)
-        v3 = fields == set(CONTAINER_FIELDS) or v3_legacy
-        if not legacy and not v2 and not v3:
+        v3 = fields == set(CONTAINER_V3_FIELDS)
+        v4 = fields == set(CONTAINER_FIELDS)
+        extended = v3_legacy or v3 or v4
+        if not legacy and not v2 and not extended:
             raise ValueError("container telemetry workload has unexpected fields")
         name = value.get("name")
         state = value.get("state")
@@ -3552,7 +3819,7 @@ def normalize_container_values(
             "startedAt": normalized_times["startedAt"],
             "finishedAt": normalized_times["finishedAt"],
         }
-        if v3:
+        if extended:
             def optional_integer(field_name: str, maximum: int) -> int | None:
                 source = value.get(field_name)
                 parsed = bounded_integer(source, 0, maximum)
@@ -3714,6 +3981,30 @@ def normalize_container_values(
                 "imageDigest": image_digest,
                 "imageDigestSource": image_digest_source,
             })
+            if v4:
+                mount_policy_status = value.get("mountPolicyStatus")
+                if mount_policy_status not in MOUNT_POLICY_STATUSES:
+                    raise ValueError(
+                        "container telemetry workload has an invalid mount policy status"
+                    )
+                reviewed_mount_policy = name in REVIEWED_HOST_STORAGE_PUBLIC_NAMES
+                if (
+                    (reviewed_mount_policy and mount_policy_status == "unmanaged")
+                    or (not reviewed_mount_policy and mount_policy_status != "unmanaged")
+                ):
+                    raise ValueError(
+                        "container telemetry workload has an invalid mount policy scope"
+                    )
+            else:
+                # Older retained rows cannot prove that their mounts still
+                # match a reviewed profile. Keep unprofiled services on the
+                # prior heuristic and fail closed for reviewed services.
+                mount_policy_status = (
+                    "unknown"
+                    if name in REVIEWED_HOST_STORAGE_PUBLIC_NAMES
+                    else "unmanaged"
+                )
+            normalized["mountPolicyStatus"] = mount_policy_status
             # Restore the declared field order after group-wise validation.
             normalized = {field_name: normalized[field_name] for field_name in CONTAINER_FIELDS}
             assert tuple(normalized) == CONTAINER_FIELDS
