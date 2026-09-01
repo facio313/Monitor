@@ -194,9 +194,13 @@ def parse_rule_pack(value: Any) -> RulePack:
             raise RulePackError(f"{field}.operator is unsupported")
         threshold = _finite(raw["threshold"], f"{field}.threshold")
         recovery_threshold = _finite(raw["recoveryThreshold"], f"{field}.recoveryThreshold")
-        if operator in {"gt", "gte"} and recovery_threshold > threshold:
+        if operator == "gte" and recovery_threshold >= threshold:
+            raise RulePackError(f"{field}.recoveryThreshold must be below threshold")
+        if operator == "gt" and recovery_threshold > threshold:
             raise RulePackError(f"{field}.recoveryThreshold must not exceed threshold")
-        if operator in {"lt", "lte"} and recovery_threshold < threshold:
+        if operator == "lte" and recovery_threshold <= threshold:
+            raise RulePackError(f"{field}.recoveryThreshold must be above threshold")
+        if operator == "lt" and recovery_threshold < threshold:
             raise RulePackError(f"{field}.recoveryThreshold must not be below threshold")
         severity = raw["severity"]
         if severity not in SEVERITIES:
@@ -281,9 +285,9 @@ def _condition(operator: str, value: float, threshold: float) -> bool:
 
 def _recovered(rule: AlertRule, value: float) -> bool:
     if rule.operator in {"gt", "gte"}:
-        return value < rule.recovery_threshold
+        return value <= rule.recovery_threshold
     if rule.operator in {"lt", "lte"}:
-        return value > rule.recovery_threshold
+        return value >= rule.recovery_threshold
     return value == rule.recovery_threshold
 
 

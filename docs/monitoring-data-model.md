@@ -181,7 +181,7 @@ stateDiagram-v2
   Pending --> Normal: clears before duration
   Pending --> Firing: duration satisfied
   Firing --> Firing: still above trigger threshold
-  Firing --> Recovering: below recovery threshold
+  Firing --> Recovering: at or beyond recovery threshold toward healthy
   Recovering --> Firing: condition returns
   Recovering --> Recovered: recovery duration satisfied
   Recovered --> [*]

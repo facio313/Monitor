@@ -46,8 +46,11 @@ tested.
   cannot satisfy wall-clock persistence early. Missing evaluations never
   advance a pending breach. A gap beyond the cadence tolerance resets pending
   and no-data duration instead of counting the gap as a continuous condition.
-- Recovery requires both `recoverySamples` and `recoverySeconds` at the separate
-  recovery threshold.
+- Recovery requires both `recoverySamples` and `recoverySeconds` at or beyond
+  the separate recovery threshold in the healthy direction. For directional
+  comparisons, equality with the recovery threshold is valid recovery evidence.
+  Inclusive trigger operators (`gte` and `lte`) therefore require a real gap
+  between the trigger and recovery thresholds.
 - No-data has its own policy, counter, and `noDataSeconds` duration.
 - Each state records the configured `evaluationIntervalSeconds` and the breach,
   recovery, and missing start timestamps. A cadence change resets a pending

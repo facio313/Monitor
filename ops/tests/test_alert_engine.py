@@ -119,8 +119,19 @@ class AlertEngineTests(unittest.TestCase):
 
     def test_rule_pack_rejects_invalid_hysteresis(self):
         value = {"schemaVersion": 1, "version": "2026.08.1", "rules": [raw_rule(recoveryThreshold=95)]}
-        with self.assertRaisesRegex(RulePackError, "must not exceed"):
+        with self.assertRaisesRegex(RulePackError, "must be below"):
             parse_rule_pack(value)
+
+        for invalid in (
+            raw_rule(operator="gte", threshold=90, recoveryThreshold=90),
+            raw_rule(operator="lte", threshold=0, recoveryThreshold=0),
+        ):
+            with self.subTest(operator=invalid["operator"]), self.assertRaisesRegex(
+                RulePackError, "must be (below|above)"
+            ):
+                parse_rule_pack({
+                    "schemaVersion": 1, "version": "2026.08.1", "rules": [invalid],
+                })
 
     def test_rule_pack_rejects_invalid_duration_and_interval(self):
         for invalid in (
@@ -358,6 +369,82 @@ class AlertEngineTests(unittest.TestCase):
             rule(), Observation("host-a", 75), recovering, NOW + dt.timedelta(minutes=1),
         )
         self.assertEqual((resolved["phase"], transition), ("inactive", "resolved"))
+
+    def test_ordered_rules_recover_at_inclusive_healthy_boundary(self):
+        cases = (
+            ("gt", 90, 80, 91, 80),
+            ("gte", 90, 80, 90, 80),
+            ("lt", 10, 20, 9, 20),
+            ("lte", 10, 20, 10, 20),
+        )
+        for operator, threshold, recovery_threshold, breached, healthy in cases:
+            with self.subTest(operator=operator):
+                alert_rule = rule(
+                    operator=operator,
+                    threshold=threshold,
+                    recovery_threshold=recovery_threshold,
+                    for_samples=1,
+                    for_seconds=0,
+                    recovery_samples=2,
+                    recovery_seconds=60,
+                )
+                firing, transition = evaluate_observation(
+                    alert_rule, Observation("host-a", breached), None, NOW,
+                )
+                self.assertEqual((firing["phase"], transition), ("firing", "firing"))
+                recovering, transition = evaluate_observation(
+                    alert_rule,
+                    Observation("host-a", healthy),
+                    firing,
+                    NOW + dt.timedelta(minutes=1),
+                )
+                self.assertEqual(
+                    (recovering["phase"], recovering["recoverySamples"], transition),
+                    ("recovering", 1, "recovering"),
+                )
+                resolved, transition = evaluate_observation(
+                    alert_rule,
+                    Observation("host-a", healthy),
+                    recovering,
+                    NOW + dt.timedelta(minutes=2),
+                )
+                self.assertEqual(
+                    (
+                        resolved["phase"], resolved["recoverySamples"],
+                        resolved["lastValue"], transition,
+                    ),
+                    ("inactive", 2, healthy, "resolved"),
+                )
+
+    def test_hysteresis_deadband_keeps_active_incident_firing(self):
+        for operator, threshold, recovery_threshold, breached, deadband in (
+            ("gte", 90, 80, 95, 85),
+            ("lte", 10, 20, 5, 15),
+        ):
+            with self.subTest(operator=operator):
+                alert_rule = rule(
+                    operator=operator,
+                    threshold=threshold,
+                    recovery_threshold=recovery_threshold,
+                    for_samples=1,
+                    recovery_samples=1,
+                )
+                firing, _ = evaluate_observation(
+                    alert_rule, Observation("host-a", breached), None, NOW,
+                )
+                still_firing, transition = evaluate_observation(
+                    alert_rule,
+                    Observation("host-a", deadband),
+                    firing,
+                    NOW + dt.timedelta(minutes=1),
+                )
+                self.assertEqual(
+                    (
+                        still_firing["phase"], still_firing["recoverySamples"],
+                        still_firing["lastValue"], transition,
+                    ),
+                    ("firing", 0, deadband, None),
+                )
 
     def test_equality_rule_recovers_at_explicit_healthy_value(self):
         alert_rule = rule(

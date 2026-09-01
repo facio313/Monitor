@@ -554,6 +554,77 @@ class AlertRuntimeTests(unittest.TestCase):
         )
         self.assertEqual(events, [])
 
+    def test_default_container_faults_resolve_at_normal_binary_boundary(self):
+        rule_ids = ("ContainerDown", "ContainerUnhealthy")
+        rules = {
+            rule.rule_id: rule for rule in self.pack.rules if rule.rule_id in rule_ids
+        }
+        self.assertEqual(set(rules), set(rule_ids))
+
+        faulted = self.snapshot()
+        faulted["containers"][0].update({
+            "state": "exited",
+            "health": "unhealthy",
+        })
+        state = {}
+        for minute in range(rules["ContainerDown"].for_samples):
+            result, _events = evaluate_snapshot(
+                self.pack, faulted, state, NOW + dt.timedelta(minutes=minute),
+            )
+            state = result["states"]
+
+        state_keys = {
+            rule_id: f"{rule_id}:container/monitor" for rule_id in rule_ids
+        }
+        for rule_id, state_key in state_keys.items():
+            with self.subTest(rule_id=rule_id, stage="firing"):
+                self.assertEqual(
+                    (state[state_key]["phase"], state[state_key]["lastValue"]),
+                    ("firing", 0),
+                )
+
+        resolved_events = []
+        for offset, expected_phase in enumerate(("recovering", "inactive")):
+            result, events = evaluate_snapshot(
+                self.pack,
+                self.snapshot(),
+                state,
+                NOW + dt.timedelta(
+                    minutes=rules["ContainerDown"].for_samples + offset
+                ),
+            )
+            state = result["states"]
+            resolved_events.extend(
+                event for event in events
+                if event["ruleId"] in rule_ids
+                and event["transition"] == "resolved"
+            )
+            for rule_id, state_key in state_keys.items():
+                with self.subTest(rule_id=rule_id, stage=expected_phase):
+                    self.assertEqual(
+                        (
+                            state[state_key]["phase"],
+                            state[state_key]["recoverySamples"],
+                            state[state_key]["lastValue"],
+                            state[state_key]["observationStatus"],
+                        ),
+                        (expected_phase, offset + 1, 1, "ok"),
+                    )
+
+        for rule_id in rule_ids:
+            with self.subTest(rule_id=rule_id, stage="resolved-event"):
+                matching = [
+                    event for event in resolved_events if event["ruleId"] == rule_id
+                ]
+                self.assertEqual(len(matching), 1)
+                self.assertEqual(
+                    (
+                        matching[0]["target"], matching[0]["value"],
+                        matching[0]["status"],
+                    ),
+                    ("container/monitor", 1, "ok"),
+                )
+
     def test_missing_collection_contract_never_defaults_to_fresh(self):
         snapshot = self.snapshot()
         snapshot.pop("containerCollection")
