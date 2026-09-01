@@ -135,6 +135,15 @@ The default output root is `/var/lib/monitor-export`:
   bounded target IDs, severity, delivery disposition, timestamps, normalized
   value/status, bounded labels, fixed description, and runbook. Raw samples,
   mount paths, commands, and log lines are never copied.
+- `monitoring-catalog.json`: an atomically replaced, mode-`0640`, 2 MiB-bounded
+  manifest of every reviewed public evidence artifact, every public
+  dashboard/current observation family, and every rule loaded from the active
+  rule pack. Runtime collection/retention limits and the exact pruning cadence
+  are resolved into the document. It contains only relative artifact labels;
+  configured input paths, credentials, private state, and raw observations are
+  never included. A catalog build failure removes the prior public copy so the
+  API fails closed instead of presenting stale runtime policy as current; the
+  independent rule evaluator continues to expose its collection error.
 - `power.jsonl`: at most 5,000 fixed-message kernel power/storage events with
   exactly `timestamp`, `severity`, `kind`, `status`, and `message`. Only kernel
   `Undervoltage detected!`, `Voltage normalised`, NVMe controller-reset, and

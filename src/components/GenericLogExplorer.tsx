@@ -24,6 +24,13 @@ const PRIORITIES: GenericLogPriority[] = ['debug', 'normal', 'incident', 'securi
 const SEVERITIES: GenericLogSeverity[] = [
   'trace', 'debug', 'info', 'notice', 'warning', 'error', 'critical',
 ];
+const GENERIC_LOG_LOCATION_KEYS = [
+  'sourceId', 'kind', 'priority', 'severity', 'text', 'from', 'to',
+] as const;
+const SAFE_SOURCE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.:/@-]{0,127}$/;
+const RAW_CONTAINER_ID_PATTERN = /^[0-9a-f]{32,64}$/i;
+const SENSITIVE_SOURCE_ID_PATTERN = /(?:authorization|proxy[-_]?authorization|cookie|set[-_]?cookie|password|passwd|pwd|secret|token|access[-_]?token|refresh[-_]?token|id[-_]?token|api[-_]?key|apikey|client[-_]?secret|session[-_]?(?:id)?|private[-_]?key|access[-_]?key(?:[-_]?id)?)/i;
+const CONTROL_CHARACTER_PATTERN = /[\u0000-\u001f\u007f]/;
 
 export interface GenericLogFilterDraft {
   text: string;
@@ -45,6 +52,117 @@ export const EMPTY_GENERIC_LOG_FILTERS: GenericLogFilterDraft = {
   to: '',
 };
 
+function safeSourceId(value: string): boolean {
+  return SAFE_SOURCE_ID_PATTERN.test(value)
+    && !RAW_CONTAINER_ID_PATTERN.test(value)
+    && !SENSITIVE_SOURCE_ID_PATTERN.test(value);
+}
+
+function canonicalTimestamp(value: string | null): Date | null {
+  if (!value) return null;
+  const parsed = new Date(value);
+  if (!Number.isFinite(parsed.getTime()) || parsed.toISOString() !== value) return null;
+  return parsed;
+}
+
+function localDateTimeValue(value: Date): string {
+  const component = (part: number, width = 2) => String(part).padStart(width, '0');
+  return `${component(value.getFullYear(), 4)}-${component(value.getMonth() + 1)}-${component(value.getDate())}`
+    + `T${component(value.getHours())}:${component(value.getMinutes())}:${component(value.getSeconds())}`
+    + `.${component(value.getMilliseconds(), 3)}`;
+}
+
+/**
+ * Reads the single-value filter UI from a deep link. Invalid or over-sized
+ * values are ignored so an untrusted URL can never broaden the API contract.
+ */
+export function genericLogFiltersFromSearch(search: string): GenericLogFilterDraft {
+  const draft = { ...EMPTY_GENERIC_LOG_FILTERS };
+  let parameters: URLSearchParams;
+  try {
+    parameters = new URLSearchParams(search);
+  } catch {
+    return draft;
+  }
+
+  const sourceId = parameters.get('sourceId');
+  if (sourceId && safeSourceId(sourceId)) draft.sourceId = sourceId;
+
+  const sourceKind = parameters.get('kind');
+  if (sourceKind && SOURCE_KINDS.includes(sourceKind as GenericLogSourceKind)) {
+    draft.sourceKind = sourceKind as GenericLogSourceKind;
+  }
+
+  const priority = parameters.get('priority');
+  if (priority && PRIORITIES.includes(priority as GenericLogPriority)) {
+    draft.priority = priority as GenericLogPriority;
+  }
+
+  const severity = parameters.get('severity');
+  if (severity && SEVERITIES.includes(severity as GenericLogSeverity)) {
+    draft.severity = severity as GenericLogSeverity;
+  }
+
+  const text = parameters.get('text');
+  if (
+    text !== null
+    && new TextEncoder().encode(text).byteLength <= 128
+    && !CONTROL_CHARACTER_PATTERN.test(text)
+  ) draft.text = text.trim();
+
+  const from = canonicalTimestamp(parameters.get('from'));
+  const to = canonicalTimestamp(parameters.get('to'));
+  if (from) draft.from = localDateTimeValue(from);
+  if (to) draft.to = localDateTimeValue(to);
+  if (from && to && from.getTime() > to.getTime()) {
+    draft.from = '';
+    draft.to = '';
+  }
+  return draft;
+}
+
+function validQueryText(value: string | undefined): value is string {
+  return typeof value === 'string'
+    && value.length > 0
+    && new TextEncoder().encode(value).byteLength <= 128
+    && !CONTROL_CHARACTER_PATTERN.test(value);
+}
+
+function validCanonicalQueryTimestamp(value: string | undefined): value is string {
+  return typeof value === 'string' && canonicalTimestamp(value) !== null;
+}
+
+/** Preserves the route, hash, range, and any future unrelated query values. */
+export function genericLogLocationFromQuery(
+  location: Pick<Location, 'pathname' | 'search' | 'hash'>,
+  query: GenericLogQuery,
+): string {
+  const parameters = new URLSearchParams(location.search);
+  GENERIC_LOG_LOCATION_KEYS.forEach((key) => parameters.delete(key));
+
+  const sourceId = query.sourceIds?.[0];
+  const sourceKind = query.sourceKinds?.[0];
+  const priority = query.priorities?.[0];
+  const severity = query.severities?.[0];
+  if (sourceId && safeSourceId(sourceId)) parameters.set('sourceId', sourceId);
+  if (sourceKind && SOURCE_KINDS.includes(sourceKind)) parameters.set('kind', sourceKind);
+  if (priority && PRIORITIES.includes(priority)) parameters.set('priority', priority);
+  if (severity && SEVERITIES.includes(severity)) parameters.set('severity', severity);
+  if (validQueryText(query.text)) parameters.set('text', query.text);
+  if (validCanonicalQueryTimestamp(query.from)) parameters.set('from', query.from);
+  if (validCanonicalQueryTimestamp(query.to)) parameters.set('to', query.to);
+
+  const serialized = parameters.toString();
+  return `${location.pathname}${serialized ? `?${serialized}` : ''}${location.hash}`;
+}
+
+function synchronizeGenericLogLocation(query: GenericLogQuery): void {
+  if (typeof window === 'undefined') return;
+  const target = genericLogLocationFromQuery(window.location, query);
+  const current = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+  if (target !== current) window.history.replaceState(window.history.state, '', target);
+}
+
 function t(locale: MonitorLocale, korean: string, english: string): string {
   return localized(locale, korean, english);
 }
@@ -58,7 +176,9 @@ function localTimestamp(value: string): string | undefined {
 
 export function genericLogQueryFromDraft(draft: GenericLogFilterDraft): GenericLogQuery {
   const text = draft.text.trim();
-  if (new TextEncoder().encode(text).byteLength > 128) throw new Error('invalid_text');
+  if (new TextEncoder().encode(text).byteLength > 128 || CONTROL_CHARACTER_PATTERN.test(text)) {
+    throw new Error('invalid_text');
+  }
   const from = localTimestamp(draft.from);
   const to = localTimestamp(draft.to);
   if (from && to && from > to) throw new Error('invalid_time_order');
@@ -298,10 +418,19 @@ export interface GenericLogExplorerProps {
 }
 
 export function GenericLogExplorer({ locale, onUnauthorized }: GenericLogExplorerProps) {
-  const [draft, setDraft] = useState<GenericLogFilterDraft>(EMPTY_GENERIC_LOG_FILTERS);
+  const [initialLocationState] = useState(() => {
+    const initialDraft = typeof window === 'undefined'
+      ? { ...EMPTY_GENERIC_LOG_FILTERS }
+      : genericLogFiltersFromSearch(window.location.search);
+    return {
+      draft: initialDraft,
+      query: genericLogQueryFromDraft(initialDraft),
+    };
+  });
+  const [draft, setDraft] = useState<GenericLogFilterDraft>(initialLocationState.draft);
   const [requestQueries, setRequestQueries] = useState<GenericLogRequestQueries>({
-    applied: EMPTY_QUERY,
-    lastAttempted: EMPTY_QUERY,
+    applied: initialLocationState.query,
+    lastAttempted: initialLocationState.query,
     lastAttemptedAppend: false,
   });
   const [data, setData] = useState<GenericLogPage | null>(null);
@@ -342,9 +471,10 @@ export function GenericLogExplorer({ locale, onUnauthorized }: GenericLogExplore
   }, [onUnauthorized]);
 
   useEffect(() => {
-    void requestPage(EMPTY_QUERY);
+    synchronizeGenericLogLocation(initialLocationState.query);
+    void requestPage(initialLocationState.query);
     return () => requestController.current?.abort();
-  }, [requestPage]);
+  }, [initialLocationState.query, requestPage]);
 
   const sourceIds = useMemo(() => {
     const values = new Set(data?.collection.sources.map((source) => source.sourceId) ?? []);
@@ -357,6 +487,7 @@ export function GenericLogExplorer({ locale, onUnauthorized }: GenericLogExplore
     try {
       const query = genericLogQueryFromDraft(draft);
       setValidationError(null);
+      synchronizeGenericLogLocation(query);
       void requestPage(query);
     } catch (error) {
       setValidationError(validationMessage(error instanceof Error ? error.message : 'invalid_time', locale));
@@ -366,6 +497,7 @@ export function GenericLogExplorer({ locale, onUnauthorized }: GenericLogExplore
   function clearFilters() {
     setDraft(EMPTY_GENERIC_LOG_FILTERS);
     setValidationError(null);
+    synchronizeGenericLogLocation(EMPTY_QUERY);
     void requestPage(EMPTY_QUERY);
   }
 
@@ -457,11 +589,11 @@ export function GenericLogExplorer({ locale, onUnauthorized }: GenericLogExplore
           </label>
           <label>
             <span>{t(locale, '시작 시각', 'Start time')}</span>
-            <input type="datetime-local" value={draft.from} onChange={(event) => setDraft((current) => ({ ...current, from: event.target.value }))} />
+            <input type="datetime-local" step="0.001" value={draft.from} onChange={(event) => setDraft((current) => ({ ...current, from: event.target.value }))} />
           </label>
           <label>
             <span>{t(locale, '종료 시각', 'End time')}</span>
-            <input type="datetime-local" value={draft.to} onChange={(event) => setDraft((current) => ({ ...current, to: event.target.value }))} />
+            <input type="datetime-local" step="0.001" value={draft.to} onChange={(event) => setDraft((current) => ({ ...current, to: event.target.value }))} />
           </label>
         </div>
 

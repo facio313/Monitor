@@ -68,6 +68,7 @@ import { DockerDiagnosticsPanel } from './DockerDiagnostics';
 import { OperationalGuidance, OperationalHealthSummary } from './OperationalHealth';
 import { OperationalLogView } from './OperationalLogView';
 import { Pagination, paginateItems, usePagination } from './Pagination';
+import { SyntheticProbePanel } from './SyntheticProbePanel';
 
 const CHART_COLORS = {
   cyan: '#55d9d1',
@@ -1120,7 +1121,7 @@ export function IncidentDetail({ data, locale }: { data: DashboardPayload; local
 }
 
 export function DetailPage({ page, data, findings, range, locale, onOpen }: VisualProps & {
-  page: Exclude<MonitorDetailPage, 'maintenance' | 'infrastructure' | 'logs'>;
+  page: Exclude<MonitorDetailPage, 'coverage' | 'maintenance' | 'infrastructure' | 'logs'>;
   findings: readonly OperationalFinding[];
 }) {
   const logs = useMemo(() => operationalLogs(data), [data]);
@@ -1138,7 +1139,7 @@ export function DetailPage({ page, data, findings, range, locale, onOpen }: Visu
     content = <><VitalSignsWidget data={data} locale={locale} onOpen={onOpen} /><ResourceWidget data={data} range={range} locale={locale} onOpen={onOpen} /><LoadWidget data={data} range={range} locale={locale} onOpen={onOpen} /><LinuxDiagnosticsPanel linux={data.linux} page="resources" locale={locale} />{commonLogs}</>;
   } else if (page === 'network') {
     targetClass += ' detail-two-column';
-    content = <><NetworkWidget data={data} range={range} locale={locale} onOpen={onOpen} /><TrafficEvidence data={data} locale={locale} /><CurrentTrafficWidget data={data} locale={locale} /><LinuxDiagnosticsPanel linux={data.linux} page="network" locale={locale} />{commonLogs}</>;
+    content = <><NetworkWidget data={data} range={range} locale={locale} onOpen={onOpen} /><SyntheticProbePanel data={data} locale={locale} /><TrafficEvidence data={data} locale={locale} /><CurrentTrafficWidget data={data} locale={locale} /><LinuxDiagnosticsPanel linux={data.linux} page="network" locale={locale} />{commonLogs}</>;
   } else if (page === 'storage') {
     content = <><StorageWidget data={data} range={range} locale={locale} onOpen={onOpen} /><LinuxDiagnosticsPanel linux={data.linux} page="storage" locale={locale} />{commonLogs}</>;
   } else if (page === 'containers') {
@@ -1168,6 +1169,7 @@ export function DetailPage({ page, data, findings, range, locale, onOpen }: Visu
 
 export function pageTitle(page: MonitorDetailPage, locale: MonitorLocale): { eyebrow: string; title: string; description: string } {
   const pages: Record<MonitorDetailPage, [[string, string], [string, string], [string, string]]> = {
+    coverage: [['관찰·검사 범위', 'MONITORING COVERAGE'], ['관찰·검사 전체 목록', 'Observation and check catalog'], ['무엇을 현재값으로 보고 무엇을 저장 기록으로 판단하는지, 수집·보존·삭제 주기와 함께 확인합니다.', 'Review what is assessed from current state or retained records, including collection, retention, and pruning cadence.']],
     resources: [['호스트 계기', 'HOST INSTRUMENTS'], ['자원과 시스템 부하', 'Resources and system load'], ['CPU·메모리·온도·부하를 현재값과 기간 추세로 분석합니다.', 'Analyze CPU, memory, temperature, and load as current readings and trends.']],
     network: [['데이터 흐름', 'DATA FLOW'], ['네트워크와 요청 처리', 'Network and request handling'], ['송수신 처리량과 피크 사건에서 수집된 익명 서비스 요청을 비교합니다.', 'Compare transfer rates with anonymous service requests captured during incidents.']],
     storage: [['저장 계통', 'STORAGE SYSTEM'], ['디스크 용량과 입출력', 'Storage capacity and I/O'], ['볼륨별 남은 공간과 읽기·쓰기 변화, 관련 신뢰성 이벤트를 확인합니다.', 'Inspect free capacity, read/write activity, and related reliability events.']],

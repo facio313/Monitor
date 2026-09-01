@@ -175,7 +175,10 @@ describe('Linux diagnostics detail panels', () => {
     expect(markup).not.toContain('<table');
     expect(markup).toContain('TCP retransmission');
     expect(markup).toContain('2%');
-    expect(markup).toContain('CLOSE_WAIT · TIME_WAIT');
+    for (const state of [
+      'ESTABLISHED', 'SYN_SENT', 'SYN_RECV', 'FIN_WAIT1', 'FIN_WAIT2', 'TIME_WAIT',
+      'CLOSE', 'CLOSE_WAIT', 'LAST_ACK', 'LISTEN', 'CLOSING', 'NEW_SYN_RECV',
+    ]) expect(markup).toContain(`<dt>${state}</dt>`);
     expect(markup).toContain('Conntrack headroom');
     expect(markup).toContain('Ephemeral port headroom');
     expect(markup).toContain('Next action');
@@ -187,8 +190,30 @@ describe('Linux diagnostics detail panels', () => {
     expect(markup).toContain('Read · write latency');
     expect(markup).toContain('Average latency · utilization');
     expect(markup).toContain('Current · average queue');
+    expect(markup).toContain('<dt>Rotational device</dt><dd>No</dd>');
+    expect(markup).toContain('<dt>RAID degraded devices</dt><dd>—</dd>');
+    expect(markup).toContain('<dt>Collection truncated</dt><dd>No</dd>');
     expect(markup).toContain('SMART Unsupported · RAID Unsupported');
     expect(markup).not.toContain('<table');
+  });
+
+  it('keeps every bounded storage device reachable and reports truncation and RAID degradation', () => {
+    const linux = fixture();
+    const base = linux.storage.devices[0];
+    linux.storage.truncated = true;
+    linux.storage.devices = Array.from({ length: 10 }, (_, index) => ({
+      ...base,
+      name: `device-${index + 1}`,
+      rotational: index % 2 === 0,
+      raidDegradedDevices: index === 0 ? 2 : 0,
+    }));
+    const markup = render('storage', linux);
+
+    expect(markup).toContain('device-8');
+    expect(markup).not.toContain('device-9');
+    expect(markup).toContain('1–8 of 10 diagnostics');
+    expect(markup).toContain('<dt>Collection truncated</dt><dd>Yes</dd>');
+    expect(markup).toContain('<dt>RAID degraded devices</dt><dd>2</dd>');
   });
 
   it('does not present empty or contract-error collection as a healthy zero', () => {
@@ -202,23 +227,76 @@ describe('Linux diagnostics detail panels', () => {
   });
 
   it('shows clock, reboot, and allow-listed systemd restart/result evidence', () => {
-    const markup = render('reliability');
+    const linux = fixture();
+    const base = linux.reliability.systemd.units[0];
+    linux.reliability.systemd.truncated = true;
+    linux.reliability.systemd.units = Array.from({ length: 5 }, (_, index) => ({
+      ...base,
+      unit: `observed-${index + 1}.service`,
+      execMainStatus: index,
+      invocationStatus: index === 4 ? 'partial' : null,
+    }));
+    const markup = render('reliability', linux);
     expect(markup).toContain('Clock synchronization');
+    expect(markup).toContain('<dt>NTP supported</dt><dd>Yes</dd>');
     expect(markup).toContain('Boot continuity');
+    expect(markup).toContain('<dt>Uptime</dt><dd>1h 0m (3,600 s)</dd>');
     expect(markup).toContain('Allow-listed systemd units');
-    expect(markup).toContain('monitor-collector.service');
-    expect(markup).toContain('restarts 2');
-    expect(markup).toContain('success');
+    expect(markup).toContain('<dt>Collection truncated</dt><dd>Yes</dd>');
+    expect(markup).toContain('observed-5.service');
+    expect(markup).toContain('<dt>Load state</dt><dd>loaded</dd>');
+    expect(markup).toContain('<dt>Active state</dt><dd>active</dd>');
+    expect(markup).toContain('<dt>Sub-state</dt><dd>running</dd>');
+    expect(markup).toContain('<dt>Restart count</dt><dd>2</dd>');
+    expect(markup).toContain('<dt>Restart count source</dt><dd>systemd_manager</dd>');
+    expect(markup).toContain('<dt>Result</dt><dd>success</dd>');
+    expect(markup).toContain('<dt>ExecMainStatus</dt><dd>4</dd>');
+    expect(markup).toContain('<dt>Invocation status</dt><dd>Partial</dd>');
   });
 
   it('shows thermal sources, fan evidence, Raspberry Pi flags, and their source', () => {
     const markup = render('power');
-    expect(markup).toContain('cpu-thermal (thermal-zone)');
-    expect(markup).toContain('case-fan 3,200 RPM');
+    expect(markup).toContain('Temperature sensor · cpu-thermal');
+    expect(markup).toContain('<dt>Source</dt><dd>thermal-zone</dd>');
+    expect(markup).toContain('Fan · case-fan');
+    expect(markup).toContain('<dt>RPM</dt><dd>3,200</dd>');
     expect(markup).toContain('Raspberry Pi power and throttling');
     expect(markup).toContain('vcgencmd');
-    expect(markup).toContain('Current undervoltage · throttle');
-    expect(markup).toContain('Historic undervoltage · throttle');
+    expect(markup).toContain('<dt>Throttled flags</dt><dd>327,685 (0x50005)</dd>');
+    expect(markup).toContain('<dt>Current undervoltage</dt><dd>Yes</dd>');
+    expect(markup).toContain('<dt>Current frequency cap</dt><dd>No</dd>');
+    expect(markup).toContain('<dt>Current throttling</dt><dd>Yes</dd>');
+    expect(markup).toContain('<dt>Current soft temperature limit</dt><dd>No</dd>');
+    expect(markup).toContain('<dt>Undervoltage occurred</dt><dd>Yes</dd>');
+    expect(markup).toContain('<dt>Frequency cap occurred</dt><dd>No</dd>');
+    expect(markup).toContain('<dt>Throttling occurred</dt><dd>Yes</dd>');
+    expect(markup).toContain('<dt>Soft temperature limit occurred</dt><dd>No</dd>');
+  });
+
+  it('renders every collected sensor and fan instead of silently slicing their arrays', () => {
+    const sensors = fixture();
+    const baseSensor = sensors.power.sensors[0];
+    sensors.power.sensors = Array.from({ length: 4 }, (_, index) => ({
+      ...baseSensor,
+      name: `thermal-${index + 1}`,
+      temperatureCelsius: 50 + index,
+    }));
+    const sensorMarkup = render('power', sensors);
+    expect(sensorMarkup).toContain('thermal-4');
+    expect(sensorMarkup).toContain('<dt>Temperature</dt><dd>53°C</dd>');
+    expect(sensorMarkup).toContain('<dt>Collection status</dt><dd>Supported</dd>');
+
+    const fans = fixture();
+    const baseFan = fans.power.fans[0];
+    fans.power.fans = Array.from({ length: 4 }, (_, index) => ({
+      ...baseFan,
+      name: `fan-${index + 1}`,
+      rpm: 3000 + index,
+    }));
+    const fanMarkup = render('power', fans);
+    expect(fanMarkup).toContain('fan-4');
+    expect(fanMarkup).toContain('<dt>RPM</dt><dd>3,003</dd>');
+    expect(fanMarkup).toContain('<dt>Collection status</dt><dd>Supported</dd>');
   });
 
   it('keeps diagnostic cards responsive at the narrow breakpoint', () => {

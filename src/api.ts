@@ -234,6 +234,94 @@ export function getGenericLogs(query: GenericLogQuery = {}, signal?: AbortSignal
   return apiFetch<GenericLogPage>(`/generic-logs${search}`, { signal });
 }
 
+export interface LocalizedCatalogText {
+  ko: string;
+  en: string;
+}
+
+export interface MonitoringRetention {
+  policy: string;
+  pruneCadence:
+    | 'replace-on-collection'
+    | 'every-collection'
+    | 'on-incident-write-or-daily'
+    | 'every-rule-evaluation'
+    | 'every-generic-collection'
+    | 'replace-on-generic-collection'
+    | 'replace-on-change'
+    | 'external-no-auto-prune';
+  maxAgeDays: number | null;
+  maxRecords: number | null;
+  recordScope: string | null;
+  maxBytes: number | null;
+}
+
+export interface MonitoringEvidenceSource {
+  id: string;
+  displayName: LocalizedCatalogText;
+  description: LocalizedCatalogText;
+  kind: string;
+  evidenceMode: string;
+  artifactLabel: string;
+  format: 'json' | 'jsonl' | 'api';
+  cadenceSeconds: number | null;
+  retention: MonitoringRetention;
+  detailPages: string[];
+}
+
+export interface MonitoringObservation {
+  id: string;
+  domain: string;
+  displayName: LocalizedCatalogText;
+  description: LocalizedCatalogText;
+  evidenceMode: string;
+  cadenceSeconds: number | null;
+  evidenceSourceIds: string[];
+  detailPages: string[];
+}
+
+export interface MonitoringRuleDefinition {
+  id: string;
+  domain: string;
+  metric: string;
+  operator: string;
+  threshold: number;
+  recoveryThreshold: number;
+  severity: 'info' | 'warning' | 'critical';
+  enabled: boolean;
+  configuredEvaluationIntervalSeconds: number;
+  effectiveEvaluationIntervalSeconds: number;
+  forSeconds: number;
+  forSamples: number;
+  recoverySeconds: number;
+  recoverySamples: number;
+  noDataPolicy: 'ignore' | 'alert';
+  noDataSeconds: number;
+  noDataSamples: number;
+  parentRuleId: string | null;
+  labels: Record<string, string>;
+  description: string;
+  runbook: string;
+  stateEvidenceSourceId: string;
+  eventEvidenceSourceId: string;
+  eventRetention: { maxRecords: number; maxBytes: number };
+  detailPages: string[];
+}
+
+export interface MonitoringCatalog {
+  schemaVersion: 1;
+  generatedAt: string;
+  collectionIntervalSeconds: number;
+  rulePackVersion: string;
+  evidenceSources: MonitoringEvidenceSource[];
+  observations: MonitoringObservation[];
+  rules: MonitoringRuleDefinition[];
+}
+
+export function getMonitoringCatalog(signal?: AbortSignal): Promise<MonitoringCatalog> {
+  return apiFetch<MonitoringCatalog>('/monitoring-catalog', { signal });
+}
+
 export type SystemUpdateState =
   | 'idle'
   | 'checking'

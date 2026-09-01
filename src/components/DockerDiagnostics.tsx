@@ -28,8 +28,13 @@ function healthcheckState(container: ContainerStatus, locale: MonitorLocale): st
   return safeText(container.health, t(locale, '상태 미확인', 'Unknown'), 48);
 }
 
-function instanceKey(container: ContainerStatus, index: number): string {
-  return container.instanceId ?? `legacy-${index}`;
+function instanceKey(index: number): string {
+  return `container-${index}`;
+}
+
+function instanceLabel(value: string | null | undefined): string {
+  if (!value) return '—';
+  return safeText(value, '—', 13);
 }
 
 function imageReference(container: ContainerStatus): string {
@@ -81,7 +86,7 @@ export function DockerDiagnosticsPanel({ data, locale }: {
   locale: MonitorLocale;
 }) {
   const choices = useMemo(
-    () => data.containers.map((container, index) => ({ container, key: instanceKey(container, index) })),
+    () => data.containers.map((container, index) => ({ container, key: instanceKey(index) })),
     [data.containers],
   );
   const [selectedKey, setSelectedKey] = useState(() => choices[0]?.key ?? '');
@@ -170,11 +175,14 @@ export function DockerDiagnosticsPanel({ data, locale }: {
               <h3>{t(locale, '실행 상태', 'Runtime')}</h3>
               <dl>
                 <div><dt>{t(locale, '상태', 'State')}</dt><dd>{safeText(container.state)}</dd></div>
+                <div><dt>{t(locale, '인스턴스', 'Instance')}</dt><dd>{instanceLabel(container.instanceId)}</dd></div>
+                <div><dt>{t(locale, '소유자', 'Owner')}</dt><dd>{safeText(container.owner, '—', 80)}</dd></div>
                 <div><dt>{t(locale, 'Healthcheck', 'Healthcheck')}</dt><dd>{healthcheckState(container, locale)}</dd></div>
                 <div><dt>{t(locale, '재시작', 'Restarts')}</dt><dd>{count(container.restartCount)} (+{count(container.restartCountDelta)})</dd></div>
                 <div><dt>OOMKilled</dt><dd>{booleanState(container.oomKilled, locale)}</dd></div>
                 <div><dt>PID</dt><dd>{count(container.pidCount)} / {count(container.pidLimit)}</dd></div>
                 <div><dt>{t(locale, '시작', 'Started')}</dt><dd>{formatDateTime(container.startedAt, locale)}</dd></div>
+                <div><dt>{t(locale, '종료', 'Finished')}</dt><dd>{formatDateTime(container.finishedAt, locale)}</dd></div>
               </dl>
             </article>
 
@@ -223,6 +231,7 @@ export function DockerDiagnosticsPanel({ data, locale }: {
                 <div><dt>{t(locale, 'root 사용자', 'Root user')}</dt><dd>{booleanState(container.rootUser, locale)}</dd></div>
                 <div><dt>{t(locale, '읽기 전용 rootfs', 'Read-only rootfs')}</dt><dd>{booleanState(container.readOnlyRootFilesystem, locale)}</dd></div>
                 <div><dt>{t(locale, '추가 / 고위험 capability', 'Added / dangerous capabilities')}</dt><dd>{count(container.addedCapabilityCount)} / {count(container.dangerousCapabilityCount)}</dd></div>
+                <div><dt>{t(locale, '과도한 capability', 'Excessive capabilities')}</dt><dd>{booleanState(container.excessiveCapabilities, locale)}</dd></div>
               </dl>
               {findings.length ? (
                 <ul>{findings.map((finding) => <li key={finding}>{finding}</li>)}</ul>

@@ -14,6 +14,7 @@ import type {
 } from './types';
 
 export const DETAIL_PAGES: readonly MonitorDetailPage[] = [
+  'coverage',
   'resources',
   'network',
   'storage',

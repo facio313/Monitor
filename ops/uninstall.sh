@@ -28,6 +28,7 @@ rm -f \
     /usr/local/lib/monitor-collector/log_sources.py \
     /usr/local/lib/monitor-collector/log_store.py \
     /usr/local/lib/monitor-collector/generic_log_collector.py \
+    /usr/local/lib/monitor-collector/monitoring_catalog.py \
     /usr/local/lib/monitor-collector/container_exporter.py \
     /usr/local/lib/monitor-collector/alert_engine.py \
     /usr/local/lib/monitor-collector/alert_runtime.py \

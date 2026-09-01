@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { getGenericLogs, type GenericLogPage } from './api';
+import { getGenericLogs, getMonitoringCatalog, type GenericLogPage, type MonitoringCatalog } from './api';
 
 const EMPTY_PAGE: GenericLogPage = {
   schemaVersion: 1,
@@ -58,5 +58,34 @@ describe('generic log API client', () => {
     expect(url.searchParams.getAll('severity')).toEqual(['warning', 'critical']);
     expect([...url.searchParams.keys()]).not.toContain('sourceIds');
     expect(init).toMatchObject({ credentials: 'same-origin', signal: controller.signal });
+  });
+});
+
+describe('monitoring catalog API client', () => {
+  it('uses the authenticated monitoring-catalog endpoint and forwards cancellation', async () => {
+    const catalog: MonitoringCatalog = {
+      schemaVersion: 1,
+      generatedAt: '2026-09-01T00:00:00.000Z',
+      collectionIntervalSeconds: 60,
+      rulePackVersion: 'test-v1',
+      evidenceSources: [],
+      observations: [],
+      rules: [],
+    };
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => ({
+      ok: true,
+      status: 200,
+      json: async () => catalog,
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+    const controller = new AbortController();
+
+    await expect(getMonitoringCatalog(controller.signal)).resolves.toBe(catalog);
+
+    expect(fetchMock).toHaveBeenCalledWith('/monitor/api/monitoring-catalog', {
+      credentials: 'same-origin',
+      headers: { Accept: 'application/json' },
+      signal: controller.signal,
+    });
   });
 });

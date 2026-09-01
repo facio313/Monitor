@@ -182,6 +182,7 @@ normalizer와 전용 API/UI에는 아직 노출되지 않는다.
 | `generic-logs.jsonl` | redacted normalized log records | default 20,000 records/30d/16MiB store cap | pending transaction digest prevents cursor-before-publication loss |
 | `generic-log-sources.json` | source freshness/error/drop/quota state | fixed reviewed source cardinality, atomic | record/status/cursor ordered commit |
 | `generic-log-collection-error.json` | config/persistence orchestration failure | one strict atomic marker | next successful collection clears it |
+| `monitoring-catalog.json` | sanitized evidence/observation/rule manifest | 1 object, atomic replace, 2 MiB hard cap | rebuilt on each valid collector pass; a build failure removes the prior public copy so stale runtime policy cannot be served as current |
 | `.state/collector-identity.json` | UUID, generation, private machine hash, sequence | exact 4KiB 이하, private 0600 | normal restart continuity; verified machine change rekey |
 | `.state/*.json` | metric/log cursors, lifecycle, delta baselines, pending journals | private 0600 | startup/re-run pre-read replay |
 | `<collector-output>/.state/alert-delivery/alert-delivery.sqlite` | ready delivery items, leases, attempts, terminal counters | finite rows/bytes/retention, root-only; network worker sees only this dedicated directory | expired lease recovery; deterministic enqueue retry |

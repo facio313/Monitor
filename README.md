@@ -769,6 +769,15 @@ The default root is `/var/lib/monitor-export`:
   idempotent firing/resolution transitions. The seed pack defines all 82
   documented defaults; rules without a proven signal remain unsupported
   rather than appearing healthy.
+- `monitoring-catalog.json` is rebuilt on each collector pass and lists all
+  reviewed public evidence artifacts, grouped observation families, and every
+  loaded alert rule. It resolves runtime cadence, retention bounds, and pruning
+  timing without exposing absolute input paths, credentials, private state, or
+  raw telemetry. Authenticated dashboard readers access the strict normalized
+  contract at `GET /monitor/api/monitoring-catalog`; unsafe ownership, mode,
+  links, size, UTF-8, or schema make the endpoint fail closed. A generation
+  failure removes the prior public catalog rather than serving stale runtime
+  policy as current.
 - `generic-logs.jsonl` and `generic-log-sources.json` contain only pre-parse
   redacted, exact-schema generic records and per-source acquisition/drop state.
   Their matching mode-`0600` cursor/quota state and pending transaction live

@@ -111,6 +111,7 @@ const AXIS_PAGE: Record<SystemEmotionAxisKey, MonitorDetailPage> = {
 };
 
 const PAGE_AXIS: Record<MonitorDetailPage, SystemEmotionAxisKey> = {
+  coverage: 'reliability',
   resources: 'compute',
   network: 'network',
   storage: 'storage',

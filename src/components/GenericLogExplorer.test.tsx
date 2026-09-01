@@ -7,6 +7,8 @@ import {
   completeGenericLogQueryRequest,
   EMPTY_GENERIC_LOG_FILTERS,
   GenericLogExplorer,
+  genericLogFiltersFromSearch,
+  genericLogLocationFromQuery,
   genericLogQueryFromDraft,
   mergeGenericLogPages,
 } from './GenericLogExplorer';
@@ -99,6 +101,88 @@ describe('generic log explorer model', () => {
       from: '2026-08-31T10:00',
       to: '2026-08-31T09:00',
     })).toThrow('invalid_time_order');
+  });
+
+  it('initializes all supported filters from a bounded, canonical deep link', () => {
+    const from = '2026-08-30T00:30:00.000Z';
+    const to = '2026-08-30T01:45:00.000Z';
+    const filters = genericLogFiltersFromSearch(
+      `?range=7d&sourceId=journal%3Anginx&kind=journald&priority=security&severity=warning&text=${encodeURIComponent('  denied request  ')}&from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`,
+    );
+
+    expect(filters).toMatchObject({
+      sourceId: 'journal:nginx',
+      sourceKind: 'journald',
+      priority: 'security',
+      severity: 'warning',
+      text: 'denied request',
+    });
+    expect(new Date(filters.from).toISOString()).toBe(from);
+    expect(new Date(filters.to).toISOString()).toBe(to);
+    expect(genericLogQueryFromDraft(filters)).toEqual({
+      limit: 50,
+      sourceIds: ['journal:nginx'],
+      sourceKinds: ['journald'],
+      priorities: ['security'],
+      severities: ['warning'],
+      text: 'denied request',
+      from,
+      to,
+    });
+  });
+
+  it('ignores URL filter values outside the generic-log API contract', () => {
+    const filters = genericLogFiltersFromSearch(
+      `?sourceId=${'a'.repeat(129)}&kind=socket&priority=urgent&severity=fatal&text=${encodeURIComponent('x\ny')}`
+      + '&from=2026-08-30T00%3A30%3A00Z&to=not-a-date',
+    );
+    expect(filters).toEqual(EMPTY_GENERIC_LOG_FILTERS);
+
+    const reversed = genericLogFiltersFromSearch(
+      '?from=2026-08-30T02%3A00%3A00.000Z&to=2026-08-30T01%3A00%3A00.000Z',
+    );
+    expect(reversed.from).toBe('');
+    expect(reversed.to).toBe('');
+  });
+
+  it('synchronizes owned filters without losing the monitor route or unrelated params', () => {
+    const target = genericLogLocationFromQuery({
+      pathname: '/monitor/details/logs',
+      search: '?range=30d&future=keep&sourceId=old&kind=file&text=old',
+      hash: '#latest',
+    }, {
+      limit: 50,
+      sourceIds: ['journal:ssh'],
+      sourceKinds: ['journald'],
+      priorities: ['security'],
+      severities: ['critical'],
+      text: 'authentication failure',
+      from: '2026-08-30T00:30:00.000Z',
+      to: '2026-08-30T01:45:00.000Z',
+    });
+    const url = new URL(target, 'https://monitor.test');
+
+    expect(url.pathname).toBe('/monitor/details/logs');
+    expect(url.hash).toBe('#latest');
+    expect(url.searchParams.get('range')).toBe('30d');
+    expect(url.searchParams.get('future')).toBe('keep');
+    expect(url.searchParams.get('sourceId')).toBe('journal:ssh');
+    expect(url.searchParams.get('kind')).toBe('journald');
+    expect(url.searchParams.get('priority')).toBe('security');
+    expect(url.searchParams.get('severity')).toBe('critical');
+    expect(url.searchParams.get('text')).toBe('authentication failure');
+    expect(url.searchParams.get('from')).toBe('2026-08-30T00:30:00.000Z');
+    expect(url.searchParams.get('to')).toBe('2026-08-30T01:45:00.000Z');
+  });
+
+  it('clears only generic-log URL filters and keeps unrelated navigation state', () => {
+    const target = genericLogLocationFromQuery({
+      pathname: '/monitor/details/logs',
+      search: '?range=24h&sourceId=journal%3Assh&kind=journald&priority=security&severity=error&text=denied&from=2026-08-30T00%3A00%3A00.000Z&to=2026-08-31T00%3A00%3A00.000Z',
+      hash: '',
+    }, { limit: 50 });
+
+    expect(target).toBe('/monitor/details/logs?range=24h');
   });
 
   it('appends current cursor pages and preserves loaded records when a cursor becomes stale', () => {

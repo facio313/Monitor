@@ -10,7 +10,7 @@ function payload(): DashboardPayload {
       name: 'monitor', project: 'monitor', owner: 'cks', state: 'running', health: 'healthy',
       healthcheckConfigured: true, cpuPercent: 95, memoryBytes: 900, memoryPercent: 90,
       memoryLimitBytes: 1000, cpuLimitCores: 1, pidLimit: 100, restartCount: 4,
-      restartCountDelta: 3, oomKilled: false, startedAt: '2026-08-30T11:00:00Z', finishedAt: null,
+      restartCountDelta: 3, oomKilled: false, startedAt: '2026-08-30T11:00:00Z', finishedAt: '2026-08-30T11:30:00Z',
       instanceId: 'a'.repeat(32), pidCount: 90, cpuThrottledPercent: 25,
       cpuThrottledPeriods: 50, cpuThrottledSeconds: 2.5,
       blockReadBytes: 1000, blockWriteBytes: 2000, blockReadBytesPerSecond: 10,
@@ -54,6 +54,9 @@ describe('DockerDiagnosticsPanel', () => {
     expect(markup).toMatch(/Event observed <strong>(?!—)[^<]+<\/strong>/);
     expect(markup).toContain('Healthcheck');
     expect(markup).toContain('healthy');
+    expect(markup).toContain('<dt>Instance</dt><dd>aaaaaaaaaaaa…</dd>');
+    expect(markup).toContain('<dt>Owner</dt><dd>cks</dd>');
+    expect(markup).toContain('<dt>Finished</dt>');
     expect(markup).toContain('CPU throttled');
     expect(markup).toContain('Throttled periods');
     expect(markup).toContain('Network received');
@@ -67,10 +70,11 @@ describe('DockerDiagnosticsPanel', () => {
     expect(markup).toContain('Root user');
     expect(markup).toContain('Writable root filesystem');
     expect(markup).toContain('Elevated capabilities');
+    expect(markup).toContain('<dt>Excessive capabilities</dt><dd>Yes</dd>');
     expect(markup).toContain('The Docker event history may contain a gap');
     expect(markup).toContain('Not collected');
     expect(markup).toContain('exit 137');
-    expect(markup).not.toContain('a'.repeat(64));
+    expect(markup).not.toContain('a'.repeat(32));
   });
 
   it('shows a known read-only sensitive bind as evidence without reporting it as high risk', () => {

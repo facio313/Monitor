@@ -26,6 +26,7 @@ import {
   type GenericLogQuery,
 } from './generic-logs.js';
 import { readInfrastructureLedger } from './infrastructure-ledger.js';
+import { readMonitoringCatalog } from './monitoring-catalog.js';
 import { inventoryLegacyAuth } from './legacy-auth.js';
 import { PasswordStore, PasswordStoreBusyError } from './password-store.js';
 import {
@@ -62,6 +63,7 @@ export interface AppOptions extends ConfigOverrides {
   now?: () => number;
   publicDir?: string;
   genericLogOwnerUid?: number;
+  monitoringCatalogOwnerUid?: number;
   agentBodyGate?: AgentBodyGate;
   agentBodyTimeoutMs?: number;
   updateGateway?: (request: UpdateGatewayRequest) => Promise<UpdateGatewayResponse>;
@@ -199,6 +201,7 @@ interface AuthorizedApplicationPrincipal {
 
 const API_KEY_EXACT_ROUTES = new Map<string, ApplicationApiKeyScope>([
   ['GET /monitor/api/dashboard', 'dashboard:read'],
+  ['GET /monitor/api/monitoring-catalog', 'dashboard:read'],
   ['GET /monitor/api/generic-logs', 'logs:read'],
   ['GET /monitor/api/agents', 'agents:read'],
   ['POST /monitor/api/agents/enrollment-tokens', 'agents:write'],
@@ -1052,6 +1055,35 @@ export function createApp(options: AppOptions = {}) {
       now(),
       config.staleAfterMs,
     ));
+  });
+
+  app.get('/monitor/api/monitoring-catalog', (request, response) => {
+    if (apiKeyPrincipals.has(request)) {
+      // The explicit bearer middleware already enforced dashboard:read.
+    } else if (config.ssoEnabled) {
+      const identity = trustedSsoIdentity(request, config.edgeSecret);
+      if (!identity) {
+        apiError(response, 401, 'AUTH_REQUIRED', 'Authentication required');
+        return;
+      }
+    } else {
+      const session = verifySession(
+        request,
+        localAuth!.sessionSecret,
+        localAuth!.passwordStore.sessionEpoch,
+        now(),
+      );
+      if (!session) {
+        apiError(response, 401, 'AUTH_REQUIRED', 'Authentication required');
+        return;
+      }
+    }
+    const catalog = readMonitoringCatalog(config.dataDir, options.monitoringCatalogOwnerUid);
+    if (!catalog) {
+      apiError(response, 503, 'MONITORING_CATALOG_UNAVAILABLE', 'Monitoring catalog is unavailable');
+      return;
+    }
+    response.status(200).json(catalog);
   });
 
   const requireGenericLogReadIdentity = (

@@ -27,9 +27,11 @@ import {
 import { Icon, type IconName } from './Icon';
 import { GenericLogExplorer } from './GenericLogExplorer';
 import { InfrastructureLedger } from './InfrastructureLedger';
+import { MonitoringCoverage } from './MonitoringCoverage';
 import { OperationalGuidance, OperationalHealthOverview } from './OperationalHealth';
 import { OperationalHeadroom } from './OperationalHeadroom';
 import { PasswordChangeDialog } from './PasswordChangeDialog';
+import { RelatedEvidencePanel } from './RelatedEvidencePanel';
 import { RuleHealthSummary } from './RuleHealthSummary';
 import { SystemMaintenance } from './SystemMaintenance';
 import { SystemEmotionEngine } from './SystemEmotionEngine';
@@ -45,6 +47,7 @@ const RANGES: Array<{ value: TimeRange; ko: string; en: string }> = [
 
 const NAVIGATION: Array<{ page: MonitorPage; icon: IconName; ko: string; en: string; koHint: string; enHint: string }> = [
   { page: 'overview', icon: 'activity', ko: '관제 개요', en: 'Overview', koHint: '전체 계통', enHint: 'All systems' },
+  { page: 'coverage', icon: 'check', ko: '관찰·검사 목록', en: 'Coverage', koHint: '수집 · 규칙 · 보존', enHint: 'Collection · rules · retention' },
   { page: 'resources', icon: 'cpu', ko: '자원·부하', en: 'Resources', koHint: 'CPU · 메모리 · 온도', enHint: 'CPU · memory · thermal' },
   { page: 'network', icon: 'network', ko: '네트워크', en: 'Network', koHint: '송수신 · 요청', enHint: 'Transfer · requests' },
   { page: 'storage', icon: 'database', ko: '저장장치', en: 'Storage', koHint: '용량 · 입출력', enHint: 'Capacity · I/O' },
@@ -460,9 +463,15 @@ export function MonitorDashboard({
           )}
 
           {normalizedPage === 'infrastructure'
-            ? <InfrastructureLedger locale={locale} onUnauthorized={onUnauthorized} />
+            ? <div className="detail-dashboard">
+                <InfrastructureLedger locale={locale} onUnauthorized={onUnauthorized} />
+                <RelatedEvidencePanel page="infrastructure" data={data} range={range} locale={locale} onUnauthorized={onUnauthorized} />
+              </div>
             : normalizedPage === 'logs'
-              ? <GenericLogExplorer locale={locale} onUnauthorized={onUnauthorized} />
+              ? <div className="detail-dashboard">
+                  <GenericLogExplorer locale={locale} onUnauthorized={onUnauthorized} />
+                  <RelatedEvidencePanel page="logs" data={data} range={range} locale={locale} onUnauthorized={onUnauthorized} />
+                </div>
             : initialLoading && !data ? <ControlSkeleton locale={locale} /> : data ? (
             normalizedPage === 'overview'
               ? <>
@@ -471,6 +480,8 @@ export function MonitorDashboard({
                     <ContainerStatusTable data={data} locale={locale} onOpen={(next) => navigate(next)} grouped />
                   </div>
                 </>
+              : normalizedPage === 'coverage'
+                ? <MonitoringCoverage data={data} range={range} locale={locale} onUnauthorized={onUnauthorized} />
               : normalizedPage === 'maintenance'
                 ? <div className="detail-dashboard">
                     <OperationalGuidance findings={findings} locale={locale} page="maintenance" range={range} />
@@ -482,8 +493,12 @@ export function MonitorDashboard({
                         updateControls={<SystemUpdateControls locale={locale} />}
                       />
                     </div>
+                    <RelatedEvidencePanel page="maintenance" data={data} range={range} locale={locale} onUnauthorized={onUnauthorized} />
                   </div>
-                : <DetailPage page={normalizedPage as Exclude<MonitorDetailPage, 'maintenance' | 'infrastructure' | 'logs'>} data={data} findings={findings} range={range} locale={locale} onOpen={(next, anchor) => navigate(next, anchor)} />
+                : <div className="detail-dashboard">
+                    <DetailPage page={normalizedPage as Exclude<MonitorDetailPage, 'coverage' | 'maintenance' | 'infrastructure' | 'logs'>} data={data} findings={findings} range={range} locale={locale} onOpen={(next, anchor) => navigate(next, anchor)} />
+                    <RelatedEvidencePanel page={normalizedPage} data={data} range={range} locale={locale} onUnauthorized={onUnauthorized} />
+                  </div>
           ) : <div className="control-empty"><Icon name="server" size={32} /><h2>{t(locale, '수집 데이터가 아직 없습니다', 'Telemetry is not available yet')}</h2><p>{t(locale, '수집기가 첫 스냅샷을 만들면 계기판이 자동으로 나타납니다.', 'The instruments will appear after the collector writes its first snapshot.')}</p><button type="button" onClick={() => void refresh()}>{t(locale, '다시 확인', 'Try again')}</button></div>}
         </main>
       </div>

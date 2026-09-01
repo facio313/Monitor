@@ -34,6 +34,7 @@ from typing import Any, Mapping, Sequence
 
 from generic_log_collector import collect_generic_logs
 from linux_telemetry import collect_linux_telemetry
+from monitoring_catalog import MAX_CATALOG_BYTES, build_monitoring_catalog
 
 
 DEFAULT_RULE_PACK_PATH = Path(__file__).resolve().parent / "rules" / "default-rules.v1.json"
@@ -7582,6 +7583,41 @@ def publish_rules_and_commit_delivery_checkpoint(
     return evaluation
 
 
+def publish_monitoring_catalog(config: Config, now: dt.datetime) -> bool:
+    """Publish the reviewed catalog, failing closed without stale metadata.
+
+    Catalog generation remains independent from telemetry collection, but a
+    failed generation removes the prior public artifact so the API cannot
+    present obsolete rules or retention settings as current.
+    """
+
+    try:
+        catalog = build_monitoring_catalog(
+            now=now,
+            rule_pack_path=config.rule_pack,
+            collection_interval_seconds=config.expected_interval_seconds,
+            retention_days=config.retention_days,
+            max_log_records=config.max_log_records,
+            incident_retention_days=config.incident_retention_days,
+            max_incident_records=config.max_incident_records,
+            generic_log_retention_days=config.generic_log_retention_days,
+            generic_log_max_records=config.generic_log_max_records,
+            generic_log_max_file_bytes=config.generic_log_max_file_bytes,
+        )
+        atomic_write_json(
+            config.output_dir / "monitoring-catalog.json",
+            catalog,
+            maximum_bytes=MAX_CATALOG_BYTES,
+        )
+        return True
+    except Exception:
+        try:
+            (config.output_dir / "monitoring-catalog.json").unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False
+
+
 def notification_delivery_signal(
     output_dir: Path,
     prior_counter: Any,
@@ -7983,6 +8019,7 @@ def run(config: Config, now: dt.datetime | None = None) -> dict[str, Any]:
             delta_state,
             notification_counter,
         )
+        publish_monitoring_catalog(config, now)
         return current
 
 

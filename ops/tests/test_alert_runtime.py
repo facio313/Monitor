@@ -483,6 +483,83 @@ class AlertRuntimeTests(unittest.TestCase):
                 self.assertEqual(observations[rule_id][0].status, "ok")
                 self.assertEqual(observations[rule_id][0].value, value)
 
+    def test_explicitly_unsupported_linux_metrics_do_not_look_like_missing_data(self):
+        snapshot = self.snapshot()
+        snapshot["disks"][0].update({
+            "filesystemType": "vfat",
+            "inodeTotal": 0,
+            "inodeUsedPercent": None,
+        })
+        snapshot["linux"]["processes"]["systemFileDescriptors"].update({
+            "status": "partial",
+            "maximum": None,
+            "usedPercent": None,
+        })
+        snapshot["linux"]["clock"]["timeSync"].update({
+            "clockDriftStatus": "unsupported",
+            "clockDriftMilliseconds": None,
+        })
+        snapshot["linux"]["clock"].update({
+            "unexpectedRebootStatus": "not_inferable_from_local_counters",
+            "unexpectedReboot": None,
+        })
+
+        observations = observations_for_snapshot(self.pack, snapshot)
+
+        for rule_id in (
+            "InodeUsageHigh",
+            "FileDescriptorUsageHigh",
+            "ClockSkewHigh",
+            "UnexpectedReboot",
+        ):
+            with self.subTest(rule_id=rule_id):
+                self.assertEqual(observations[rule_id][0].status, "unsupported")
+                self.assertIsNone(observations[rule_id][0].value)
+
+    def test_missing_supported_linux_metric_values_remain_no_data(self):
+        snapshot = self.snapshot()
+        snapshot["disks"][0].update({
+            "inodeTotal": 100,
+            "inodeUsedPercent": None,
+        })
+        snapshot["linux"]["processes"]["systemFileDescriptors"].update({
+            "status": "supported",
+            "maximum": 1000,
+            "usedPercent": None,
+        })
+        snapshot["linux"]["clock"]["timeSync"].update({
+            "status": "supported",
+            "clockDriftStatus": "supported",
+            "clockDriftMilliseconds": None,
+        })
+        snapshot["linux"]["clock"].update({
+            "status": "supported",
+            "unexpectedRebootStatus": "supported",
+            "unexpectedReboot": None,
+        })
+
+        observations = observations_for_snapshot(self.pack, snapshot)
+
+        for rule_id in (
+            "InodeUsageHigh",
+            "FileDescriptorUsageHigh",
+            "ClockSkewHigh",
+            "UnexpectedReboot",
+        ):
+            with self.subTest(rule_id=rule_id):
+                self.assertEqual(observations[rule_id][0].status, "no_data")
+                self.assertIsNone(observations[rule_id][0].value)
+
+    def test_current_disk_schema_without_inode_capacity_marks_null_inode_metric_unsupported(self):
+        snapshot = self.snapshot()
+        snapshot["disks"][0]["inodeUsedPercent"] = None
+        snapshot["disks"][0].pop("inodeTotal", None)
+
+        observation = observations_for_snapshot(self.pack, snapshot)["InodeUsageHigh"][0]
+
+        self.assertEqual(observation.status, "unsupported")
+        self.assertIsNone(observation.value)
+
     def test_hwmon_only_raspberry_pi_flags_do_not_create_false_throttle_normal(self):
         snapshot = self.snapshot()
         raspberry_pi = snapshot["linux"]["thermal"]["raspberryPi"]

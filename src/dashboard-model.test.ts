@@ -56,11 +56,13 @@ describe('monitor navigation', () => {
     expect(monitorPageFromPath('/monitor/')).toBe('overview');
     expect(monitorPageFromPath('/monitor/details')).toBe('resources');
     expect(monitorPageFromPath('/monitor/details/logs/')).toBe('logs');
+    expect(monitorPageFromPath('/monitor/details/coverage')).toBe('coverage');
     expect(monitorPageFromPath('/monitor/details/reliability')).toBe('reliability');
     expect(monitorPageFromPath('/monitor/details/maintenance')).toBe('maintenance');
     expect(monitorPageFromPath('/monitor/details/infrastructure')).toBe('infrastructure');
     expect(monitorPageFromPath('/monitor/details/not-real')).toBe('overview');
     expect(monitorPathForPage('overview')).toBe('/monitor/');
+    expect(monitorPathForPage('coverage')).toBe('/monitor/details/coverage');
     expect(monitorPathForPage('containers')).toBe('/monitor/details/containers');
     expect(monitorPathForPage('reliability')).toBe('/monitor/details/reliability');
     expect(monitorPathForPage('maintenance')).toBe('/monitor/details/maintenance');

@@ -5,7 +5,8 @@ import type {
   LinuxRateStatus,
   MonitorLocale,
 } from '../types';
-import { formatDateTime, safeText } from '../utils';
+import { formatDateTime, formatUptime, safeText } from '../utils';
+import { paginateItems, Pagination, usePagination } from './Pagination';
 
 type LinuxDiagnosticsPage = 'resources' | 'network' | 'storage' | 'reliability' | 'power';
 
@@ -204,8 +205,17 @@ function networkCards(linux: LinuxDiagnostics, locale: MonitorLocale) {
       locale={locale}
       evidence={[
         { label: 'ESTABLISHED', value: number(tcp.states.established, locale) },
-        { label: 'CLOSE_WAIT · TIME_WAIT', value: `${number(tcp.states.closeWait, locale)} · ${number(tcp.states.timeWait, locale)}` },
-        { label: 'SYN_SENT · SYN_RECV', value: `${number(tcp.states.synSent, locale)} · ${number(tcp.states.synRecv, locale)}` },
+        { label: 'SYN_SENT', value: number(tcp.states.synSent, locale) },
+        { label: 'SYN_RECV', value: number(tcp.states.synRecv, locale) },
+        { label: 'FIN_WAIT1', value: number(tcp.states.finWait1, locale) },
+        { label: 'FIN_WAIT2', value: number(tcp.states.finWait2, locale) },
+        { label: 'TIME_WAIT', value: number(tcp.states.timeWait, locale) },
+        { label: 'CLOSE', value: number(tcp.states.close, locale) },
+        { label: 'CLOSE_WAIT', value: number(tcp.states.closeWait, locale) },
+        { label: 'LAST_ACK', value: number(tcp.states.lastAck, locale) },
+        { label: 'LISTEN', value: number(tcp.states.listen, locale) },
+        { label: 'CLOSING', value: number(tcp.states.closing, locale) },
+        { label: 'NEW_SYN_RECV', value: number(tcp.states.newSynRecv, locale) },
         { label: t(locale, '상태 근거', 'Status basis'), value: tcp.socketScanTruncated ? t(locale, '소켓 상한 도달', 'Socket cap reached') : linuxCollectionStatusLabel(tcp.socketScanStatus, locale) },
       ]}
       action={tcp.states.closeWait > 0
@@ -252,12 +262,13 @@ function storageCards(linux: LinuxDiagnostics, locale: MonitorLocale) {
       locale={locale}
       evidence={[
         { label: t(locale, '관찰 장치', 'Observed devices'), value: '0' },
+        { label: t(locale, '수집 범위 잘림', 'Collection truncated'), value: yesNo(storage.truncated, locale) },
         { label: t(locale, '상태 근거', 'Status basis'), value: linuxCollectionStatusLabel(storage.status, locale) },
       ]}
       action={collectionAction(storage.status, locale)}
     />];
   }
-  return storage.devices.slice(0, 3).map((device) => {
+  return storage.devices.map((device, index) => {
     const degraded = device.raidDegradedDevices !== null && device.raidDegradedDevices > 0;
     const pressure = (device.utilizationPercent ?? 0) >= 80 || (device.averageLatencyMilliseconds ?? 0) >= 20;
     const action = degraded
@@ -268,7 +279,7 @@ function storageCards(linux: LinuxDiagnostics, locale: MonitorLocale) {
           ? t(locale, '다음 유효 표본에서 카운터 차분을 다시 확인합니다.', 'Recheck counter deltas on the next valid sample.')
           : collectionAction(storage.status, locale);
     return <DiagnosticCard
-      key={device.name}
+      key={`${device.name}-${index}`}
       title={`${safeText(device.name, 'device', 64)} · ${safeText(device.type, 'block', 32)}`}
       status={storage.status}
       locale={locale}
@@ -276,6 +287,9 @@ function storageCards(linux: LinuxDiagnostics, locale: MonitorLocale) {
         { label: t(locale, '읽기 · 쓰기 지연', 'Read · write latency'), value: `${milliseconds(device.readLatencyMilliseconds, locale)} · ${milliseconds(device.writeLatencyMilliseconds, locale)}` },
         { label: t(locale, '평균 지연 · 사용률', 'Average latency · utilization'), value: `${milliseconds(device.averageLatencyMilliseconds, locale)} · ${percent(device.utilizationPercent, locale)}` },
         { label: t(locale, '현재 · 평균 큐', 'Current · average queue'), value: `${number(device.queueDepth, locale)} · ${number(device.averageQueueDepth, locale)}` },
+        { label: t(locale, '회전식 장치', 'Rotational device'), value: yesNo(device.rotational, locale) },
+        { label: t(locale, 'RAID 저하 장치', 'RAID degraded devices'), value: number(device.raidDegradedDevices, locale) },
+        { label: t(locale, '수집 범위 잘림', 'Collection truncated'), value: yesNo(storage.truncated, locale) },
         { label: t(locale, '상태 근거', 'Status basis'), value: `${rateStatusLabel(device.rateStatus, locale)} · SMART ${linuxCollectionStatusLabel(device.smartStatus, locale)} · RAID ${device.raidArrayState ?? linuxCollectionStatusLabel(device.raidStatus, locale)}` },
       ]}
       action={action}
@@ -285,24 +299,18 @@ function storageCards(linux: LinuxDiagnostics, locale: MonitorLocale) {
 
 function reliabilityCards(linux: LinuxDiagnostics, locale: MonitorLocale) {
   const { clock, systemd } = linux.reliability;
-  const units = systemd.units.slice(0, 4);
-  const unitEvidence = units.length
-    ? units.map((unit) => ({
-      label: safeText(unit.unit, 'unit', 128),
-      value: `${safeText(unit.activeState, 'unknown', 32)} / ${safeText(unit.subState, 'unknown', 32)} · ${t(locale, '재시작', 'restarts')} ${number(unit.restartCount, locale)} · ${safeText(unit.result, 'unknown', 32)}`,
-    }))
-    : [{ label: t(locale, '허용 목록 unit', 'Allow-listed units'), value: '0' }];
   const problematicUnit = systemd.units.find((unit) => (
     unit.activeState !== 'active' || (unit.restartCount ?? 0) > 0 || !['success', 'unknown'].includes(unit.result)
   ));
-  return [
+  const cards = [
     <DiagnosticCard
       key="clock"
       title={t(locale, '시계 동기화', 'Clock synchronization')}
       status={clock.timeSync.status}
       locale={locale}
       evidence={[
-        { label: t(locale, '동기화 · NTP', 'Synchronized · NTP'), value: `${yesNo(clock.timeSync.synchronized, locale)} · ${yesNo(clock.timeSync.ntpEnabled, locale)}` },
+        { label: t(locale, '동기화 · NTP 활성', 'Synchronized · NTP enabled'), value: `${yesNo(clock.timeSync.synchronized, locale)} · ${yesNo(clock.timeSync.ntpEnabled, locale)}` },
+        { label: t(locale, 'NTP 지원', 'NTP supported'), value: yesNo(clock.timeSync.ntpSupported, locale) },
         { label: t(locale, '드리프트', 'Drift'), value: `${milliseconds(clock.timeSync.clockDriftMilliseconds, locale)} · ${linuxCollectionStatusLabel(clock.timeSync.clockDriftStatus, locale)}` },
         { label: t(locale, '상태 근거', 'Status basis'), value: clock.timeSync.reason ?? linuxCollectionStatusLabel(clock.timeSync.status, locale) },
       ]}
@@ -316,6 +324,7 @@ function reliabilityCards(linux: LinuxDiagnostics, locale: MonitorLocale) {
       status={clock.status}
       locale={locale}
       evidence={[
+        { label: t(locale, '가동 시간', 'Uptime'), value: clock.uptimeSeconds === null ? '—' : `${formatUptime(clock.uptimeSeconds)} (${number(clock.uptimeSeconds, locale)} s)` },
         { label: t(locale, '부팅 시각', 'Boot time'), value: clock.bootTime ? formatDateTime(clock.bootTime, locale) : '—' },
         { label: t(locale, '표본 사이 재부팅', 'Reboot between samples'), value: yesNo(clock.rebootDetectedSincePreviousSample, locale) },
         { label: t(locale, '예상 밖 재부팅', 'Unexpected reboot'), value: `${yesNo(clock.unexpectedReboot, locale)} · ${safeText(clock.unexpectedRebootStatus, 'unknown', 64)}` },
@@ -330,8 +339,8 @@ function reliabilityCards(linux: LinuxDiagnostics, locale: MonitorLocale) {
       status={systemd.status}
       locale={locale}
       evidence={[
-        ...unitEvidence,
-        ...(systemd.units.length > units.length ? [{ label: t(locale, '그 밖의 unit', 'Additional units'), value: `+${systemd.units.length - units.length}` }] : []),
+        { label: t(locale, '허용 목록 unit', 'Allow-listed units'), value: number(systemd.units.length, locale) },
+        { label: t(locale, '수집 범위 잘림', 'Collection truncated'), value: yesNo(systemd.truncated, locale) },
         { label: t(locale, '상태 근거', 'Status basis'), value: systemd.reason ?? linuxCollectionStatusLabel(systemd.status, locale) },
       ]}
       action={problematicUnit
@@ -339,24 +348,45 @@ function reliabilityCards(linux: LinuxDiagnostics, locale: MonitorLocale) {
         : collectionAction(systemd.status, locale)}
     />,
   ];
+
+  systemd.units.forEach((unit, index) => {
+    const unitProblem = unit.activeState !== 'active'
+      || (unit.restartCount ?? 0) > 0
+      || !['success', 'unknown'].includes(unit.result);
+    cards.push(<DiagnosticCard
+      key={`systemd-${unit.unit}-${index}`}
+      title={safeText(unit.unit, 'unit', 128)}
+      status={systemd.status}
+      locale={locale}
+      evidence={[
+        { label: t(locale, '로드 상태', 'Load state'), value: safeText(unit.loadState, 'unknown', 32) },
+        { label: t(locale, '활성 상태', 'Active state'), value: safeText(unit.activeState, 'unknown', 32) },
+        { label: t(locale, '하위 상태', 'Sub-state'), value: safeText(unit.subState, 'unknown', 32) },
+        { label: t(locale, '재시작 횟수', 'Restart count'), value: number(unit.restartCount, locale) },
+        { label: t(locale, '재시작 근거', 'Restart count source'), value: safeText(unit.restartCountStatus, 'unknown', 64) },
+        { label: t(locale, '실행 결과', 'Result'), value: safeText(unit.result, 'unknown', 32) },
+        { label: 'ExecMainStatus', value: number(unit.execMainStatus, locale) },
+        { label: t(locale, 'Invocation 상태', 'Invocation status'), value: unit.invocationStatus === null ? '—' : linuxCollectionStatusLabel(unit.invocationStatus, locale) },
+      ]}
+      action={unitProblem
+        ? t(locale, '이 unit의 상태·결과·재시작 원인을 확인합니다.', 'Inspect this unit’s state, result, and restart cause.')
+        : collectionAction(systemd.status, locale)}
+    />);
+  });
+
+  return cards;
 }
 
 function powerCards(linux: LinuxDiagnostics, locale: MonitorLocale) {
   const power = linux.power;
   const rpi = power.raspberryPi;
-  const sensorSources = power.sensors.length
-    ? power.sensors.slice(0, 3).map((sensor) => `${safeText(sensor.name, 'sensor', 64)} (${sensor.source})`).join(' · ')
-    : '—';
-  const fanEvidence = power.fans.length
-    ? power.fans.slice(0, 3).map((fan) => `${safeText(fan.name, 'fan', 64)} ${number(fan.rpm, locale)} RPM`).join(' · ')
-    : '—';
   const hasRpiFault = [
     rpi.currentUnderVoltage, rpi.currentFrequencyCapped, rpi.currentThrottled,
     rpi.currentSoftTemperatureLimit, rpi.underVoltageOccurred,
     rpi.frequencyCapOccurred, rpi.throttlingOccurred,
     rpi.softTemperatureLimitOccurred,
   ].some((value) => value === true);
-  return [
+  const cards = [
     <DiagnosticCard
       key="thermal"
       title={t(locale, '열원과 팬 근거', 'Thermal and fan evidence')}
@@ -364,30 +394,72 @@ function powerCards(linux: LinuxDiagnostics, locale: MonitorLocale) {
       locale={locale}
       evidence={[
         { label: t(locale, '최고 온도', 'Maximum temperature'), value: power.maximumTemperatureCelsius === null ? '—' : `${number(power.maximumTemperatureCelsius, locale)}°C` },
-        { label: t(locale, '센서 출처', 'Sensor sources'), value: sensorSources },
-        { label: t(locale, '팬', 'Fans'), value: fanEvidence },
-        { label: t(locale, '상태 근거', 'Status basis'), value: power.truncated ? t(locale, '표시 범위 축약', 'Display reduced to bounded items') : linuxCollectionStatusLabel(power.status, locale) },
+        { label: t(locale, '센서', 'Sensors'), value: number(power.sensors.length, locale) },
+        { label: t(locale, '팬', 'Fans'), value: number(power.fans.length, locale) },
+        { label: t(locale, '수집 범위 잘림', 'Collection truncated'), value: yesNo(power.truncated, locale) },
+        { label: t(locale, '상태 근거', 'Status basis'), value: linuxCollectionStatusLabel(power.status, locale) },
       ]}
       action={power.maximumTemperatureCelsius !== null && power.maximumTemperatureCelsius >= 80
         ? t(locale, '냉각 경로, 팬 회전, 지속 부하를 함께 확인합니다.', 'Check airflow, fan rotation, and sustained load together.')
         : collectionAction(power.status, locale)}
     />,
-    <DiagnosticCard
+  ];
+
+  power.sensors.forEach((sensor, index) => {
+    cards.push(<DiagnosticCard
+      key={`sensor-${sensor.name}-${index}`}
+      title={`${t(locale, '온도 센서', 'Temperature sensor')} · ${safeText(sensor.name, 'sensor', 64)}`}
+      status={sensor.status}
+      locale={locale}
+      evidence={[
+        { label: t(locale, '출처', 'Source'), value: sensor.source },
+        { label: t(locale, '온도', 'Temperature'), value: sensor.temperatureCelsius === null ? '—' : `${number(sensor.temperatureCelsius, locale)}°C` },
+        { label: t(locale, '수집 상태', 'Collection status'), value: linuxCollectionStatusLabel(sensor.status, locale) },
+      ]}
+      action={sensor.temperatureCelsius !== null && sensor.temperatureCelsius >= 80
+        ? t(locale, '센서 위치의 냉각 경로와 지속 부하를 확인합니다.', 'Check airflow and sustained load at this sensor.')
+        : collectionAction(sensor.status, locale)}
+    />);
+  });
+
+  power.fans.forEach((fan, index) => {
+    cards.push(<DiagnosticCard
+      key={`fan-${fan.name}-${index}`}
+      title={`${t(locale, '팬', 'Fan')} · ${safeText(fan.name, 'fan', 64)}`}
+      status={fan.status}
+      locale={locale}
+      evidence={[
+        { label: 'RPM', value: number(fan.rpm, locale) },
+        { label: t(locale, '수집 상태', 'Collection status'), value: linuxCollectionStatusLabel(fan.status, locale) },
+      ]}
+      action={collectionAction(fan.status, locale)}
+    />);
+  });
+
+  cards.push(<DiagnosticCard
       key="raspberry-pi"
       title={t(locale, 'Raspberry Pi 전원·제한', 'Raspberry Pi power and throttling')}
       status={rpi.status}
       locale={locale}
       evidence={[
         { label: t(locale, '감지 · 플래그 출처', 'Detected · flag source'), value: `${yesNo(rpi.detected, locale)} · ${rpi.flagSource ?? '—'}` },
-        { label: t(locale, '현재 저전압 · 제한', 'Current undervoltage · throttle'), value: `${yesNo(rpi.currentUnderVoltage, locale)} · ${yesNo(rpi.currentThrottled, locale)}` },
-        { label: t(locale, '과거 저전압 · 제한', 'Historic undervoltage · throttle'), value: `${yesNo(rpi.underVoltageOccurred, locale)} · ${yesNo(rpi.throttlingOccurred, locale)}` },
+        { label: t(locale, '제한 플래그', 'Throttled flags'), value: rpi.throttledFlags === null ? '—' : `${number(rpi.throttledFlags, locale)} (0x${rpi.throttledFlags.toString(16)})` },
+        { label: t(locale, '현재 저전압', 'Current undervoltage'), value: yesNo(rpi.currentUnderVoltage, locale) },
+        { label: t(locale, '현재 주파수 제한', 'Current frequency cap'), value: yesNo(rpi.currentFrequencyCapped, locale) },
+        { label: t(locale, '현재 쓰로틀링', 'Current throttling'), value: yesNo(rpi.currentThrottled, locale) },
+        { label: t(locale, '현재 소프트 온도 제한', 'Current soft temperature limit'), value: yesNo(rpi.currentSoftTemperatureLimit, locale) },
+        { label: t(locale, '과거 저전압', 'Undervoltage occurred'), value: yesNo(rpi.underVoltageOccurred, locale) },
+        { label: t(locale, '과거 주파수 제한', 'Frequency cap occurred'), value: yesNo(rpi.frequencyCapOccurred, locale) },
+        { label: t(locale, '과거 쓰로틀링', 'Throttling occurred'), value: yesNo(rpi.throttlingOccurred, locale) },
+        { label: t(locale, '과거 소프트 온도 제한', 'Soft temperature limit occurred'), value: yesNo(rpi.softTemperatureLimitOccurred, locale) },
         { label: t(locale, '온도 · 공급 전압', 'Temperature · supply voltage'), value: `${rpi.temperatureCelsius === null ? '—' : `${number(rpi.temperatureCelsius, locale)}°C`} · ${rpi.supplyVoltageVolts === null ? '—' : `${number(rpi.supplyVoltageVolts, locale)} V`}` },
       ]}
       action={hasRpiFault
         ? t(locale, '전원 어댑터·케이블·냉각 상태를 확인하고 플래그 변화를 재검증합니다.', 'Check the adapter, cable, and cooling, then verify the flag changes.')
         : collectionAction(rpi.status, locale)}
-    />,
-  ];
+    />);
+
+  return cards;
 }
 
 export function LinuxDiagnosticsPanel({
@@ -416,6 +488,12 @@ export function LinuxDiagnosticsPanel({
         : page === 'reliability'
           ? reliabilityCards(linux, locale)
           : powerCards(linux, locale);
+  const pagination = usePagination({
+    totalItems: cards.length,
+    pageSize: 8,
+    resetKey: page,
+  });
+  const visibleCards = paginateItems(cards, pagination);
   const headingId = `linux-${page}-diagnostics-heading`;
 
   return (
@@ -432,7 +510,16 @@ export function LinuxDiagnosticsPanel({
           {linux.collectedAt && <time dateTime={linux.collectedAt}>{formatDateTime(linux.collectedAt, locale)}</time>}
         </div>
       </header>
-      <div className="linux-diagnostic-grid">{cards}</div>
+      <div className="linux-diagnostic-grid">{visibleCards}</div>
+      {pagination.pageCount > 1 && (
+        <Pagination
+          model={pagination}
+          locale={locale}
+          onPageChange={pagination.setPage}
+          ariaLabel={t(locale, 'Linux 진단 페이지', 'Linux diagnostic pages')}
+          itemLabel={t(locale, '개 진단', 'diagnostics')}
+        />
+      )}
     </section>
   );
 }

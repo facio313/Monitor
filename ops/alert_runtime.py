@@ -459,7 +459,27 @@ def observations_for_snapshot(pack: RulePack, snapshot: Mapping[str, Any]) -> di
         if "DiskUsageCritical" in result:
             result.setdefault("DiskUsageCritical", []).append(_observation(target, disk.get("usedPercent"), parent_target=host_target))
         if "InodeUsageHigh" in result:
-            result.setdefault("InodeUsageHigh", []).append(_observation(target, disk.get("inodeUsedPercent"), parent_target=host_target))
+            inode_total = _number(disk.get("inodeTotal"))
+            result.setdefault("InodeUsageHigh", []).append(
+                Observation(
+                    target,
+                    None,
+                    "unsupported",
+                    (("parent_target", host_target),),
+                )
+                if (
+                    inode_total == 0
+                    or (
+                        "inodeTotal" not in disk
+                        and disk.get("inodeUsedPercent") is None
+                    )
+                )
+                else _observation(
+                    target,
+                    disk.get("inodeUsedPercent"),
+                    parent_target=host_target,
+                )
+            )
         if "DiskReadOnly" in result:
             read_only = disk.get("readOnly")
             result.setdefault("DiskReadOnly", []).append(_observation(
@@ -510,7 +530,12 @@ def observations_for_snapshot(pack: RulePack, snapshot: Mapping[str, Any]) -> di
     if "FileDescriptorUsageHigh" in result:
         file_descriptors = _mapping(linux_processes.get("systemFileDescriptors"))
         result["FileDescriptorUsageHigh"] = [
-            _source_observation(
+            Observation(host_target, None, "unsupported")
+            if (
+                file_descriptors.get("status") == "partial"
+                and file_descriptors.get("maximum") is None
+            )
+            else _source_observation(
                 host_target, file_descriptors.get("usedPercent"),
                 file_descriptors if "status" in file_descriptors else linux_processes,
             )
@@ -555,7 +580,9 @@ def observations_for_snapshot(pack: RulePack, snapshot: Mapping[str, Any]) -> di
         drift_ms = _number(time_sync.get("clockDriftMilliseconds"))
         drift_seconds = abs(drift_ms) / 1000 if drift_ms is not None else None
         result["ClockSkewHigh"] = [
-            _source_observation(
+            Observation(host_target, None, "unsupported")
+            if time_sync.get("clockDriftStatus") == "unsupported"
+            else _source_observation(
                 host_target, drift_seconds,
                 time_sync if "status" in time_sync else linux_clock,
             )
@@ -563,7 +590,9 @@ def observations_for_snapshot(pack: RulePack, snapshot: Mapping[str, Any]) -> di
     if "UnexpectedReboot" in result:
         reboot = linux_clock.get("unexpectedReboot")
         result["UnexpectedReboot"] = [
-            _source_observation(
+            Observation(host_target, None, "unsupported")
+            if linux_clock.get("unexpectedRebootStatus") == "not_inferable_from_local_counters"
+            else _source_observation(
                 host_target,
                 1 if reboot is True else 0 if reboot is False else None,
                 linux_clock,

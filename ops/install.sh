@@ -27,6 +27,7 @@ log_pipeline_target=/usr/local/lib/monitor-collector/log_pipeline.py
 log_sources_target=/usr/local/lib/monitor-collector/log_sources.py
 log_store_target=/usr/local/lib/monitor-collector/log_store.py
 generic_log_collector_target=/usr/local/lib/monitor-collector/generic_log_collector.py
+monitoring_catalog_target=/usr/local/lib/monitor-collector/monitoring_catalog.py
 exporter_target=/usr/local/lib/monitor-collector/container_exporter.py
 alert_engine_target=/usr/local/lib/monitor-collector/alert_engine.py
 alert_runtime_target=/usr/local/lib/monitor-collector/alert_runtime.py
@@ -56,6 +57,7 @@ for source in \
     "$script_dir/log_sources.py" \
     "$script_dir/log_store.py" \
     "$script_dir/generic_log_collector.py" \
+    "$script_dir/monitoring_catalog.py" \
     "$script_dir/container_exporter.py" \
     "$script_dir/alert_engine.py" \
     "$script_dir/alert_runtime.py" \
@@ -91,6 +93,7 @@ had_log_pipeline=false
 had_log_sources=false
 had_log_store=false
 had_generic_log_collector=false
+had_monitoring_catalog=false
 had_exporter=false
 had_alert_engine=false
 had_alert_runtime=false
@@ -203,6 +206,7 @@ finish() {
         restore_file "$backup_dir/log_sources.py" "$log_sources_target" "$had_log_sources" || rollback_failed=true
         restore_file "$backup_dir/log_store.py" "$log_store_target" "$had_log_store" || rollback_failed=true
         restore_file "$backup_dir/generic_log_collector.py" "$generic_log_collector_target" "$had_generic_log_collector" || rollback_failed=true
+        restore_file "$backup_dir/monitoring_catalog.py" "$monitoring_catalog_target" "$had_monitoring_catalog" || rollback_failed=true
         restore_file "$backup_dir/container_exporter.py" "$exporter_target" "$had_exporter" || rollback_failed=true
         restore_file "$backup_dir/alert_engine.py" "$alert_engine_target" "$had_alert_engine" || rollback_failed=true
         restore_file "$backup_dir/alert_runtime.py" "$alert_runtime_target" "$had_alert_runtime" || rollback_failed=true
@@ -338,6 +342,7 @@ for target in \
     "$log_sources_target" \
     "$log_store_target" \
     "$generic_log_collector_target" \
+    "$monitoring_catalog_target" \
     "$exporter_target" \
     "$alert_engine_target" \
     "$alert_runtime_target" \
@@ -399,6 +404,7 @@ if [ -e "$log_pipeline_target" ]; then cp -p "$log_pipeline_target" "$backup_dir
 if [ -e "$log_sources_target" ]; then cp -p "$log_sources_target" "$backup_dir/log_sources.py"; had_log_sources=true; fi
 if [ -e "$log_store_target" ]; then cp -p "$log_store_target" "$backup_dir/log_store.py"; had_log_store=true; fi
 if [ -e "$generic_log_collector_target" ]; then cp -p "$generic_log_collector_target" "$backup_dir/generic_log_collector.py"; had_generic_log_collector=true; fi
+if [ -e "$monitoring_catalog_target" ]; then cp -p "$monitoring_catalog_target" "$backup_dir/monitoring_catalog.py"; had_monitoring_catalog=true; fi
 if [ -e "$exporter_target" ]; then cp -p "$exporter_target" "$backup_dir/container_exporter.py"; had_exporter=true; fi
 if [ -e "$alert_engine_target" ]; then cp -p "$alert_engine_target" "$backup_dir/alert_engine.py"; had_alert_engine=true; fi
 if [ -e "$alert_runtime_target" ]; then cp -p "$alert_runtime_target" "$backup_dir/alert_runtime.py"; had_alert_runtime=true; fi
@@ -470,6 +476,7 @@ install -m 0644 "$script_dir/log_pipeline.py" "$log_pipeline_target"
 install -m 0644 "$script_dir/log_sources.py" "$log_sources_target"
 install -m 0644 "$script_dir/log_store.py" "$log_store_target"
 install -m 0644 "$script_dir/generic_log_collector.py" "$generic_log_collector_target"
+install -m 0644 "$script_dir/monitoring_catalog.py" "$monitoring_catalog_target"
 install -m 0755 "$script_dir/container_exporter.py" "$exporter_target"
 install -m 0644 "$script_dir/alert_engine.py" "$alert_engine_target"
 install -m 0644 "$script_dir/alert_runtime.py" "$alert_runtime_target"
