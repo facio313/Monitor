@@ -40,6 +40,11 @@ const MAX_INCIDENT_CONTAINERS = 256;
 const MAX_INCIDENT_TRAFFIC = 64;
 const MAX_CURRENT_TRAFFIC = 16;
 const MAX_SYNTHETIC_PROBES = 32;
+// Keep the API reader's freshness decision aligned with the collector's
+// MAX_SYNTHETIC_INPUT_AGE_SECONDS contract. Synthetic probes run every five
+// minutes, so the application-wide snapshot threshold is intentionally not
+// used for this independently timestamped evidence.
+const MAX_SYNTHETIC_INPUT_AGE_MS = 10 * 60 * 1_000;
 const MAX_POWER_CORRELATION_MS = 2 * 60 * 1_000;
 const MAX_UINT32 = 0xffff_ffff;
 const MAX_INCIDENT_DURATION_SECONDS = 366 * 24 * 60 * 60;
@@ -1699,7 +1704,6 @@ function syntheticFallback(
 function normalizeSyntheticProbeTelemetry(
   current: JsonRecord | null,
   nowMs: number,
-  staleAfterMs: number,
 ): Pick<DashboardResponse, 'syntheticProbeCollection' | 'syntheticProbes'> {
   if (!current) return syntheticFallback('unsupported');
   const rawCollection = own(current, 'syntheticProbeCollection');
@@ -1727,7 +1731,7 @@ function normalizeSyntheticProbeTelemetry(
   if (
     status === 'fresh'
     && observedAt !== null
-    && nowMs - new Date(observedAt).getTime() > staleAfterMs
+    && nowMs - new Date(observedAt).getTime() > MAX_SYNTHETIC_INPUT_AGE_MS
   ) status = 'stale';
 
   const probes: DashboardResponse['syntheticProbes'] = [];
@@ -3812,7 +3816,7 @@ export function readDashboard(
   const latest = observedLatest ?? emptySample(new Date(nowMs).toISOString());
   const containerTelemetry = normalizeContainerTelemetry(current, nowMs, staleAfterMs);
   const dockerEventTelemetry = normalizeDockerEventTelemetry(current, nowMs, staleAfterMs, cutoff);
-  const syntheticProbeTelemetry = normalizeSyntheticProbeTelemetry(current, nowMs, staleAfterMs);
+  const syntheticProbeTelemetry = normalizeSyntheticProbeTelemetry(current, nowMs);
   const alerts = parseJsonLines(root, join(root, 'alerts.jsonl'), MAX_EVENT_FILE_BYTES);
   const ruleEvaluation = readRuleEvaluation(root, nowMs, staleAfterMs);
   const ruleAlerts = readRuleAlerts(root, cutoff, nowMs);

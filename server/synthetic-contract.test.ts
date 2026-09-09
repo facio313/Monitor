@@ -36,7 +36,7 @@ function snapshot() {
   };
 }
 
-function read(current: Record<string, unknown>, now = NOW, staleAfterMs = 180_000) {
+function read(current: Record<string, unknown>, now = NOW, staleAfterMs = 300_000) {
   const root = directory();
   writeFileSync(join(root, 'current.json'), `${JSON.stringify(current)}\n`);
   return readDashboard(root, '1h', now, staleAfterMs);
@@ -73,7 +73,7 @@ describe('synthetic probe collector contract', () => {
   });
 
   it('preserves explicit source states and ages fresh evidence to stale', () => {
-    const aged = read(snapshot(), Date.parse('2026-08-31T06:10:00Z'));
+    const aged = read(snapshot(), Date.parse('2026-08-31T06:10:01Z'));
     expect(aged.syntheticProbeCollection.status).toBe('stale');
     expect(aged.syntheticProbes).toHaveLength(1);
 
@@ -88,6 +88,21 @@ describe('synthetic probe collector contract', () => {
       current.syntheticProbes = status === 'stale' ? [probe()] : [];
       expect(read(current).syntheticProbeCollection.status).toBe(status);
     }
+  });
+
+  it('does not apply the 300-second application stale threshold to synthetic evidence', () => {
+    const result = read(snapshot(), Date.parse('2026-08-31T06:06:01Z'), 300_000);
+    expect(result.stale).toBe(true);
+    expect(result.syntheticProbeCollection.status).toBe('fresh');
+    expect(result.syntheticProbes).toHaveLength(1);
+  });
+
+  it('matches the collector inclusive 600-second freshness boundary', () => {
+    const atBoundary = read(snapshot(), Date.parse('2026-08-31T06:10:00Z'), 300_000);
+    const pastBoundary = read(snapshot(), Date.parse('2026-08-31T06:10:01Z'), 300_000);
+
+    expect(atBoundary.syntheticProbeCollection.status).toBe('fresh');
+    expect(pastBoundary.syntheticProbeCollection.status).toBe('stale');
   });
 
   it('treats legacy snapshots without probe fields as explicitly unsupported', () => {

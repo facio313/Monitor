@@ -1093,6 +1093,20 @@ class ParsingTests(unittest.TestCase):
             self.assertNotIn("public.example", serialized)
             self.assertNotIn("token", serialized)
 
+            boundary_at = now - dt.timedelta(seconds=collector.MAX_SYNTHETIC_INPUT_AGE_SECONDS)
+            document["generatedAt"] = collector.iso_timestamp(boundary_at)
+            document["results"][0]["checkedAt"] = collector.iso_timestamp(boundary_at)
+            path.write_text(json.dumps(document, sort_keys=True), encoding="utf-8")
+            boundary, _rows = collector.load_synthetic_probe_document(
+                path,
+                now,
+                expected_uid=os.geteuid(),
+                expected_gid=os.getegid(),
+            )
+            self.assertEqual(boundary, {
+                "status": "fresh", "observedAt": collector.iso_timestamp(boundary_at),
+            })
+
             stale_at = now - dt.timedelta(seconds=collector.MAX_SYNTHETIC_INPUT_AGE_SECONDS + 1)
             document["generatedAt"] = collector.iso_timestamp(stale_at)
             document["results"][0]["checkedAt"] = collector.iso_timestamp(stale_at)

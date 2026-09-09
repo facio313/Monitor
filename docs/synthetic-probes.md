@@ -71,6 +71,12 @@ through `BindReadOnlyPaths`; the producer directory is never a collector write
 surface. The collector independently checks ownership, mode, link count,
 schema, size, and freshness before publishing reduced probe state.
 
+Synthetic evidence uses its own ten-minute freshness window in both the
+collector and the dashboard API: exactly 600 seconds remains fresh, and older
+evidence is stale. The dashboard's separate five-minute snapshot threshold
+does not shorten this window; the application snapshot can be stale while
+the independently timestamped probe evidence is still fresh.
+
 Upgrades stop the worker while replacing assets, then restore the synthetic
 timer's prior enabled and active states. A first installation has neither state
 and remains disabled. If any later installation step fails, the installer
