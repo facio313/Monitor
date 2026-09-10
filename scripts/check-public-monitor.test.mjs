@@ -9,8 +9,9 @@ import {
 } from './check-public-monitor.mjs';
 
 const TARGET = new URL('https://bonifacio.work/monitor/');
+const SSO_REDIRECT = 'https://bonifacio.work/sso/?rd=https%3A%2F%2Fbonifacio.work%2Fmonitor%2F';
 
-function redirect(location = 'https://bonifacio.work/sso/?rd=https%3A%2F%2Fbonifacio.work%2Fmonitor%2F&rm=GET') {
+function redirect(location = SSO_REDIRECT) {
   return new Response('', { status: 302, headers: { location } });
 }
 
@@ -75,12 +76,26 @@ describe('external Monitor dead-man probe', () => {
       .rejects.toMatchObject({ code: 'BODY_INVALID' });
   });
 
+  it.each(['', '&rm=GET'])('accepts the canonical SSO redirect with method suffix %j', (suffix) => {
+    const location = `${SSO_REDIRECT}${suffix}`;
+    expect(validateSsoRedirect(TARGET, redirect(location))).toBe(location);
+  });
+
+  it.each(['', 'POST', 'HEAD', 'get'])('rejects an explicit invalid SSO return method %j', (method) => {
+    expect(() => validateSsoRedirect(TARGET, redirect(`${SSO_REDIRECT}&rm=${method}`)))
+      .toThrowError(/return method/u);
+  });
+
   it('requires the exact same-origin SSO return contract', () => {
     expect(validateSsoRedirect(TARGET, redirect())).toContain('/sso/');
     expect(() => validateSsoRedirect(TARGET, new Response('', { status: 200 })))
       .toThrowError(/HTTP 200/u);
     expect(() => validateSsoRedirect(TARGET, redirect('https://attacker.invalid/sso/?rd=x&rm=GET')))
       .toThrowError(/origin or path/u);
+    expect(() => validateSsoRedirect(TARGET, redirect('https://bonifacio.work/sso/')))
+      .toThrowError(/return target/u);
+    expect(() => validateSsoRedirect(TARGET, redirect('https://bonifacio.work/sso/?rd=https%3A%2F%2Fbonifacio.work%2F')))
+      .toThrowError(/return target/u);
     expect(() => validateSsoRedirect(TARGET, redirect('https://bonifacio.work/sso/?rd=https%3A%2F%2Fbonifacio.work%2F&rm=GET')))
       .toThrowError(/return target/u);
     expect(() => validateSsoRedirect(TARGET, redirect('https://bonifacio.work/sso/?rd=https%3A%2F%2Fbonifacio.work%2Fmonitor%2F&rm=GET&token=secret')))

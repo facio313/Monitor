@@ -140,8 +140,13 @@ export function validateSsoRedirect(target, response) {
   ) {
     throw new PublicMonitorProbeError('REDIRECT_INVALID', 'SSO redirect left the expected origin or path');
   }
-  if (location.searchParams.get('rd') !== target.href || location.searchParams.get('rm') !== 'GET') {
+  if (location.searchParams.get('rd') !== target.href) {
     throw new PublicMonitorProbeError('REDIRECT_INVALID', 'SSO redirect did not preserve the exact Monitor return target');
+  }
+  // The catalog authorization broker omits rm; Authelia may include rm=GET.
+  const returnMethod = location.searchParams.get('rm');
+  if (returnMethod !== null && returnMethod !== 'GET') {
+    throw new PublicMonitorProbeError('REDIRECT_INVALID', 'SSO redirect included an unexpected return method');
   }
   const allowedKeys = new Set(['rd', 'rm']);
   if ([...location.searchParams.keys()].some((key) => !allowedKeys.has(key))) {
