@@ -72,12 +72,14 @@ describe('monitor overview composition', () => {
     expect(markup).toContain('data-renderer="monochrome-density-grain-wave"');
   });
 
-  it('keeps operational evidence above the dashboard and restores the mobile traffic table as a scroller', () => {
+  it('moves operational evidence into a sticky alert rail above the primary instruments and restores the mobile traffic table as a scroller', () => {
     const css = readFileSync(new URL('../monitor-dashboard.css', import.meta.url), 'utf8');
     const source = readFileSync(new URL('./MonitorDashboard.tsx', import.meta.url), 'utf8');
     const overviewComposition = source.slice(source.lastIndexOf('return (\n    <div className="control-room"'));
 
     expect(css).toMatch(/\.current-traffic-table\.table-wrap\s*\{[^}]*display: block;[^}]*overflow-x: auto;/s);
+    expect(css).toMatch(/\.overview-alert-rail\s*\{[^}]*position: sticky;[^}]*overflow-y: auto;/s);
+    expect(overviewComposition).toContain('<aside className="overview-alert-rail"');
     expect(overviewComposition.indexOf('<OperationalHealthOverview')).toBeLessThan(overviewComposition.indexOf('<RuleHealthSummary'));
     expect(overviewComposition.indexOf('<RuleHealthSummary')).toBeLessThan(overviewComposition.indexOf('<SystemEmotionEngine'));
     expect(overviewComposition.indexOf('<SystemEmotionEngine')).toBeLessThan(overviewComposition.indexOf('<AdaptiveGrid'));

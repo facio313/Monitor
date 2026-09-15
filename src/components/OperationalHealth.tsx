@@ -19,7 +19,15 @@ interface OperationalHealthSummaryProps {
   onNavigate: (page: MonitorDetailPage, anchor?: string, range?: TimeRange) => void;
 }
 
-type OperationalHealthOverviewProps = OperationalHealthSummaryProps;
+interface OperationalHealthOverviewProps extends OperationalHealthSummaryProps {
+  serviceStatus?: {
+    available: boolean;
+    cautionCount: number;
+    dangerCount: number;
+    label: string;
+    total: number;
+  };
+}
 
 interface OperationalGuidanceProps {
   findings: readonly OperationalFinding[];
@@ -29,6 +37,7 @@ interface OperationalGuidanceProps {
 }
 
 const PRIMARY_FINDING_LIMIT = 4;
+const OVERVIEW_FINDING_LIMIT = 3;
 
 function t(locale: MonitorLocale, korean: string, english: string): string {
   return locale === 'ko' ? korean : english;
@@ -86,28 +95,62 @@ function FindingLink({ finding, locale, range, onNavigate, compact = false }: {
   );
 }
 
-export function OperationalHealthOverview({ findings, locale, range, onNavigate }: OperationalHealthOverviewProps) {
+export function OperationalHealthOverview({ findings, locale, range, onNavigate, serviceStatus }: OperationalHealthOverviewProps) {
   const dangerCount = findings.filter((finding) => finding.level === 'danger').length;
   const cautionCount = findings.length - dangerCount;
+  const primary = findings.slice(0, OVERVIEW_FINDING_LIMIT);
+  const remainingCount = Math.max(0, findings.length - primary.length);
   const href = `${monitorPathForPage('reliability')}?range=${encodeURIComponent(range)}`;
   const tone = dangerCount ? 'danger' : cautionCount ? 'caution' : 'nominal';
 
   return (
     <section className={`operational-health-overview overview-${tone}`} aria-labelledby="operational-health-overview-title">
-      <span className="health-overview-icon"><Icon name={findings.length ? 'alert' : 'check'} size={19} /></span>
-      <div className="health-overview-copy">
-        <span>{t(locale, '운영 판단 개요', 'OPERATIONAL OVERVIEW')}</span>
-        <h2 id="operational-health-overview-title">
-          {findings.length
-            ? t(locale, '확인할 항목이 있습니다', 'Some items need review')
-            : t(locale, '즉시 대응할 항목 없음', 'No items need immediate action')}
-        </h2>
-        <p>{t(locale, '홈에서는 핵심 상태만 요약합니다. 전체 진단 목록은 신뢰성 상세에서 확인합니다.', 'The home page shows key status only; the complete assessment is available in Reliability details.')}</p>
-      </div>
+      <p className="sr-only" aria-live="polite" aria-atomic="true">
+        {findings.length
+          ? t(locale, `위험·주의 알림 갱신: 위험 ${dangerCount}개, 주의 ${cautionCount}개.`, `Risk panel updated: ${dangerCount} danger and ${cautionCount} caution findings.`)
+          : t(locale, '위험·주의 알림 갱신: 즉시 대응할 항목 없음.', 'Risk panel updated: no items need immediate action.')}
+      </p>
+      <header className="health-overview-header">
+        <span className="health-overview-icon"><Icon name={findings.length ? 'alert' : 'check'} size={19} /></span>
+        <div className="health-overview-copy">
+          <span>{t(locale, '분리 관제 패널', 'DETACHED ALERT PANEL')}</span>
+          <h2 id="operational-health-overview-title">
+            {findings.length
+              ? t(locale, '위험·주의 알림', 'Risk and caution alerts')
+              : t(locale, '현재 활성 경고 없음', 'No active alerts')}
+          </h2>
+          <p>{t(locale, '기본 계기와 분리해 지금 확인할 운영 항목만 모았습니다.', 'Actionable operating findings are kept separate from the primary instruments.')}</p>
+        </div>
+      </header>
       <div className="health-overview-counts" aria-label={t(locale, `위험 ${dangerCount}개, 주의 ${cautionCount}개`, `${dangerCount} danger and ${cautionCount} caution findings`)}>
         <span><b className="count-danger">{dangerCount}</b>{t(locale, '위험', 'Danger')}</span>
         <span><b className="count-caution">{cautionCount}</b>{t(locale, '주의', 'Caution')}</span>
       </div>
+
+      {primary.length > 0 && (
+        <div className="health-overview-findings" aria-label={t(locale, '우선 확인 항목', 'Priority findings')}>
+          <span>{t(locale, '우선 확인', 'REVIEW FIRST')}</span>
+          {primary.map((finding) => <FindingLink key={finding.id} finding={finding} locale={locale} range={range} onNavigate={onNavigate} compact />)}
+          {remainingCount > 0 && <small>{t(locale, `그 외 ${remainingCount}개 항목은 전체 진단에서 확인할 수 있습니다.`, `${remainingCount} more ${remainingCount === 1 ? 'item is' : 'items are'} available in the full assessment.`)}</small>}
+        </div>
+      )}
+
+      {serviceStatus && (
+        <div className="health-overview-services">
+          <div>
+            <span>{t(locale, '서비스 상태', 'SERVICE STATUS')}</span>
+            <strong>{serviceStatus.label}</strong>
+            <small>{t(locale, `서비스 ${serviceStatus.total.toLocaleString()}개`, `${serviceStatus.total.toLocaleString()} services`)}</small>
+          </div>
+          <div className="health-service-counts" aria-label={serviceStatus.available
+            ? t(locale, `서비스 위험 ${serviceStatus.dangerCount}개, 주의 ${serviceStatus.cautionCount}개`, `${serviceStatus.dangerCount} service danger and ${serviceStatus.cautionCount} service caution findings`)
+            : t(locale, '서비스 위험·주의 수 확인 불가', 'Service danger and caution counts unavailable')}>
+            <span><b>{serviceStatus.available ? serviceStatus.dangerCount : '—'}</b>{t(locale, '위험', 'Danger')}</span>
+            <span><b>{serviceStatus.available ? serviceStatus.cautionCount : '—'}</b>{t(locale, '주의', 'Caution')}</span>
+          </div>
+        </div>
+      )}
+
       <a
         className="health-overview-link"
         href={href}

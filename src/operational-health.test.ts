@@ -699,7 +699,7 @@ describe('operational health presentation', () => {
     expect(markup).not.toContain('상세와 해결 방법 보기');
   });
 
-  it('keeps the home assessment compact and routes the full list to reliability details', () => {
+  it('keeps priority findings in the detached home alert panel and routes the full list to reliability details', () => {
     const data = payload();
     data.reliabilityEvents = [{
       timestamp: '2026-08-29T08:34:41Z',
@@ -717,13 +717,15 @@ describe('operational health presentation', () => {
       onNavigate: vi.fn(),
     }));
 
-    expect(markup).toContain('운영 판단 개요');
-    expect(markup).toContain('홈에서는 핵심 상태만 요약');
+    expect(markup).toContain('분리 관제 패널');
+    expect(markup).toContain('위험·주의 알림');
+    expect(markup).toContain('기본 계기와 분리');
     expect(markup).toContain('href="/monitor/details/reliability?range=7d"');
     expect(markup).toContain('전체 진단 보기');
     expect(markup).not.toContain('health-finding-grid');
     expect(markup).not.toContain('health-more-findings');
-    expect(markup).not.toContain('짧은 RCU expedited 지연');
+    expect(markup).toContain('health-overview-findings');
+    expect(markup).toContain('짧은 RCU expedited 지연');
   });
 
   it('renders a linked detail guide with problem, symptoms, and resolution sections in Korean and English', () => {
