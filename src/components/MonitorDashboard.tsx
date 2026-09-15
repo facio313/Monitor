@@ -440,60 +440,73 @@ export function MonitorDashboard({
             </div>
           </section>
 
-          <section className={`system-strip strip-${overall}`} aria-label={t(locale, '항상 표시되는 핵심 운영 상태', 'Persistent operating status')}>
+          <section className={`system-strip strip-${overall}`} aria-label={t(locale, '항상 표시되는 기본 운영 상태', 'Persistent primary operating status')}>
             <div className="system-state"><span>{overall === 'danger' ? '▲' : overall === 'caution' ? '●' : '✓'}</span><div><small>{t(locale, '전체 상태', 'OVERALL')}</small><strong>{overall === 'danger' ? t(locale, '확인 필요', 'CHECK SYSTEMS') : overall === 'caution' ? t(locale, '주의 관찰', 'CAUTION') : t(locale, '정상 운용', 'ALL NOMINAL')}</strong></div></div>
             <div><small>{t(locale, '수집 상태', 'COLLECTOR')}</small><strong>{data ? agentHeartbeatLabel(data.agent.status, locale, effectiveStale) : t(locale, '대기 중', 'WAITING')}</strong><span>{data?.latestObservedAt ? formatDateTime(data.latestObservedAt, locale) : '—'}</span></div>
-            <div><small>{t(locale, '위험 / 주의', 'DANGER / CAUTION')}</small><strong><b className="strip-danger">{counts.danger}</b> / <b className="strip-caution">{counts.caution}</b></strong><span>{t(locale, '현재 판단 항목', 'assessed findings')}</span></div>
-            <div><small>{t(locale, '서비스 위험 / 주의', 'SERVICE DANGER / CAUTION')}</small><strong>{serviceCollectionNotCurrent ? '—' : <><b className="strip-danger">{serviceDangerCount}</b> / <b className="strip-caution">{serviceCautionCount}</b></>}</strong><span>{data ? `${containerCollectionLabel(data.containerCollection.status, locale)} · ${data.containers.length.toLocaleString()}` : '—'}</span></div>
             <div><small>{t(locale, '현재 분석 범위', 'ACTIVE RANGE')}</small><strong>{locale === 'ko' ? selectedRange.ko : selectedRange.en}</strong><span>{data ? t(locale, `차트 ${data.series.length} · 원본 ${data.telemetrySummary.sampleCount}`, `${data.series.length} chart · ${data.telemetrySummary.sampleCount} raw`) : '—'}</span></div>
             <div><small>{t(locale, '화면 갱신', 'DISPLAY UPDATE')}</small><strong>{lastUpdated ? formatDateTime(lastUpdated.toISOString(), locale) : '—'}</strong><span>{t(locale, '60초마다 자동 갱신', 'automatic every 60s')}</span></div>
           </section>
 
-          {data && assessmentPresentation === 'overview' && (
-            <OperationalHealthOverview findings={findings} locale={locale} range={range} onNavigate={onNavigate} />
-          )}
-
-          {data && assessmentPresentation === 'overview' && (
-            <RuleHealthSummary evaluation={data.ruleEvaluation} alerts={data.ruleAlerts} locale={locale} stale={effectiveStale} compactWhenNominal />
-          )}
-
           {error && normalizedPage !== 'logs' && <div className="control-notice" role="alert"><Icon name="alert" size={19} /><div><strong>{t(locale, '원격 측정 갱신 실패', 'Telemetry refresh failed')}</strong><span>{safeText(error)} {data ? t(locale, '마지막 정상 화면을 유지합니다.', 'The last good snapshot remains visible.') : ''}</span></div><button type="button" onClick={() => void refresh()}>{t(locale, '재시도', 'Retry')}</button></div>}
 
-          {normalizedPage === 'overview' && (
-            <SystemEmotionEngine
-              locale={locale}
-              model={emotionModel}
-              paused={passwordDialogOpen || helpOpen}
-            />
-          )}
-
-          {normalizedPage === 'infrastructure'
-            ? <div className="detail-dashboard">
-                <InfrastructureObservability
-                  data={observabilityData}
-                  locale={locale}
-                  ssoEnabled={ssoEnabled}
-                  viewer={viewer}
-                  onUnauthorized={onUnauthorized}
-                />
-                <InfrastructureLedger locale={locale} onUnauthorized={onUnauthorized} />
-                <RelatedEvidencePanel page="infrastructure" data={data} range={range} locale={locale} onUnauthorized={onUnauthorized} />
+          {normalizedPage === 'overview'
+            ? <div className={`overview-control-deck${data ? ' overview-control-deck--with-alerts' : ''}`}>
+                {data && assessmentPresentation === 'overview' && (
+                  <aside className="overview-alert-rail" aria-label={t(locale, '위험·주의 독립 관제 패널', 'Detached risk and caution panel')}>
+                    <OperationalHealthOverview
+                      findings={findings}
+                      locale={locale}
+                      range={range}
+                      onNavigate={onNavigate}
+                      serviceStatus={{
+                        available: !serviceCollectionNotCurrent,
+                        cautionCount: serviceCautionCount,
+                        dangerCount: serviceDangerCount,
+                        label: containerCollectionLabel(data.containerCollection.status, locale),
+                        total: data.containers.length,
+                      }}
+                    />
+                    <RuleHealthSummary evaluation={data.ruleEvaluation} alerts={data.ruleAlerts} locale={locale} stale={effectiveStale} compactWhenNominal />
+                  </aside>
+                )}
+                <div className="overview-primary-deck">
+                  <SystemEmotionEngine
+                    locale={locale}
+                    model={emotionModel}
+                    paused={passwordDialogOpen || helpOpen}
+                  />
+                  {initialLoading && !data
+                    ? <ControlSkeleton locale={locale} />
+                    : data
+                      ? <>
+                          <AdaptiveGrid items={overviewItems} storageKey={`monitor.layout.v4.${storageSubject}`} locale={locale} />
+                          <div className="overview-service-table">
+                            <ContainerStatusTable data={data} locale={locale} onOpen={(next) => navigate(next)} grouped />
+                          </div>
+                        </>
+                      : <div className="control-empty"><Icon name="server" size={32} /><h2>{t(locale, '수집 데이터가 아직 없습니다', 'Telemetry is not available yet')}</h2><p>{t(locale, '수집기가 첫 스냅샷을 만들면 계기판이 자동으로 나타납니다.', 'The instruments will appear after the collector writes its first snapshot.')}</p><button type="button" onClick={() => void refresh()}>{t(locale, '다시 확인', 'Try again')}</button></div>}
+                </div>
               </div>
+            : normalizedPage === 'infrastructure'
+              ? <div className="detail-dashboard">
+                  <InfrastructureObservability
+                    data={observabilityData}
+                    locale={locale}
+                    ssoEnabled={ssoEnabled}
+                    viewer={viewer}
+                    onUnauthorized={onUnauthorized}
+                  />
+                  <InfrastructureLedger locale={locale} onUnauthorized={onUnauthorized} />
+                  <RelatedEvidencePanel page="infrastructure" data={data} range={range} locale={locale} onUnauthorized={onUnauthorized} />
+                </div>
             : normalizedPage === 'logs'
               ? <div className="detail-dashboard">
                   <GenericLogExplorer locale={locale} onUnauthorized={onUnauthorized} />
                   <RelatedEvidencePanel page="logs" data={data} range={range} locale={locale} onUnauthorized={onUnauthorized} />
                 </div>
             : initialLoading && !data ? <ControlSkeleton locale={locale} /> : data ? (
-            normalizedPage === 'overview'
-              ? <>
-                  <AdaptiveGrid items={overviewItems} storageKey={`monitor.layout.v4.${storageSubject}`} locale={locale} />
-                  <div className="overview-service-table">
-                    <ContainerStatusTable data={data} locale={locale} onOpen={(next) => navigate(next)} grouped />
-                  </div>
-                </>
-              : normalizedPage === 'coverage'
-                ? <MonitoringCoverage data={data} range={range} locale={locale} onUnauthorized={onUnauthorized} />
+            normalizedPage === 'coverage'
+              ? <MonitoringCoverage data={data} range={range} locale={locale} onUnauthorized={onUnauthorized} />
               : normalizedPage === 'maintenance'
                 ? <div className="detail-dashboard">
                     <OperationalGuidance findings={findings} locale={locale} page="maintenance" range={range} />
