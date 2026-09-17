@@ -1,14 +1,17 @@
 import { createElement } from 'react';
+import { execFileSync } from 'node:child_process';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it, vi } from 'vitest';
 import { operationalLogs } from './dashboard-model';
 import {
   operationalFindingHref,
+  operationalCollectionLimitations,
   operationalFindings,
   operationalServiceStates,
 } from './operational-health';
 import { OperationalGuidance, OperationalHealthOverview, OperationalHealthSummary } from './components/OperationalHealth';
 import { OperationalLogView } from './components/OperationalLogView';
+import { PSI_THRESHOLDS, RESOURCE_THRESHOLDS } from './operational-thresholds';
 import type {
   DashboardPayload,
   LinuxDiagnostics,
@@ -260,6 +263,105 @@ function incident(observedAt: string): PeakIncident {
 }
 
 describe('operational health assessment', () => {
+  it('separates only known unverified rule coverage without hiding faults or opened incidents', () => {
+    const data = payload();
+    data.linux = linuxDiagnostics();
+    Object.assign(data.linux.resources, { status: 'partial', processCountIsLowerBound: true });
+    Object.assign(data.linux.reliability.systemd, { status: 'partial', reason: 'bounded_runtime_observation',
+      units: [{ unit: 'monitor-collector.service', loadState: 'unknown', activeState: 'active', subState: 'running',
+        restartCount: null, restartCountStatus: 'observed_invocation_changes', result: 'unknown',
+        execMainStatus: null, invocationStatus: 'supported' }] });
+    const states = [
+      ['PidUsageHigh', 'host/node-a'], ['ZombieProcessesHigh', 'host/node-a'],
+      ['SystemdServiceFailed', 'systemd/monitor-collector.service'],
+    ].map(([ruleId, target]) => ({
+      ruleId: ruleId!, target: target!, metric: 'test', severity: 'warning' as const,
+      description: '', runbook: '', phase: 'no_data' as const, breachSamples: 0, recoverySamples: 0,
+      missingSamples: 3, openedAt: null, conditionStartedAt: null, recoveryStartedAt: null,
+      missingStartedAt: data.generatedAt, evaluationIntervalSeconds: 60, changedAt: data.generatedAt,
+      lastEvaluatedAt: data.generatedAt, lastValue: null, observationStatus: 'no_data' as const,
+    }));
+    data.ruleEvaluation.states = Object.fromEntries(states.map(state => [state.ruleId, state]));
+    const coverage = () => operationalFindings(data).find(f => f.id === 'rule-evaluation');
+    expect(coverage()).toBeUndefined();
+    expect(operationalCollectionLimitations(data)).toHaveLength(2);
+    const pid = data.ruleEvaluation.states.PidUsageHigh!;
+    pid.openedAt = data.generatedAt;
+    expect(coverage()?.count).toBe(1);
+    pid.openedAt = null;
+    pid.phase = 'permission_denied';
+    expect(coverage()?.count).toBe(1);
+    pid.phase = 'no_data';
+    data.linux.resources.scanTruncated = true;
+    expect(coverage()?.count).toBe(2);
+    data.linux.resources.scanTruncated = false;
+    data.ruleEvaluation.states.SystemdServiceFailed!.target = 'systemd/unobserved.service';
+    expect(coverage()?.count).toBe(1);
+    data.ruleEvaluation.states.SystemdServiceFailed!.target = 'systemd/monitor-collector.service';
+    pid.ruleId = 'CpuUsageHigh';
+    expect(coverage()?.count).toBe(1);
+  });
+
+  it('separates expected observation limits while preserving real pressure and failures', () => {
+    const data = payload();
+    data.linux = linuxDiagnostics();
+    Object.assign(data.linux.resources, { status: 'partial', processCountIsLowerBound: true });
+    Object.assign(data.linux.reliability, { status: 'partial' });
+    Object.assign(data.linux.reliability.systemd, { status: 'partial', reason: 'bounded_runtime_observation' });
+    expect(operationalCollectionLimitations(data)).toHaveLength(2);
+    expect(operationalFindings(data).filter(f => ['resource-pressure', 'linux-reliability'].includes(f.id))).toEqual([]);
+    data.latest!.memoryPercent = 95;
+    data.linux.reliability.clock.timeSync.synchronized = false;
+    expect(operationalFindings(data).find(f => f.id === 'resource-pressure')?.level).toBe('danger');
+    expect(operationalFindings(data).find(f => f.id === 'linux-reliability')?.level).toBe('danger');
+    data.linux.resources.status = 'permission_error';
+    expect(operationalCollectionLimitations(data)).toHaveLength(1);
+    expect(operationalFindings(data).find(f => f.id === 'resource-pressure')?.evidence[0]).toContain('permission_error');
+  });
+
+  it('uses qualified TCP windows, never sparse instantaneous or stale ratios', () => {
+    const data = payload();
+    data.linux = linuxDiagnostics();
+    const tcp = data.linux.network.tcp;
+    tcp.retransmissionPercent = 10;
+    expect(operationalFindings(data).find(f => f.id === 'network-quality')).toBeUndefined();
+    tcp.assessment = { status: 'ok', observedAt: data.generatedAt, retransmissionPercent: 0.37,
+      sampleCount: 4, windowSeconds: 240, outboundSegmentsDelta: 10000, retransmittedSegmentsDelta: 37 };
+    expect(operationalFindings(data).find(f => f.id === 'network-quality')).toBeUndefined();
+    tcp.assessment.retransmissionPercent = 6;
+    tcp.assessment.retransmittedSegmentsDelta = 600;
+    expect(operationalFindings(data).find(f => f.id === 'network-quality')?.level).toBe('danger');
+    tcp.assessment.status = 'stale';
+    expect(operationalFindings(data).find(f => f.id === 'network-quality')).toBeUndefined();
+    tcp.assessment.status = 'ok';
+    tcp.rateStatus = 'warmup';
+    expect(operationalFindings(data).find(f => f.id === 'network-quality')).toBeUndefined();
+  });
+
+  it('does not report cache-heavy healthy containers as exhausted and retains OOM risk', () => {
+    const data = payload();
+    data.containers = [{ name: 'database', owner: 'cks', state: 'running', health: 'healthy', cpuPercent: 1,
+      memoryBytes: 980, memoryPercent: 98, memoryLimitBytes: 1000,
+      memoryInactiveFileBytes: 270, memoryWorkingSetBytes: 710 }];
+    expect(operationalServiceStates(data)).toEqual(['nominal']);
+    data.containers[0]!.oomKilled = true;
+    expect(operationalServiceStates(data)).toEqual(['danger']);
+    data.containers[0]!.oomKilled = false;
+    data.containers[0]!.memoryWorkingSetBytes = null;
+    expect(operationalServiceStates(data)).toEqual(['danger']);
+  });
+
+  it('reports a successful slow probe as caution and failed availability as danger', () => {
+    const data = payload();
+    data.syntheticProbeCollection = { status: 'fresh', observedAt: data.generatedAt };
+    data.syntheticProbes = [{ id: 'public-readiness', status: 'ok', checkedAt: data.generatedAt,
+      httpStatus: 200, redirectCount: 0, latencyMilliseconds: 3209,
+      certificateExpiresAt: null, certificateDaysRemaining: 60 }];
+    expect(operationalFindings(data).find(f => f.id === 'synthetic-availability')?.level).toBe('caution');
+    data.syntheticProbes[0]!.status = 'timeout';
+    expect(operationalFindings(data).find(f => f.id === 'synthetic-availability')?.level).toBe('danger');
+  });
+
   it('stays quiet for a nominal current state and current boot', () => {
     expect(operationalFindings(payload())).toEqual([]);
   });
@@ -269,6 +371,10 @@ describe('operational health assessment', () => {
     data.linux = linuxDiagnostics();
     data.linux.resources.pid.usedPercent = 92;
     data.linux.network.tcp.retransmissionPercent = 6;
+    data.linux.network.tcp.assessment = {
+      status: 'ok', observedAt: data.generatedAt, retransmissionPercent: 6,
+      sampleCount: 4, windowSeconds: 240, outboundSegmentsDelta: 2000, retransmittedSegmentsDelta: 120,
+    };
     data.linux.storage.devices = [{
       name: 'nvme0n1', type: 'disk', rotational: false, rateStatus: 'ok',
       queueDepth: 1, readLatencyMilliseconds: 10, writeLatencyMilliseconds: 20,
@@ -795,12 +901,12 @@ describe('operational health assessment', () => {
   it('uses logical CPU count, PSI full stalls, active swap pressure, and inode headroom in resource decisions', () => {
     const normalizedLoad = payload();
     normalizedLoad.host.logicalCpuCount = 8;
-    normalizedLoad.latest = latest({ load1: 6 });
+    normalizedLoad.latest = latest({ load1: 12 });
     expect(operationalFindings(normalizedLoad).find((entry) => entry.id === 'resource-pressure')).toMatchObject({ level: 'caution' });
 
     const fullStall = payload();
     fullStall.latest = latest({ memoryPressureFullAvg10: 5 });
-    expect(operationalFindings(fullStall).find((entry) => entry.id === 'resource-pressure')).toMatchObject({ level: 'danger' });
+    expect(operationalFindings(fullStall).find((entry) => entry.id === 'resource-pressure')).toMatchObject({ level: 'caution' });
 
     const retainedSwap = payload();
     retainedSwap.latest = latest({ swapTotalBytes: 1_000, swapUsedBytes: 600, swapPercent: 60 });
@@ -821,6 +927,59 @@ describe('operational health assessment', () => {
     const readOnly = payload();
     readOnly.disks[0].readOnly = true;
     expect(operationalFindings(readOnly).find((entry) => entry.id === 'storage-integrity')).toMatchObject({ level: 'danger', scope: 'current' });
+  });
+
+  it.each([
+    ['cpuPercent', 89, null], ['cpuPercent', 90, 'caution'], ['cpuPercent', 100, 'caution'],
+    ['memoryPercent', 79, null], ['memoryPercent', 80, 'caution'], ['memoryPercent', 90, 'danger'],
+    ['temperatureC', 79, null], ['temperatureC', 80, 'caution'], ['temperatureC', 85, 'danger'],
+    ['cpuPressureSomeAvg10', 19, null], ['cpuPressureSomeAvg10', 20, 'caution'], ['cpuPressureSomeAvg10', 100, 'caution'],
+    ['cpuPressureFullAvg10', 100, null],
+    ['memoryPressureSomeAvg10', 1.9, null], ['memoryPressureSomeAvg10', 2, 'caution'], ['memoryPressureSomeAvg10', 10, 'danger'],
+    ['memoryPressureFullAvg10', 4.9, null], ['memoryPressureFullAvg10', 5, 'caution'], ['memoryPressureFullAvg10', 100, 'caution'],
+    ['ioPressureSomeAvg10', 19, null], ['ioPressureSomeAvg10', 20, 'caution'], ['ioPressureSomeAvg10', 100, 'caution'],
+    ['ioPressureFullAvg10', 7.9, null], ['ioPressureFullAvg10', 8, 'caution'], ['ioPressureFullAvg10', 100, 'caution'],
+  ] as const)('uses the canonical resource tier for %s=%s', (field, value, expected) => {
+    const data = payload();
+    data.latest = latest({ [field]: value });
+    const observed = operationalFindings(data).find((entry) => entry.id === 'resource-pressure');
+    expect(observed?.level ?? null).toBe(expected);
+  });
+
+  it.each([
+    ['usedPercent', 84, null], ['usedPercent', 85, 'caution'],
+    ['usedPercent', 90, 'caution'], ['usedPercent', 95, 'danger'],
+    ['inodeUsedPercent', 84, null], ['inodeUsedPercent', 85, 'caution'],
+    ['inodeUsedPercent', 90, 'danger'],
+  ] as const)('keeps byte-capacity and inode thresholds distinct for %s=%s', (field, value, expected) => {
+    const data = payload();
+    data.disks[0][field] = value;
+    const observed = operationalFindings(data).find((entry) => entry.id === 'storage-capacity');
+    expect(observed?.level ?? null).toBe(expected);
+  });
+
+  it('does not invent a load denominator when CPU count is unknown', () => {
+    const data = payload();
+    data.host.logicalCpuCount = null;
+    data.latest = latest({ load1: 100 });
+    expect(operationalFindings(data).find((entry) => entry.id === 'resource-pressure')).toBeUndefined();
+  });
+
+  it('keeps visual resource thresholds aligned with the canonical mail policy', () => {
+    const canonical = JSON.parse(execFileSync('python3', ['-c',
+      'import json; from ops.notification_policy import RESOURCE_POLICIES; print(json.dumps({key: {"caution": value.warning, "danger": value.critical} for key, value in RESOURCE_POLICIES.items()}))',
+    ], { cwd: new URL('..', import.meta.url), encoding: 'utf8' })) as Record<string, { caution: number; danger: number | null }>;
+    for (const [visual, source] of [
+      ['cpu', 'cpuPercent'], ['memory', 'memoryPercent'], ['temperature', 'temperatureC'],
+      ['load', 'load'], ['disk', 'usedPercent'], ['inode', 'inodeUsedPercent'],
+    ] as const) expect(RESOURCE_THRESHOLDS[visual]).toEqual(canonical[source]);
+    for (const [visual, source] of [
+      ['cpuSome', 'cpuPressureSomeAvg10'], ['memorySome', 'memoryPressureSomeAvg10'],
+      ['memoryFull', 'memoryPressureFullAvg10'], ['ioSome', 'ioPressureSomeAvg10'],
+      ['ioFull', 'ioPressureFullAvg10'],
+    ] as const) expect(PSI_THRESHOLDS[visual]).toEqual(canonical[source]);
+    expect(PSI_THRESHOLDS.cpuFull).toEqual({ caution: null, danger: null });
+    expect(canonical.cpuPressureFullAvg10).toBeUndefined();
   });
 
   it('reports live network counter faults and sanitized request failures', () => {
@@ -856,6 +1015,21 @@ describe('operational health assessment', () => {
     traffic.currentTraffic[0].status2xx = 90;
     traffic.currentTraffic[0].status5xx = 10;
     expect(operationalFindings(traffic).find((entry) => entry.id === 'application-traffic')).toMatchObject({ level: 'danger' });
+  });
+
+  it.each([
+    [19, 19, 0, 'danger'], [100_000, 20, 0, 'caution'], [1, 1, 0, 'caution'],
+    [6, 3, 0, 'danger'], [100, 5, 0, 'danger'], [100, 4, 0, 'caution'],
+    [20, 0, 20, 'caution'],
+  ] as const)('requires both count and share for HTTP risk (%s requests, %s 5xx, %s 4xx)', (requests, serverErrors, clientErrors, expected) => {
+    const data = payload();
+    data.currentTraffic = [{
+      app: 'monitor', requestCount: requests,
+      status2xx: requests - serverErrors - clientErrors, status3xx: 0,
+      status4xx: clientErrors, status5xx: serverErrors,
+      slowCount: 0, avgResponseMs: 20, maxResponseMs: 100,
+    }];
+    expect(operationalFindings(data).find((entry) => entry.id === 'application-traffic')?.level).toBe(expected);
   });
 
   it('marks snapshot-dependent evidence as last-known when collection is stale', () => {
@@ -899,6 +1073,23 @@ describe('operational health assessment', () => {
       scope: 'current',
       evidence: ['보호 설정 확인 불가', 'mitigation state unknown'],
     });
+  });
+
+  it('reports a general package reboot request with matched kernels and retains stale provenance', () => {
+    const data = payload();
+    data.system.reboot = {
+      status: 'ok', required: true, observedAt: data.generatedAt,
+      packages: ['libc6:arm64'], packagesStatus: 'ok', packagesTruncated: false,
+    };
+    expect(data.system.versions.kernelRebootRequired).toBe(false);
+    expect(operationalFindings(data).find((entry) => entry.id === 'reboot-required')).toMatchObject({
+      level: 'caution', scope: 'current', page: 'maintenance',
+      evidence: ['호스트 재부팅 요청 · libc6:arm64', 'Host reboot requested · libc6:arm64'],
+    });
+    data.system.reboot.observedAt = '2026-08-29T00:00:00Z';
+    expect(operationalFindings(data).find((entry) => entry.id === 'reboot-required')?.scope).toBe('last-known');
+    data.system.reboot.required = false;
+    expect(operationalFindings(data).find((entry) => entry.id === 'reboot-required')).toBeUndefined();
   });
 
   it('ranks current danger before boot and range observations and maps each finding to its system page', () => {
@@ -1044,7 +1235,7 @@ describe('operational health presentation', () => {
   it('keeps every dangerous finding visible instead of hiding danger behind the more-items disclosure', () => {
     const data = payload();
     data.containers = [{ name: 'service', owner: null, state: 'running', health: 'unhealthy', cpuPercent: 1, memoryBytes: 1, memoryPercent: 1 }];
-    data.latest = latest({ cpuPercent: 95, supplyVoltageVolts: 4.5, throttledFlags: 1 });
+    data.latest = latest({ cpuPercent: 95, memoryPercent: 90, supplyVoltageVolts: 4.5, throttledFlags: 1 });
     data.disks = [{ mount: '/', totalBytes: 100, usedBytes: 95, availableBytes: 5, usedPercent: 95, inodeUsedPercent: 20, readOnly: false }];
     data.reliability.networkLinkAvailable = false;
     data.system.kernel.panic = count(1, '2026-08-29T23:55:00Z');

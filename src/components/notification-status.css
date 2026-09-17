@@ -1,0 +1,24 @@
+.notification-status-panel {
+  padding: 20px;
+  border: 1px solid var(--control-border, #2b373b);
+  border-radius: 12px;
+  background: var(--control-panel, #111b20);
+  min-width: 0;
+}
+.notification-status-panel h2 { margin: 0 0 8px; font-size: 18px; }
+.notification-status-panel h3 { margin: 20px 0 12px; font-size: 15px; }
+.notification-status-panel p { color: var(--control-muted, #a9b5bc); font-size: 13px; line-height: 1.7; }
+.notification-status-panel .evidence-table-scroll { overflow-x: auto; max-width: 100%; }
+.notification-status-panel table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.notification-status-panel th, .notification-status-panel td {
+  text-align: left;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--control-border, #2b373b);
+  vertical-align: top;
+}
+.notification-status-panel th { color: var(--control-muted, #a9b5bc); font-weight: 500; }
+.notification-status-panel td:first-child { white-space: nowrap; }
+@media (max-width: 640px) {
+  .notification-status-panel { padding: 14px; }
+  .notification-status-panel th, .notification-status-panel td { padding: 8px; }
+}

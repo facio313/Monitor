@@ -25,9 +25,12 @@ try:  # Package imports for tests; direct imports for the installed scripts.
         LABEL_NAME,
         LABEL_VALUE,
         METRIC_NAME,
+        MAX_RETIRED_TARGETS,
         OBSERVATION_STATUSES,
         PACK_VERSION,
         RULE_ID,
+        RETIRED_CONTAINER_TARGET,
+        RETIREMENT_DESCRIPTION,
         SEVERITIES,
         Silence,
         TARGET_ID,
@@ -40,9 +43,12 @@ except ImportError:  # pragma: no cover - exercised by collector integration
         LABEL_NAME,
         LABEL_VALUE,
         METRIC_NAME,
+        MAX_RETIRED_TARGETS,
         OBSERVATION_STATUSES,
         PACK_VERSION,
         RULE_ID,
+        RETIRED_CONTAINER_TARGET,
+        RETIREMENT_DESCRIPTION,
         SEVERITIES,
         Silence,
         TARGET_ID,
@@ -65,6 +71,12 @@ MAX_SILENCE_CONFIG_BYTES = 128 * 1024
 MAX_SILENCES = 256
 SILENCE_CONFIG_ENV = "MONITOR_ALERT_SILENCES"
 DEFAULT_SILENCE_CONFIG_PATH = Path("/etc/monitor/alert-silences.json")
+RETIREMENT_CONFIG_ENV = "MONITOR_ALERT_RETIREMENTS"
+DEFAULT_RETIREMENT_CONFIG_PATH = Path("/etc/monitor/alert-retirements.json")
+MAX_RETIREMENT_CONFIG_BYTES = 32 * 1024
+RETIREMENT_CONFIG_OWNER_UID = 0
+# Match the collector's maximum age for fresh container inventory.
+MAX_RETIREMENT_SOURCE_AGE_SECONDS = 180
 TIMESTAMP = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 PHASES = frozenset({
     "inactive", "pending", "firing", "recovering", "no_data",
@@ -93,11 +105,13 @@ LEGACY_PRIVATE_STATE_FIELD_ORDER = (
     "evaluationIntervalSeconds",
     "changedAt", "lastEvaluatedAt", "lastValue", "observationStatus",
 )
-PRIVATE_STATE_FIELD_ORDER = (
+LIFECYCLE_PRIVATE_STATE_FIELD_ORDER = (
     *LEGACY_PRIVATE_STATE_FIELD_ORDER,
     "notificationState", "notificationLabels",
 )
+PRIVATE_STATE_FIELD_ORDER = (*LIFECYCLE_PRIVATE_STATE_FIELD_ORDER, "lastSampledAt")
 LEGACY_PRIVATE_STATE_FIELDS = frozenset(LEGACY_PRIVATE_STATE_FIELD_ORDER)
+LIFECYCLE_PRIVATE_STATE_FIELDS = frozenset(LIFECYCLE_PRIVATE_STATE_FIELD_ORDER)
 PRIVATE_STATE_FIELDS = frozenset(PRIVATE_STATE_FIELD_ORDER)
 PRIVATE_BUNDLE_FIELDS = frozenset({"schemaVersion", "rulePackVersion", "states"})
 
@@ -232,7 +246,10 @@ def _normalize_private_bundle(value: Any) -> dict[str, Any]:
         if (
             not isinstance(key, str)
             or not isinstance(raw_state, Mapping)
-            or raw_fields not in {PRIVATE_STATE_FIELDS, LEGACY_PRIVATE_STATE_FIELDS}
+            or raw_fields not in {
+                PRIVATE_STATE_FIELDS, LIFECYCLE_PRIVATE_STATE_FIELDS,
+                LEGACY_PRIVATE_STATE_FIELDS,
+            }
         ):
             raise ValueError("private rule state is invalid")
         rule_id, separator, target = key.partition(":")
@@ -284,6 +301,7 @@ def _normalize_private_bundle(value: Any) -> dict[str, Any]:
             "observationStatus": observation_status,
             "notificationState": notification_state,
             "notificationLabels": notification_labels,
+            "lastSampledAt": _timestamp(raw_state.get("lastSampledAt"), True),
         }
     return {"schemaVersion": SCHEMA_VERSION, "rulePackVersion": version, "states": states}
 
@@ -381,14 +399,17 @@ def normalize_event(value: Any) -> dict[str, Any]:
     }
 
 
-def _safe_existing_file(path: Path, maximum_bytes: int, expected_mode: int | None) -> os.stat_result | None:
+def _safe_existing_file(
+    path: Path, maximum_bytes: int, expected_mode: int | None,
+    owner_uid: int | None = None,
+) -> os.stat_result | None:
     try:
         metadata = path.lstat()
     except FileNotFoundError:
         return None
     if (
         not stat.S_ISREG(metadata.st_mode)
-        or metadata.st_uid != os.geteuid()
+        or metadata.st_uid != (os.geteuid() if owner_uid is None else owner_uid)
         or metadata.st_nlink != 1
         or metadata.st_size > maximum_bytes
         or (expected_mode is not None and stat.S_IMODE(metadata.st_mode) != expected_mode)
@@ -397,8 +418,11 @@ def _safe_existing_file(path: Path, maximum_bytes: int, expected_mode: int | Non
     return metadata
 
 
-def _read_file(path: Path, maximum_bytes: int, expected_mode: int | None) -> bytes | None:
-    metadata = _safe_existing_file(path, maximum_bytes, expected_mode)
+def _read_file(
+    path: Path, maximum_bytes: int, expected_mode: int | None,
+    owner_uid: int | None = None,
+) -> bytes | None:
+    metadata = _safe_existing_file(path, maximum_bytes, expected_mode, owner_uid)
     if metadata is None:
         return None
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
@@ -410,6 +434,8 @@ def _read_file(path: Path, maximum_bytes: int, expected_mode: int | None) -> byt
             or opened.st_ino != metadata.st_ino
             or opened.st_size != metadata.st_size
             or opened.st_nlink != 1
+            or opened.st_uid != metadata.st_uid
+            or stat.S_IMODE(opened.st_mode) != stat.S_IMODE(metadata.st_mode)
         ):
             raise ValueError("alert persistence file changed while reading")
         payload = os.read(descriptor, maximum_bytes + 1)
@@ -424,7 +450,7 @@ def _reject_duplicate_object(pairs: Sequence[tuple[str, Any]]) -> dict[str, Any]
     result: dict[str, Any] = {}
     for key, value in pairs:
         if key in result:
-            raise ValueError("alert silence JSON contains duplicate keys")
+            raise ValueError("alert configuration JSON contains duplicate keys")
         result[key] = value
     return result
 
@@ -513,6 +539,100 @@ def load_silences(path: Path) -> tuple[Silence, ...]:
             labels=tuple(sorted(normalized_labels)),
         ))
     return tuple(result)
+
+
+def _retirement_config_path(explicit: Path | None) -> Path | None:
+    if explicit is not None:
+        candidate = explicit
+    else:
+        configured = os.environ.get(RETIREMENT_CONFIG_ENV)
+        if configured is not None:
+            if not configured or len(configured) > 512 or "\x00" in configured:
+                raise ValueError("alert retirement configuration path is invalid")
+            candidate = Path(configured)
+        elif os.path.lexists(DEFAULT_RETIREMENT_CONFIG_PATH):
+            candidate = DEFAULT_RETIREMENT_CONFIG_PATH
+        else:
+            return None
+    if not candidate.is_absolute() or ".." in candidate.parts:
+        raise ValueError("alert retirement configuration path must be absolute")
+    return candidate
+
+
+def load_retired_targets(path: Path) -> tuple[str, ...]:
+    """Read an exact, root-owned retirement inventory; never accept patterns."""
+
+    payload = _read_file(
+        path, MAX_RETIREMENT_CONFIG_BYTES, 0o600,
+        owner_uid=RETIREMENT_CONFIG_OWNER_UID,
+    )
+    if payload is None:
+        raise ValueError("alert retirement configuration is missing")
+    try:
+        value = json.loads(
+            payload.decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_object,
+            parse_constant=lambda _value: (_ for _ in ()).throw(
+                ValueError("alert retirement JSON contains a non-finite value")
+            ),
+        )
+    except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
+        raise ValueError("alert retirement configuration is invalid") from error
+    if (
+        not isinstance(value, Mapping)
+        or frozenset(value) != {"schemaVersion", "targets"}
+        or type(value.get("schemaVersion")) is not int
+        or value.get("schemaVersion") != SCHEMA_VERSION
+    ):
+        raise ValueError("alert retirement configuration does not match the schema")
+    targets = value.get("targets")
+    if (
+        not isinstance(targets, list)
+        or len(targets) > MAX_RETIRED_TARGETS
+        or any(
+            not isinstance(target, str)
+            or RETIRED_CONTAINER_TARGET.fullmatch(target) is None
+            for target in targets
+        )
+        or len(set(targets)) != len(targets)
+    ):
+        raise ValueError("alert retirement targets are invalid")
+    return tuple(sorted(targets))
+
+
+def _eligible_retired_targets(
+    snapshot: Mapping[str, Any], now: dt.datetime, targets: Sequence[str],
+) -> tuple[str, ...]:
+    """Only a complete fresh inventory proves an explicitly retired target absent."""
+
+    if not targets:
+        return ()
+    collection = snapshot.get("containerCollection")
+    containers = snapshot.get("containers")
+    if (
+        not isinstance(collection, Mapping)
+        or collection.get("status") != "fresh"
+        or not isinstance(containers, list)
+        or any(
+            not isinstance(container, Mapping)
+            or not isinstance(container.get("name"), str)
+            or RETIRED_CONTAINER_TARGET.fullmatch(f'container/{container["name"]}') is None
+            for container in containers
+        )
+    ):
+        return ()
+    try:
+        observed_at = _timestamp(collection.get("observedAt"))
+        assert observed_at is not None
+        observed = dt.datetime.fromisoformat(observed_at[:-1] + "+00:00")
+    except ValueError:
+        return ()
+    normalized_now = now if now.tzinfo is not None else now.replace(tzinfo=dt.timezone.utc)
+    age = (normalized_now - observed).total_seconds()
+    if not 0 <= age <= MAX_RETIREMENT_SOURCE_AGE_SECONDS:
+        return ()
+    present = {f'container/{container["name"]}' for container in containers}
+    return tuple(target for target in targets if target not in present)
 
 
 def _ensure_replaceable(path: Path) -> None:
@@ -742,6 +862,17 @@ def _rehydrate_active_states(
             and active[state_key].get("openedAt") == event["openedAt"]
         ):
             active.pop(state_key, None)
+        if (
+            event["transition"] == "resolved"
+            and event["status"] == "unsupported"
+            and event["labels"].get("retirement") == "service-retired"
+            and event["description"] == RETIREMENT_DESCRIPTION
+        ):
+            prior = result.get(state_key)
+            if isinstance(prior, Mapping) and prior.get("openedAt") == event["openedAt"]:
+                # A durable retirement is authoritative even if the old active
+                # state survived an event-first crash or config was removed.
+                result.pop(state_key, None)
 
     for state_key, event in active.items():
         prior = result.get(state_key)
@@ -881,6 +1012,7 @@ def evaluate_and_persist(
     max_records: int = MAX_EVENT_RECORDS,
     delivery_config_path: Path | None = None,
     silence_config_path: Path | None = None,
+    retirement_config_path: Path | None = None,
 ) -> dict[str, Any]:
     """Evaluate one snapshot and publish bounded state without raising.
 
@@ -903,8 +1035,15 @@ def evaluate_and_persist(
         )
         configured_silences = _silence_config_path(silence_config_path)
         silences = load_silences(configured_silences) if configured_silences is not None else ()
+        configured_retirements = _retirement_config_path(retirement_config_path)
+        retired_targets = (
+            load_retired_targets(configured_retirements)
+            if configured_retirements is not None else ()
+        )
         raw_evaluation, additions = evaluate_snapshot(
-            pack, snapshot, previous, now, silences
+            pack, snapshot, previous, now, silences,
+            _eligible_retired_targets(snapshot, now, retired_targets),
+            include_sample_checkpoints=True,
         )
         private_states = _states_with_notification_lifecycle(
             raw_evaluation["states"],
@@ -918,7 +1057,13 @@ def evaluate_and_persist(
             private_states = _states_with_notification_lifecycle(
                 private_states, previous, releases, pack.version,
             )
-        evaluation = normalize_evaluation(raw_evaluation)
+        evaluation = normalize_evaluation({
+            **raw_evaluation,
+            "states": {
+                key: {field: value for field, value in state.items() if field != "lastSampledAt"}
+                for key, state in raw_evaluation["states"].items()
+            },
+        })
         events = _merge_events(existing_events, additions, limit)
         # Events precede state. The next evaluation can rehydrate both an active
         # transition and ready notification authority if collection stops before

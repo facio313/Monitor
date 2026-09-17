@@ -272,6 +272,165 @@ class AlertEngineTests(unittest.TestCase):
         self.assertEqual(state["changedAt"], "2026-08-30T12:05:00Z")
         self.assertEqual(transition, "pending")
 
+    def test_cached_probe_samples_hold_streak_until_new_source_observation(self):
+        alert_rule = rule(for_samples=3, for_seconds=600)
+        state = None
+        for minute in range(11):
+            sampled_at = NOW + dt.timedelta(minutes=(minute // 5) * 5)
+            state, transition = evaluate_observation(
+                alert_rule,
+                Observation("synthetic/probe", 95, sampled_at=sampled_at,
+                            sample_interval_seconds=300, max_sample_age_seconds=600),
+                state, NOW + dt.timedelta(minutes=minute),
+            )
+            self.assertEqual(state["breachSamples"], minute // 5 + 1)
+            self.assertEqual(state["phase"], "firing" if minute == 10 else "pending")
+            if minute not in (0, 10):
+                self.assertIsNone(transition)
+        self.assertEqual(state["openedAt"], "2026-08-30T12:00:00Z")
+
+    def test_probe_cadence_preserves_progress_across_five_minute_evaluation_gaps(self):
+        alert_rule = rule(for_samples=2, for_seconds=300)
+        state = None
+        for minute in (0, 5):
+            at = NOW + dt.timedelta(minutes=minute)
+            state, transition = evaluate_observation(
+                alert_rule,
+                Observation("synthetic/probe", 95, sampled_at=at, sample_interval_seconds=300),
+                state, at,
+            )
+        self.assertEqual((state["phase"], transition), ("firing", "firing"))
+
+    def test_probe_out_of_order_sample_cannot_change_last_value_or_advance_streak(self):
+        alert_rule = rule(for_samples=3)
+        state, _ = evaluate_observation(
+            alert_rule,
+            Observation("synthetic/probe", 95, sampled_at=NOW, sample_interval_seconds=300),
+            None, NOW,
+        )
+        for offset in (0, -60):
+            state, transition = evaluate_observation(
+                alert_rule,
+                Observation("synthetic/probe", 10, sampled_at=NOW + dt.timedelta(seconds=offset),
+                            sample_interval_seconds=300),
+                state, NOW + dt.timedelta(seconds=60),
+            )
+            self.assertEqual((state["phase"], state["breachSamples"]), ("pending", 1))
+            self.assertEqual(state["lastValue"], 95)
+            self.assertIsNone(transition)
+
+    def test_probe_recovery_requires_distinct_fresh_samples_and_source_duration(self):
+        alert_rule = rule(for_samples=1, recovery_samples=2, recovery_seconds=300)
+        state = None
+        for minute in range(11):
+            sampled_minute = (minute // 5) * 5
+            state, transition = evaluate_observation(
+                alert_rule,
+                Observation("synthetic/probe", 95 if sampled_minute == 0 else 10,
+                            sampled_at=NOW + dt.timedelta(minutes=sampled_minute),
+                            sample_interval_seconds=300, max_sample_age_seconds=600),
+                state, NOW + dt.timedelta(minutes=minute),
+            )
+            self.assertEqual(state["phase"], "firing" if minute < 5 else "recovering" if minute < 10 else "inactive")
+            if 5 <= minute < 10:
+                self.assertEqual(state["recoverySamples"], 1)
+        self.assertEqual(transition, "resolved")
+
+    def test_invalid_probe_evidence_never_advances_breach_or_proves_recovery(self):
+        alert_rule = rule(for_samples=1, recovery_samples=1)
+        initial, _ = evaluate_observation(
+            alert_rule,
+            Observation("synthetic/probe", 95, sampled_at=NOW, sample_interval_seconds=300),
+            None, NOW,
+        )
+        for sampled_at, status in (
+            (None, "ok"),
+            (NOW + dt.timedelta(minutes=2), "ok"),
+            (NOW - dt.timedelta(minutes=10), "ok"),
+            (NOW + dt.timedelta(minutes=1), "stale"),
+            (NOW + dt.timedelta(minutes=1), "collection_error"),
+        ):
+            with self.subTest(sampled_at=sampled_at, status=status):
+                observation = Observation(
+                    "synthetic/probe", 10, status, sampled_at=sampled_at,
+                    sample_interval_seconds=300, max_sample_age_seconds=600,
+                )
+                state, transition = evaluate_observation(
+                    alert_rule, observation, initial, NOW + dt.timedelta(minutes=1),
+                )
+                self.assertEqual(state["phase"], "firing")
+                self.assertEqual(state["recoverySamples"], 0)
+                self.assertEqual(
+                    state["lastSampledAt"],
+                    "2026-08-30T12:01:00Z" if status != "ok" else initial["lastSampledAt"],
+                )
+                self.assertIsNone(transition)
+                breach, _ = evaluate_observation(
+                    rule(threshold=5, recovery_threshold=2, for_samples=1),
+                    observation, None, NOW + dt.timedelta(minutes=1),
+                )
+                self.assertNotEqual(breach["phase"], "firing")
+
+    def test_probe_stale_repetition_and_missed_cadence_break_pending_streak(self):
+        alert_rule = rule(for_samples=2)
+        observation = Observation("synthetic/probe", 95, sampled_at=NOW,
+                                  sample_interval_seconds=300, max_sample_age_seconds=600)
+        initial, _ = evaluate_observation(alert_rule, observation, None, NOW)
+        stale, _ = evaluate_observation(alert_rule, observation, initial, NOW + dt.timedelta(seconds=601))
+        self.assertEqual((stale["phase"], stale["breachSamples"]), ("no_data", 0))
+        later = NOW + dt.timedelta(minutes=10)
+        state, _ = evaluate_observation(
+            alert_rule,
+            Observation("synthetic/probe", 95, sampled_at=later, sample_interval_seconds=300),
+            initial, later,
+        )
+        self.assertEqual((state["phase"], state["breachSamples"]), ("pending", 1))
+
+    def test_legacy_active_incident_requires_recovery_newer_than_last_evaluation(self):
+        alert_rule = rule(for_samples=1, recovery_samples=1)
+        state, _ = evaluate_observation(alert_rule, Observation("synthetic/probe", 95), None, NOW)
+        state.pop("lastSampledAt")
+        opened_at = state["openedAt"]
+        state, transition = evaluate_observation(
+            alert_rule,
+            Observation("synthetic/probe", 10, sampled_at=NOW, sample_interval_seconds=300),
+            state, NOW + dt.timedelta(minutes=1),
+        )
+        self.assertEqual((state["phase"], state["openedAt"]), ("firing", opened_at))
+        self.assertEqual(state["recoverySamples"], 0)
+        self.assertIsNone(transition)
+        later = NOW + dt.timedelta(minutes=5)
+        state, transition = evaluate_observation(
+            alert_rule,
+            Observation("synthetic/probe", 10, sampled_at=later, sample_interval_seconds=300),
+            state, later,
+        )
+        self.assertEqual((state["phase"], transition), ("inactive", "resolved"))
+
+    def test_new_failed_probe_prevents_older_success_from_proving_recovery(self):
+        alert_rule = rule(for_samples=1, recovery_samples=1)
+        state, _ = evaluate_observation(
+            alert_rule,
+            Observation("synthetic/probe", 95, sampled_at=NOW, sample_interval_seconds=300),
+            None, NOW,
+        )
+        state, _ = evaluate_observation(
+            alert_rule,
+            Observation("synthetic/probe", None, "collection_error",
+                        sampled_at=NOW + dt.timedelta(minutes=5), sample_interval_seconds=300),
+            state, NOW + dt.timedelta(minutes=5),
+        )
+        state, transition = evaluate_observation(
+            alert_rule,
+            Observation("synthetic/probe", 10, sampled_at=NOW + dt.timedelta(minutes=4),
+                        sample_interval_seconds=300),
+            state, NOW + dt.timedelta(minutes=6),
+        )
+        self.assertEqual(state["phase"], "firing")
+        self.assertEqual(state["recoverySamples"], 0)
+        self.assertEqual(state["lastSampledAt"], "2026-08-30T12:05:00Z")
+        self.assertIsNone(transition)
+
     def test_missing_sample_never_silently_resolves_an_active_alert(self):
         active_rule = rule(for_samples=1, recovery_samples=2)
         firing, _ = evaluate_observation(active_rule, Observation("host-a", 95), None, NOW)
@@ -357,6 +516,69 @@ class AlertEngineTests(unittest.TestCase):
                 self.assertEqual(carried[state_key]["phase"], "firing")
                 self.assertEqual(carried[state_key]["observationStatus"], status)
                 self.assertEqual(events, [])
+
+    def test_explicit_retirement_resolves_only_the_missing_exact_target(self):
+        active_rule = rule(for_samples=1, recovery_samples=1)
+        pack = RulePack(1, "2026.08.1", (active_rule,))
+        targets = ("container/service-a", "container/service-a-new")
+        previous, opening = evaluate_rule_pack(
+            pack,
+            {active_rule.rule_id: [Observation(target, 95) for target in targets]},
+            {}, NOW,
+        )
+
+        retired, events = evaluate_rule_pack(
+            pack, {}, previous, NOW + dt.timedelta(minutes=1),
+            retired_targets=(targets[0],),
+        )
+        self.assertNotIn(f"{active_rule.rule_id}:{targets[0]}", retired)
+        self.assertEqual(retired[f"{active_rule.rule_id}:{targets[1]}"]["phase"], "firing")
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["transition"], "resolved")
+        self.assertEqual(events[0]["status"], "unsupported")
+        self.assertIsNone(events[0]["value"])
+        self.assertEqual(events[0]["labels"]["retirement"], "service-retired")
+        self.assertEqual(
+            events[0]["description"],
+            "Monitoring target was retired; this does not assert service recovery.",
+        )
+        self.assertEqual(events[0]["openedAt"], opening[0]["openedAt"])
+        _, replay = evaluate_rule_pack(
+            pack, {}, previous, NOW + dt.timedelta(minutes=2),
+            retired_targets=(targets[0],),
+        )
+        self.assertEqual(events[0]["idempotencyKey"], replay[0]["idempotencyKey"])
+        _, repeated = evaluate_rule_pack(
+            pack, {}, retired, NOW + dt.timedelta(minutes=2),
+            retired_targets=(targets[0],),
+        )
+        self.assertEqual(repeated, [])
+
+    def test_retirement_never_hides_a_target_observed_by_any_rule(self):
+        active_rule = rule(for_samples=1, recovery_samples=1)
+        pack = RulePack(1, "2026.08.1", (active_rule,))
+        target = "container/service-a"
+        previous, _ = evaluate_rule_pack(
+            pack, {active_rule.rule_id: [Observation(target, 95)]}, {}, NOW,
+        )
+        for rule_id in (active_rule.rule_id, "OtherRule"):
+            for status in ("ok", "unsupported", "collection_error"):
+                with self.subTest(rule_id=rule_id, status=status):
+                    states, events = evaluate_rule_pack(
+                        pack, {rule_id: [Observation(target, 95 if status == "ok" else None, status)]},
+                        previous, NOW + dt.timedelta(minutes=1), retired_targets=(target,),
+                    )
+                    self.assertEqual(states[f"{active_rule.rule_id}:{target}"]["phase"], "firing")
+                    self.assertEqual(events, [])
+
+    def test_retirement_rejects_patterns_and_non_container_targets(self):
+        pack = RulePack(1, "2026.08.1", (rule(),))
+        for targets in (
+            ("container/service-*",), ("host/node-a",), ("container/service-a/child",),
+            (None,), "container/service-a", ("container/a",) * 129,
+        ):
+            with self.subTest(targets=targets), self.assertRaisesRegex(ValueError, "retirement"):
+                evaluate_rule_pack(pack, {}, {}, NOW, retired_targets=targets)
 
     def test_hysteresis_requires_recovery_samples(self):
         active = {

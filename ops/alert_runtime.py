@@ -9,9 +9,9 @@ import re
 from typing import Any, Mapping, Sequence
 
 try:  # Package imports for tests; direct imports for the installed scripts.
-    from .alert_engine import Observation, RulePack, evaluate_rule_pack
+    from .alert_engine import Observation, RETIRED_CONTAINER_TARGET, RulePack, evaluate_rule_pack
 except ImportError:  # pragma: no cover - exercised by collector integration
-    from alert_engine import Observation, RulePack, evaluate_rule_pack
+    from alert_engine import Observation, RETIRED_CONTAINER_TARGET, RulePack, evaluate_rule_pack
 
 
 SAFE_TARGET = re.compile(r"[^a-zA-Z0-9_.:/-]+")
@@ -31,6 +31,10 @@ SYNTHETIC_RULES = frozenset({
     "HttpEndpointDown", "HttpLatencyHigh",
     "TlsCertificateExpiring", "TlsCertificateInvalid",
 })
+# Match monitor-synthetic-probe.timer and the collector's input freshness bound.
+SYNTHETIC_SAMPLE_INTERVAL_SECONDS = 60
+MAX_SYNTHETIC_SAMPLE_AGE_SECONDS = 600
+MAX_CONTAINER_INVENTORY_AGE_SECONDS = 180
 SWAP_PRESSURE_MEMORY_USED_PERCENT = 75.0
 SWAP_PRESSURE_MEMORY_PSI_SOME_AVG10 = 1.0
 SWAP_PRESSURE_MEMORY_PSI_FULL_AVG10 = 0.2
@@ -120,6 +124,35 @@ def _container_source_status(snapshot: Mapping[str, Any]) -> str:
     collection = _mapping(snapshot.get("containerCollection"))
     value = collection.get("status")
     return value if value in {"fresh", "last-known", "unavailable", "permission-denied", "unsupported"} else "unavailable"
+
+
+def _excluded_container(container: Any) -> bool:
+    return isinstance(container, Mapping) and any(
+        isinstance(container.get(field), str) and "wgang" in container[field].casefold()
+        for field in ("name", "project", "service")
+    )
+
+
+def _container_inventory_complete(snapshot: Mapping[str, Any], now: dt.datetime) -> bool:
+    """Only a complete, recent source can prove a previously seen target absent."""
+    containers = snapshot.get("containers")
+    if _container_source_status(snapshot) != "fresh" or not isinstance(containers, list):
+        return False
+    names: set[str] = set()
+    for container in containers:
+        if _excluded_container(container):
+            continue
+        name = container.get("name") if isinstance(container, Mapping) else None
+        if (
+            not isinstance(name, str)
+            or RETIRED_CONTAINER_TARGET.fullmatch(f"container/{name}") is None
+            or name in names
+        ):
+            return False
+        names.add(name)
+    reference = now if now.tzinfo is not None else now.replace(tzinfo=dt.timezone.utc)
+    age = _age_seconds(reference, _mapping(snapshot.get("containerCollection")).get("observedAt"))
+    return age is not None and age <= MAX_CONTAINER_INVENTORY_AGE_SECONDS
 
 
 def _observation_status_for_source(source_status: str) -> str:
@@ -375,37 +408,45 @@ def observations_for_snapshot(pack: RulePack, snapshot: Mapping[str, Any]) -> di
                     probe_status = str(probe["status"])
                     target = _target("synthetic", probe_id, "probe")
                     labels = (("probe", probe_id),)
+
+                    def probe_observation(value: float | None, status: str = "ok") -> Observation:
+                        return Observation(
+                            target, value, status, labels,
+                            sampled_at=_timestamp(probe.get("checkedAt")),
+                            sample_interval_seconds=SYNTHETIC_SAMPLE_INTERVAL_SECONDS,
+                            max_sample_age_seconds=MAX_SYNTHETIC_SAMPLE_AGE_SECONDS,
+                        )
+
                     if probe_status == "unsupported":
                         for rule_id in SYNTHETIC_RULES & result.keys():
                             result[rule_id].append(
-                                Observation(target, None, "unsupported", labels)
+                                probe_observation(None, "unsupported")
                             )
                         continue
 
                     availability = 1 if probe_status == "ok" else 0
                     if "HttpEndpointDown" in result:
                         result["HttpEndpointDown"].append(
-                            Observation(target, float(availability), "ok", labels)
+                            probe_observation(float(availability))
                         )
                     if "HttpLatencyHigh" in result:
-                        latency = _number(probe.get("latencyMilliseconds"))
-                        result["HttpLatencyHigh"].append(Observation(
-                            target,
+                        # A quick DNS/TLS/HTTP failure is not evidence that a
+                        # successful endpoint response recovered its latency.
+                        latency = (
+                            _number(probe.get("latencyMilliseconds"))
+                            if probe_status == "ok" else None
+                        )
+                        result["HttpLatencyHigh"].append(probe_observation(
                             latency,
                             "ok" if latency is not None else "no_data",
-                            labels,
                         ))
 
                     days_remaining = _number(probe.get("certificateDaysRemaining"))
                     if "TlsCertificateExpiring" in result:
-                        result["TlsCertificateExpiring"].append(Observation(
-                            target,
+                        result["TlsCertificateExpiring"].append(probe_observation(
                             days_remaining,
                             "ok" if days_remaining is not None
-                            else "no_data" if probe_status == "tls"
-                            else "unsupported" if probe_status in {"ok", "http", "invalid"}
-                            else "no_data",
-                            labels,
+                            else "unsupported",
                         ))
                     if "TlsCertificateInvalid" in result:
                         invalid_value = (
@@ -415,11 +456,10 @@ def observations_for_snapshot(pack: RulePack, snapshot: Mapping[str, Any]) -> di
                         )
                         invalid_status = (
                             "ok" if invalid_value is not None
-                            else "unsupported" if probe_status in {"ok", "http", "invalid"}
-                            else "no_data"
+                            else "unsupported"
                         )
-                        result["TlsCertificateInvalid"].append(Observation(
-                            target, invalid_value, invalid_status, labels,
+                        result["TlsCertificateInvalid"].append(probe_observation(
+                            invalid_value, invalid_status,
                         ))
     linux_thermal = _mapping(linux.get("thermal"))
     raspberry_pi = _mapping(linux_thermal.get("raspberryPi"))
@@ -512,9 +552,10 @@ def observations_for_snapshot(pack: RulePack, snapshot: Mapping[str, Any]) -> di
 
     linux_tcp = _mapping(linux.get("tcp"))
     if "TcpRetransmissionHigh" in result:
+        assessment = _mapping(linux_tcp.get("assessment"))
         result["TcpRetransmissionHigh"] = [
             _source_observation(
-                host_target, linux_tcp.get("retransmissionPercent"), linux_tcp,
+                host_target, assessment.get("retransmissionPercent") if assessment.get("status") == "ok" else None, linux_tcp,
             )
         ]
     if "ConntrackUsageHigh" in result:
@@ -542,10 +583,16 @@ def observations_for_snapshot(pack: RulePack, snapshot: Mapping[str, Any]) -> di
         ]
     if "PidUsageHigh" in result:
         result["PidUsageHigh"] = [
+            Observation(host_target, None, "no_data")
+            if linux_processes.get("status") == "partial" or linux_processes.get("pidCountLowerBound") is True
+            else
             _source_observation(host_target, linux_processes.get("pidUsedPercent"), linux_processes)
         ]
     if "ZombieProcessesHigh" in result:
         result["ZombieProcessesHigh"] = [
+            Observation(host_target, None, "no_data")
+            if linux_processes.get("status") == "partial" or linux_processes.get("pidCountLowerBound") is True
+            else
             _source_observation(host_target, linux_processes.get("zombieCount"), linux_processes)
         ]
 
@@ -558,9 +605,21 @@ def observations_for_snapshot(pack: RulePack, snapshot: Mapping[str, Any]) -> di
                 continue
             active_state = item.get("activeState")
             unit_result = item.get("result")
+            # Cgroup presence and invocation IDs do not report systemd Result.
+            # In particular absent cgroups do not distinguish a successful
+            # oneshot from a failed service, and unknown must not recover one.
+            manager_observation = (
+                item.get("restartCountStatus") != "observed_invocation_changes"
+                and linux_systemd.get("reason") != "bounded_runtime_observation"
+            )
             failed = (
                 True if active_state == "failed" or unit_result == "failed"
-                else False if active_state in {"active", "inactive", "activating", "deactivating"}
+                else True if manager_observation and unit_result in {
+                    "exit-code", "signal", "core-dump", "timeout", "watchdog",
+                    "start-limit-hit", "resources", "protocol", "oom-kill",
+                }
+                else False if manager_observation and unit_result == "success"
+                and active_state in {"active", "inactive", "activating", "deactivating"}
                 else None
             )
             result["SystemdServiceFailed"].append(_source_observation(
@@ -605,7 +664,7 @@ def observations_for_snapshot(pack: RulePack, snapshot: Mapping[str, Any]) -> di
     for rule_id in CONTAINER_RULES & result.keys():
         result[rule_id] = []
     for container in containers:
-        if not isinstance(container, Mapping):
+        if not isinstance(container, Mapping) or _excluded_container(container):
             continue
         target = _target("container", container.get("name"), "unknown")
         labels = {"parent_target": host_target}
@@ -621,7 +680,14 @@ def observations_for_snapshot(pack: RulePack, snapshot: Mapping[str, Any]) -> di
                     target, None, source_observation_status, tuple(sorted(labels.items())),
                 ))
             else:
-                result[rule_id].append(_observation(target, value, missing, **labels))
+                numeric = _number(value)
+                result[rule_id].append(Observation(
+                    target, numeric, "ok" if numeric is not None else missing,
+                    tuple(sorted(labels.items())),
+                    sampled_at=_timestamp(_mapping(snapshot.get("containerCollection")).get("observedAt")),
+                    sample_interval_seconds=60,
+                    max_sample_age_seconds=MAX_CONTAINER_INVENTORY_AGE_SECONDS,
+                ))
 
         state = container.get("state")
         health = container.get("health")
@@ -658,7 +724,9 @@ def observations_for_snapshot(pack: RulePack, snapshot: Mapping[str, Any]) -> di
             "ContainerCpuThrottlingHigh", container.get("cpuThrottledPercent"), "unsupported"
         )
 
-        memory_bytes = _number(container.get("memoryBytes"))
+        memory_bytes = _number(container.get("memoryWorkingSetBytes"))
+        if memory_bytes is None:
+            memory_bytes = _number(container.get("memoryBytes"))
         memory_limit = _number(container.get("memoryLimitBytes"))
         memory_of_limit = (
             100.0 * memory_bytes / memory_limit
@@ -757,9 +825,15 @@ def evaluate_snapshot(
     previous_states: Mapping[str, Any],
     now: dt.datetime,
     silences: Sequence[Any] = (),
+    retired_targets: Sequence[str] = (),
+    *,
+    include_sample_checkpoints: bool = False,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     states, events = evaluate_rule_pack(
         pack, observations_for_snapshot(pack, snapshot), previous_states, now, silences,
+        retired_targets,
+        container_inventory_complete=_container_inventory_complete(snapshot, now),
+        container_inventory_sampled_at=_timestamp(_mapping(snapshot.get("containerCollection")).get("observedAt")),
     )
     counts: dict[str, int] = {}
     for state in states.values():
@@ -779,6 +853,8 @@ def evaluate_snapshot(
             "runbook": rule.runbook,
             **state,
         }
+        if not include_sample_checkpoints:
+            public_states[state_key].pop("lastSampledAt", None)
     evaluated_at = now.astimezone(dt.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
     return {
         "schemaVersion": 1,

@@ -32,6 +32,8 @@ BindPaths=/run/monitor-collector
 BindReadOnlyPaths=/proc/1/mountinfo:/run/monitor-collector/host-mountinfo
 BindReadOnlyPaths=-/run/monitor-container-exporter/containers.json
 BindReadOnlyPaths=-/var/lib/monitor-synthetic/results.json
+BindReadOnlyPaths=-/var/lib/monitor-synthetic/diagnostics.json
+BindReadOnlyPaths=-/run/reboot-required -/run/reboot-required.pkgs
 # Read-only observation surfaces only; the systemd control sockets remain
 # outside this service's private /run namespace.
 BindReadOnlyPaths=-/run/systemd/units -/run/systemd/timesync

@@ -133,6 +133,14 @@ export interface KernelEventCounter {
 }
 
 export interface SystemSnapshot {
+  reboot: {
+    status: 'ok' | 'unavailable' | 'permission-denied' | 'collection-error';
+    required: boolean | null;
+    observedAt: string | null;
+    packages: string[];
+    packagesStatus: 'ok' | 'unavailable' | 'permission-denied' | 'collection-error';
+    packagesTruncated: boolean;
+  };
   versions: {
     kernelRunning: string | null;
     kernelLatestInstalled: string | null;
@@ -302,6 +310,15 @@ export interface LinuxDiagnostics {
       outgoingSegmentsPerSecond: number | null;
       retransmittedSegmentsPerSecond: number | null;
       retransmissionPercent: number | null;
+      assessment?: {
+        status: 'ok' | 'insufficient_samples' | 'stale';
+        observedAt: string | null;
+        retransmissionPercent: number | null;
+        sampleCount: number;
+        windowSeconds: number;
+        outboundSegmentsDelta: number;
+        retransmittedSegmentsDelta: number;
+      } | null;
       states: {
         established: number;
         synSent: number;
@@ -500,6 +517,8 @@ export interface DashboardResponse {
     memoryBytes: number | null;
     memoryPercent: number | null;
     memoryLimitBytes: number | null;
+    memoryInactiveFileBytes?: number | null;
+    memoryWorkingSetBytes?: number | null;
     cpuLimitCores: number | null;
     pidLimit: number | null;
     restartCount: number | null;

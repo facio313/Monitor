@@ -1,5 +1,6 @@
 import type { ReactNode } from 'react';
 import { localized } from '../dashboard-model';
+import { currentRebootRequirement, rebootObservationIsFresh } from '../system-maintenance';
 import type { MonitorLocale, SystemStatus } from '../types';
 import { formatDateTime, safeText } from '../utils';
 import { CockpitPanel } from './CockpitVisuals';
@@ -65,15 +66,29 @@ export interface SystemMaintenanceProps {
   generatedAt: string;
   locale: MonitorLocale;
   updateControls?: ReactNode;
+  stale?: boolean;
 }
 
-export function SystemMaintenance({ system, generatedAt, locale, updateControls }: SystemMaintenanceProps) {
+export function SystemMaintenance({ system, generatedAt, locale, updateControls, stale = false }: SystemMaintenanceProps) {
   const versions = system.versions;
   const versionText = (value: string | null, fallback = t(locale, '미확인', 'Unknown')) => safeText(value, fallback);
   const kernelTone = kernelVersionTone(system);
   const bootloaderTone = bootloaderVersionTone(system);
   const nvmeTone: MaintenanceTone = known(versions.nvmeModel) || known(versions.nvmeFirmware) ? 'ok' : 'unknown';
   const collectorTone: MaintenanceTone = known(versions.collector) ? 'ok' : 'unknown';
+  const reboot = currentRebootRequirement(system, stale);
+  const rebootValue = reboot === true ? t(locale, '재부팅 필요', 'Reboot required')
+    : reboot === false ? t(locale, '재부팅 요구 없음', 'No reboot requested') : t(locale, '재부팅 상태 미확인', 'Reboot status unknown');
+  const rebootPackages = rebootObservationIsFresh(system, stale) ? system.reboot?.packages ?? [] : [];
+  const rebootDetail = rebootPackages.length > 0
+    ? `${rebootPackages.join(', ')}${system.reboot?.packagesTruncated ? ' …' : ''}`
+    : system.reboot?.status === 'permission-denied'
+      ? t(locale, '호스트 재부팅 표시 읽기 권한이 없습니다.', 'Permission denied reading the host reboot marker.')
+      : reboot === null
+        ? t(locale, '최근 호스트 재부팅 관측이 필요합니다.', 'A recent host reboot observation is needed.')
+        : reboot === true
+          ? t(locale, '유지보수 시간에 재부팅 후 상태를 다시 확인하세요.', 'Reboot during maintenance and check the status again.')
+          : t(locale, '호스트의 일반 재부팅 표시와 설치 커널을 확인했습니다.', 'Checked the host reboot marker and installed kernel.');
   const kernelDetail = versions.kernelRebootRequired === true
     ? t(locale, `설치됨 ${versionText(versions.kernelLatestInstalled)} · 재부팅 필요`, `Installed ${versionText(versions.kernelLatestInstalled)} · reboot required`)
     : t(locale, `설치됨 ${versionText(versions.kernelLatestInstalled)}`, `Installed ${versionText(versions.kernelLatestInstalled)}`);
@@ -93,6 +108,13 @@ export function SystemMaintenance({ system, generatedAt, locale, updateControls 
         locale={locale}
       >
         <div className="system-version-grid">
+          <VersionCard
+            label={t(locale, '호스트 재부팅', 'Host reboot')}
+            value={rebootValue}
+            detail={rebootDetail}
+            tone={reboot === true ? 'caution' : reboot === false ? 'ok' : 'unknown'}
+            locale={locale}
+          />
           <VersionCard
             label={t(locale, '실행 중인 커널', 'Running kernel')}
             value={versionText(versions.kernelRunning)}

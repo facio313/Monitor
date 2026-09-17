@@ -1,0 +1,12 @@
+.detail-two-column > .network-diagnostics-history { grid-column: 1 / -1; }
+.network-diagnostics-history > :not(.cockpit-panel-header) { margin-left: 16px; margin-right: 16px; }
+.network-diagnostic-filters { display: flex; flex-wrap: wrap; align-items: center; gap: 1rem; margin: .8rem 0; }
+.network-diagnostic-filters select, .network-diagnostic-filters button, .network-diagnostic-filters input { color: inherit; background: #14221f; border: 1px solid #40514d; border-radius: 6px; padding: .4rem .65rem; }
+.network-incident-window summary { cursor: pointer; }
+.network-diagnostics-table td { vertical-align: top; min-width: 11rem; line-height: 1.65; }
+.network-diagnostics-table small { display: block; }
+.network-diagnostics-table summary { cursor: pointer; }
+.network-diagnostics-table details + details { margin-top: .6rem; }
+.network-phase-values { display: grid; grid-template-columns: max-content auto; gap: .2rem 1rem; margin: .5rem 0; }
+.network-phase-values dd { margin: 0; }
+.network-diagnostic-note { font-size: .78rem; line-height: 1.6; color: var(--text-muted, #9dafaa); }

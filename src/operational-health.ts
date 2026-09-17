@@ -2,8 +2,11 @@ import {
   NETWORK_DROP_RATE_THRESHOLDS,
   NETWORK_ERROR_RATE_THRESHOLDS,
   PSI_THRESHOLDS,
+  RESOURCE_THRESHOLDS,
 } from './operational-thresholds';
 import { unresolvedIncidents } from './incident-read-model';
+import { containerMemoryPercent } from './container-memory';
+import { kernelRebootRequired, rebootObservationIsFresh } from './system-maintenance';
 import type {
   ContainerStatus,
   DashboardPayload,
@@ -409,16 +412,16 @@ const DEFINITIONS: Record<OperationalFindingId, OperationalFindingDefinition> = 
     id: 'reboot-required',
     page: 'maintenance',
     priority: 14,
-    title: ['새 커널 적용 대기', 'New kernel awaiting reboot'],
-    summary: ['더 최신 커널이 설치됐지만 아직 실행 중이지 않습니다.', 'A newer kernel is installed but is not running yet.'],
-    problem: ['업데이트 파일은 준비됐지만 재부팅 전까지 기존 커널과 드라이버가 계속 사용됩니다.', 'The update is staged, but the existing kernel and drivers remain active until reboot.'],
+    title: ['시스템 재부팅 대기', 'System reboot pending'],
+    summary: ['운영체제가 재부팅을 요청했거나 실행 커널과 설치 커널이 다릅니다.', 'The operating system requested a reboot or the running and installed kernels differ.'],
+    problem: ['커널뿐 아니라 libc 같은 핵심 패키지 업데이트도 재부팅 표시를 남길 수 있습니다. 이 표시는 유지보수 필요를 뜻하며, 단독으로 현재 장애를 뜻하지는 않습니다.', 'Core package updates such as libc can request a reboot as well as kernel updates. This indicates pending maintenance and does not by itself establish an outage.'],
     symptoms: [
+      ['호스트 재부팅 표시와 요청 패키지 이름이 표시됩니다.', 'The host reboot marker and requesting package names are shown.'],
       ['실행 중 커널과 최신 설치 커널 버전이 다르게 표시됩니다.', 'The running and latest installed kernel versions differ.'],
-      ['수정된 드라이버 문제나 보안 패치가 아직 효력을 내지 않습니다.', 'Driver fixes or security patches are not yet effective.'],
     ],
     resolutions: [
       ['중요 서비스와 원격 접속 경로의 재시작 영향을 확인합니다.', 'Review restart impact for critical services and remote access.'],
-      ['안전한 유지보수 시간에 재부팅하고 새 커널 부팅을 확인합니다.', 'Reboot during a safe maintenance window and verify the new kernel.'],
+      ['안전한 유지보수 시간에 재부팅하고 호스트 재부팅 표시 해제와 실행 커널을 확인합니다.', 'Reboot during a safe maintenance window and verify that the marker cleared and the expected kernel is running.'],
       ['재부팅 후 서비스·네트워크·저장장치 회귀 검사를 수행합니다.', 'After reboot, run service, network, and storage regression checks.'],
     ],
   },
@@ -618,6 +621,44 @@ function addCapacitySignal(
   });
 }
 
+function limitedProcessObservation(data: DashboardPayload): boolean {
+  const resources = data.linux?.resources;
+  return resources?.status === 'partial' && resources.processCountIsLowerBound === true
+    && !resources.scanTruncated && !resources.deadlineReached;
+}
+
+function limitedSystemdObservation(data: DashboardPayload): boolean {
+  const systemd = data.linux?.reliability?.systemd;
+  return systemd?.status === 'partial' && systemd.reason === 'bounded_runtime_observation' && !systemd.truncated;
+}
+
+function expectedRuleObservationLimit(data: DashboardPayload, state: RuleEvaluationState): boolean {
+  // Keep raw no_data visible in rule details; only separate known installation
+  // limits from operational faults. Never hide an opened, unresolved incident.
+  if (data.stale || data.ruleEvaluation.status !== 'ok' || state.phase !== 'no_data'
+    || state.observationStatus !== 'no_data' || state.openedAt != null) return false;
+  if (['PidUsageHigh', 'ZombieProcessesHigh'].includes(state.ruleId)) {
+    return state.target.startsWith('host/') && limitedProcessObservation(data);
+  }
+  return state.ruleId === 'SystemdServiceFailed' && limitedSystemdObservation(data)
+    && data.linux.reliability.systemd.units.some(unit => state.target === `systemd/${unit.unit}`
+      && unit.restartCountStatus === 'observed_invocation_changes' && unit.result === 'unknown'
+      && unit.activeState !== 'failed');
+}
+
+export function operationalCollectionLimitations(data: DashboardPayload): LocalizedText[] {
+  const limitations: LocalizedText[] = [];
+  if (limitedProcessObservation(data)) limitations.push([
+    '프로세스 관측이 제한되어 전체 PID·좀비 상태를 확인할 수 없습니다.',
+    'Process visibility is limited; whole-host PID and zombie state is unverified.',
+  ]);
+  if (limitedSystemdObservation(data)) limitations.push([
+    'systemd 일부 실행 상태만 관측하며 종료 결과·재시작 횟수는 확인할 수 없습니다.',
+    'Only limited systemd runtime state is observed; results and restart counts are unverified.',
+  ]);
+  return limitations;
+}
+
 function projectedLinuxSignals(data: DashboardPayload): LinuxFindingSignals {
   const result: LinuxFindingSignals = {
     resource: [], network: [], storage: [], reliability: [], power: [], observedAt: null,
@@ -632,7 +673,8 @@ function projectedLinuxSignals(data: DashboardPayload): LinuxFindingSignals {
   }
   result.observedAt = linux.collectedAt ?? data.latestObservedAt;
 
-  const resourceStatus = collectionSignal('resource:status', '자원 수집', 'resource collection', linux.resources.status);
+  const resourceStatus = limitedProcessObservation(data) ? null
+    : collectionSignal('resource:status', '자원 수집', 'resource collection', linux.resources.status);
   if (resourceStatus) result.resource.push(resourceStatus);
   addCapacitySignal(result.resource, 'resource:pid', 'PID', 'PID', linux.resources.pid.usedPercent);
   addCapacitySignal(result.resource, 'resource:fds', '파일 디스크립터', 'file descriptors', linux.resources.systemFileDescriptors.usedPercent);
@@ -653,10 +695,15 @@ function projectedLinuxSignals(data: DashboardPayload): LinuxFindingSignals {
   if (networkStatus) result.network.push(networkStatus);
   if (tcpStatus) result.network.push(tcpStatus);
   if (socketStatus) result.network.push(socketStatus);
-  const retransmission = linux.network.tcp.retransmissionPercent;
+  const assessment = linux.network.tcp.assessment;
+  const assessmentAge = assessment?.observedAt ? Date.parse(data.generatedAt) - Date.parse(assessment.observedAt) : NaN;
+  const retransmission = !data.stale && linux.network.tcp.rateStatus === 'ok'
+    && assessment?.status === 'ok' && assessmentAge >= 0 && assessmentAge <= 180_000
+    ? assessment.retransmissionPercent : null;
   if (typeof retransmission === 'number' && Number.isFinite(retransmission) && retransmission >= 1) result.network.push({
     key: 'network:tcp-retransmission', level: retransmission >= 5 ? 'danger' : 'caution',
-    ko: `TCP 재전송 ${percent(retransmission)}`, en: `TCP retransmission ${percent(retransmission)}`,
+    ko: `TCP 재전송 ${percent(retransmission)} · ${assessment!.sampleCount}구간/${Math.round(assessment!.windowSeconds)}초 합산`,
+    en: `TCP retransmission ${percent(retransmission)} · ${assessment!.sampleCount} intervals/${Math.round(assessment!.windowSeconds)}s weighted`,
   });
   addCapacitySignal(result.network, 'network:conntrack', 'conntrack', 'conntrack', linux.network.tcp.conntrack.usedPercent);
   addCapacitySignal(result.network, 'network:ephemeral', '임시 포트', 'ephemeral ports', linux.network.tcp.ephemeralPorts.usedPercent);
@@ -695,13 +742,16 @@ function projectedLinuxSignals(data: DashboardPayload): LinuxFindingSignals {
     }
   }
 
-  const reliabilityStatus = collectionSignal('reliability:status', '신뢰성 수집', 'reliability collection', linux.reliability.status);
+  const boundedSystemd = limitedSystemdObservation(data);
+  const reliabilityStatus = boundedSystemd && linux.reliability.status === 'partial' ? null
+    : collectionSignal('reliability:status', '신뢰성 수집', 'reliability collection', linux.reliability.status);
   const clockStatus = collectionSignal('reliability:clock', '시계 수집', 'clock collection', linux.reliability.clock.status);
   const timeStatus = linux.reliability.clock.timeSync.synchronized === true
     && linux.reliability.clock.timeSync.status === 'partial'
     ? null
     : collectionSignal('reliability:time-sync', '시간 동기화 수집', 'time synchronization collection', linux.reliability.clock.timeSync.status);
-  const systemdStatus = collectionSignal('reliability:systemd', 'systemd 수집', 'systemd collection', linux.reliability.systemd.status);
+  const systemdStatus = boundedSystemd ? null
+    : collectionSignal('reliability:systemd', 'systemd 수집', 'systemd collection', linux.reliability.systemd.status);
   for (const signal of [reliabilityStatus, clockStatus, timeStatus, systemdStatus]) if (signal) result.reliability.push(signal);
   if (linux.reliability.clock.timeSync.synchronized === false) result.reliability.push({
     key: 'reliability:not-synchronized', level: 'danger', ko: '시간 동기화 실패', en: 'time not synchronized',
@@ -815,11 +865,12 @@ function projectedContainerRuntimeSignals(data: DashboardPayload): FindingSignal
       'cpu-throttled', throttled >= 50 ? 'danger' : 'caution',
       `CPU 제한 ${percent(throttled)}`, `CPU throttled ${percent(throttled)}`,
     );
-    const memoryRatio = typeof container.memoryBytes === 'number' && typeof container.memoryLimitBytes === 'number' && container.memoryLimitBytes > 0
-      ? (container.memoryBytes / container.memoryLimitBytes) * 100 : null;
+    const memoryRatio = typeof container.memoryLimitBytes === 'number' && container.memoryLimitBytes > 0
+      ? containerMemoryPercent(container) : null;
     if (memoryRatio !== null && Number.isFinite(memoryRatio) && memoryRatio >= 80) add(
       'memory-limit', memoryRatio >= 90 ? 'danger' : 'caution',
-      `메모리 한도 ${percent(memoryRatio)}`, `memory limit ${percent(memoryRatio)}`,
+      `메모리 한도 ${percent(memoryRatio)}${container.memoryWorkingSetBytes != null ? ' (캐시 보정)' : ' (전체 사용량)'}`,
+      `memory limit ${percent(memoryRatio)} (${container.memoryWorkingSetBytes != null ? 'cache adjusted' : 'total usage'})`,
     );
     const pidRatio = typeof container.pidCount === 'number' && typeof container.pidLimit === 'number' && container.pidLimit > 0
       ? (container.pidCount / container.pidLimit) * 100 : null;
@@ -1041,7 +1092,7 @@ export function operationalFindings(data: DashboardPayload): OperationalFinding[
   const ruleCoverageFailures = ruleStates.filter((state) => (
     state.phase === 'collection_error'
     || state.phase === 'permission_denied'
-    || state.phase === 'no_data'
+    || (state.phase === 'no_data' && !expectedRuleObservationLimit(data, state))
   ));
   if (activeRules.length) {
     const firing = activeRules.filter((state) => state.phase === 'firing');
@@ -1172,7 +1223,7 @@ export function operationalFindings(data: DashboardPayload): OperationalFinding[
         }
         if (probe.latencyMilliseconds >= 1_000) add(
           'latency',
-          probe.latencyMilliseconds >= 3_000 ? 'danger' : 'caution',
+          'caution',
           `지연 ${Math.round(probe.latencyMilliseconds).toLocaleString()}ms`,
           `latency ${Math.round(probe.latencyMilliseconds).toLocaleString()}ms`,
         );
@@ -1201,33 +1252,30 @@ export function operationalFindings(data: DashboardPayload): OperationalFinding[
   const pressure: string[] = [];
   const pressureEn: string[] = [];
   let pressureLevel: OperationalFindingLevel | null = null;
-  const pressureMetric = (label: string, english: string, value: number | null | undefined, caution: number, danger: number, suffix = '%') => {
+  const pressureMetric = (label: string, english: string, value: number | null | undefined, caution: number, danger: number | null, suffix = '%') => {
     if (typeof value !== 'number' || !Number.isFinite(value) || value < caution) return;
     const formatted = suffix === '%' ? percent(value) : `${value.toFixed(1)}${suffix}`;
     pressure.push(`${label} ${formatted}`);
     pressureEn.push(`${english} ${formatted}`);
-    if (value >= danger) pressureLevel = 'danger';
+    if (danger !== null && value >= danger) pressureLevel = 'danger';
     else if (!pressureLevel) pressureLevel = 'caution';
   };
-  pressureMetric('CPU', 'CPU', data.latest?.cpuPercent, 75, 90);
-  pressureMetric('메모리', 'memory', data.latest?.memoryPercent, 75, 90);
+  pressureMetric('CPU', 'CPU', data.latest?.cpuPercent, RESOURCE_THRESHOLDS.cpu.caution, RESOURCE_THRESHOLDS.cpu.danger);
+  pressureMetric('메모리', 'memory', data.latest?.memoryPercent, RESOURCE_THRESHOLDS.memory.caution, RESOURCE_THRESHOLDS.memory.danger);
   const memoryPressureActive = (data.latest?.memoryPercent ?? 0) >= 75
-    || (data.latest?.memoryPressureSomeAvg10 ?? 0) >= PSI_THRESHOLDS.memorySome.caution
-    || (data.latest?.memoryPressureFullAvg10 ?? 0) >= PSI_THRESHOLDS.memoryFull.caution;
+    || (data.latest?.memoryPressureSomeAvg10 ?? 0) >= 1
+    || (data.latest?.memoryPressureFullAvg10 ?? 0) >= 0.2;
   if (memoryPressureActive) pressureMetric('스왑', 'swap', data.latest?.swapPercent, 50, 85);
-  pressureMetric('온도', 'temperature', data.latest?.temperatureC, 75, 85, '°C');
+  pressureMetric('온도', 'temperature', data.latest?.temperatureC, RESOURCE_THRESHOLDS.temperature.caution, RESOURCE_THRESHOLDS.temperature.danger, '°C');
   const logicalCpuCount = typeof data.host.logicalCpuCount === 'number'
     && Number.isSafeInteger(data.host.logicalCpuCount)
     && data.host.logicalCpuCount > 0
     ? data.host.logicalCpuCount
     : null;
   if (logicalCpuCount && typeof data.latest?.load1 === 'number' && Number.isFinite(data.latest.load1)) {
-    pressureMetric('코어당 부하', 'load per CPU', data.latest.load1 / logicalCpuCount, 0.75, 1.5, '×');
-  } else {
-    pressureMetric('부하', 'load', data.latest?.load1, 4, 8, '');
+    pressureMetric('코어당 부하', 'load per CPU', data.latest.load1 / logicalCpuCount, RESOURCE_THRESHOLDS.load.caution, RESOURCE_THRESHOLDS.load.danger, '×');
   }
   pressureMetric('CPU PSI', 'CPU PSI', data.latest?.cpuPressureSomeAvg10, PSI_THRESHOLDS.cpuSome.caution, PSI_THRESHOLDS.cpuSome.danger);
-  pressureMetric('CPU full PSI', 'CPU full PSI', data.latest?.cpuPressureFullAvg10, PSI_THRESHOLDS.cpuFull.caution, PSI_THRESHOLDS.cpuFull.danger);
   pressureMetric('메모리 PSI', 'memory PSI', data.latest?.memoryPressureSomeAvg10, PSI_THRESHOLDS.memorySome.caution, PSI_THRESHOLDS.memorySome.danger);
   pressureMetric('메모리 full PSI', 'memory full PSI', data.latest?.memoryPressureFullAvg10, PSI_THRESHOLDS.memoryFull.caution, PSI_THRESHOLDS.memoryFull.danger);
   pressureMetric('I/O PSI', 'I/O PSI', data.latest?.ioPressureSomeAvg10, PSI_THRESHOLDS.ioSome.caution, PSI_THRESHOLDS.ioSome.danger);
@@ -1249,20 +1297,19 @@ export function operationalFindings(data: DashboardPayload): OperationalFinding[
   }
 
   const storageSignals = data.disks.flatMap((disk) => {
-    const signals: Array<{ value: number; ko: string; en: string }> = [];
-    if (typeof disk.usedPercent === 'number' && Number.isFinite(disk.usedPercent) && disk.usedPercent >= 75) {
-      signals.push({ value: disk.usedPercent, ko: `${disk.mount} 용량 ${percent(disk.usedPercent)}`, en: `${disk.mount} capacity ${percent(disk.usedPercent)}` });
+    const signals: Array<{ level: OperationalFindingLevel; ko: string; en: string }> = [];
+    if (typeof disk.usedPercent === 'number' && Number.isFinite(disk.usedPercent) && disk.usedPercent >= RESOURCE_THRESHOLDS.disk.caution) {
+      signals.push({ level: disk.usedPercent >= RESOURCE_THRESHOLDS.disk.danger ? 'danger' : 'caution', ko: `${disk.mount} 용량 ${percent(disk.usedPercent)}`, en: `${disk.mount} capacity ${percent(disk.usedPercent)}` });
     }
-    if (typeof disk.inodeUsedPercent === 'number' && Number.isFinite(disk.inodeUsedPercent) && disk.inodeUsedPercent >= 75) {
-      signals.push({ value: disk.inodeUsedPercent, ko: `${disk.mount} 아이노드 ${percent(disk.inodeUsedPercent)}`, en: `${disk.mount} inodes ${percent(disk.inodeUsedPercent)}` });
+    if (typeof disk.inodeUsedPercent === 'number' && Number.isFinite(disk.inodeUsedPercent) && disk.inodeUsedPercent >= RESOURCE_THRESHOLDS.inode.caution) {
+      signals.push({ level: disk.inodeUsedPercent >= RESOURCE_THRESHOLDS.inode.danger ? 'danger' : 'caution', ko: `${disk.mount} 아이노드 ${percent(disk.inodeUsedPercent)}`, en: `${disk.mount} inodes ${percent(disk.inodeUsedPercent)}` });
     }
     return signals;
   });
   if (storageSignals.length) {
-    const maximum = Math.max(...storageSignals.map((signal) => signal.value));
     findings.push(finding(
       'storage-capacity',
-      maximum >= 90 ? 'danger' : 'caution',
+      storageSignals.some((signal) => signal.level === 'danger') ? 'danger' : 'caution',
       snapshotScope,
       [storageSignals.map((signal) => signal.ko).join(' · '), storageSignals.map((signal) => signal.en).join(' · ')],
       storageSignals.length,
@@ -1412,22 +1459,27 @@ export function operationalFindings(data: DashboardPayload): OperationalFinding[
   const currentRequestCount = data.currentTraffic.reduce((total, entry) => total + entry.requestCount, 0);
   if (currentRequestCount > 0) {
     const serverErrors = data.currentTraffic.reduce((total, entry) => total + entry.status5xx, 0);
+    const clientErrors = data.currentTraffic.reduce((total, entry) => total + entry.status4xx, 0);
     const slowRequests = data.currentTraffic.reduce((total, entry) => total + entry.slowCount, 0);
     const maximumResponseMs = data.currentTraffic.reduce((maximum, entry) => Math.max(maximum, entry.maxResponseMs ?? 0), 0);
     const serverErrorPercent = (serverErrors / currentRequestCount) * 100;
     const slowPercent = (slowRequests / currentRequestCount) * 100;
-    const noteworthy = serverErrors > 0 || slowPercent >= 10 || maximumResponseMs >= 5_000;
+    const noteworthy = serverErrors > 0 || clientErrors > 0 || slowPercent >= 10 || maximumResponseMs >= 5_000;
     if (noteworthy) {
-      const danger = serverErrorPercent >= 5 || slowPercent >= 40 || maximumResponseMs >= 15_000;
+      const severeServerErrors = (serverErrors >= 3 && serverErrorPercent >= 50)
+        || (serverErrors >= 5 && serverErrorPercent >= 5);
+      // Counts and share must agree; client rejections alone are never danger.
+      // Latency remains an instantaneous reading, not a qualified mail state.
+      const danger = severeServerErrors || slowPercent >= 40 || maximumResponseMs >= 15_000;
       findings.push(finding(
         'application-traffic',
         danger ? 'danger' : 'caution',
         snapshotScope,
         [
-          `요청 ${currentRequestCount.toLocaleString()} · 5xx ${serverErrors.toLocaleString()} (${percent(serverErrorPercent)}) · 느림 ${slowRequests.toLocaleString()} (${percent(slowPercent)}) · 최대 ${maximumResponseMs.toFixed(0)}ms`,
-          `${currentRequestCount.toLocaleString()} requests · ${serverErrors.toLocaleString()} 5xx (${percent(serverErrorPercent)}) · ${slowRequests.toLocaleString()} slow (${percent(slowPercent)}) · ${maximumResponseMs.toFixed(0)}ms max`,
+          `요청 ${currentRequestCount.toLocaleString()} · 5xx ${serverErrors.toLocaleString()} (${percent(serverErrorPercent)}) · 4xx ${clientErrors.toLocaleString()} · 느림 ${slowRequests.toLocaleString()} (${percent(slowPercent)}) · 최대 ${maximumResponseMs.toFixed(0)}ms`,
+          `${currentRequestCount.toLocaleString()} requests · ${serverErrors.toLocaleString()} 5xx (${percent(serverErrorPercent)}) · ${clientErrors.toLocaleString()} 4xx · ${slowRequests.toLocaleString()} slow (${percent(slowPercent)}) · ${maximumResponseMs.toFixed(0)}ms max`,
         ],
-        serverErrors + slowRequests,
+        serverErrors + clientErrors + slowRequests,
         snapshotObservedAt,
       ));
     }
@@ -1583,14 +1635,19 @@ export function operationalFindings(data: DashboardPayload): OperationalFinding[
 
   const runningKernel = data.system.versions.kernelRunning;
   const installedKernel = data.system.versions.kernelLatestInstalled;
-  if (data.system.versions.kernelRebootRequired === true || (runningKernel && installedKernel && runningKernel !== installedKernel)) {
+  const generalReboot = data.system.reboot?.status === 'ok' && data.system.reboot.required === true;
+  const generalRebootCurrent = rebootObservationIsFresh(data.system, data.stale, Date.parse(data.generatedAt));
+  if (generalReboot || kernelRebootRequired(data.system)) {
+    const packages = data.system.reboot?.packages.join(', ');
     findings.push(finding(
       'reboot-required',
       'caution',
-      snapshotScope,
-      [`실행 ${runningKernel ?? '미확인'} · 설치 ${installedKernel ?? '미확인'}`, `running ${runningKernel ?? 'unknown'} · installed ${installedKernel ?? 'unknown'}`],
+      generalReboot && !generalRebootCurrent && !kernelRebootRequired(data.system) ? 'last-known' : snapshotScope,
+      generalReboot
+        ? [`호스트 재부팅 요청${packages ? ` · ${packages}` : ' · 요청 패키지 미확인'}`, `Host reboot requested${packages ? ` · ${packages}` : ' · requesting packages unknown'}`]
+        : [`실행 ${runningKernel ?? '미확인'} · 설치 ${installedKernel ?? '미확인'}`, `running ${runningKernel ?? 'unknown'} · installed ${installedKernel ?? 'unknown'}`],
       1,
-      snapshotScope === 'current' ? data.generatedAt : snapshotObservedAt,
+      generalReboot ? data.system.reboot?.observedAt ?? snapshotObservedAt : snapshotScope === 'current' ? data.generatedAt : snapshotObservedAt,
     ));
   }
 

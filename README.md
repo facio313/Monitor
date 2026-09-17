@@ -6,6 +6,10 @@ rootless Docker status, storage information, sanitized alerts, and sanitized
 privilege activity in a responsive React dashboard protected by the central
 Bonifacio SSO boundary.
 
+Host SSH allows Korean sources, the designated management PC, and GitHub's
+official published IP ranges. A daily GitHub range refresh preserves the last
+valid policy on failure; see [SSH source policy and deployment exceptions](docs/ssh-korea-only.md).
+
 ## Architecture
 
 ```text
@@ -106,6 +110,15 @@ is now only a compatibility check: if an older deployment still supplies it,
 it must agree with the canonical mode.
 
 The dashboard provides:
+
+- persistent network phase diagnostics and TCP/interface history, live general
+  reboot requirements, stale update-list labels, hourly email reports and
+  immediate reduced incident notifications; see the
+  [diagnostics and notification operations guide](docs/diagnostics-notifications-2026-09-13.md);
+
+- authenticated SSH access history with source IP, KST event time, distinct
+  failure/success categories and offline country estimates; see
+  [SSH observation operations](docs/ssh-access-observations.md);
 
 - a Korean-first control-room view with an explicit English switch, large page
   and panel headings, persistent critical-state strip, and an in-product guide

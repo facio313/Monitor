@@ -194,6 +194,8 @@ export function DockerDiagnosticsPanel({ data, locale }: {
                 <div><dt>{t(locale, '제한 period', 'Throttled periods')}</dt><dd>{count(container.cpuThrottledPeriods)}</dd></div>
                 <div><dt>{t(locale, '누적 제한 시간', 'Throttled time')}</dt><dd>{reading(container.cpuThrottledSeconds, (value) => `${value.toFixed(3)} s`)}</dd></div>
                 <div><dt>{t(locale, '메모리', 'Memory')}</dt><dd>{formatBytes(container.memoryBytes)} / {formatBytes(container.memoryLimitBytes)}</dd></div>
+                <div><dt>{t(locale, '캐시 보정 메모리', 'Cache-adjusted memory')}</dt><dd>{formatBytes(container.memoryWorkingSetBytes)}</dd></div>
+                <div><dt>{t(locale, '비활성 파일 캐시', 'Inactive file cache')}</dt><dd>{formatBytes(container.memoryInactiveFileBytes)}</dd></div>
                 <div><dt>{t(locale, 'Block 읽기', 'Block read')}</dt><dd>{formatBytes(container.blockReadBytes)} · {formatRate(container.blockReadBytesPerSecond)}</dd></div>
                 <div><dt>{t(locale, 'Block 쓰기', 'Block write')}</dt><dd>{formatBytes(container.blockWriteBytes)} · {formatRate(container.blockWriteBytesPerSecond)}</dd></div>
                 <div><dt>{t(locale, '네트워크 수신', 'Network received')}</dt><dd>{formatBytes(container.networkRxBytes)} · {formatRate(container.networkRxBytesPerSecond)}</dd></div>

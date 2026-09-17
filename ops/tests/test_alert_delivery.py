@@ -299,6 +299,103 @@ class AlertDeliveryTests(unittest.TestCase):
             ["primary-hook", "secondary-hook"],
         )
 
+    def test_optional_rule_exclusions_preserve_default_routing(self):
+        omitted = config_value()
+        explicit = config_value()
+        explicit["routes"][0]["excludeRuleIds"] = []
+        default_config = alert_delivery.parse_delivery_config(omitted)
+        self.assertEqual(default_config, alert_delivery.parse_delivery_config(explicit))
+        self.assertEqual(default_config.routes[0].excluded_rule_ids, ())
+        for rule_id in ("TcpRetransmissionHigh", "HttpLatencyHigh", "CpuUsageHigh"):
+            with self.subTest(rule_id=rule_id):
+                ordinary = event()
+                ordinary["ruleId"] = rule_id
+                self.assertEqual(
+                    [item.channel_id for item in alert_delivery.route_channels(default_config, ordinary)],
+                    ["ops-webhook"],
+                )
+
+    def test_route_exclusions_skip_both_transitions_but_allow_other_rules(self):
+        value = config_value()
+        value["routes"][0]["excludeRuleIds"] = ["TcpRetransmissionHigh", "HttpLatencyHigh"]
+        with tempfile.TemporaryDirectory() as directory:
+            outbox, config = self.outbox(Path(directory), value)
+            events = []
+            for rule_id in ("TcpRetransmissionHigh", "HttpLatencyHigh", "OperationalCaution", "CpuUsageHigh"):
+                for transition in ("firing", "resolved"):
+                    candidate = event(f"{rule_id}-{transition}", transition=transition)
+                    candidate["ruleId"] = rule_id
+                    events.append(candidate)
+                    with self.subTest(rule_id=rule_id, transition=transition):
+                        self.assertEqual(
+                            [item.channel_id for item in alert_delivery.route_channels(config, candidate)],
+                            [] if rule_id in config.routes[0].excluded_rule_ids else ["ops-webhook"],
+                        )
+            result = alert_delivery.enqueue_operational_events(outbox, config, events, NOW)
+            self.assertEqual(result, {
+                "enqueued": 4, "deduplicated": 0, "dropped": 0, "skipped": 4,
+            })
+            self.assertEqual(outbox.status()["states"]["pending"], 4)
+
+    def test_route_exclusion_does_not_stop_fallback_or_globally_exclude_rule(self):
+        value = config_value(channels=[channel("primary-hook"), channel("secondary-hook")])
+        primary = value["routes"][0]
+        primary["channels"] = ["primary-hook"]
+        primary["excludeRuleIds"] = ["HttpLatencyHigh"]
+        value["routes"].append({
+            **primary, "id": "fallback", "priority": 10,
+            "channels": ["secondary-hook"], "excludeRuleIds": [],
+        })
+        candidate = event()
+        candidate["ruleId"] = "HttpLatencyHigh"
+        for continue_matching in (False, True):
+            primary["continue"] = continue_matching
+            config = alert_delivery.parse_delivery_config(value)
+            with self.subTest(continue_matching=continue_matching):
+                self.assertEqual(
+                    [item.channel_id for item in alert_delivery.route_channels(config, candidate)],
+                    ["secondary-hook"],
+                )
+        primary["continue"] = False
+        config = alert_delivery.parse_delivery_config(value)
+        self.assertEqual(
+            [item.channel_id for item in alert_delivery.route_channels(config, event())],
+            ["primary-hook"],
+        )
+
+    def test_rule_exclusions_reject_invalid_duplicate_and_oversized_lists(self):
+        for excluded in (
+            None, "CpuUsageHigh", {}, [None], [1], [[]], [""], ["cpuUsageHigh"],
+            ["AB"], ["Cpu_UsageHigh"], ["CpuUsageHigh\n"], ["A" * 65],
+            ["CpuUsageHigh", "CpuUsageHigh"],
+            [f"Rule{index}" for index in range(129)],
+        ):
+            with self.subTest(excluded=excluded):
+                value = config_value()
+                value["routes"][0]["excludeRuleIds"] = excluded
+                with self.assertRaisesRegex(ValueError, "excludeRuleIds"):
+                    alert_delivery.parse_delivery_config(value)
+        value = config_value()
+        value["routes"][0]["excludeRuleIds"] = [f"Rule{index}" for index in range(128)]
+        self.assertEqual(
+            len(alert_delivery.parse_delivery_config(value).routes[0].excluded_rule_ids), 128,
+        )
+
+    def test_optional_rule_exclusions_keep_other_route_fields_exact(self):
+        for include_exclusions in (False, True):
+            for change in ("unknown", "missing"):
+                with self.subTest(include_exclusions=include_exclusions, change=change):
+                    value = config_value()
+                    route = value["routes"][0]
+                    if include_exclusions:
+                        route["excludeRuleIds"] = ["HttpLatencyHigh"]
+                    if change == "unknown":
+                        route["excludeRules"] = []
+                    else:
+                        del route["continue"]
+                    with self.assertRaisesRegex(ValueError, "schema"):
+                        alert_delivery.parse_delivery_config(value)
+
     def test_retry_backoff_retry_after_and_max_attempts_use_virtual_clock(self):
         with tempfile.TemporaryDirectory() as directory:
             outbox, config = self.outbox(Path(directory))

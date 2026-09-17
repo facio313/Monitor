@@ -153,6 +153,9 @@ const FIXED_CONTAINER_SERVICE_NAMES = [
   'multtara-collector',
   'multtara-database',
   'multtara-frontend',
+  'pongdang-frontend',
+  'pongdang-backend',
+  'pongdang-db',
   'pilgrimage-frontend',
   'pilgrimage-backend',
   'pilgrimage-redis',
@@ -175,6 +178,9 @@ const CURRENT_CONTAINER_PROJECTS: Readonly<Record<string, string>> = {
   'multtara-backend': 'pongdang-multtara',
   'multtara-collector': 'pongdang-multtara',
   'multtara-frontend': 'pongdang-multtara',
+  'pongdang-frontend': 'pongdang',
+  'pongdang-backend': 'pongdang',
+  'pongdang-db': 'pongdang',
   'pilgrimage-frontend': 'pilgrimage',
   'pilgrimage-backend': 'pilgrimage',
   'pilgrimage-redis': 'pilgrimage',
@@ -1071,6 +1077,38 @@ function normalizeSystemKernel(
   })) as DashboardResponse['system']['kernel'];
 }
 
+function normalizeSystemReboot(value: JsonRecord | undefined, nowMs: number): DashboardResponse['system']['reboot'] {
+  const unknown: DashboardResponse['system']['reboot'] = {
+    status: 'unavailable', required: null, observedAt: null,
+    packages: [], packagesStatus: 'unavailable', packagesTruncated: false,
+  };
+  if (!value) return unknown;
+  const observedAt = isoTimestamp(own(value, 'observedAt'));
+  if (observedAt === null || Date.parse(observedAt) > nowMs + 60_000) return unknown;
+  const status = own(value, 'status');
+  const statuses = ['ok', 'unavailable', 'permission-denied', 'collection-error'];
+  if (typeof status !== 'string' || !statuses.includes(status)) return unknown;
+  const required = optionalBoolean(own(value, 'required'));
+  if ((status === 'ok') !== (required !== null)) return unknown;
+  const packages = own(value, 'packages');
+  const packagesStatus = own(value, 'packagesStatus');
+  const packagesTruncated = own(value, 'packagesTruncated');
+  const packagesValid = Array.isArray(packages) && packages.length <= 64
+    && packages.every((name) => typeof name === 'string'
+      && /^[a-z0-9][a-z0-9+.-]{0,127}(?::[a-z0-9][a-z0-9-]{0,31})?$/.test(name));
+  const knownPackages = required === true && packagesStatus === 'ok'
+    && packagesValid && typeof packagesTruncated === 'boolean';
+  return {
+    status: status as DashboardResponse['system']['reboot']['status'],
+    required, observedAt,
+    packages: knownPackages ? [...new Set(packages as string[])] : [],
+    packagesStatus: required === false ? 'ok' : knownPackages ? 'ok'
+      : typeof packagesStatus === 'string' && statuses.includes(packagesStatus) && packagesStatus !== 'ok'
+        ? packagesStatus as DashboardResponse['system']['reboot']['packagesStatus'] : 'collection-error',
+    packagesTruncated: knownPackages && packagesTruncated === true,
+  };
+}
+
 function normalizeSystem(
   current: JsonRecord | null,
   nowMs: number,
@@ -1085,6 +1123,7 @@ function normalizeSystem(
   ));
   const bootStartedMs = bootStartedAt ? new Date(bootStartedAt).getTime() : null;
   return {
+    reboot: normalizeSystemReboot(recordAt(system, 'reboot'), nowMs),
     versions: {
       kernelRunning: systemText(own(versions, 'kernelRunning'), 128),
       kernelLatestInstalled: systemText(own(versions, 'kernelLatestInstalled'), 128),
@@ -1173,6 +1212,7 @@ const CONTAINER_V3_LEGACY_FIELDS = CONTAINER_V3_FIELDS.filter(
   (field) => field !== 'writableSensitiveBindMounted',
 );
 const CONTAINER_V4_FIELDS = [...CONTAINER_V3_FIELDS, 'mountPolicyStatus'] as const;
+const CONTAINER_V5_FIELDS = [...CONTAINER_V4_FIELDS, 'memoryInactiveFileBytes', 'memoryWorkingSetBytes'] as const;
 type ContainerRow = DashboardResponse['containers'][number];
 type ContainerV3Extras = Pick<ContainerRow, (typeof CONTAINER_V3_ONLY_FIELDS)[number]>;
 type MountPolicyStatus = NonNullable<ContainerRow['mountPolicyStatus']>;
@@ -1332,6 +1372,7 @@ function normalizeContainerList(
     if (!isRecord(value)) return [];
     if (own(value, 'owner') !== 'cks') return [];
     const v4 = Object.prototype.hasOwnProperty.call(value, 'mountPolicyStatus');
+    const v5 = ['memoryInactiveFileBytes', 'memoryWorkingSetBytes'].some((field) => Object.prototype.hasOwnProperty.call(value, field));
     const v3 = !v4
       && CONTAINER_V3_ONLY_FIELDS.some((field) => Object.prototype.hasOwnProperty.call(value, field));
     const v2 = !v4 && !v3
@@ -1341,7 +1382,8 @@ function normalizeContainerList(
       && !Object.prototype.hasOwnProperty.call(value, 'writableSensitiveBindMounted')
       && exactKeys(value, CONTAINER_V3_LEGACY_FIELDS);
     if (
-      (v4 && !exactKeys(value, CONTAINER_V4_FIELDS))
+      (v5 && (!v4 || !exactKeys(value, CONTAINER_V5_FIELDS)))
+      || (v4 && !v5 && !exactKeys(value, CONTAINER_V4_FIELDS))
       || (v3 && !legacyV3 && !exactKeys(value, CONTAINER_V3_FIELDS))
       || (v2 && !exactKeys(value, CONTAINER_V2_FIELDS))
     ) {
@@ -1391,6 +1433,12 @@ function normalizeContainerList(
     const memoryLimitBytes = modern
       ? (own(value, 'memoryLimitBytes') === null ? null : integer(own(value, 'memoryLimitBytes')))
       : null;
+    const memoryInactiveFileBytes = v5 ? nullableContainerInteger(value, 'memoryInactiveFileBytes', Number.MAX_SAFE_INTEGER) : null;
+    const memoryWorkingSetBytes = v5 ? nullableContainerInteger(value, 'memoryWorkingSetBytes', Number.MAX_SAFE_INTEGER) : null;
+    if (v5 && (memoryInactiveFileBytes === undefined || memoryWorkingSetBytes === undefined
+      || (memoryInactiveFileBytes === null) !== (memoryWorkingSetBytes === null)
+      || (memoryInactiveFileBytes !== null && memoryWorkingSetBytes !== null
+        && (memoryBytes === null || memoryInactiveFileBytes + memoryWorkingSetBytes !== memoryBytes)))) return [];
     const cpuLimitCores = modern
       ? (own(value, 'cpuLimitCores') === null ? null : finite(own(value, 'cpuLimitCores'), 0, 1024))
       : null;
@@ -1443,6 +1491,7 @@ function normalizeContainerList(
       memoryBytes,
       memoryPercent,
       memoryLimitBytes,
+      ...(v5 ? { memoryInactiveFileBytes, memoryWorkingSetBytes } : {}),
       cpuLimitCores,
       pidLimit,
       restartCount,
@@ -3118,7 +3167,7 @@ function validateLinuxTcp(value: unknown): boolean {
     'status', 'counters', 'rateStatus', 'outgoingSegmentsPerSecond',
     'retransmittedSegmentsPerSecond', 'retransmissionPercent', 'states',
     'socketScanStatus', 'socketScanTruncated', 'ephemeralPorts', 'conntrack',
-  ]);
+  ], ['assessment']);
   if (!record || !linuxRawStatus(own(record, 'status')) || !linuxRateStatusIsValid(own(record, 'rateStatus'))) return false;
   if (!linuxNullableNumber(own(record, 'outgoingSegmentsPerSecond'))
     || !linuxNullableNumber(own(record, 'retransmittedSegmentsPerSecond'))
@@ -3544,6 +3593,29 @@ function emptyLinuxDiagnostics(
   };
 }
 
+function normalizeTcpAssessment(value: unknown, sourceAt: unknown, nowMs: number): NonNullable<DashboardResponse['linux']['network']['tcp']['assessment']> | null {
+  const row = linuxRecord(value, ['status', 'observedAt', 'retransmissionPercent'],
+    ['outboundSegmentsDelta', 'retransmittedSegmentsDelta', 'windowSeconds', 'sampleCount']);
+  if (!row || !['ok', 'insufficient_samples'].includes(String(row.status))) return null;
+  const observedAt = linuxTimestamp(row.observedAt, nowMs);
+  if (!observedAt || observedAt !== linuxTimestamp(sourceAt, nowMs)) return null;
+  const sampleCount = integer(row.sampleCount, 0, 8) ?? 0;
+  const windowSeconds = finite(row.windowSeconds, 0, 300) ?? 0;
+  const outboundSegmentsDelta = integer(row.outboundSegmentsDelta) ?? 0;
+  const retransmittedSegmentsDelta = integer(row.retransmittedSegmentsDelta) ?? 0;
+  const ratio = finite(row.retransmissionPercent, 0, MAX_LINUX_RATE);
+  if (row.status === 'ok' && (ratio === null || sampleCount < 3 || windowSeconds < 120
+    || !outboundSegmentsDelta || Math.abs(ratio - 100 * retransmittedSegmentsDelta / outboundSegmentsDelta) > 0.000001
+    || (ratio >= 1 && outboundSegmentsDelta < 1000 && retransmittedSegmentsDelta < 20))) return null;
+  if (row.status === 'insufficient_samples' && row.retransmissionPercent !== null) return null;
+  const age = nowMs - Date.parse(observedAt);
+  return {
+    status: age < 0 || age > 180_000 ? 'stale' : row.status as 'ok' | 'insufficient_samples',
+    observedAt, retransmissionPercent: ratio, sampleCount, windowSeconds,
+    outboundSegmentsDelta, retransmittedSegmentsDelta,
+  };
+}
+
 function normalizeLinuxDiagnostics(
   current: JsonRecord | null,
   nowMs: number,
@@ -3557,6 +3629,8 @@ function normalizeLinuxDiagnostics(
   const cgroup = own(processes, 'cgroupPids') as JsonRecord;
   const pidCount = integer(own(processes, 'pidCount'), 0, 8192);
   const resourceStatus = normalizeLinuxStatus(own(processes, 'status'));
+  const processCountIsLowerBound = own(processes, 'pidCountLowerBound') as boolean;
+  const processVisibilityComplete = resourceStatus === 'supported' && !processCountIsLowerBound;
   const descriptorMaximum = integer(own(descriptors, 'maximum'), 1, MAX_LINUX_COUNTER);
   const descriptorStatus = descriptorMaximum === null && typeof own(descriptors, 'maximum') === 'number'
     ? 'partial'
@@ -3564,17 +3638,19 @@ function normalizeLinuxDiagnostics(
   const resources: DashboardResponse['linux']['resources'] = {
     status: resourceStatus,
     processCount: pidCount,
-    processCountIsLowerBound: own(processes, 'pidCountLowerBound') as boolean,
+    processCountIsLowerBound,
     observedProcessCount: integer(own(processes, 'observedProcessCount'), 0, 8192),
     zombieCount: integer(own(processes, 'zombieCount'), 0, 8192),
     threadCount: integer(own(processes, 'threadCount'), 0, MAX_LINUX_COUNTER),
     scanTruncated: own(processes, 'scanTruncated') as boolean,
     deadlineReached: own(processes, 'deadlineReached') as boolean,
     pid: {
-      status: normalizeLinuxStatus(own(processes, 'pidMaximumStatus')),
-      current: pidCount,
+      status: processVisibilityComplete
+        ? normalizeLinuxStatus(own(processes, 'pidMaximumStatus'))
+        : resourceStatus === 'supported' ? 'partial' : resourceStatus,
+      current: processVisibilityComplete ? pidCount : null,
       maximum: integer(own(processes, 'pidMaximum'), 1, MAX_LINUX_COUNTER),
-      usedPercent: percent(own(processes, 'pidUsedPercent')),
+      usedPercent: processVisibilityComplete ? percent(own(processes, 'pidUsedPercent')) : null,
     },
     systemFileDescriptors: {
       status: descriptorStatus,
@@ -3638,6 +3714,7 @@ function normalizeLinuxDiagnostics(
       outgoingSegmentsPerSecond: finite(own(tcp, 'outgoingSegmentsPerSecond'), 0, MAX_LINUX_RATE),
       retransmittedSegmentsPerSecond: finite(own(tcp, 'retransmittedSegmentsPerSecond'), 0, MAX_LINUX_RATE),
       retransmissionPercent: percent(own(tcp, 'retransmissionPercent')),
+      assessment: normalizeTcpAssessment(own(tcp, 'assessment'), own(raw, 'collectedAt'), nowMs),
       states: {
         established: integer(own(tcpStates, 'established'), 0, 65_536) ?? 0,
         synSent: integer(own(tcpStates, 'synSent'), 0, 65_536) ?? 0,

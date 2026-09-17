@@ -1,0 +1,27 @@
+[Unit]
+Description=Refresh GitHub source exceptions for host SSH
+Wants=network-online.target
+After=network-online.target monitor-ssh-geo.service
+RequiresMountsFor=/etc/monitor/ssh-kr-only.nft /usr/local/lib/monitor-ssh-geo
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/monitor-ssh-geo-apply --update-github
+RuntimeDirectory=monitor-ssh-geo
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+UMask=0077
+TimeoutStartSec=150s
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
+CapabilityBoundingSet=CAP_NET_ADMIN
+ReadWritePaths=/run/monitor-ssh-geo /etc/monitor
+MemoryMax=128M
+TasksMax=16

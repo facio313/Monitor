@@ -1,5 +1,5 @@
 import type { CSSProperties } from 'react';
-import { PSI_THRESHOLDS } from '../operational-thresholds';
+import { PSI_THRESHOLDS, RESOURCE_THRESHOLDS, type OperationalThreshold } from '../operational-thresholds';
 import { useResponsivePageSize } from '../responsive-page-size';
 import type { DashboardPayload, MonitorDetailPage, MonitorLocale } from '../types';
 import { formatBytes } from '../utils';
@@ -36,10 +36,10 @@ function percent(value: number | null | undefined, digits = 1): string {
   return finite(value) ? `${value.toFixed(digits)}%` : '—';
 }
 
-function tone(value: number | null, caution: number, danger: number): HeadroomTone {
-  if (value === null) return 'unknown';
-  if (value >= danger) return 'danger';
-  if (value >= caution) return 'caution';
+function tone(value: number | null, caution: number | null, danger: number | null): HeadroomTone {
+  if (value === null || (caution === null && danger === null)) return 'unknown';
+  if (danger !== null && value >= danger) return 'danger';
+  if (caution !== null && value >= caution) return 'caution';
   return 'ok';
 }
 
@@ -53,8 +53,8 @@ function toneText(value: HeadroomTone, locale: MonitorLocale): string {
   return t(locale, labels[value][0], labels[value][1]);
 }
 
-function normalizedLevel(value: number | null, severe: number): number | null {
-  return value === null ? null : Math.max(0, Math.min(1, value / severe));
+function normalizedLevel(value: number | null, maximum: number | null): number | null {
+  return value === null || maximum === null ? null : Math.max(0, Math.min(1, value / maximum));
 }
 
 function toneRank(value: HeadroomTone): number {
@@ -64,8 +64,8 @@ function toneRank(value: HeadroomTone): number {
 function psiAssessment(
   some: number | null | undefined,
   full: number | null | undefined,
-  someThreshold: { caution: number; danger: number },
-  fullThreshold: { caution: number; danger: number },
+  someThreshold: OperationalThreshold,
+  fullThreshold: OperationalThreshold,
 ): Pick<HeadroomReading, 'level' | 'tone'> {
   const someValue = finite(some) ? some : null;
   const fullValue = finite(full) ? full : null;
@@ -73,8 +73,8 @@ function psiAssessment(
   const fullTone = tone(fullValue, fullThreshold.caution, fullThreshold.danger);
   const resultTone = toneRank(fullTone) > toneRank(someTone) ? fullTone : someTone;
   const levels = [
-    normalizedLevel(someValue, someThreshold.danger),
-    normalizedLevel(fullValue, fullThreshold.danger),
+    normalizedLevel(someValue, someThreshold.danger ?? someThreshold.caution),
+    normalizedLevel(fullValue, fullThreshold.danger ?? fullThreshold.caution),
   ].filter((value): value is number => value !== null);
   return { level: levels.length ? Math.max(...levels) : null, tone: resultTone };
 }
@@ -99,11 +99,14 @@ function HeadroomMeter({ reading, locale, onOpen }: { reading: HeadroomReading; 
 export function operationalHeadroomReadings(data: DashboardPayload, locale: MonitorLocale): HeadroomReading[] {
   const latest = data.latest;
   const logicalCpuCount = finite(data.host.logicalCpuCount) && data.host.logicalCpuCount > 0 ? data.host.logicalCpuCount : null;
-  const loadRatio = finite(latest?.load1) && logicalCpuCount ? (latest.load1 / logicalCpuCount) * 100 : null;
+  const loadRatio = finite(latest?.load1) && logicalCpuCount ? latest.load1 / logicalCpuCount : null;
   const cpuPsi = psiAssessment(latest?.cpuPressureSomeAvg10, latest?.cpuPressureFullAvg10, PSI_THRESHOLDS.cpuSome, PSI_THRESHOLDS.cpuFull);
   const memoryPsi = psiAssessment(latest?.memoryPressureSomeAvg10, latest?.memoryPressureFullAvg10, PSI_THRESHOLDS.memorySome, PSI_THRESHOLDS.memoryFull);
   const ioPsi = psiAssessment(latest?.ioPressureSomeAvg10, latest?.ioPressureFullAvg10, PSI_THRESHOLDS.ioSome, PSI_THRESHOLDS.ioFull);
   const swap = finite(latest?.swapPercent) ? latest.swapPercent : null;
+  const memoryPressureActive = (latest?.memoryPercent ?? 0) >= 75
+    || (latest?.memoryPressureSomeAvg10 ?? 0) >= 1
+    || (latest?.memoryPressureFullAvg10 ?? 0) >= 0.2;
   const observedCapacity = data.disks.filter((disk) => finite(disk.usedPercent) || finite(disk.availableBytes));
   const tightestDisk = observedCapacity.length
     ? observedCapacity.reduce((left, right) => {
@@ -123,17 +126,17 @@ export function operationalHeadroomReadings(data: DashboardPayload, locale: Moni
     {
       key: 'load-per-cpu',
       label: t(locale, '코어당 부하', 'Load per CPU'),
-      value: loadRatio === null ? '—' : `${(loadRatio / 100).toFixed(2)}×`,
+      value: loadRatio === null ? '—' : `${loadRatio.toFixed(2)}×`,
       detail: logicalCpuCount ? t(locale, `논리 CPU ${logicalCpuCount}개 기준`, `${logicalCpuCount} logical CPUs`) : t(locale, 'CPU 개수 미수집', 'CPU count unavailable'),
-      level: normalizedLevel(loadRatio, 180),
-      tone: tone(loadRatio, 75, 150),
+      level: normalizedLevel(loadRatio, RESOURCE_THRESHOLDS.load.caution),
+      tone: tone(loadRatio, RESOURCE_THRESHOLDS.load.caution, RESOURCE_THRESHOLDS.load.danger),
       page: 'resources',
     },
     {
       key: 'cpu-psi',
       label: t(locale, 'CPU 실제 대기', 'CPU stall (PSI)'),
       value: percent(latest?.cpuPressureSomeAvg10),
-      detail: t(locale, `full ${percent(latest?.cpuPressureFullAvg10)}`, `full ${percent(latest?.cpuPressureFullAvg10)}`),
+      detail: t(locale, 'some 기준 · 호스트 full은 해당 없음', 'some only · host full is not applicable'),
       level: cpuPsi.level,
       tone: cpuPsi.tone,
       page: 'resources',
@@ -164,7 +167,7 @@ export function operationalHeadroomReadings(data: DashboardPayload, locale: Moni
         ? `${formatBytes(latest.swapUsedBytes)} / ${formatBytes(latest.swapTotalBytes)}`
         : t(locale, '스왑 없음 또는 미수집', 'No swap or unavailable'),
       level: normalizedLevel(swap, 100),
-      tone: tone(swap, 45, 80),
+      tone: swap === null ? 'unknown' : memoryPressureActive ? tone(swap, 50, 85) : 'ok',
       page: 'resources',
     },
     {
@@ -175,7 +178,7 @@ export function operationalHeadroomReadings(data: DashboardPayload, locale: Moni
         ? `${tightestDisk.mount} · ${finite(tightestDisk.availableBytes) ? t(locale, `${formatBytes(tightestDisk.availableBytes)} 남음`, `${formatBytes(tightestDisk.availableBytes)} available`) : t(locale, '가용 공간 미수집', 'Free space unavailable')}`
         : t(locale, '보고 없음', 'Not reported'),
       level: tightestDisk && finite(tightestDisk.usedPercent) ? normalizedLevel(tightestDisk.usedPercent, 100) : null,
-      tone: tightestDisk && finite(tightestDisk.usedPercent) ? tone(tightestDisk.usedPercent, 75, 90) : 'unknown',
+      tone: tightestDisk && finite(tightestDisk.usedPercent) ? tone(tightestDisk.usedPercent, RESOURCE_THRESHOLDS.disk.caution, RESOURCE_THRESHOLDS.disk.danger) : 'unknown',
       page: 'storage',
     },
     {
@@ -184,7 +187,7 @@ export function operationalHeadroomReadings(data: DashboardPayload, locale: Moni
       value: percent(maxInode),
       detail: t(locale, '파일 개수 한계 여유', 'File-count headroom'),
       level: normalizedLevel(maxInode, 100),
-      tone: tone(maxInode, 75, 90),
+      tone: tone(maxInode, RESOURCE_THRESHOLDS.inode.caution, RESOURCE_THRESHOLDS.inode.danger),
       page: 'storage',
     },
     {

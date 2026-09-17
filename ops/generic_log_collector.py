@@ -12,6 +12,11 @@ from pathlib import Path
 from time import monotonic as _monotonic
 from typing import Any, Sequence
 
+if __package__:
+    from . import ssh_access
+else:  # Installed sibling modules are imported without the ops package.
+    import ssh_access
+
 try:  # Installed modules share one directory.
     from log_pipeline import (
         PipelineLimits,
@@ -249,6 +254,27 @@ def collect_generic_logs(
                 pem_recovery_sources.append(source_id)
             batches.append(SourceBatch(definition.source, acquired["lines"]))
             next_cursors[source_id] = acquired["cursor"]
+        # Extract only the reviewed SSH metadata before generic redaction and
+        # durably publish it before committing journal cursors. If this optional
+        # export fails, the affected SSH cursors are held for an idempotent retry;
+        # unrelated generic sources and their redaction/quota state still proceed.
+        try:
+            _, retry_ssh_sources = ssh_access.collect_ssh_access(
+                root, definitions, acquisitions, observed_at, expected_uid=owner,
+            )
+        except Exception:
+            retry_ssh_sources = {item.source.source_id for item in definitions if ssh_access.is_ssh_source(item)}
+            ssh_access.record_failure(root, definitions, observed_at, expected_uid=owner)
+        for source_id in retry_ssh_sources:
+            next_cursors[source_id] = prior_cursors.get(source_id, {})
+            acquisitions[source_id] = {
+                "status": "failed", "errorClass": "read_failed", "lines": [],
+                "cursor": next_cursors[source_id], "droppedLines": 0,
+            }
+        if retry_ssh_sources:
+            # A held cursor must not advance its associated PEM/quota state.
+            batches = [SourceBatch(batch.source, []) if batch.source.source_id in retry_ssh_sources else batch
+                       for batch in batches]
         pipeline = process_batches(
             batches,
             observed_at,

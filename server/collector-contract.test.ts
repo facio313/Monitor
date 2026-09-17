@@ -235,7 +235,20 @@ describe('collector to server contract', () => {
     chmodSync(vcgencmd, 0o755);
 
     execFileSync('python3', [
-      resolve('ops/collector.py'),
+      '-c', `
+import os, sys
+from pathlib import Path
+sys.path.insert(0, str(Path('ops').resolve()))
+import collector, alert_store
+fixture = Path(sys.argv.pop(1))
+# Installed private routing/retirement files are not part of this fixture.
+# Exercise the real CLI with isolated optional config defaults, not host policy.
+for kind, variable in [('DELIVERY', 'MONITOR_ALERT_DELIVERY_CONFIG'), ('SILENCE', 'MONITOR_ALERT_SILENCES'), ('RETIREMENT', 'MONITOR_ALERT_RETIREMENTS')]:
+    setattr(alert_store, 'DEFAULT_' + kind + '_CONFIG_PATH', fixture / ('absent-' + kind.lower() + '.json'))
+    os.environ.pop(variable, None)
+raise SystemExit(collector.main(sys.argv[1:]))
+`,
+      fixture,
       '--output-dir', outputRoot,
       '--runtime-dir', runtimeRoot,
       '--proc-root', procRoot,
@@ -249,6 +262,7 @@ describe('collector to server contract', () => {
       '--traffic-log', trafficLog,
       '--docker-sockets', '',
       '--synthetic-input', '',
+      '--log-sources-config', join(fixture, 'absent-log-sources.json'),
       '--vcgencmd', vcgencmd,
       '--temperature-warn-c', '40',
       '--temperature-recover-c', '35',

@@ -1,6 +1,6 @@
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import type { SystemStatus } from '../types';
 import { bootloaderVersionTone, kernelVersionTone, SystemMaintenance } from './SystemMaintenance';
 
@@ -54,6 +54,33 @@ function system(overrides: Partial<SystemStatus['versions']> = {}): SystemStatus
 }
 
 describe('system maintenance presentation', () => {
+  it('shows a libc reboot request even with the current kernel and clears after reboot', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-09-13T07:00:00Z'));
+    try {
+      const current = system();
+      current.reboot = {
+        status: 'ok', required: true, observedAt: '2026-09-13T07:00:00Z',
+        packages: ['libc6:arm64'], packagesStatus: 'ok', packagesTruncated: false,
+      };
+      const render = () => renderToStaticMarkup(createElement(SystemMaintenance, {
+        system: current, generatedAt: '2026-09-13T07:00:00Z', locale: 'en',
+      }));
+      expect(render()).toContain('Reboot required');
+      expect(render()).toContain('libc6:arm64');
+      expect(kernelVersionTone(current)).toBe('ok');
+      current.reboot.required = false;
+      current.reboot.packages = [];
+      expect(render()).toContain('No reboot requested');
+      expect(render()).not.toContain('Reboot required');
+      current.reboot.status = 'permission-denied';
+      current.reboot.required = null;
+      expect(render()).toContain('Reboot status unknown');
+      expect(render()).toContain('Permission denied');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
   it('reports current versions and renders the bounded update placeholder', () => {
     const current = system();
     expect(kernelVersionTone(current)).toBe('ok');

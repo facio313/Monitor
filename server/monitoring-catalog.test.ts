@@ -67,7 +67,7 @@ describe('monitoring catalog strict reader', () => {
     expect(catalog?.rules).toHaveLength(82);
     expect(catalog?.observations.map((item) => item.id).sort())
       .toEqual([...REQUIRED_MONITORING_OBSERVATION_IDS].sort());
-    expect(catalog?.evidenceSources).toHaveLength(14);
+    expect(catalog?.evidenceSources).toHaveLength(16);
     expect(catalog?.evidenceSources.find((source) => source.id === 'telemetry-history')?.retention)
       .toEqual({
         policy: 'daily-age-and-count',

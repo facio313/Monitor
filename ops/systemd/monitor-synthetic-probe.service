@@ -16,7 +16,7 @@ Environment=http_proxy=
 Environment=https_proxy=
 Environment=all_proxy=
 Environment=no_proxy=
-ExecStart=/usr/bin/python3 /usr/local/lib/monitor-collector/synthetic_probe.py --config /etc/monitor-synthetic-probe/probes.json --output /var/lib/monitor-synthetic/results.json
+ExecStart=/usr/bin/python3 /usr/local/lib/monitor-collector/synthetic_probe.py --config /etc/monitor-synthetic-probe/probes.json --output /var/lib/monitor-synthetic/results.json --diagnostics-output /var/lib/monitor-synthetic/diagnostics.json
 StateDirectory=monitor-synthetic
 StateDirectoryMode=0750
 UMask=0027
@@ -50,6 +50,9 @@ MemoryHigh=64M
 MemoryMax=80M
 TasksMax=16
 TimeoutStartSec=40s
+# Bound cleanup below the one-minute timer cadence; a running oneshot is never
+# started concurrently by its timer. The process limit also bounds stuck DNS.
+TimeoutStopSec=5s
 Nice=10
 IOSchedulingClass=best-effort
 IOSchedulingPriority=7

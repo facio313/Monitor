@@ -7,10 +7,12 @@ import {
   prepareSystemUpdate,
   type SystemUpdateCategory,
   type SystemUpdateState,
+  type SystemUpdateStatus,
   type SystemUpdatesResponse,
 } from '../api';
 import { localized } from '../dashboard-model';
-import type { MonitorLocale } from '../types';
+import type { MonitorLocale, SystemStatus } from '../types';
+import { currentRebootRequirement, updateCheckIsFresh } from '../system-maintenance';
 import { formatDateTime, safeText } from '../utils';
 import { Icon } from './Icon';
 import { Pagination, paginateItems, usePagination } from './Pagination';
@@ -122,7 +124,56 @@ function safeError(error: unknown, locale: MonitorLocale): string {
   return t(locale, '업데이트 서비스 요청을 완료하지 못했습니다.', 'The update service request could not be completed.');
 }
 
-export function SystemUpdateControls({ locale }: { locale: MonitorLocale }) {
+export function UpdateStatusSummary({ status, locale, loading = false, nowMs = Date.now() }: {
+  status: SystemUpdateStatus | null;
+  locale: MonitorLocale;
+  loading?: boolean;
+  nowMs?: number;
+}) {
+  const stale = status !== null && status.state !== 'idle' && !updateCheckIsFresh(status.checkedAt, nowMs);
+  const active = status?.state === 'checking' || status?.state === 'applying';
+  const completed = status?.state === 'available' || status?.state === 'up-to-date' || status?.state === 'succeeded';
+  return (
+    <div>
+      <span>{t(locale, '호스트 패키지 상태', 'HOST PACKAGE STATUS')}</span>
+      <h3>{loading ? t(locale, '상태 확인 중', 'Loading status')
+        : stale && completed ? t(locale, '업데이트 정보 오래됨 · 재확인 필요', 'Update information is stale · check again')
+          : status?.state === 'up-to-date' && (status.summary?.keptBackCount ?? 0) > 0
+            ? t(locale, '안전 적용 가능 없음 · 보류 있음', 'No safe updates · packages kept back')
+            : stateLabel(status?.state ?? null, locale)}</h3>
+      <p>{status?.state === 'failed' && statusCodeDetail(status.code, locale)
+        ? statusCodeDetail(status.code, locale)
+        : status?.checkedAt && Number.isFinite(Date.parse(status.checkedAt))
+          ? t(locale, `마지막 확인 ${formatDateTime(status.checkedAt, locale)}`, `Last checked ${formatDateTime(status.checkedAt, locale)}`)
+          : t(locale, '아직 유효한 업데이트 조회 시간이 없습니다.', 'No valid update check time is available.')}</p>
+      {stale && !active && <p role="status">{t(locale,
+        '24시간 이상 지난 조회 또는 유효하지 않은 조회 시간입니다. 아래 목록과 수량은 이전 기록이며, 현재 업데이트 여부는 다시 확인해야 합니다.',
+        'The check is over 24 hours old or its time is invalid. The list and counts below are historical; check again for current updates.')}</p>}
+    </div>
+  );
+}
+
+export function LiveRebootNotice({ system, telemetryStale = false, locale, nowMs = Date.now() }: {
+  system?: SystemStatus;
+  telemetryStale?: boolean;
+  locale: MonitorLocale;
+  nowMs?: number;
+}) {
+  const required = currentRebootRequirement(system, telemetryStale, nowMs);
+  if (required === false) return null;
+  return <div className="update-inline-note note-caution" role="status">
+    <Icon name="alert" size={18} />
+    <span>{required === true
+      ? t(locale, '최근 호스트 관측에서 재부팅이 필요합니다. 유지보수 시간에 재부팅해 주세요.', 'Recent host telemetry requires a reboot. Reboot during maintenance.')
+      : t(locale, '현재 재부팅 필요 여부를 확인할 수 없습니다. 최근 호스트 관측이 필요합니다.', 'Current reboot status is unknown. Recent host telemetry is needed.')}</span>
+  </div>;
+}
+
+export function SystemUpdateControls({ locale, system, telemetryStale = false }: {
+  locale: MonitorLocale;
+  system?: SystemStatus;
+  telemetryStale?: boolean;
+}) {
   const [snapshot, setSnapshot] = useState<SystemUpdatesResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState<'check' | 'apply' | null>(null);
@@ -173,7 +224,9 @@ export function SystemUpdateControls({ locale }: { locale: MonitorLocale }) {
   };
   const tone = updateStateTone(status?.state ?? null);
   const active = status?.state === 'checking' || status?.state === 'applying';
+  const checkStale = status !== null && status.state !== 'idle' && !updateCheckIsFresh(status.checkedAt);
   const planUsable = status?.state === 'available'
+    && !checkStale
     && typeof status.planId === 'string'
     && typeof status.planExpiresAt === 'string'
     && Date.parse(status.planExpiresAt) > Date.now();
@@ -200,19 +253,19 @@ export function SystemUpdateControls({ locale }: { locale: MonitorLocale }) {
     + categories['container-runtime']
     + categories.network
     + categories['core-system'];
-  const effectiveTone: UpdateTone = status?.summary
+  const effectiveTone: UpdateTone = checkStale && !active && tone !== 'danger' ? 'caution' : status?.summary
     && status.summary.packageCount === 0
     && status.summary.keptBackCount > 0
     ? 'caution'
     : tone;
 
   useEffect(() => {
-    if (!confirming || confirmationMatchesPlan(reviewedPlanId, status?.planId ?? null)) return;
+    if (!confirming || (planUsable && confirmationMatchesPlan(reviewedPlanId, status?.planId ?? null))) return;
     setConfirming(false);
     setAcknowledged(false);
     setReviewedPlanId(null);
     setNotice(t(locale, '업데이트 계획이 바뀌어 기존 확인을 취소했습니다. 새 계획을 다시 검토해 주세요.', 'The update plan changed, so the previous confirmation was cancelled. Review the new plan.'));
-  }, [confirming, locale, reviewedPlanId, status?.planId]);
+  }, [confirming, locale, planUsable, reviewedPlanId, status?.planId]);
 
   async function handleCheck(): Promise<void> {
     setBusy('check');
@@ -261,21 +314,7 @@ export function SystemUpdateControls({ locale }: { locale: MonitorLocale }) {
     <div className="system-update-controls">
       <section className={`update-status-card update-${effectiveTone}`} aria-live="polite">
         <div className="update-status-icon"><Icon name={active ? 'refresh' : tone === 'danger' ? 'alert' : 'shield'} size={25} className={active ? 'spin' : ''} /></div>
-        <div>
-          <span>{t(locale, '호스트 패키지 상태', 'HOST PACKAGE STATUS')}</span>
-          <h3>{loading && !snapshot
-            ? t(locale, '상태 확인 중', 'Loading status')
-            : status?.state === 'up-to-date' && (status.summary?.keptBackCount ?? 0) > 0
-              ? t(locale, '안전 적용 가능 없음 · 보류 있음', 'No safe updates · packages kept back')
-              : stateLabel(status?.state ?? null, locale)}</h3>
-          <p>
-            {status?.state === 'failed' && statusCodeDetail(status.code, locale)
-              ? statusCodeDetail(status.code, locale)
-              : status?.checkedAt
-              ? t(locale, `마지막 확인 ${formatDateTime(status.checkedAt, locale)}`, `Last checked ${formatDateTime(status.checkedAt, locale)}`)
-              : t(locale, '아직 업데이트 목록을 확인하지 않았습니다.', 'No update plan has been checked yet.')}
-          </p>
-        </div>
+        <UpdateStatusSummary status={status} locale={locale} loading={loading && !snapshot} />
         <button
           type="button"
           className="maintenance-primary-action"
@@ -299,12 +338,7 @@ export function SystemUpdateControls({ locale }: { locale: MonitorLocale }) {
           <span>{t(locale, '업데이트 확인은 정규 관리자 계정에서만 실행할 수 있습니다.', 'Update checks require an eligible canonical admin identity.')}</span>
         </div>
       )}
-      {status?.rebootRequired && (
-        <div className="update-inline-note note-danger" role="alert">
-          <Icon name="alert" size={18} />
-          <span>{t(locale, '설치된 변경을 완료하려면 재부팅이 필요합니다. Monitor가 자동으로 재부팅하지는 않습니다.', 'A reboot is required to finish installed changes. Monitor never reboots automatically.')}</span>
-        </div>
-      )}
+      <LiveRebootNotice system={system} telemetryStale={telemetryStale} locale={locale} />
       {notice && <div className="update-inline-note note-ok"><Icon name="check" size={18} /><span>{notice}</span></div>}
       {error && <div className="update-inline-note note-danger" role="alert"><Icon name="alert" size={18} /><span>{error}</span></div>}
 

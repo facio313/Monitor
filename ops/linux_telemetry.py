@@ -1071,6 +1071,36 @@ def _process_candidates(proc_root: Path) -> tuple[list[Path], bool, str]:
     return sorted(result, key=lambda item: int(item.name)), False, "supported"
 
 
+def _process_visibility_complete(proc_root: Path) -> bool:
+    """A successful proc directory scan does not prove host-wide visibility.
+
+    ProtectProc/hidepid deliberately makes other PIDs invisible even though
+    scandir succeeds.  Retain that sandbox and report bounded observations,
+    rather than interpreting a small visible list as a healthy whole host.
+    Missing mount evidence is likewise not proof of complete visibility.
+    """
+    status, text = read_limited(proc_root / "self" / "mountinfo", 262_144)
+    if status != "supported":
+        return False
+    found_proc = False
+    for line in text.splitlines()[:4096]:
+        fields = line.split()
+        try:
+            separator = fields.index("-")
+            if fields[separator + 1] != "proc":
+                continue
+            options = set(fields[5].split(",")) | set(fields[separator + 3].split(","))
+        except (ValueError, IndexError):
+            continue
+        found_proc = True
+        if any(
+            option.startswith("hidepid=") and option.split("=", 1)[1] not in {"0", "off"}
+            for option in options
+        ):
+            return False
+    return found_proc
+
+
 def _allowed_process_name(value: str, allowlist: set[str]) -> str | None:
     if value not in allowlist:
         return None
@@ -1170,6 +1200,7 @@ def collect_processes(
     page_size: int,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     candidates, truncated, scan_status = _process_candidates(proc_root)
+    visibility_complete = _process_visibility_complete(proc_root)
     prior = previous if isinstance(previous, Mapping) else {}
     groups: dict[str, dict[str, Any]] = {}
     next_state: dict[str, Any] = {}
@@ -1286,7 +1317,11 @@ def collect_processes(
     )[:MAX_PROCESS_GROUPS]
     important = sorted((item for item in normalized if item["allowlisted"]), key=lambda item: item["name"])
     terminated: dict[tuple[str, bool], int] = {}
-    if not truncated and not deadline_reached:
+    complete = (
+        scan_status == "supported" and visibility_complete
+        and not truncated and not deadline_reached and observed == len(candidates)
+    )
+    if complete:
         for identity, prior_process in prior.items():
             if identity in next_state or not isinstance(prior_process, Mapping):
                 continue
@@ -1304,12 +1339,12 @@ def collect_processes(
     pid_count = len(candidates)
     pid_max = int(pid_max_value) if pid_max_value is not None else None
     return ({
-        "status": "partial" if truncated or deadline_reached else scan_status,
+        "status": "partial" if scan_status in {"supported", "partial"} and not complete else scan_status,
         "pidCount": pid_count,
-        "pidCountLowerBound": truncated,
+        "pidCountLowerBound": not complete,
         "pidMaximumStatus": pid_max_status,
         "pidMaximum": pid_max,
-        "pidUsedPercent": round(100.0 * pid_count / pid_max, 2) if pid_max else None,
+        "pidUsedPercent": round(100.0 * pid_count / pid_max, 2) if pid_max and complete else None,
         "zombieCount": zombies,
         "threadCount": total_threads,
         "observedProcessCount": observed,
@@ -1408,8 +1443,9 @@ def collect_systemd_runtime(
 
     systemd publishes an opaque invocation-id symlink for each invoked unit.
     The ID is retained only as a private digest and changes are counted across
-    collector samples.  Active state is inferred from the system unit cgroup;
-    fields that require the manager API remain explicitly unknown.
+    collector samples, not reported as restarts: a oneshot timer invocation is
+    not a service restart.  A cgroup proves presence, not manager failure or
+    successful completion; fields requiring the manager remain unknown.
     """
     safe_units = sorted({
         unit for unit in units
@@ -1467,26 +1503,21 @@ def collect_systemd_runtime(
         cgroup = sys_root / "fs" / "cgroup" / "system.slice" / unit
         try:
             active = cgroup.is_dir()
-            active_status = "supported"
-        except PermissionError:
-            active = False
-            active_status = "permission_error"
         except OSError:
             active = False
-            active_status = "unavailable"
         result.append({
             "unit": unit,
             "loadState": "unknown",
-            "activeState": "active" if active else "inactive" if active_status == "supported" else "unknown",
+            "activeState": "active" if active else "unknown",
             "subState": "running" if active else "unknown",
-            "restartCount": changes,
+            "restartCount": None,
             "restartCountStatus": "observed_invocation_changes",
             "result": "unknown",
             "execMainStatus": None,
             "invocationStatus": invocation_status,
         })
     return ({
-        "status": "supported",
+        "status": "partial",
         "reason": "bounded_runtime_observation",
         "units": result,
         "truncated": len(units) > MAX_SYSTEMD_UNITS,
@@ -1501,7 +1532,7 @@ def collect_systemd_observation(
     if manager["status"] in {"supported", "partial"}:
         return manager, {}
     runtime, state = collect_systemd_runtime(units, runtime_units, sys_root, previous)
-    if runtime["status"] == "supported":
+    if runtime["status"] in {"supported", "partial"}:
         return runtime, state
     return manager if manager["status"] != "unsupported" else runtime, state
 

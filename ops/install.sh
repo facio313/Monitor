@@ -34,6 +34,14 @@ alert_runtime_target=/usr/local/lib/monitor-collector/alert_runtime.py
 alert_store_target=/usr/local/lib/monitor-collector/alert_store.py
 alert_delivery_target=/usr/local/lib/monitor-collector/alert_delivery.py
 synthetic_probe_target=/usr/local/lib/monitor-collector/synthetic_probe.py
+network_diagnostics_target=/usr/local/lib/monitor-collector/network_diagnostics.py
+notification_reports_target=/usr/local/lib/monitor-collector/notification_reports.py
+notification_policy_target=/usr/local/lib/monitor-collector/notification_policy.py
+security_signals_target=/usr/local/lib/monitor-collector/security_signals.py
+email_visuals_target=/usr/local/lib/monitor-collector/email_visuals.py
+notification_visuals_target=/usr/local/lib/monitor-collector/notification_visuals.py
+ssh_access_target=/usr/local/lib/monitor-collector/ssh_access.py
+ip_country_target=/usr/local/lib/monitor-collector/ip_country.py
 rule_target=/usr/local/lib/monitor-collector/rules/default-rules.v1.json
 documentation_target=/usr/local/share/doc/monitor-collector/README.md
 alert_delivery_doc_target=/usr/local/share/doc/monitor-collector/alert-delivery.md
@@ -64,6 +72,14 @@ for source in \
     "$script_dir/alert_store.py" \
     "$script_dir/alert_delivery.py" \
     "$script_dir/synthetic_probe.py" \
+    "$script_dir/network_diagnostics.py" \
+    "$script_dir/notification_reports.py" \
+    "$script_dir/notification_policy.py" \
+    "$script_dir/security_signals.py" \
+    "$script_dir/email_visuals.py" \
+    "$script_dir/notification_visuals.py" \
+    "$script_dir/ssh_access.py" \
+    "$script_dir/ip_country.py" \
     "$script_dir/rules/default-rules.v1.json" \
     "$script_dir/README.md" \
     "$script_dir/../docs/alert-delivery.md" \
@@ -100,6 +116,14 @@ had_alert_runtime=false
 had_alert_store=false
 had_alert_delivery=false
 had_synthetic_probe=false
+had_network_diagnostics=false
+had_notification_reports=false
+had_notification_policy=false
+had_security_signals=false
+had_email_visuals=false
+had_notification_visuals=false
+had_ssh_access=false
+had_ip_country=false
 had_rule=false
 had_rule_directory=false
 had_documentation=false
@@ -213,6 +237,14 @@ finish() {
         restore_file "$backup_dir/alert_store.py" "$alert_store_target" "$had_alert_store" || rollback_failed=true
         restore_file "$backup_dir/alert_delivery.py" "$alert_delivery_target" "$had_alert_delivery" || rollback_failed=true
         restore_file "$backup_dir/synthetic_probe.py" "$synthetic_probe_target" "$had_synthetic_probe" || rollback_failed=true
+        restore_file "$backup_dir/network_diagnostics.py" "$network_diagnostics_target" "$had_network_diagnostics" || rollback_failed=true
+        restore_file "$backup_dir/notification_reports.py" "$notification_reports_target" "$had_notification_reports" || rollback_failed=true
+        restore_file "$backup_dir/notification_policy.py" "$notification_policy_target" "$had_notification_policy" || rollback_failed=true
+        restore_file "$backup_dir/security_signals.py" "$security_signals_target" "$had_security_signals" || rollback_failed=true
+        restore_file "$backup_dir/email_visuals.py" "$email_visuals_target" "$had_email_visuals" || rollback_failed=true
+        restore_file "$backup_dir/notification_visuals.py" "$notification_visuals_target" "$had_notification_visuals" || rollback_failed=true
+        restore_file "$backup_dir/ssh_access.py" "$ssh_access_target" "$had_ssh_access" || rollback_failed=true
+        restore_file "$backup_dir/ip_country.py" "$ip_country_target" "$had_ip_country" || rollback_failed=true
         restore_file "$backup_dir/default-rules.v1.json" "$rule_target" "$had_rule" || rollback_failed=true
         if [ "$had_rule_directory" != true ]; then
             rmdir /usr/local/lib/monitor-collector/rules 2>/dev/null || true
@@ -280,6 +312,14 @@ finish() {
         "$backup_dir/alert_store.py" \
         "$backup_dir/alert_delivery.py" \
         "$backup_dir/synthetic_probe.py" \
+        "$backup_dir/network_diagnostics.py" \
+        "$backup_dir/notification_reports.py" \
+        "$backup_dir/notification_policy.py" \
+        "$backup_dir/security_signals.py" \
+        "$backup_dir/email_visuals.py" \
+        "$backup_dir/notification_visuals.py" \
+        "$backup_dir/ssh_access.py" \
+        "$backup_dir/ip_country.py" \
         "$backup_dir/default-rules.v1.json" \
         "$backup_dir/README.md" \
         "$backup_dir/alert-delivery.md" \
@@ -349,6 +389,14 @@ for target in \
     "$alert_store_target" \
     "$alert_delivery_target" \
     "$synthetic_probe_target" \
+    "$network_diagnostics_target" \
+    "$notification_reports_target" \
+    "$notification_policy_target" \
+    "$security_signals_target" \
+    "$email_visuals_target" \
+    "$notification_visuals_target" \
+    "$ssh_access_target" \
+    "$ip_country_target" \
     "$rule_target" \
     "$documentation_target" \
     "$alert_delivery_doc_target" \
@@ -411,6 +459,14 @@ if [ -e "$alert_runtime_target" ]; then cp -p "$alert_runtime_target" "$backup_d
 if [ -e "$alert_store_target" ]; then cp -p "$alert_store_target" "$backup_dir/alert_store.py"; had_alert_store=true; fi
 if [ -e "$alert_delivery_target" ]; then cp -p "$alert_delivery_target" "$backup_dir/alert_delivery.py"; had_alert_delivery=true; fi
 if [ -e "$synthetic_probe_target" ]; then cp -p "$synthetic_probe_target" "$backup_dir/synthetic_probe.py"; had_synthetic_probe=true; fi
+if [ -e "$network_diagnostics_target" ]; then cp -p "$network_diagnostics_target" "$backup_dir/network_diagnostics.py"; had_network_diagnostics=true; fi
+if [ -e "$notification_reports_target" ]; then cp -p "$notification_reports_target" "$backup_dir/notification_reports.py"; had_notification_reports=true; fi
+if [ -e "$notification_policy_target" ]; then cp -p "$notification_policy_target" "$backup_dir/notification_policy.py"; had_notification_policy=true; fi
+if [ -e "$security_signals_target" ]; then cp -p "$security_signals_target" "$backup_dir/security_signals.py"; had_security_signals=true; fi
+if [ -e "$email_visuals_target" ]; then cp -p "$email_visuals_target" "$backup_dir/email_visuals.py"; had_email_visuals=true; fi
+if [ -e "$notification_visuals_target" ]; then cp -p "$notification_visuals_target" "$backup_dir/notification_visuals.py"; had_notification_visuals=true; fi
+if [ -e "$ssh_access_target" ]; then cp -p "$ssh_access_target" "$backup_dir/ssh_access.py"; had_ssh_access=true; fi
+if [ -e "$ip_country_target" ]; then cp -p "$ip_country_target" "$backup_dir/ip_country.py"; had_ip_country=true; fi
 if [ -e "$rule_target" ]; then cp -p "$rule_target" "$backup_dir/default-rules.v1.json"; had_rule=true; fi
 if [ -d /usr/local/lib/monitor-collector/rules ]; then had_rule_directory=true; fi
 if [ -e "$documentation_target" ]; then cp -p "$documentation_target" "$backup_dir/README.md"; had_documentation=true; fi
@@ -483,6 +539,14 @@ install -m 0644 "$script_dir/alert_runtime.py" "$alert_runtime_target"
 install -m 0644 "$script_dir/alert_store.py" "$alert_store_target"
 install -m 0755 "$script_dir/alert_delivery.py" "$alert_delivery_target"
 install -m 0755 "$script_dir/synthetic_probe.py" "$synthetic_probe_target"
+install -m 0644 "$script_dir/network_diagnostics.py" "$network_diagnostics_target"
+install -m 0644 "$script_dir/notification_reports.py" "$notification_reports_target"
+install -m 0644 "$script_dir/notification_policy.py" "$notification_policy_target"
+install -m 0644 "$script_dir/security_signals.py" "$security_signals_target"
+install -m 0644 "$script_dir/email_visuals.py" "$email_visuals_target"
+install -m 0644 "$script_dir/notification_visuals.py" "$notification_visuals_target"
+install -m 0644 "$script_dir/ssh_access.py" "$ssh_access_target"
+install -m 0644 "$script_dir/ip_country.py" "$ip_country_target"
 install -d -m 0755 /usr/local/lib/monitor-collector/rules
 install -m 0644 "$script_dir/rules/default-rules.v1.json" "$rule_target"
 install -d -m 0755 /usr/local/share/doc/monitor-collector

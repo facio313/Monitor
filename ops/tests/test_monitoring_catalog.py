@@ -75,7 +75,10 @@ class MonitoringCatalogTests(unittest.TestCase):
 
     def test_runtime_retention_and_pruning_cadence_are_resolved(self):
         sources = {source["id"]: source for source in build()["evidenceSources"]}
-        self.assertEqual(len(sources), 14)
+        self.assertEqual(len(sources), 16)
+        self.assertEqual(sources["network-diagnostics-history"]["retention"]["maxAgeDays"], 30)
+        self.assertEqual(sources["network-diagnostics-history"]["retention"]["maxBytes"], 8 * 1024 * 1024)
+        self.assertEqual(sources["notification-report-state"]["artifactLabel"], "notification-reports.json")
         self.assertEqual(sources["telemetry-history"]["retention"], {
             "policy": "daily-age-and-count",
             "pruneCadence": "every-collection",

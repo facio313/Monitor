@@ -8,7 +8,7 @@ if str(OPS_ROOT) not in sys.path:
     sys.path.insert(0, str(OPS_ROOT))
 
 from alert_engine import load_rule_pack
-from alert_runtime import evaluate_snapshot, observations_for_snapshot
+from alert_runtime import _container_inventory_complete, evaluate_snapshot, observations_for_snapshot
 
 
 NOW = dt.datetime(2026, 8, 30, 12, 0, tzinfo=dt.timezone.utc)
@@ -88,6 +88,7 @@ class AlertRuntimeTests(unittest.TestCase):
                 "tcp": {
                     "status": "supported",
                     "retransmissionPercent": 6,
+                    "assessment": {"status": "ok", "retransmissionPercent": 6},
                     "conntrack": {"status": "supported", "usedPercent": 81},
                 },
                 "processes": {
@@ -308,10 +309,15 @@ class AlertRuntimeTests(unittest.TestCase):
         self.assertEqual(by_rule["HttpEndpointDown"][ready].value, 1)
         self.assertEqual(by_rule["HttpEndpointDown"][broken].value, 0)
         self.assertEqual(by_rule["HttpLatencyHigh"][ready].value, 1500)
+        self.assertEqual(by_rule["HttpLatencyHigh"][ready].sampled_at, NOW)
+        self.assertEqual(by_rule["HttpLatencyHigh"][ready].sample_interval_seconds, 60)
+        self.assertEqual(by_rule["HttpLatencyHigh"][ready].max_sample_age_seconds, 600)
         self.assertEqual(by_rule["TlsCertificateExpiring"][ready].value, 20)
         self.assertEqual(by_rule["TlsCertificateInvalid"][ready].value, 0)
         self.assertEqual(by_rule["TlsCertificateInvalid"][broken].value, 1)
-        self.assertEqual(by_rule["TlsCertificateExpiring"][broken].status, "no_data")
+        self.assertIsNone(by_rule["HttpLatencyHigh"][broken].value)
+        self.assertEqual(by_rule["HttpLatencyHigh"][broken].status, "no_data")
+        self.assertEqual(by_rule["TlsCertificateExpiring"][broken].status, "unsupported")
         self.assertEqual(
             observations["MonitoringServiceUnavailable"][0].status,
             "unsupported",
@@ -354,6 +360,36 @@ class AlertRuntimeTests(unittest.TestCase):
             "TlsCertificateExpiring", "TlsCertificateInvalid",
         ):
             self.assertEqual(observations[rule_id][0].status, "unsupported")
+
+    def test_unexamined_certificate_does_not_turn_dns_or_timeout_into_tls_alerts(self):
+        for failure in ("dns", "timeout", "permission", "invalid"):
+            with self.subTest(failure=failure):
+                snapshot = self.snapshot()
+                snapshot["syntheticProbeCollection"] = {
+                    "status": "fresh", "observedAt": "2026-08-30T12:00:00Z",
+                }
+                snapshot["syntheticProbes"] = [{
+                    "id": "ready", "status": failure,
+                    "checkedAt": "2026-08-30T12:00:00Z",
+                    "certificateDaysRemaining": None,
+                }]
+                observations = observations_for_snapshot(self.pack, snapshot)
+                self.assertEqual(observations["HttpEndpointDown"][0].value, 0)
+                for rule_id in ("TlsCertificateExpiring", "TlsCertificateInvalid"):
+                    self.assertEqual(observations[rule_id][0].status, "unsupported")
+                    self.assertIsNone(observations[rule_id][0].value)
+                states = {}
+                all_events = []
+                for minute in range(6):
+                    now = NOW + dt.timedelta(minutes=minute)
+                    snapshot["generatedAt"] = now.isoformat()
+                    evaluation, events = evaluate_snapshot(self.pack, snapshot, states, now)
+                    states = evaluation["states"]
+                    all_events.extend(events)
+                self.assertFalse(any(
+                    event["ruleId"] in {"TlsCertificateExpiring", "TlsCertificateInvalid"}
+                    for event in all_events
+                ))
 
     def test_host_alert_identity_survives_rename_and_legacy_snapshots_fall_back(self):
         renamed = self.snapshot()
@@ -483,6 +519,68 @@ class AlertRuntimeTests(unittest.TestCase):
                 self.assertEqual(observations[rule_id][0].status, "ok")
                 self.assertEqual(observations[rule_id][0].value, value)
 
+    def test_unqualified_tcp_spike_is_not_a_rule_breach_or_recovery(self):
+        snapshot = self.snapshot()
+        snapshot["linux"]["tcp"].pop("assessment")
+        observation = observations_for_snapshot(self.pack, snapshot)["TcpRetransmissionHigh"][0]
+        self.assertEqual(observation.status, "no_data")
+        self.assertIsNone(observation.value)
+
+    def test_container_memory_rule_uses_working_set_and_keeps_raw_fallback(self):
+        snapshot = self.snapshot()
+        row = snapshot["containers"][0]
+        row.update(memoryBytes=980, memoryLimitBytes=1000, memoryInactiveFileBytes=270, memoryWorkingSetBytes=710)
+        self.assertEqual(observations_for_snapshot(self.pack, snapshot)["ContainerMemoryNearLimit"][0].value, 71)
+        row["memoryWorkingSetBytes"] = None
+        self.assertEqual(observations_for_snapshot(self.pack, snapshot)["ContainerMemoryNearLimit"][0].value, 98)
+
+    def test_partial_process_view_never_proves_healthy_host_pid_or_zombies(self):
+        for status, lower_bound in (("partial", False), ("supported", True)):
+            with self.subTest(status=status, lower_bound=lower_bound):
+                snapshot = self.snapshot()
+                snapshot["linux"]["processes"].update({
+                    "status": status, "pidCountLowerBound": lower_bound,
+                    "pidUsedPercent": 0, "zombieCount": 0,
+                })
+                observations = observations_for_snapshot(self.pack, snapshot)
+                for rule_id in ("PidUsageHigh", "ZombieProcessesHigh"):
+                    self.assertEqual(observations[rule_id][0].status, "no_data")
+                    self.assertIsNone(observations[rule_id][0].value)
+                self.assertEqual(observations["FileDescriptorUsageHigh"][0].value, 83)
+                self.assertEqual(observations["FileDescriptorUsageHigh"][0].status, "ok")
+
+    def test_systemd_requires_manager_result_to_claim_healthy_or_recovered(self):
+        for active_state in ("active", "inactive", "unknown"):
+            with self.subTest(active_state=active_state):
+                snapshot = self.snapshot()
+                snapshot["linux"]["systemd"] = {
+                    "status": "partial", "reason": "bounded_runtime_observation",
+                    "units": [{
+                        "unit": "monitor-collector.service", "activeState": active_state,
+                        "result": "unknown", "restartCountStatus": "observed_invocation_changes",
+                    }],
+                }
+                observation = observations_for_snapshot(self.pack, snapshot)["SystemdServiceFailed"][0]
+                self.assertEqual(observation.status, "no_data")
+                self.assertIsNone(observation.value)
+
+        for active_state, unit_result, expected in (
+            ("inactive", "success", 0),  # Successful oneshot is not a failure.
+            ("active", "success", 0),
+            ("failed", "exit-code", 1),
+            ("inactive", "timeout", 1),
+            ("inactive", "unknown", None),
+        ):
+            with self.subTest(active_state=active_state, result=unit_result):
+                snapshot = self.snapshot()
+                snapshot["linux"]["systemd"]["units"][0].update({
+                    "activeState": active_state, "result": unit_result,
+                    "restartCountStatus": "systemd_manager",
+                })
+                observation = observations_for_snapshot(self.pack, snapshot)["SystemdServiceFailed"][0]
+                self.assertEqual(observation.value, expected)
+                self.assertEqual(observation.status, "ok" if expected is not None else "no_data")
+
     def test_explicitly_unsupported_linux_metrics_do_not_look_like_missing_data(self):
         snapshot = self.snapshot()
         snapshot["disks"][0].update({
@@ -590,6 +688,59 @@ class AlertRuntimeTests(unittest.TestCase):
         self.assertEqual(observations["ContainerDown"][0].status, "stale")
         self.assertIsNone(observations["ContainerDown"][0].value)
 
+    def test_container_inventory_completeness_requires_fresh_valid_unique_rows(self):
+        snapshot = self.snapshot()
+        self.assertTrue(_container_inventory_complete(snapshot, NOW))
+        snapshot["containers"] = []
+        self.assertTrue(_container_inventory_complete(snapshot, NOW))
+        for elapsed, expected in ((-1, False), (180, True), (181, False)):
+            with self.subTest(elapsed=elapsed):
+                self.assertEqual(_container_inventory_complete(
+                    snapshot, NOW + dt.timedelta(seconds=elapsed),
+                ), expected)
+        for containers in (None, [None], [{}], [{"name": "bad/name"}], [{"name": "monitor"}] * 2):
+            with self.subTest(containers=containers):
+                snapshot["containers"] = containers
+                self.assertFalse(_container_inventory_complete(snapshot, NOW))
+        snapshot["containers"] = []
+        for status in ("last-known", "unavailable", "permission-denied", "unsupported"):
+            snapshot["containerCollection"]["status"] = status
+            self.assertFalse(_container_inventory_complete(snapshot, NOW))
+
+    def test_container_disappearance_and_recovery_require_distinct_inventory_exports(self):
+        snapshot = self.snapshot()
+        evaluation, _ = evaluate_snapshot(
+            self.pack, snapshot, {}, NOW, include_sample_checkpoints=True,
+        )
+        states = evaluation["states"]
+        key = "ContainerDown:container/monitor"
+        self.assertEqual(states[key]["phase"], "inactive")
+        snapshot["containers"] = []
+        for minute, source_minute, expected in (
+            (1, 1, "pending"), (2, 1, "pending"), (3, 3, "pending"),
+            (4, 4, "pending"), (5, 5, "firing"),
+        ):
+            snapshot["containerCollection"]["observedAt"] = (NOW + dt.timedelta(minutes=source_minute)).isoformat()
+            evaluation, _ = evaluate_snapshot(
+                self.pack, snapshot, states, NOW + dt.timedelta(minutes=minute),
+                include_sample_checkpoints=True,
+            )
+            states = evaluation["states"]
+            self.assertEqual(states[key]["phase"], expected)
+
+        snapshot["containers"] = self.snapshot()["containers"]
+        for minute, source_minute, expected in (
+            (6, 6, "recovering"), (7, 6, "recovering"),
+            (8, 8, "recovering"), (9, 9, "inactive"),
+        ):
+            snapshot["containerCollection"]["observedAt"] = (NOW + dt.timedelta(minutes=source_minute)).isoformat()
+            evaluation, _ = evaluate_snapshot(
+                self.pack, snapshot, states, NOW + dt.timedelta(minutes=minute),
+                include_sample_checkpoints=True,
+            )
+            states = evaluation["states"]
+            self.assertEqual(states[key]["phase"], expected)
+
     def test_permission_denied_is_distinct_from_down(self):
         snapshot = self.snapshot()
         snapshot["containerCollection"]["status"] = "permission-denied"
@@ -606,11 +757,13 @@ class AlertRuntimeTests(unittest.TestCase):
         active_snapshot["containers"][0]["state"] = "exited"
         state = {}
         for minute in range(container_down_rule.for_samples):
+            active_snapshot["containerCollection"]["observedAt"] = (NOW + dt.timedelta(minutes=minute)).isoformat()
             result, _events = evaluate_snapshot(
                 self.pack,
                 active_snapshot,
                 state,
                 NOW + dt.timedelta(minutes=minute),
+                include_sample_checkpoints=True,
             )
             state = result["states"]
         state_key = "ContainerDown:container/monitor"
@@ -645,8 +798,10 @@ class AlertRuntimeTests(unittest.TestCase):
         })
         state = {}
         for minute in range(rules["ContainerDown"].for_samples):
+            faulted["containerCollection"]["observedAt"] = (NOW + dt.timedelta(minutes=minute)).isoformat()
             result, _events = evaluate_snapshot(
                 self.pack, faulted, state, NOW + dt.timedelta(minutes=minute),
+                include_sample_checkpoints=True,
             )
             state = result["states"]
 
@@ -662,13 +817,15 @@ class AlertRuntimeTests(unittest.TestCase):
 
         resolved_events = []
         for offset, expected_phase in enumerate(("recovering", "inactive")):
+            restored = self.snapshot()
+            now = NOW + dt.timedelta(minutes=rules["ContainerDown"].for_samples + offset)
+            restored["containerCollection"]["observedAt"] = now.isoformat()
             result, events = evaluate_snapshot(
                 self.pack,
-                self.snapshot(),
+                restored,
                 state,
-                NOW + dt.timedelta(
-                    minutes=rules["ContainerDown"].for_samples + offset
-                ),
+                now,
+                include_sample_checkpoints=True,
             )
             state = result["states"]
             resolved_events.extend(

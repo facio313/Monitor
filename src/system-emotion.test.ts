@@ -245,6 +245,75 @@ describe('system affect synthesis', () => {
     expect(model.mood).toBe('serene');
   });
 
+  it.each([90, 100])('does not turn CPU %s or warning-only CPU pressure into a critical field', (cpuPercent) => {
+    const data = payload();
+    data.latest!.cpuPercent = cpuPercent;
+    data.latest!.cpuPressureSomeAvg10 = 100;
+    data.latest!.cpuPressureFullAvg10 = 100;
+    data.latest!.load1 = 100;
+    const model = deriveSystemEmotion({ data, stale: false, dangerCount: 0, cautionCount: 1 });
+    expect(model.mood).toBe('watchful');
+    expect(model.axes.find((axis) => axis.key === 'compute')?.intensity).toBe(0.46);
+  });
+
+  it('does not treat host CPU full as either pressure or an observed compute signal', () => {
+    const data = payload();
+    data.latest!.cpuPercent = null;
+    data.latest!.cpuPressureSomeAvg10 = null;
+    data.latest!.cpuPressureFullAvg10 = 100;
+    data.latest!.load1 = null;
+    const model = deriveSystemEmotion({ data, stale: false, dangerCount: 0, cautionCount: 0 });
+    expect(model.axes.find((axis) => axis.key === 'compute')).toMatchObject({ observed: false, intensity: 0 });
+    expect(model.mood).not.toBe('critical');
+  });
+
+  it('keeps memory-full and I/O PSI warning-only while memory-some supports danger', () => {
+    const data = payload();
+    data.latest!.memoryPressureFullAvg10 = 100;
+    data.latest!.ioPressureFullAvg10 = 100;
+    data.latest!.ioPressureSomeAvg10 = 100;
+    const warning = deriveSystemEmotion({ data, stale: false, dangerCount: 0, cautionCount: 0 });
+    expect(warning.mood).not.toBe('critical');
+    expect(warning.axes.find((axis) => axis.key === 'memory')?.intensity).toBe(0.46);
+    expect(warning.axes.find((axis) => axis.key === 'storage')?.intensity).toBe(0.46);
+    data.latest!.memoryPressureSomeAvg10 = 10;
+    expect(deriveSystemEmotion({ data, stale: false, dangerCount: 0, cautionCount: 0 }).mood).toBe('critical');
+  });
+
+  it('uses canonical temperature boundaries and preserves the existing active swap gate', () => {
+    const data = payload();
+    data.latest!.temperatureC = 80;
+    data.latest!.swapPercent = 85;
+    const quietSwap = deriveSystemEmotion({ data, stale: false, dangerCount: 0, cautionCount: 0 });
+    expect(quietSwap.axes.find((axis) => axis.key === 'thermal')?.intensity).toBe(0.46);
+    expect(quietSwap.axes.find((axis) => axis.key === 'memory')?.intensity).toBe(0);
+    data.latest!.memoryPressureFullAvg10 = 0.2;
+    expect(deriveSystemEmotion({ data, stale: false, dangerCount: 0, cautionCount: 0 }).axes.find((axis) => axis.key === 'memory')?.intensity).toBe(1);
+    data.latest!.temperatureC = 85;
+    expect(deriveSystemEmotion({ data, stale: false, dangerCount: 0, cautionCount: 0 }).axes.find((axis) => axis.key === 'thermal')?.intensity).toBe(1);
+  });
+
+  it.each([
+    [1, 1, 0, false],
+    [2, 2, 0, false],
+    [100_000, 20, 0, false],
+    [100, 4, 0, false],
+    [1, 0, 1, false],
+    [6, 3, 0, true],
+    [19, 19, 0, true],
+    [100, 5, 0, true],
+  ])('requires both error count and share for HTTP danger (%s requests, %s 5xx, %s 4xx)', (requestCount, status5xx, status4xx, critical) => {
+    const data = payload();
+    data.currentTraffic = [{
+      app: 'fixture', requestCount, status5xx, status4xx,
+      status2xx: requestCount - status5xx - status4xx, status3xx: 0,
+      slowCount: 0, avgResponseMs: 20, maxResponseMs: 50,
+    }];
+    const model = deriveSystemEmotion({ data, stale: false, dangerCount: 0, cautionCount: 0 });
+    expect(model.mood === 'critical').toBe(critical);
+    expect(model.axes.find((axis) => axis.key === 'network')?.intensity).toBe(critical ? 1 : 0.46);
+  });
+
   it('keeps wholly unobserved disk fields unknown', () => {
     const data = payload();
     data.latest!.ioPressureSomeAvg10 = null;

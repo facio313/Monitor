@@ -449,6 +449,8 @@
 
 .control-notice { margin: 0 0 18px; padding: 14px 16px; display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 12px; color: #ffd0d1; border: 1px solid rgb(255 119 121 / 42%); border-radius: 9px; background: rgb(255 119 121 / 8%); }
 .control-notice div { display: grid; }
+.control-notice.collection-limitations { color: var(--control-text); border-color: var(--control-border); background: rgb(145 167 160 / 6%); }
+.control-notice.collection-limitations span { color: var(--control-muted); }
 .control-notice strong { font-size: 13px; }
 .control-notice span { color: #c99a9a; font-size: 11px; }
 .control-notice button { min-height: 38px; padding: 0 12px; border: 1px solid rgb(255 119 121 / 40%); border-radius: 7px; color: #ffd0d1; background: transparent; cursor: pointer; }

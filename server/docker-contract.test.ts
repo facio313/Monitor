@@ -70,7 +70,35 @@ function read(current: ReturnType<typeof snapshot>, now = NOW) {
   return readDashboard(root, '1h', now, 180_000);
 }
 
+it('preserves total and cache-adjusted memory, rejecting inconsistent or incomplete accounting', () => {
+  const current = snapshot();
+  Object.assign(current.containers[0]!, { memoryInactiveFileBytes: 200, memoryWorkingSetBytes: 700 });
+  expect(read(current).containers[0]).toMatchObject({ memoryBytes: 900, memoryPercent: 90,
+    memoryInactiveFileBytes: 200, memoryWorkingSetBytes: 700 });
+  Object.assign(current.containers[0]!, { memoryWorkingSetBytes: 0 });
+  expect(read(current).containers).toEqual([]);
+  Object.assign(current.containers[0]!, { memoryWorkingSetBytes: null, memoryInactiveFileBytes: null });
+  expect(read(current).containers[0]?.memoryBytes).toBe(900);
+});
+
 describe('Docker v4 collector contract', () => {
+  it('accepts standalone Pongdang components only with their exact project identity', () => {
+    const names = ['pongdang-frontend', 'pongdang-backend', 'pongdang-db'];
+    const current = snapshot();
+    current.containers = names.map((name) => ({ ...container('unmanaged'), name, project: 'pongdang' }));
+    current.dockerEvents = names.map((containerName, index) => ({
+      ...event(), id: String(index + 1).repeat(32), containerName, project: 'pongdang',
+    }));
+    expect(read(current).containers.map((row) => row.name)).toEqual(names);
+    expect(read(current).dockerEvents.map((row) => row.containerName)).toEqual(names);
+
+    current.containers = [{ ...container('unmanaged'), name: 'pongdang-backend', project: 'pongdang-multtara' }];
+    expect(read(current).containers).toEqual([]);
+
+    current.containers = [{ ...container('unmanaged'), name: 'multtara-backend', project: 'pongdang-multtara' }];
+    expect(read(current).containers[0]?.name).toBe('multtara-backend');
+  });
+
   it('preserves every bounded resource, security, image, and event field', () => {
     const result = read(snapshot());
     expect(result.containers).toEqual([{

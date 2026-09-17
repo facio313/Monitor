@@ -53,6 +53,10 @@ describe('system snapshot contract', () => {
     writeCurrent(directory);
     const dashboard = readDashboard(directory, '1h', NOW, 300_000);
     const system = dashboard.system;
+    expect(system.reboot).toEqual({
+      status: 'unavailable', required: null, observedAt: null,
+      packages: [], packagesStatus: 'unavailable', packagesTruncated: false,
+    });
 
     expect(dashboard.containerCollection).toEqual({
       status: 'last-known',
@@ -174,6 +178,42 @@ describe('system snapshot contract', () => {
     expect(system.kernel.pcieAerFatal).toEqual({ count: 0, lastEventAt: null });
     expect(JSON.stringify(system)).not.toContain('must-not-appear');
     expect(JSON.stringify(system)).not.toContain('rawConfig');
+  });
+
+  it('keeps general package reboot requirements independent of kernel versions', () => {
+    const directory = dataDirectory();
+    const reboot = {
+      status: 'ok', required: true, observedAt: '2026-08-27T11:59:30Z',
+      packages: ['libc6:arm64'], packagesStatus: 'ok', packagesTruncated: false,
+    };
+    writeCurrent(directory, { system: { reboot, versions: { kernelRebootRequired: false } } });
+    expect(readDashboard(directory, '1h', NOW, 300_000).system).toMatchObject({
+      reboot: { ...reboot, observedAt: '2026-08-27T11:59:30.000Z' },
+      versions: { kernelRebootRequired: false },
+    });
+    for (const invalid of [
+      { ...reboot, packages: ['libc6', 'token=private'] },
+      { ...reboot, packages: Array(65).fill('libc6') },
+    ]) {
+      writeCurrent(directory, { system: { reboot: invalid } });
+      expect(readDashboard(directory, '1h', NOW, 300_000).system.reboot).toMatchObject({
+        required: true, packages: [], packagesStatus: 'collection-error',
+      });
+    }
+    for (const invalid of [
+      { ...reboot, observedAt: '2026-08-28T00:00:00Z' },
+      { ...reboot, observedAt: 'not-a-time' },
+      { ...reboot, status: 'permission-denied', required: false },
+    ]) {
+      writeCurrent(directory, { system: { reboot: invalid } });
+      expect(readDashboard(directory, '1h', NOW, 300_000).system.reboot).toMatchObject({
+        status: 'unavailable', required: null,
+      });
+    }
+    writeCurrent(directory, { system: { reboot: { ...reboot, status: 'permission-denied', required: null, packages: [] } } });
+    expect(readDashboard(directory, '1h', NOW, 300_000).system.reboot).toMatchObject({
+      status: 'permission-denied', required: null, packages: [],
+    });
   });
 
   it('admits only fixed new kernel and PCIe reliability contracts', () => {

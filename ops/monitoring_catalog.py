@@ -233,6 +233,28 @@ def evidence_sources(
             ["maintenance"],
         ),
         _source(
+            "network-diagnostics-history", "네트워크 진단 이력", "Network diagnostic history",
+            "HTTP 구간별 지연과 TCP 재전송·인터페이스 품질을 같은 시각의 서버 부하와 함께 저장합니다.",
+            "HTTP phase timings and TCP/interface quality retained with contemporaneous host pressure.",
+            "time-series", "accumulated-log", "network-diagnostics/YYYY-MM-DD.jsonl", "jsonl", interval,
+            _retention(
+                "bounded-age-count-and-bytes", "every-collection", max_age_days=30,
+                max_records=10_000, record_scope="daily-partition", max_bytes=8 * 1024 * 1024,
+            ),
+            ["network"],
+        ),
+        _source(
+            "notification-report-state", "메일 알림·이상 징후 상태", "Notification and detection state",
+            "시간별 보고 예약, 이상 징후, 감지 자료의 상태와 메일 전송 결과를 구분해 관측합니다.",
+            "Hourly report queueing, detected conditions, source health and email delivery outcomes.",
+            "source-status", "current-state", "notification-reports.json", "json", interval,
+            _retention(
+                "replace-on-collect", "replace-on-collection", max_records=1,
+                record_scope="artifact", max_bytes=256 * 1024,
+            ),
+            ["maintenance", "logs"],
+        ),
+        _source(
             "infrastructure-ledger", "인프라 관리 원장", "Infrastructure ledger",
             "검증된 인프라 작업·결정·증거를 별도로 관리하는 공개 원장입니다.",
             "A separately managed public ledger of verified infrastructure work and evidence.",

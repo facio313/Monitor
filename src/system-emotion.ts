@@ -2,6 +2,8 @@ import {
   NETWORK_DROP_RATE_THRESHOLDS,
   NETWORK_ERROR_RATE_THRESHOLDS,
   PSI_THRESHOLDS,
+  RESOURCE_THRESHOLDS,
+  type OperationalThreshold,
 } from './operational-thresholds';
 import { unresolvedIncidents } from './incident-read-model';
 import { operationalServiceState } from './operational-health';
@@ -167,9 +169,18 @@ function combine(...values: Array<number | null>): { intensity: number; observed
   };
 }
 
-function maximumRamp<T>(items: T[], value: (item: T) => number | null | undefined, quiet: number, severe: number): number | null {
+/** Warning-only signals may animate the field, but cannot imply a critical state. */
+function thresholdRisk(value: number | null | undefined, threshold: OperationalThreshold): number | null {
+  if (!finite(value) || (threshold.caution === null && threshold.danger === null)) return null;
+  if (threshold.danger !== null && value >= threshold.danger) return 1;
+  if (threshold.caution === null || value < threshold.caution) return 0;
+  if (threshold.danger === null) return 0.46;
+  return 0.46 + 0.44 * (ramp(value, threshold.caution, threshold.danger) ?? 0);
+}
+
+function maximumThresholdRisk<T>(items: T[], value: (item: T) => number | null | undefined, threshold: OperationalThreshold): number | null {
   const observed = items
-    .map((item) => ramp(value(item), quiet, severe))
+    .map((item) => thresholdRisk(value(item), threshold))
     .filter((item): item is number => item !== null);
   return observed.length ? Math.max(...observed) : null;
 }
@@ -209,11 +220,17 @@ function networkRisk(data: DashboardPayload): number | null {
   const requests = data.currentTraffic.reduce((total, traffic) => total + traffic.requestCount, 0);
   if (requests <= 0) return combine(faultRisk, 0).intensity;
   const serverErrors = data.currentTraffic.reduce((total, traffic) => total + traffic.status5xx, 0);
+  const clientErrors = data.currentTraffic.reduce((total, traffic) => total + traffic.status4xx, 0);
+  const serverErrorPercent = (serverErrors / requests) * 100;
+  const httpErrorRisk = (serverErrors >= 3 && serverErrorPercent >= 50)
+    || (serverErrors >= 5 && serverErrorPercent >= 5)
+    ? 1
+    : serverErrors > 0 || clientErrors > 0 ? 0.46 : 0;
   const slow = data.currentTraffic.reduce((total, traffic) => total + traffic.slowCount, 0);
   const maximumResponseMs = data.currentTraffic.reduce((maximum, traffic) => Math.max(maximum, traffic.maxResponseMs ?? 0), 0);
   return Math.max(
     faultRisk ?? 0,
-    ramp((serverErrors / requests) * 100, 0.5, 10) ?? 0,
+    httpErrorRisk,
     ramp((slow / requests) * 100, 5, 40) ?? 0,
     ramp(maximumResponseMs, 1_000, 10_000) ?? 0,
   );
@@ -321,33 +338,32 @@ export function deriveSystemEmotion({
     ? logicalCpuCount ? latest.load1 / logicalCpuCount : null
     : null;
   const compute = combine(
-    ramp(latest?.cpuPercent, 55, 96),
-    ramp(normalizedLoad, 0.7, 1.8),
-    ramp(latest?.cpuPressureSomeAvg10, PSI_THRESHOLDS.cpuSome.caution, PSI_THRESHOLDS.cpuSome.danger),
-    ramp(latest?.cpuPressureFullAvg10, PSI_THRESHOLDS.cpuFull.caution, PSI_THRESHOLDS.cpuFull.danger),
+    thresholdRisk(latest?.cpuPercent, RESOURCE_THRESHOLDS.cpu),
+    thresholdRisk(normalizedLoad, RESOURCE_THRESHOLDS.load),
+    thresholdRisk(latest?.cpuPressureSomeAvg10, PSI_THRESHOLDS.cpuSome),
   );
   const memoryPressureActive = (latest?.memoryPercent ?? 0) >= 75
-    || (latest?.memoryPressureSomeAvg10 ?? 0) >= PSI_THRESHOLDS.memorySome.caution
-    || (latest?.memoryPressureFullAvg10 ?? 0) >= PSI_THRESHOLDS.memoryFull.caution;
+    || (latest?.memoryPressureSomeAvg10 ?? 0) >= 1
+    || (latest?.memoryPressureFullAvg10 ?? 0) >= 0.2;
   const memory = combine(
-    ramp(latest?.memoryPercent, 65, 96),
-    memoryPressureActive ? ramp(latest?.swapPercent, 10, 75) : null,
-    ramp(latest?.memoryPressureSomeAvg10, PSI_THRESHOLDS.memorySome.caution, PSI_THRESHOLDS.memorySome.danger),
-    ramp(latest?.memoryPressureFullAvg10, PSI_THRESHOLDS.memoryFull.caution, PSI_THRESHOLDS.memoryFull.danger),
+    thresholdRisk(latest?.memoryPercent, RESOURCE_THRESHOLDS.memory),
+    memoryPressureActive ? thresholdRisk(latest?.swapPercent, { caution: 50, danger: 85 }) : null,
+    thresholdRisk(latest?.memoryPressureSomeAvg10, PSI_THRESHOLDS.memorySome),
+    thresholdRisk(latest?.memoryPressureFullAvg10, PSI_THRESHOLDS.memoryFull),
   );
   const thermal = combine(
-    ramp(latest?.temperatureC, 60, 88),
+    thresholdRisk(latest?.temperatureC, RESOURCE_THRESHOLDS.temperature),
     finite(latest?.throttledFlags) ? ((latest.throttledFlags & 0xf) !== 0 ? 1 : 0) : null,
     finite(latest?.supplyVoltageVolts) ? ramp(4.85 - latest.supplyVoltageVolts, 0, 0.3) : null,
   );
   const storage = combine(
-    maximumRamp(data.disks, (disk) => disk.usedPercent, 70, 97),
+    maximumThresholdRisk(data.disks, (disk) => disk.usedPercent, RESOURCE_THRESHOLDS.disk),
     data.disks.some((disk) => disk.readOnly === true)
       ? 1
       : data.disks.length > 0 && data.disks.every((disk) => disk.readOnly === false) ? 0 : null,
-    maximumRamp(data.disks, (disk) => disk.inodeUsedPercent, 70, 97),
-    ramp(latest?.ioPressureSomeAvg10, PSI_THRESHOLDS.ioSome.caution, PSI_THRESHOLDS.ioSome.danger),
-    ramp(latest?.ioPressureFullAvg10, PSI_THRESHOLDS.ioFull.caution, PSI_THRESHOLDS.ioFull.danger),
+    maximumThresholdRisk(data.disks, (disk) => disk.inodeUsedPercent, RESOURCE_THRESHOLDS.inode),
+    thresholdRisk(latest?.ioPressureSomeAvg10, PSI_THRESHOLDS.ioSome),
+    thresholdRisk(latest?.ioPressureFullAvg10, PSI_THRESHOLDS.ioFull),
   );
   const network = combine(networkRisk(data));
   const services = combine(serviceRisk(data));

@@ -35,6 +35,14 @@ rm -f \
     /usr/local/lib/monitor-collector/alert_store.py \
     /usr/local/lib/monitor-collector/alert_delivery.py \
     /usr/local/lib/monitor-collector/synthetic_probe.py \
+    /usr/local/lib/monitor-collector/network_diagnostics.py \
+    /usr/local/lib/monitor-collector/notification_reports.py \
+    /usr/local/lib/monitor-collector/notification_policy.py \
+    /usr/local/lib/monitor-collector/security_signals.py \
+    /usr/local/lib/monitor-collector/email_visuals.py \
+    /usr/local/lib/monitor-collector/notification_visuals.py \
+    /usr/local/lib/monitor-collector/ssh_access.py \
+    /usr/local/lib/monitor-collector/ip_country.py \
     /usr/local/lib/monitor-collector/rules/default-rules.v1.json
 rmdir /usr/local/lib/monitor-collector/rules 2>/dev/null || true
 rmdir /usr/local/lib/monitor-collector 2>/dev/null || true
@@ -59,6 +67,7 @@ echo "  /etc/monitor-collector/log-sources.json"
 echo "  /etc/monitor/alert-delivery.json and referenced secrets"
 echo "  /etc/monitor-synthetic-probe/probes.json"
 echo "  /var/lib/monitor-synthetic/results.json"
+echo "  /usr/local/share/monitor-collector/ip-country.sqlite (optional country data)"
 echo "Monitor application auth state and its backups were not modified:"
 echo "  /home/cks/.local/state/monitor-auth"
 echo "  /home/cks/backups/monitor-auth"

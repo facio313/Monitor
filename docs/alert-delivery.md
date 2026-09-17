@@ -141,6 +141,15 @@ unions subsequent matching channels. The per-channel delivery identity is:
 
 `SHA-256(event idempotency key + NUL + channel ID + NUL + purpose)`.
 
+A route can optionally set `"excludeRuleIds": ["TcpRetransmissionHigh",
+"HttpLatencyHigh"]` to omit those rules from that route for both firing and
+resolved transitions. This is useful when another producer already supplies
+the same incident family to that channel. An excluded event does not match
+the route, so subsequent routes remain eligible even if `continue=false`.
+The list defaults to empty, accepts at most 128 distinct rule IDs matching
+`^[A-Z][A-Za-z0-9]{2,63}$`, and does not change local rule history or other
+routes. An omitted or empty list preserves existing routing behavior.
+
 Run a bounded delivery batch from a separate network-enabled service or timer:
 
 ```sh

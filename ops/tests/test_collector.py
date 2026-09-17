@@ -68,6 +68,64 @@ def empty_pressure():
 
 
 class ParsingTests(unittest.TestCase):
+    def test_general_reboot_marker_clears_and_packages_are_bounded(self):
+        now = dt.datetime(2026, 9, 13, 7, 0, tzinfo=dt.timezone.utc)
+        with tempfile.TemporaryDirectory() as temporary:
+            run = Path(temporary)
+            self.assertEqual(collector.collect_reboot_status(run, now), {
+                "status": "ok", "required": False, "observedAt": "2026-09-13T07:00:00Z",
+                "packages": [], "packagesStatus": "ok", "packagesTruncated": False,
+            })
+            marker = run / "reboot-required"
+            marker.write_text("free-form marker text never exported\n")
+            packages = run / "reboot-required.pkgs"
+            packages.write_text("libc6:arm64\nlibc6:arm64\nlibssl3\n")
+            pending = collector.collect_reboot_status(run, now)
+            self.assertTrue(pending["required"])
+            self.assertEqual(pending["packages"], ["libc6:arm64", "libssl3"])
+            self.assertNotIn("free-form", json.dumps(pending))
+            packages.write_text("libc6\ntoken=private\n")
+            invalid = collector.collect_reboot_status(run, now)
+            self.assertEqual(invalid["packagesStatus"], "collection-error")
+            self.assertEqual(invalid["packages"], [])
+            packages.write_text("\n".join(f"package-{index:03d}" for index in range(100)))
+            bounded = collector.collect_reboot_status(run, now)
+            self.assertEqual(len(bounded["packages"]), 64)
+            self.assertTrue(bounded["packagesTruncated"])
+            marker.unlink()
+            self.assertFalse(collector.collect_reboot_status(run, now)["required"])
+            self.assertEqual(collector.collect_reboot_status(run, now)["packages"], [])
+
+    def test_general_reboot_unknown_and_permission_are_not_reported_as_clear(self):
+        now = dt.datetime(2026, 9, 13, tzinfo=dt.timezone.utc)
+        with tempfile.TemporaryDirectory() as temporary:
+            run = Path(temporary)
+            self.assertEqual(collector.collect_reboot_status(run / "absent", now)["status"], "unavailable")
+            with mock.patch.object(collector.os, "open", side_effect=PermissionError()):
+                denied = collector.collect_reboot_status(run, now)
+            self.assertEqual(denied["status"], "permission-denied")
+            self.assertIsNone(denied["required"])
+            (run / "reboot-required").symlink_to(run / "absent")
+            invalid = collector.collect_reboot_status(run, now)
+            self.assertEqual(invalid["status"], "collection-error")
+            self.assertIsNone(invalid["required"])
+
+    def test_reboot_package_permission_failure_keeps_positive_marker(self):
+        now = dt.datetime(2026, 9, 13, tzinfo=dt.timezone.utc)
+        with tempfile.TemporaryDirectory() as temporary:
+            run = Path(temporary)
+            (run / "reboot-required").touch()
+            original_open = collector.os.open
+            def checked_open(path, *arguments, **keywords):
+                if path == "reboot-required.pkgs":
+                    raise PermissionError()
+                return original_open(path, *arguments, **keywords)
+            with mock.patch.object(collector.os, "open", side_effect=checked_open):
+                denied = collector.collect_reboot_status(run, now)
+            self.assertTrue(denied["required"])
+            self.assertEqual(denied["status"], "ok")
+            self.assertEqual(denied["packagesStatus"], "permission-denied")
+
     def test_proc_parsers_and_rates(self):
         proc_stat = (
             "cpu  100 2 30 400 5 0 0 0\n"
@@ -812,9 +870,9 @@ class ParsingTests(unittest.TestCase):
             ("dukkeobi", "dukkeobi"): "dukkeobi",
             ("react", "react"): "react",
             ("vue", "vue"): "vue",
-            ("pongdang-multtara", "backend"): "multtara-backend",
-            ("pongdang-multtara", "collector"): "multtara-collector",
-            ("pongdang-multtara", "frontend"): "multtara-frontend",
+            ("pongdang", "backend"): "pongdang-backend",
+            ("pongdang", "db"): "pongdang-db",
+            ("pongdang", "frontend"): "pongdang-frontend",
         }
         self.assertEqual(collector.ALLOWED_COMPOSE_SERVICES, expected_pairs)
         self.assertNotIn(("pilgrimage", "pilgrimageDB"), collector.ALLOWED_COMPOSE_SERVICES)
@@ -834,6 +892,11 @@ class ParsingTests(unittest.TestCase):
         self.assertNotIn(
             ("pongdang-multtara", "db"), collector.ALLOWED_COMPOSE_SERVICES
         )
+        for excluded_project in ("pongdang-multtara", "wgang"):
+            with self.subTest(excluded_project=excluded_project):
+                self.assertNotIn(excluded_project, collector.ALLOWED_COMPOSE_PROJECTS)
+                with self.assertRaisesRegex(ValueError, "outside the allowlist"):
+                    collector.compose_project_list_path(excluded_project)
         paths = []
         inspect_paths = []
         stats_paths = []
@@ -883,15 +946,25 @@ class ParsingTests(unittest.TestCase):
                         "State": "running",
                     },
                 ])
-            if project == "pongdang-multtara":
-                records.append({
-                    "Id": "d" * 64,
-                    "Labels": {
-                        "com.docker.compose.project": "pongdang-multtara",
-                        "com.docker.compose.service": "db",
-                    },
-                    "State": "running",
-                })
+            if project == "pongdang":
+                # Even if Docker returns unrelated rows, only the three exact
+                # standalone service pairs may receive inspect/stats requests.
+                for index, pair in enumerate((
+                    ("pongdang-multtara", "backend"),
+                    ("pongdang-multtara", "collector"),
+                    ("pongdang-multtara", "frontend"),
+                    ("pongdang-multtara", "db"),
+                    ("pongdang", "collector"),
+                    ("wgang", "frontend"),
+                )):
+                    records.append({
+                        "Id": f"{100 + index:064x}",
+                        "Labels": {
+                            "com.docker.compose.project": pair[0],
+                            "com.docker.compose.service": pair[1],
+                        },
+                        "State": "exited",
+                    })
             return records
 
         with mock.patch.object(collector, "docker_get", side_effect=fake_get):
@@ -922,6 +995,47 @@ class ParsingTests(unittest.TestCase):
             {item["project"] for item in containers},
             set(collector.ALLOWED_COMPOSE_PROJECTS),
         )
+
+    def test_retired_multtara_provenance_is_readable_only_as_retained_data(self):
+        now = dt.datetime(2026, 9, 9, tzinfo=dt.timezone.utc)
+        for service in ("backend", "collector", "frontend"):
+            with self.subTest(service=service):
+                name = f"multtara-{service}"
+                row = dict.fromkeys(collector.CONTAINER_V2_FIELDS)
+                row.update({
+                    "name": name, "project": "pongdang-multtara", "owner": "cks",
+                    "state": "exited",
+                })
+                normalized = collector.normalize_container_values([row], now)[0]
+                self.assertEqual(normalized["name"], name)
+                self.assertEqual(normalized["project"], "pongdang-multtara")
+                self.assertNotIn(name, collector.CURRENT_CONTAINER_NAMES)
+                labels = {
+                    "com.docker.compose.project": "pongdang-multtara",
+                    "com.docker.compose.service": service,
+                }
+                self.assertIsNone(collector.safe_container_name({"Labels": labels}))
+                with self.assertRaisesRegex(ValueError, "invalid Compose project"):
+                    collector.normalize_container_values([{**row, "project": "pongdang"}], now)
+
+                retained_event = {
+                    "id": "a" * 32, "occurredAt": "2026-09-07T00:00:00Z",
+                    "action": "stop", "containerName": name,
+                    "project": "pongdang-multtara", "instanceId": "b" * 32,
+                    "exitCode": None, "healthStatus": None,
+                }
+                self.assertEqual(
+                    collector.normalize_public_docker_event(retained_event, now),
+                    retained_event,
+                )
+                self.assertIsNone(collector.normalize_public_docker_event({
+                    **retained_event, "project": "pongdang",
+                }, now))
+                self.assertIsNone(collector.normalize_docker_event({
+                    "Type": "container", "Action": "stop",
+                    "Actor": {"ID": "b" * 64, "Attributes": labels},
+                    "time": int(now.timestamp()),
+                }, now))
 
     def test_reduced_container_input_requires_fresh_cks_owned_fixed_schema(self):
         now = dt.datetime(2026, 8, 23, 3, 0, tzinfo=dt.timezone.utc)
@@ -2718,6 +2832,29 @@ class RedactionTests(unittest.TestCase):
 
 
 class FilesystemTests(unittest.TestCase):
+    def setUp(self):
+        # The installed collector imports this top-level module lazily. Keep
+        # fixture evaluations independent of private host config and shell env.
+        import alert_store
+
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        environment = mock.patch.dict(os.environ)
+        environment.start()
+        self.addCleanup(environment.stop)
+        for kind, variable in (
+            ("DELIVERY", alert_store.DELIVERY_CONFIG_ENV),
+            ("SILENCE", alert_store.SILENCE_CONFIG_ENV),
+            ("RETIREMENT", alert_store.RETIREMENT_CONFIG_ENV),
+        ):
+            patcher = mock.patch.object(
+                alert_store, f"DEFAULT_{kind}_CONFIG_PATH",
+                Path(directory.name) / f"absent-{kind.lower()}.json",
+            )
+            patcher.start()
+            self.addCleanup(patcher.stop)
+            os.environ.pop(variable, None)
+
     def test_atomic_write_leaves_complete_file_and_no_temp(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "nested" / "current.json"
@@ -3527,7 +3664,8 @@ class FilesystemTests(unittest.TestCase):
                 "bootStartedAt", "collectorGapSeconds", "sshListenersAvailable",
                 "networkLinkAvailable", "nvmeMitigationActive",
             })
-            self.assertEqual(set(current["system"]), {"versions", "pcie", "kernel"})
+            self.assertEqual(set(current["system"]), {"versions", "pcie", "kernel", "reboot"})
+            self.assertEqual(current["system"]["reboot"]["observedAt"], current["generatedAt"])
             self.assertEqual(current["linux"]["schemaVersion"], 1)
             self.assertEqual(current["linux"]["collectedAt"], current["generatedAt"])
             self.assertEqual(current["linux"]["privacy"], {

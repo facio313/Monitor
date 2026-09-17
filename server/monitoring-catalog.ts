@@ -77,6 +77,8 @@ const SOURCE_ARTIFACTS = new Map<string, {
   ['generic-log-events', { label: 'generic-logs.jsonl', format: 'jsonl', kind: 'event-log', evidenceMode: 'accumulated-log', retentionPolicy: 'bounded-age-count-and-bytes', pruneCadence: 'every-generic-collection', recordScope: 'artifact' }],
   ['generic-log-source-state', { label: 'generic-log-sources.json', format: 'json', kind: 'source-status', evidenceMode: 'current-state', retentionPolicy: 'replace-on-collect', pruneCadence: 'replace-on-generic-collection', recordScope: 'artifact' }],
   ['system-update-state', { label: 'system-update.json', format: 'json', kind: 'external-state', evidenceMode: 'current-state', retentionPolicy: 'replace-on-change', pruneCadence: 'replace-on-change', recordScope: 'artifact' }],
+  ['network-diagnostics-history', { label: 'network-diagnostics/YYYY-MM-DD.jsonl', format: 'jsonl', kind: 'time-series', evidenceMode: 'accumulated-log', retentionPolicy: 'bounded-age-count-and-bytes', pruneCadence: 'every-collection', recordScope: 'daily-partition' }],
+  ['notification-report-state', { label: 'notification-reports.json', format: 'json', kind: 'source-status', evidenceMode: 'current-state', retentionPolicy: 'replace-on-collect', pruneCadence: 'replace-on-collection', recordScope: 'artifact' }],
   ['infrastructure-ledger', { label: 'infrastructure-ledger.json', format: 'json', kind: 'external-state', evidenceMode: 'current-state', retentionPolicy: 'externally-managed', pruneCadence: 'external-no-auto-prune', recordScope: 'artifact' }],
   ['agent-inventory', { label: 'agents API', format: 'api', kind: 'external-state', evidenceMode: 'current-state', retentionPolicy: 'externally-managed', pruneCadence: 'external-no-auto-prune', recordScope: null }],
 ]);
@@ -543,7 +545,8 @@ export function normalizeMonitoringCatalog(value: unknown): MonitoringCatalog | 
     || collectionIntervalSeconds === null
     || !rulePackVersion
     || !Array.isArray(value.evidenceSources)
-    || value.evidenceSources.length !== SOURCE_ARTIFACTS.size
+    || value.evidenceSources.length < SOURCE_ARTIFACTS.size - 2
+    || value.evidenceSources.length > SOURCE_ARTIFACTS.size
     || value.evidenceSources.length > MAX_EVIDENCE_SOURCES
   ) return null;
   const evidenceSources = value.evidenceSources.map(normalizeEvidenceSource);
@@ -552,7 +555,7 @@ export function normalizeMonitoringCatalog(value: unknown): MonitoringCatalog | 
   const sourceIds = new Set(normalizedSources.map((source) => source.id));
   if (
     sourceIds.size !== normalizedSources.length
-    || [...SOURCE_ARTIFACTS.keys()].some((sourceId) => !sourceIds.has(sourceId))
+    || [...SOURCE_ARTIFACTS.keys()].some((sourceId) => !['network-diagnostics-history', 'notification-report-state'].includes(sourceId) && !sourceIds.has(sourceId))
     || !Array.isArray(value.observations)
     || value.observations.length > MAX_OBSERVATIONS
   ) return null;

@@ -511,9 +511,9 @@ class LinuxTelemetryTests(unittest.TestCase):
             first, state = telemetry.collect_systemd_runtime(
                 {"nginx.service"}, runtime, root / "sys", None,
             )
-            self.assertEqual(first["status"], "supported")
+            self.assertEqual(first["status"], "partial")
             self.assertEqual(first["units"][0]["activeState"], "active")
-            self.assertEqual(first["units"][0]["restartCount"], 0)
+            self.assertIsNone(first["units"][0]["restartCount"])
             self.assertEqual(
                 first["units"][0]["restartCountStatus"],
                 "observed_invocation_changes",
@@ -523,9 +523,49 @@ class LinuxTelemetryTests(unittest.TestCase):
             second, next_state = telemetry.collect_systemd_runtime(
                 {"nginx.service"}, runtime, root / "sys", state,
             )
-            self.assertEqual(second["units"][0]["restartCount"], 1)
+            self.assertIsNone(second["units"][0]["restartCount"])
+            self.assertEqual(next_state["nginx.service"]["observedInvocationChanges"], 1)
             self.assertNotIn("1" * 32, json.dumps(second))
             self.assertRegex(next_state["nginx.service"]["invocationDigest"], r"^[0-9a-f]{32}$")
+
+            cgroup.rmdir()
+            missing, _ = telemetry.collect_systemd_observation(
+                {"nginx.service"}, "/missing/systemctl", 0.5, False,
+                runtime, root / "sys", next_state,
+            )
+            self.assertEqual(missing["status"], "partial")
+            self.assertEqual(missing["units"][0]["activeState"], "unknown")
+            self.assertEqual(missing["units"][0]["result"], "unknown")
+
+    def test_process_hidepid_and_incomplete_stat_reads_are_partial_host_visibility(self):
+        for hidepid in ("1", "2", "4", "invisible", "ptraceable"):
+            with self.subTest(hidepid=hidepid), tempfile.TemporaryDirectory() as temporary:
+                paths = self.create_fixture(Path(temporary))
+                (paths["proc"] / "self" / "mountinfo").write_text(
+                    f"37 25 0:4 / /proc rw - proc proc rw,hidepid={hidepid}\n"
+                )
+                result, _ = self.collect(paths)
+                processes = result["processes"]
+                self.assertEqual(processes["status"], "partial")
+                self.assertTrue(processes["pidCountLowerBound"])
+                self.assertIsNone(processes["pidUsedPercent"])
+                self.assertEqual(processes["pidCount"], 1)
+                self.assertEqual(processes["observedProcessCount"], 1)
+                self.assertEqual(processes["zombieCount"], 0)
+                self.assertEqual(processes["systemFileDescriptors"]["status"], "supported")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = self.create_fixture(Path(temporary))
+            result, _ = self.collect(paths)
+            self.assertEqual(result["processes"]["status"], "supported")
+            self.assertFalse(result["processes"]["pidCountLowerBound"])
+            (paths["proc"] / "123" / "stat").write_text("invalid\n")
+            result, _ = self.collect(paths)
+            self.assertEqual(result["processes"]["status"], "partial")
+            self.assertTrue(result["processes"]["pidCountLowerBound"])
+            self.assertIsNone(result["processes"]["pidUsedPercent"])
+            (paths["proc"] / "self" / "mountinfo").unlink()
+            self.assertFalse(telemetry._process_visibility_complete(paths["proc"]))
 
 
 if __name__ == "__main__":

@@ -18,6 +18,7 @@ import {
   ReliabilitySignalGrid,
   ReliabilityWidget,
   storageCapacityChartRows,
+  VitalSignsWidget,
 } from './CockpitVisuals';
 
 function event(count = 0, lastEventAt: string | null = null): SystemEventCount {
@@ -444,5 +445,47 @@ describe('missing telemetry presentation', () => {
       { name: 'cpu-only', cpu: 4, memory: null },
       { name: 'memory-only', cpu: null, memory: 70 },
     ]);
+  });
+});
+
+describe('canonical resource vital thresholds', () => {
+  function vitalMarkup(latest: Record<string, number | null>, logicalCpuCount: number | null = 4): string {
+    const data = {
+      ...reliabilityPayload(),
+      host: { logicalCpuCount },
+      latest,
+      disks: [{ mount: '/', usedPercent: 90 }],
+    } as unknown as DashboardPayload;
+    return renderToStaticMarkup(createElement(VitalSignsWidget, { data, locale: 'en', onOpen: () => {} }));
+  }
+
+  function vital(markup: string, label: string): string {
+    return markup.match(new RegExp(`<div class="cockpit-vital [^"]+"><span>${label}(?:<[^>]+>[^<]*<[^>]+>)?</span>.*?</div>`))?.[0] ?? '';
+  }
+
+  it.each([90, 100])('shows CPU %s as caution rather than danger', (cpuPercent) => {
+    const markup = vitalMarkup({ cpuPercent, cpuPressureSomeAvg10: 20, cpuPressureFullAvg10: 100, load1: 60 });
+    expect(vital(markup, 'CPU')).toContain('vital-caution');
+    expect(vital(markup, 'CPU stall \\(PSI\\)')).toContain('vital-caution');
+    expect(vital(markup, 'System load')).toContain('vital-caution');
+    expect(markup).toContain('Host full is not applicable');
+    expect(markup).not.toContain('Infinity');
+  });
+
+  it('ignores CPU full when some is missing and does not invent a CPU count', () => {
+    const markup = vitalMarkup({ cpuPressureSomeAvg10: null, cpuPressureFullAvg10: 100, load1: 60 }, null);
+    expect(vital(markup, 'CPU stall \\(PSI\\)')).toContain('vital-unknown');
+    expect(vital(markup, 'System load')).toContain('vital-unknown');
+  });
+
+  it('aligns memory, temperature, disk and both PSI components', () => {
+    const markup = vitalMarkup({ memoryPercent: 80, temperatureC: 80, memoryPressureSomeAvg10: 0, memoryPressureFullAvg10: 5, ioPressureSomeAvg10: 0, ioPressureFullAvg10: 8 });
+    for (const label of ['Memory', 'Temperature', 'Highest disk usage', 'Memory stall \\(PSI\\)', 'I/O stall \\(PSI\\)']) {
+      expect(vital(markup, label)).toContain('vital-caution');
+    }
+    const critical = vitalMarkup({ memoryPercent: 90, temperatureC: 85, memoryPressureSomeAvg10: 10 });
+    for (const label of ['Memory', 'Temperature', 'Memory stall \\(PSI\\)']) {
+      expect(vital(critical, label)).toContain('vital-danger');
+    }
   });
 });

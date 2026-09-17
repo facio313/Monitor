@@ -190,11 +190,14 @@ function networkCards(linux: LinuxDiagnostics, locale: MonitorLocale) {
       status={tcp.status}
       locale={locale}
       evidence={[
-        { label: t(locale, '재전송률', 'Retransmission'), value: percent(tcp.retransmissionPercent, locale) },
+        { label: t(locale, '순간 재전송률', 'Instantaneous retransmission'), value: percent(tcp.retransmissionPercent, locale) },
+        { label: t(locale, '경고 판정용 합산', 'Weighted assessment'), value: tcp.assessment?.status === 'ok'
+          ? `${percent(tcp.assessment.retransmissionPercent, locale)} · ${tcp.assessment.sampleCount}${t(locale, '구간', ' intervals')}`
+          : t(locale, '유효 표본 부족 또는 오래된 관측', 'Insufficient or stale observations') },
         { label: t(locale, '재전송 / 송신', 'Retransmitted / outgoing'), value: `${number(tcp.retransmittedSegmentsPerSecond, locale)}/s · ${number(tcp.outgoingSegmentsPerSecond, locale)}/s` },
         { label: t(locale, '계산 근거', 'Rate basis'), value: rateStatusLabel(tcp.rateStatus, locale) },
       ]}
-      action={tcp.retransmissionPercent !== null && tcp.retransmissionPercent >= 1
+      action={tcp.assessment?.status === 'ok' && (tcp.assessment.retransmissionPercent ?? 0) >= 1
         ? t(locale, '링크 손실, 혼잡, 애플리케이션 재시도를 함께 확인합니다.', 'Check link loss, congestion, and application retries together.')
         : collectionAction(tcp.status, locale)}
     />,

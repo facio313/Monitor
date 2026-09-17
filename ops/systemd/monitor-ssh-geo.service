@@ -1,0 +1,34 @@
+[Unit]
+Description=South Korea source restriction for host SSH only
+DefaultDependencies=no
+After=local-fs.target ufw.service
+Before=ssh.socket ssh.service
+RequiresMountsFor=/etc/monitor/ssh-kr-only.nft /usr/local/sbin/monitor-ssh-geo-apply
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/monitor-ssh-geo-apply
+ExecReload=/usr/local/sbin/monitor-ssh-geo-apply
+# No ExecStop: stopping this unit must never remove firewall protection.
+RuntimeDirectory=monitor-ssh-geo
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+UMask=0077
+TimeoutStartSec=50s
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+CapabilityBoundingSet=CAP_NET_ADMIN
+ReadWritePaths=/run/monitor-ssh-geo
+MemoryMax=96M
+TasksMax=16
+
+[Install]
+WantedBy=multi-user.target

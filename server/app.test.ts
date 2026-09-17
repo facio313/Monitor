@@ -792,6 +792,7 @@ describe('dashboard ingestion', () => {
     const response = await request(app)
       .get('/monitor/api/dashboard?range=1h')
       .set('Cookie', cookie)
+      .expect('X-Accel-Buffering', 'no')
       .expect(200);
     expect(response.body.stale).toBe(true);
     expect(response.body.latestObservedAt).toBeNull();
@@ -1833,12 +1834,14 @@ describe('dashboard ingestion', () => {
     const index = await request(app).get('/monitor/').expect(200);
     expect(index.text).toContain('<title>Monitor</title>');
     expect(index.headers['cache-control']).toBe('no-store');
+    expect(index.headers['x-accel-buffering']).toBe('no');
     expect(index.headers['content-security-policy']).toContain("default-src 'self'");
     const details = await request(app).get('/monitor/details').expect(200);
     expect(details.text).toContain('<title>Monitor</title>');
     expect(details.headers['cache-control']).toBe('no-store');
     const asset = await request(app).get('/monitor/assets/app-ABC12345.js').expect(200);
     expect(asset.headers['cache-control']).toContain('immutable');
+    expect(asset.headers['x-accel-buffering']).toBe('no');
     await request(app).get('/monitor/api/not-a-route').expect(404).expect('Content-Type', /json/);
   });
 });

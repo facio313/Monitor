@@ -1,4 +1,5 @@
 import { useMemo, type ReactNode } from 'react';
+import { containerMemoryBytes, containerMemoryPercent } from '../container-memory';
 import {
   Area,
   AreaChart,
@@ -37,6 +38,7 @@ import {
   NETWORK_DROP_RATE_THRESHOLDS,
   NETWORK_ERROR_RATE_THRESHOLDS,
   PSI_THRESHOLDS,
+  RESOURCE_THRESHOLDS,
 } from '../operational-thresholds';
 import { useResponsivePageSize } from '../responsive-page-size';
 import type {
@@ -69,6 +71,7 @@ import { OperationalGuidance, OperationalHealthSummary } from './OperationalHeal
 import { OperationalLogView } from './OperationalLogView';
 import { Pagination, paginateItems, usePagination } from './Pagination';
 import { SyntheticProbePanel } from './SyntheticProbePanel';
+import { NetworkDiagnosticsHistory } from './NetworkDiagnosticsHistory';
 
 const CHART_COLORS = {
   cyan: '#55d9d1',
@@ -161,7 +164,7 @@ export function containerUtilizationChartRows(containers: ContainerStatus[]) {
     .map((container) => ({
       name: safeText(container.name, 'container', 24),
       cpu: isObservedNumber(container.cpuPercent) ? container.cpuPercent : null,
-      memory: isObservedNumber(container.memoryPercent) ? container.memoryPercent : null,
+      memory: containerMemoryPercent(container),
     }));
 }
 
@@ -190,10 +193,10 @@ function localUptime(seconds: number | null | undefined, locale: MonitorLocale):
   return `${minutes}분`;
 }
 
-function statusTone(value: number | null | undefined, warning = 75, critical = 90): 'ok' | 'caution' | 'danger' | 'unknown' {
-  if (typeof value !== 'number' || !Number.isFinite(value)) return 'unknown';
-  if (value >= critical) return 'danger';
-  if (value >= warning) return 'caution';
+function statusTone(value: number | null | undefined, warning: number | null, critical: number | null): 'ok' | 'caution' | 'danger' | 'unknown' {
+  if (typeof value !== 'number' || !Number.isFinite(value) || (warning === null && critical === null)) return 'unknown';
+  if (critical !== null && value >= critical) return 'danger';
+  if (warning !== null && value >= warning) return 'caution';
   return 'ok';
 }
 
@@ -294,8 +297,8 @@ export function VitalSignsWidget({ data, locale, onOpen }: Omit<VisualProps, 'ra
   ]);
   const networkFaultRate = sumObserved([networkErrorRate, networkDropRate]);
   const currentMemoryPressure = (latest?.memoryPercent ?? 0) >= 75
-    || (latest?.memoryPressureSomeAvg10 ?? 0) >= PSI_THRESHOLDS.memorySome.caution
-    || (latest?.memoryPressureFullAvg10 ?? 0) >= PSI_THRESHOLDS.memoryFull.caution;
+    || (latest?.memoryPressureSomeAvg10 ?? 0) >= 1
+    || (latest?.memoryPressureFullAvg10 ?? 0) >= 0.2;
   const voltageTone = typeof latest?.supplyVoltageVolts !== 'number'
     ? 'unknown'
     : latest.supplyVoltageVolts < 4.63
@@ -309,20 +312,27 @@ export function VitalSignsWidget({ data, locale, onOpen }: Omit<VisualProps, 'ra
   const loadPerCpu = typeof latest?.load1 === 'number' && logicalCpuCount
     ? latest.load1 / logicalCpuCount
     : null;
-  const loadTone = loadPerCpu == null
-    ? statusTone(latest?.load1, 4, 8)
-    : statusTone(loadPerCpu, 0.75, 1.5);
+  const loadTone = statusTone(loadPerCpu, RESOURCE_THRESHOLDS.load.caution, RESOURCE_THRESHOLDS.load.danger);
+  const cpuTone = statusTone(latest?.cpuPercent, RESOURCE_THRESHOLDS.cpu.caution, RESOURCE_THRESHOLDS.cpu.danger);
+  const memoryPsiTone = strongerTone(
+    statusTone(latest?.memoryPressureSomeAvg10, PSI_THRESHOLDS.memorySome.caution, PSI_THRESHOLDS.memorySome.danger),
+    statusTone(latest?.memoryPressureFullAvg10, PSI_THRESHOLDS.memoryFull.caution, PSI_THRESHOLDS.memoryFull.danger),
+  );
+  const ioPsiTone = strongerTone(
+    statusTone(latest?.ioPressureSomeAvg10, PSI_THRESHOLDS.ioSome.caution, PSI_THRESHOLDS.ioSome.danger),
+    statusTone(latest?.ioPressureFullAvg10, PSI_THRESHOLDS.ioFull.caution, PSI_THRESHOLDS.ioFull.danger),
+  );
   const vitals = [
-    <Vital key="cpu" label="CPU" value={formatPercent(latest?.cpuPercent, 1)} note={statusWord(statusTone(latest?.cpuPercent), locale)} tone={statusTone(latest?.cpuPercent)} />,
-    <Vital key="memory" label={t(locale, '메모리', 'Memory')} value={formatPercent(latest?.memoryPercent, 1)} note={`${formatBytes(latest?.memoryUsedBytes)} / ${formatBytes(latest?.memoryTotalBytes)}`} tone={statusTone(latest?.memoryPercent)} />,
-    <Vital key="temperature" label={t(locale, '온도', 'Temperature')} value={temperature(latest?.temperatureC)} note={t(locale, '기기 센서', 'Device sensor')} tone={statusTone(latest?.temperatureC, 75, 85)} />,
+    <Vital key="cpu" label="CPU" value={formatPercent(latest?.cpuPercent, 1)} note={statusWord(cpuTone, locale)} tone={cpuTone} />,
+    <Vital key="memory" label={t(locale, '메모리', 'Memory')} value={formatPercent(latest?.memoryPercent, 1)} note={`${formatBytes(latest?.memoryUsedBytes)} / ${formatBytes(latest?.memoryTotalBytes)}`} tone={statusTone(latest?.memoryPercent, RESOURCE_THRESHOLDS.memory.caution, RESOURCE_THRESHOLDS.memory.danger)} />,
+    <Vital key="temperature" label={t(locale, '온도', 'Temperature')} value={temperature(latest?.temperatureC)} note={t(locale, '기기 센서', 'Device sensor')} tone={statusTone(latest?.temperatureC, RESOURCE_THRESHOLDS.temperature.caution, RESOURCE_THRESHOLDS.temperature.danger)} />,
     <Vital key="load" label={t(locale, '시스템 부하', 'System load')} term={t(locale, '실행 중이거나 실행을 기다리는 작업의 양입니다. 논리 CPU 개수로 나눈 값이 1을 오래 넘으면 대기가 쌓일 수 있습니다.', 'Work running or waiting to run. A sustained value above 1 per logical CPU can indicate a queue.')} value={decimal(latest?.load1)} note={logicalCpuCount ? t(locale, `CPU ${logicalCpuCount}개 · 코어당 ${decimal(loadPerCpu)}×`, `${logicalCpuCount} CPUs · ${decimal(loadPerCpu)}× each`) : t(locale, '최근 1분 평균 · CPU 개수 미확인', '1-minute average · CPU count unknown')} tone={loadTone} />,
-    <Vital key="cpu-psi" label={t(locale, 'CPU 실제 대기', 'CPU stall (PSI)')} term={t(locale, '최근 10초 중 적어도 하나의 작업이 CPU를 기다린 시간 비율입니다.', 'Share of the last 10 seconds in which at least one task waited for CPU.')} value={formatPercent(latest?.cpuPressureSomeAvg10, 1)} note={`full ${formatPercent(latest?.cpuPressureFullAvg10, 1)}`} tone={statusTone(latest?.cpuPressureSomeAvg10, 5, 20)} />,
-    <Vital key="memory-psi" label={t(locale, '메모리 실제 대기', 'Memory stall (PSI)')} term={t(locale, '메모리 회수나 할당 때문에 작업이 실제로 멈춘 시간 비율입니다.', 'Share of time tasks actually stalled on memory allocation or reclaim.')} value={formatPercent(latest?.memoryPressureSomeAvg10, 1)} note={`full ${formatPercent(latest?.memoryPressureFullAvg10, 1)}`} tone={statusTone(latest?.memoryPressureSomeAvg10, 1, 10)} />,
-    <Vital key="io-psi" label={t(locale, 'I/O 실제 대기', 'I/O stall (PSI)')} term={t(locale, '저장장치 입출력을 기다리느라 작업이 실제로 멈춘 시간 비율입니다.', 'Share of time tasks actually stalled while waiting for storage I/O.')} value={formatPercent(latest?.ioPressureSomeAvg10, 1)} note={`full ${formatPercent(latest?.ioPressureFullAvg10, 1)}`} tone={statusTone(latest?.ioPressureSomeAvg10, 5, 20)} />,
+    <Vital key="cpu-psi" label={t(locale, 'CPU 실제 대기', 'CPU stall (PSI)')} term={t(locale, '최근 10초 중 적어도 하나의 작업이 CPU를 기다린 시간 비율입니다.', 'Share of the last 10 seconds in which at least one task waited for CPU.')} value={formatPercent(latest?.cpuPressureSomeAvg10, 1)} note={t(locale, '호스트 full은 해당 없음', 'Host full is not applicable')} tone={statusTone(latest?.cpuPressureSomeAvg10, PSI_THRESHOLDS.cpuSome.caution, PSI_THRESHOLDS.cpuSome.danger)} />,
+    <Vital key="memory-psi" label={t(locale, '메모리 실제 대기', 'Memory stall (PSI)')} term={t(locale, '메모리 회수나 할당 때문에 작업이 실제로 멈춘 시간 비율입니다.', 'Share of time tasks actually stalled on memory allocation or reclaim.')} value={formatPercent(latest?.memoryPressureSomeAvg10, 1)} note={`full ${formatPercent(latest?.memoryPressureFullAvg10, 1)}`} tone={memoryPsiTone} />,
+    <Vital key="io-psi" label={t(locale, 'I/O 실제 대기', 'I/O stall (PSI)')} term={t(locale, '저장장치 입출력을 기다리느라 작업이 실제로 멈춘 시간 비율입니다.', 'Share of time tasks actually stalled while waiting for storage I/O.')} value={formatPercent(latest?.ioPressureSomeAvg10, 1)} note={`full ${formatPercent(latest?.ioPressureFullAvg10, 1)}`} tone={ioPsiTone} />,
     <Vital key="swap" label={t(locale, '스왑', 'Swap')} value={formatPercent(latest?.swapPercent, 1)} note={typeof latest?.swapTotalBytes === 'number' && latest.swapTotalBytes > 0 ? `${formatBytes(latest.swapUsedBytes)} / ${formatBytes(latest.swapTotalBytes)}` : t(locale, '스왑 없음 또는 미확인', 'No swap or unavailable')} tone={latest?.swapPercent == null ? 'unknown' : currentMemoryPressure ? statusTone(latest.swapPercent, 50, 85) : 'ok'} />,
     <Vital key="services" label={t(locale, '서비스', 'Services')} value={data.containers.length ? `${running}/${data.containers.length}` : '—'} note={!data.containers.length ? t(locale, '추적 대상 없음', 'No services reported') : unhealthy ? t(locale, `${unhealthy}개 이상`, `${unhealthy} abnormal`) : t(locale, '모두 정상', 'All nominal')} tone={!data.containers.length ? 'unknown' : unhealthy ? 'danger' : 'ok'} />,
-    <Vital key="disk-usage" label={t(locale, '디스크 최고 사용률', 'Highest disk usage')} value={formatPercent(highestDisk, 0)} note={t(locale, `${data.disks.length}개 볼륨`, `${data.disks.length} volumes`)} tone={statusTone(highestDisk)} />,
+    <Vital key="disk-usage" label={t(locale, '디스크 최고 사용률', 'Highest disk usage')} value={formatPercent(highestDisk, 0)} note={t(locale, `${data.disks.length}개 볼륨`, `${data.disks.length} volumes`)} tone={statusTone(highestDisk, RESOURCE_THRESHOLDS.disk.caution, RESOURCE_THRESHOLDS.disk.danger)} />,
     <Vital key="voltage" label={t(locale, '공급 전압', 'Supply voltage')} value={voltage(latest?.supplyVoltageVolts)} note={t(locale, 'EXT5V 입력', 'EXT5V input')} tone={voltageTone} />,
     <Vital key="uptime" label={t(locale, '가동 시간', 'Uptime')} value={localUptime(data.host.uptimeSeconds, locale)} note={safeText(data.host.os, t(locale, '운영체제 미확인', 'OS unavailable'), 72)} tone={data.host.uptimeSeconds == null ? 'unknown' : 'ok'} />,
     <Vital key="network-rx" label={t(locale, '수신 처리량', 'Network receive')} value={formatRate(latest?.networkRxBytesPerSecond)} note={t(locale, '현재 초당 수신량', 'Current receive rate')} tone={latest?.networkRxBytesPerSecond == null ? 'unknown' : 'ok'} />,
@@ -390,7 +400,8 @@ export function ResourceWidget({ data, range, locale, onOpen }: VisualProps) {
               <YAxis domain={[0, 100]} stroke={CHART_COLORS.axis} tickFormatter={(value) => `${value}%`} tickLine={false} axisLine={false} width={42} />
               <Tooltip contentStyle={TOOLTIP_STYLE} labelFormatter={(_label, payload) => payload?.[0]?.payload?.fullTime ?? _label} formatter={(value: any, name: any) => [formatPercent(Number(value), 1), name]} />
               <Legend />
-              <ReferenceLine y={75} stroke={CHART_COLORS.orange} strokeDasharray="4 4" />
+              {cpuVisible && <ReferenceLine y={RESOURCE_THRESHOLDS.cpu.caution} stroke={CHART_COLORS.cyan} strokeDasharray="4 4" label={{ value: t(locale, 'CPU 주의', 'CPU caution'), fill: CHART_COLORS.cyan, fontSize: 10 }} />}
+              {memoryVisible && <ReferenceLine y={RESOURCE_THRESHOLDS.memory.caution} stroke={CHART_COLORS.violet} strokeDasharray="4 4" label={{ value: t(locale, '메모리 주의', 'Memory caution'), fill: CHART_COLORS.violet, fontSize: 10 }} />}
               {cpuVisible && <Area type="monotone" dataKey="cpuPercent" name="CPU" stroke={CHART_COLORS.cyan} fill="url(#v2CpuFill)" strokeWidth={2} />}
               {memoryVisible && <Area type="monotone" dataKey="memoryPercent" name={t(locale, '메모리', 'Memory')} stroke={CHART_COLORS.violet} fill="url(#v2MemoryFill)" strokeWidth={2} />}
             </AreaChart>
@@ -555,9 +566,9 @@ export function StorageWidget({ data, range, locale, onOpen }: VisualProps) {
                 <XAxis type="number" domain={[0, 100]} tickFormatter={(value) => `${value}%`} stroke={CHART_COLORS.axis} tickLine={false} axisLine={false} />
                 <YAxis type="category" dataKey="name" width={70} stroke={CHART_COLORS.axis} tickLine={false} axisLine={false} />
                 <Tooltip contentStyle={TOOLTIP_STYLE} formatter={(value: any) => formatPercent(Number(value), 1)} />
-                <ReferenceLine x={75} stroke={CHART_COLORS.orange} strokeDasharray="4 4" />
+                <ReferenceLine x={RESOURCE_THRESHOLDS.disk.caution} stroke={CHART_COLORS.orange} strokeDasharray="4 4" />
                 <Bar dataKey="used" name={t(locale, '사용률', 'Used')} radius={[0, 5, 5, 0]}>
-                  {diskBars.map((entry) => <Cell key={entry.name} fill={entry.used >= 90 ? CHART_COLORS.red : entry.used >= 75 ? CHART_COLORS.orange : CHART_COLORS.green} />)}
+                  {diskBars.map((entry) => <Cell key={entry.name} fill={entry.used >= RESOURCE_THRESHOLDS.disk.danger ? CHART_COLORS.red : entry.used >= RESOURCE_THRESHOLDS.disk.caution ? CHART_COLORS.orange : CHART_COLORS.green} />)}
                 </Bar>
               </BarChart>
             </ResponsiveContainer>
@@ -1071,7 +1082,7 @@ export function ContainerStatusTable({ data, locale, onOpen, grouped = false }: 
               <thead><tr><th>{t(locale, '서비스', 'Service')}</th><th>{t(locale, '상태', 'State')}</th><th>{t(locale, '건강', 'Health')}</th><th>CPU</th><th>{t(locale, '메모리', 'Memory')}</th><th>{t(locale, '소유', 'Owner')}</th></tr></thead>
               <tbody>{containers.map((container) => {
                 const tone = containerTone(container);
-                return <tr key={container.name}><td><strong>{safeText(container.name)}</strong></td><td><span className={`status-token status-${tone}`}>{safeText(container.state, t(locale, '미확인', 'Unknown'))}</span></td><td>{safeText(container.health, '—')}</td><td>{formatPercent(container.cpuPercent, 1)}</td><td>{formatBytes(container.memoryBytes)} <small>{formatPercent(container.memoryPercent, 1)}</small></td><td>{safeText(container.owner, '—')}</td></tr>;
+                return <tr key={container.name}><td><strong>{safeText(container.name)}</strong></td><td><span className={`status-token status-${tone}`}>{safeText(container.state, t(locale, '미확인', 'Unknown'))}</span></td><td>{safeText(container.health, '—')}</td><td>{formatPercent(container.cpuPercent, 1)}</td><td>{formatBytes(containerMemoryBytes(container))} <small>{formatPercent(containerMemoryPercent(container), 1)}</small><small>{container.memoryWorkingSetBytes != null ? t(locale, `캐시 보정 · 전체 ${formatBytes(container.memoryBytes)}`, `Cache adjusted · total ${formatBytes(container.memoryBytes)}`) : t(locale, '전체 사용량 · 캐시 미확인', 'Total usage · cache unverified')}</small></td><td>{safeText(container.owner, '—')}</td></tr>;
               })}</tbody>
             </table>
           </div>
@@ -1101,7 +1112,7 @@ export function IncidentDetail({ data, locale }: { data: DashboardPayload; local
             <header><div><span>{incident.phase === 'active' ? t(locale, '발생 중', 'ACTIVE') : incident.phase === 'follow-up' ? t(locale, '후속 관찰', 'FOLLOW-UP') : t(locale, '복구됨', 'RECOVERED')}</span><h3>{incident.reasons.map((reason) => incidentReason(reason, locale)).join(' · ') || t(locale, '원인 미확인', 'Cause unavailable')}</h3></div><time dateTime={incident.observedAt}>{formatDateTime(incident.observedAt, locale)}</time></header>
             <div className="incident-evidence-grid">
               <dl><div><dt>CPU</dt><dd>{formatPercent(incident.metrics.cpuPercent, 1)}</dd></div><div><dt>{t(locale, '메모리', 'Memory')}</dt><dd>{formatPercent(incident.metrics.memoryPercent, 1)}</dd></div><div><dt>{t(locale, '온도', 'Temperature')}</dt><dd>{temperature(incident.metrics.temperatureC)}</dd></div><div><dt>{t(locale, '부하', 'Load')}</dt><dd>{decimal(incident.metrics.load1)}</dd></div></dl>
-              <div><strong>{t(locale, '압박 지표(PSI)', 'Pressure stall information')}</strong><p>CPU some {decimal(incident.pressure.cpu.someAvg10)} · full {decimal(incident.pressure.cpu.fullAvg10)}</p><p>MEM some {decimal(incident.pressure.memory.someAvg10)} · full {decimal(incident.pressure.memory.fullAvg10)}</p><p>I/O some {decimal(incident.pressure.io.someAvg10)} · full {decimal(incident.pressure.io.fullAvg10)}</p></div>
+              <div><strong>{t(locale, '압박 지표(PSI)', 'Pressure stall information')}</strong><p>CPU some {decimal(incident.pressure.cpu.someAvg10)} · {t(locale, '호스트 full은 해당 없음', 'host full is not applicable')}</p><p>MEM some {decimal(incident.pressure.memory.someAvg10)} · full {decimal(incident.pressure.memory.fullAvg10)}</p><p>I/O some {decimal(incident.pressure.io.someAvg10)} · full {decimal(incident.pressure.io.fullAvg10)}</p></div>
               <div><strong>{t(locale, '주요 프로세스', 'Top process classes')}</strong>{incident.processes.length ? <ul>{incident.processes.slice(0, 6).map((process) => <li key={process.name}>{safeText(process.name)} · {formatPercent(process.cpuPercent, 1)} · {formatBytes(process.memoryBytes)}</li>)}</ul> : <p>{t(locale, '수집된 프로세스 증거 없음', 'No process evidence captured')}</p>}</div>
             </div>
           </li>
@@ -1139,7 +1150,7 @@ export function DetailPage({ page, data, findings, range, locale, onOpen }: Visu
     content = <><VitalSignsWidget data={data} locale={locale} onOpen={onOpen} /><ResourceWidget data={data} range={range} locale={locale} onOpen={onOpen} /><LoadWidget data={data} range={range} locale={locale} onOpen={onOpen} /><LinuxDiagnosticsPanel linux={data.linux} page="resources" locale={locale} />{commonLogs}</>;
   } else if (page === 'network') {
     targetClass += ' detail-two-column';
-    content = <><NetworkWidget data={data} range={range} locale={locale} onOpen={onOpen} /><SyntheticProbePanel data={data} locale={locale} /><TrafficEvidence data={data} locale={locale} /><CurrentTrafficWidget data={data} locale={locale} /><LinuxDiagnosticsPanel linux={data.linux} page="network" locale={locale} />{commonLogs}</>;
+    content = <><NetworkWidget data={data} range={range} locale={locale} onOpen={onOpen} /><SyntheticProbePanel data={data} locale={locale} /><NetworkDiagnosticsHistory locale={locale} /><TrafficEvidence data={data} locale={locale} /><CurrentTrafficWidget data={data} locale={locale} /><LinuxDiagnosticsPanel linux={data.linux} page="network" locale={locale} />{commonLogs}</>;
   } else if (page === 'storage') {
     content = <><StorageWidget data={data} range={range} locale={locale} onOpen={onOpen} /><LinuxDiagnosticsPanel linux={data.linux} page="storage" locale={locale} />{commonLogs}</>;
   } else if (page === 'containers') {

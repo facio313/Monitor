@@ -36,10 +36,12 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
 try:  # Package imports for tests; direct imports for installed scripts.
-    from .alert_engine import LABEL_NAME, LABEL_VALUE, SEVERITIES
+    from . import email_visuals
+    from .alert_engine import LABEL_NAME, LABEL_VALUE, RULE_ID, SEVERITIES
     from .alert_store import normalize_event
 except ImportError:  # pragma: no cover - exercised by the installed script
-    from alert_engine import LABEL_NAME, LABEL_VALUE, SEVERITIES  # type: ignore[no-redef]
+    import email_visuals
+    from alert_engine import LABEL_NAME, LABEL_VALUE, RULE_ID, SEVERITIES  # type: ignore[no-redef]
     from alert_store import normalize_event  # type: ignore[no-redef]
 
 
@@ -52,6 +54,7 @@ MAX_SECRET_BYTES = 8192
 MAX_STAT_COUNTER = (1 << 63) - 1
 MAX_CHANNELS = 64
 MAX_ROUTES = 128
+MAX_EXCLUDED_RULE_IDS = 128
 MAX_HEADERS = 16
 MAX_RECIPIENTS = 20
 MAX_HTTPS_DNS_ANSWERS = 32
@@ -120,6 +123,7 @@ class RouteConfig:
     labels: tuple[tuple[str, str], ...]
     channel_ids: tuple[str, ...]
     continue_matching: bool
+    excluded_rule_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -438,7 +442,11 @@ def parse_delivery_config(value: Any) -> DeliveryConfig:
         field = f"routes[{index}]"
         if not isinstance(raw, Mapping):
             raise ValueError(f"{field} is invalid")
-        _exact(raw, route_fields, field)
+        _exact(
+            raw,
+            route_fields | {"excludeRuleIds"} if "excludeRuleIds" in raw else route_fields,
+            field,
+        )
         route_id = raw.get("id")
         enabled = raw.get("enabled")
         continue_matching = raw.get("continue")
@@ -454,6 +462,17 @@ def parse_delivery_config(value: Any) -> DeliveryConfig:
         raw_severities = raw.get("severities")
         raw_transitions = raw.get("transitions")
         raw_channel_ids = raw.get("channels")
+        raw_excluded_rule_ids = raw.get("excludeRuleIds", [])
+        if (
+            not isinstance(raw_excluded_rule_ids, list)
+            or len(raw_excluded_rule_ids) > MAX_EXCLUDED_RULE_IDS
+            or not all(
+                isinstance(item, str) and RULE_ID.fullmatch(item) is not None
+                for item in raw_excluded_rule_ids
+            )
+            or len(raw_excluded_rule_ids) != len(set(raw_excluded_rule_ids))
+        ):
+            raise ValueError(f"{field}.excludeRuleIds is invalid")
         if (
             not isinstance(raw_severities, list)
             or not raw_severities
@@ -494,6 +513,7 @@ def parse_delivery_config(value: Any) -> DeliveryConfig:
             labels=tuple(sorted(labels)),
             channel_ids=tuple(raw_channel_ids),
             continue_matching=continue_matching,
+            excluded_rule_ids=tuple(raw_excluded_rule_ids),
         ))
     return DeliveryConfig(
         channels=tuple(channels),
@@ -779,8 +799,9 @@ class DeliveryOutbox:
         channel: ChannelConfig,
         purpose: str,
         now: dt.datetime | float | int,
+        presentation: Mapping[str, Any] | None = None,
     ) -> str:
-        prepared = self._prepare_enqueue(event, channel, purpose, _epoch(now))
+        prepared = self._prepare_enqueue(event, channel, purpose, _epoch(now), presentation)
         with contextlib.closing(self._connect()) as connection:
             connection.execute("BEGIN IMMEDIATE")
             disposition = self._enqueue_prepared(connection, prepared)
@@ -794,7 +815,10 @@ class DeliveryOutbox:
         channel: ChannelConfig,
         purpose: str,
         created_at: float,
+        presentation: Mapping[str, Any] | None = None,
     ) -> tuple[dict[str, Any], ChannelConfig, str, str, str, int, float]:
+        if "wgang" in json.dumps(event, ensure_ascii=False).casefold():
+            raise ValueError("delivery target is excluded")
         normalized = normalize_event(event)
         if (
             not isinstance(purpose, str)
@@ -810,9 +834,19 @@ class DeliveryOutbox:
             "test": purpose == "test",
             "event": normalized,
         }
+        if presentation is not None:
+            payload_value["presentation"] = _normalize_presentation(presentation)
         payload_json = json.dumps(
             payload_value, ensure_ascii=False, separators=(",", ":"), allow_nan=False,
         )
+        if (len(payload_json.encode("utf-8")) > MAX_PAYLOAD_BYTES
+                and "visual" in payload_value.get("presentation", {})):
+            # Visuals are optional; never lose the complete text alert to the
+            # existing SQLite/envelope cap. No schema migration is required.
+            del payload_value["presentation"]["visual"]
+            payload_json = json.dumps(
+                payload_value, ensure_ascii=False, separators=(",", ":"), allow_nan=False,
+            )
         if len(payload_json.encode("utf-8")) > MAX_PAYLOAD_BYTES:
             raise ValueError("delivery payload exceeds its byte limit")
         severity_priority = {"info": 100, "warning": 200, "critical": 300}[normalized["severity"]]
@@ -827,17 +861,41 @@ class DeliveryOutbox:
         self,
         connection: sqlite3.Connection,
         prepared: tuple[dict[str, Any], ChannelConfig, str, str, str, int, float],
+        *, retry_dropped: bool = False,
     ) -> str:
         normalized, channel, purpose, delivery_key, payload_json, priority, created_at = prepared
         event_key = normalized["idempotencyKey"]
-        if connection.execute(
-            """SELECT 1 FROM outbox WHERE delivery_key = ?
-               UNION ALL
-               SELECT 1 FROM delivery_log WHERE delivery_key = ?
-               LIMIT 1""",
-            (delivery_key, delivery_key),
-        ).fetchone() is not None:
-            return "deduplicated"
+        previous = connection.execute(
+            "SELECT state,attempts,last_error_code FROM outbox WHERE delivery_key=?", (delivery_key,),
+        ).fetchone()
+        audit = connection.execute(
+            "SELECT outcome,attempt FROM delivery_log WHERE delivery_key=? ORDER BY id DESC LIMIT 1",
+            (delivery_key,),
+        ).fetchone()
+        never_sent_drop = (
+            previous is not None and previous["state"] == "dropped" and previous["attempts"] == 0
+            and previous["last_error_code"] in {"queue_full", "queue_evicted"}
+        ) or (previous is None and audit is not None and audit["attempt"] == 0
+              and audit["outcome"] in {"dropped", "evicted"})
+        if previous is not None or audit is not None:
+            if not retry_dropped or not never_sent_drop:
+                return "deduplicated"
+            active = connection.execute(
+                "SELECT count(*) FROM outbox WHERE state IN ('pending','retry','leased')"
+            ).fetchone()[0]
+            if active >= self.queue.max_pending:
+                return "dropped"
+            if previous is not None:
+                connection.execute(
+                    """UPDATE outbox SET state='pending',payload_json=?,next_attempt_at=?,updated_at=?,
+                       completed_at=NULL,last_error_code=NULL WHERE delivery_key=? AND state='dropped' AND attempts=0""",
+                    (payload_json, created_at, created_at, delivery_key),
+                )
+                self._increment(connection, f"{purpose}_enqueued")
+                self._increment(connection, "queue_readmitted")
+                return "enqueued"
+            # Only a never-sent queue drop remains in bounded audit retention.
+            # Reinsert the same identity, preserving its attempt-0 drop audit.
         active_count = int(connection.execute(
             "SELECT count(*) FROM outbox WHERE state IN ('pending','retry','leased')"
         ).fetchone()[0])
@@ -860,7 +918,10 @@ class DeliveryOutbox:
                     """INSERT INTO delivery_log(
                        delivery_key,channel_id,purpose,attempt,started_at,finished_at,
                        outcome,status_code,error_code
-                       ) VALUES(?,?,?,?,?,?,?,?,?)""",
+                       ) VALUES(?,?,?,?,?,?,?,?,?)
+                       ON CONFLICT(delivery_key,attempt) DO UPDATE SET
+                           started_at=excluded.started_at,finished_at=excluded.finished_at,
+                           outcome=excluded.outcome,error_code=excluded.error_code""",
                     (
                         victim["delivery_key"], victim["channel_id"], victim["purpose"],
                         0, created_at, created_at,
@@ -1185,6 +1246,8 @@ def _event_time(value: Any) -> dt.datetime | None:
 
 
 def route_channels(config: DeliveryConfig, event: Mapping[str, Any]) -> tuple[ChannelConfig, ...]:
+    if "wgang" in json.dumps(event, ensure_ascii=False).casefold():
+        return ()
     normalized = normalize_event(event)
     if (
         normalized["notificationState"] != "ready"
@@ -1199,6 +1262,7 @@ def route_channels(config: DeliveryConfig, event: Mapping[str, Any]) -> tuple[Ch
         if (
             normalized["severity"] not in route.severities
             or normalized["transition"] not in route.transitions
+            or normalized["ruleId"] in route.excluded_rule_ids
             or any(event_labels.get(key) != value for key, value in route.labels)
         ):
             continue
@@ -1222,6 +1286,9 @@ def enqueue_operational_events(
     counts = {"enqueued": 0, "deduplicated": 0, "dropped": 0, "skipped": 0}
     eligible: list[dict[str, Any]] = []
     for raw in events:
+        if "wgang" in json.dumps(raw, ensure_ascii=False).casefold():
+            counts["skipped"] += 1
+            continue
         event = normalize_event(raw)
         observed_at = _event_time(event["observedAt"])
         if (
@@ -1274,6 +1341,7 @@ def enqueue_test_delivery(
     request_id: str,
     message: str,
     now: dt.datetime,
+    presentation: Mapping[str, Any] | None = None,
 ) -> tuple[str, str, str]:
     channel = config.channel(channel_id)
     if channel is None or not channel.enabled:
@@ -1303,15 +1371,36 @@ def enqueue_test_delivery(
         "description": normalized_message,
         "runbook": "This is a delivery test and does not create or update an incident.",
     }
-    disposition = outbox.enqueue(event, channel, "test", timestamp)
+    disposition = outbox.enqueue(event, channel, "test", timestamp, presentation)
     return disposition, event_key, delivery_identity(event_key, channel_id, "test")
+
+
+def _normalize_presentation(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping) or set(value) not in (
+        {"subject", "body"}, {"subject", "body", "visual"},
+    ):
+        raise ValueError("delivery presentation is invalid")
+    subject = _string(value.get("subject"), "delivery subject", 180)
+    body = value.get("body")
+    if (
+        re.search(r"[\x00-\x1f\x7f]", subject)
+        or not isinstance(body, str) or not body or len(body.encode("utf-8")) > 10000
+        or re.search(r"[\x00-\x08\x0b-\x1f\x7f]", body)
+        or "wgang" in (subject + body).casefold()
+    ):
+        raise ValueError("delivery presentation is invalid")
+    result = {"subject": subject, "body": body}
+    if "visual" in value:
+        result["visual"] = email_visuals.normalize_visual(value["visual"])
+    return result
 
 
 def _validated_payload(task: DeliveryTask) -> dict[str, Any]:
     value = task.payload
-    if not isinstance(value, Mapping) or frozenset(value) != {
-        "schemaVersion", "purpose", "test", "event",
-    }:
+    base_fields = {"schemaVersion", "purpose", "test", "event"}
+    if not isinstance(value, Mapping) or set(value) not in (
+        base_fields, base_fields | {"presentation"},
+    ):
         raise ValueError("delivery payload is corrupt")
     if (
         value.get("schemaVersion") != 1
@@ -1320,17 +1409,24 @@ def _validated_payload(task: DeliveryTask) -> dict[str, Any]:
     ):
         raise ValueError("delivery payload is corrupt")
     event = normalize_event(value.get("event"))
+    if "wgang" in json.dumps(event, ensure_ascii=False).casefold():
+        raise ValueError("delivery target is excluded")
     if event["idempotencyKey"] != task.event_key:
         raise ValueError("delivery payload identity is corrupt")
-    return {
+    result = {
         "schemaVersion": 1,
         "purpose": task.purpose,
         "test": task.purpose == "test",
         "event": event,
     }
+    if "presentation" in value:
+        result["presentation"] = _normalize_presentation(value["presentation"])
+    return result
 
 
 def _message_text(payload: Mapping[str, Any]) -> str:
+    if "presentation" in payload:
+        return payload["presentation"]["body"]
     event = payload["event"]
     marker = "[TEST]" if payload["test"] else "[ALERT]"
     transition = "FIRING" if event["transition"] == "firing" else "RESOLVED"
@@ -1782,6 +1878,41 @@ def _classify_smtp_recipient_refusals(
     )
 
 
+def build_smtp_message(
+    channel: ChannelConfig, payload: Mapping[str, Any], delivery_key: str,
+) -> email.message.EmailMessage:
+    """Compose frozen queue data without credentials, files or network access."""
+    message = email.message.EmailMessage()
+    event = payload["event"]
+    prefix = "[TEST]" if payload["test"] else "[ALERT]"
+    message["Subject"] = (
+        payload["presentation"]["subject"] if "presentation" in payload else
+        f"{prefix} {event['severity']} {event['ruleId']} {event['transition']}"
+    )
+    message["From"] = channel.settings["from"]
+    message["To"] = ", ".join(channel.settings["to"])
+    message["Message-ID"] = f"<monitor.{delivery_key}@localhost>"
+    message["X-Monitor-Idempotency-Key"] = delivery_key
+    message.set_content(_message_text(payload))
+    try:
+        html_body, images = email_visuals.render_email(payload, delivery_key)
+        if len(html_body.encode("utf-8")) > 60 * 1024 or len(images) > 2:
+            raise ValueError("visual email exceeds its bounds")
+        if any(not isinstance(content_id, str) or re.fullmatch(r"[A-Za-z0-9._@-]{1,160}", content_id) is None
+               or not isinstance(data, bytes) or not data.startswith(b"\x89PNG\r\n\x1a\n")
+               or len(data) > 200 * 1024 for content_id, data in images):
+            raise ValueError("visual chart exceeds its bounds")
+        message.add_alternative(html_body, subtype="html")
+        html_part = message.get_payload()[-1]
+        for content_id, data in images:
+            html_part.add_related(data, maintype="image", subtype="png", cid=f"<{content_id}>", disposition="inline")
+    except (ValueError, TypeError, KeyError, OverflowError):
+        # Preserve the original alert when optional visual rendering is invalid.
+        message.clear_content()
+        message.set_content(_message_text(payload))
+    return message
+
+
 class SmtpAdapter:
     def __init__(
         self,
@@ -1793,15 +1924,7 @@ class SmtpAdapter:
 
     def send(self, channel: ChannelConfig, task: DeliveryTask, payload: Mapping[str, Any], secret: str) -> DeliveryResult:
         settings = channel.settings
-        message = email.message.EmailMessage()
-        event = payload["event"]
-        prefix = "[TEST]" if payload["test"] else "[ALERT]"
-        message["Subject"] = f"{prefix} {event['severity']} {event['ruleId']} {event['transition']}"
-        message["From"] = settings["from"]
-        message["To"] = ", ".join(settings["to"])
-        message["Message-ID"] = f"<monitor.{task.delivery_key}@localhost>"
-        message["X-Monitor-Idempotency-Key"] = task.delivery_key
-        message.set_content(_message_text(payload))
+        message = build_smtp_message(channel, payload, task.delivery_key)
         client: smtplib.SMTP | smtplib.SMTP_SSL | None = None
         try:
             if settings["tlsMode"] == "implicit":
@@ -2085,6 +2208,8 @@ def _cli_parser() -> argparse.ArgumentParser:
     test.add_argument("--channel", required=True)
     test.add_argument("--request-id", required=True)
     test.add_argument("--message", required=True)
+    test.add_argument("--preview-hourly", action="store_true", help="attach a read-only current hourly-report design preview")
+    test.add_argument("--data-dir", type=Path, default=Path("/var/lib/monitor-export"))
     subparsers.add_parser("status", help="print bounded queue counters without payloads")
     return parser
 
@@ -2102,9 +2227,18 @@ def run_cli(arguments: Sequence[str] | None = None) -> int:
                 max_runtime_seconds=values.max_runtime_seconds,
             )
         elif values.command == "test":
+            presentation = None
+            if values.preview_hourly:
+                try:
+                    from .notification_reports import build_hourly_presentation
+                except ImportError:
+                    from notification_reports import build_hourly_presentation
+                presentation = build_hourly_presentation(values.data_dir, dt.datetime.now(dt.timezone.utc))
+                presentation["subject"] = "[TEST · 디자인 미리보기] " + presentation["subject"]
+                presentation["body"] = "디자인 확인용 시험 보고서입니다. 새로운 장애를 만들지 않습니다.\n\n" + presentation["body"]
             disposition, event_key, delivery_key = enqueue_test_delivery(
                 outbox, config, values.channel, values.request_id,
-                values.message, dt.datetime.now(dt.timezone.utc),
+                values.message, dt.datetime.now(dt.timezone.utc), presentation,
             )
             result = {
                 "disposition": disposition,

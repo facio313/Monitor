@@ -104,6 +104,33 @@ def reduced_stats(read: str = "2026-08-30T12:01:00Z") -> dict[str, object]:
 
 
 class DockerTelemetryV3Tests(unittest.TestCase):
+    def test_memory_accounting_preserves_raw_and_only_subtracts_inactive_file_cache(self):
+        for key in ("inactive_file", "total_inactive_file"):
+            with self.subTest(cgroup_field=key):
+                stats = collector.reduce_container_stats({"memory_stats": {
+                    "usage": 980, "limit": 1000,
+                    "stats": {key: 270, "active_file": 500, "shmem": 150, "secret": "not-exported"},
+                }})
+                row = collector.container_from_api(raw_container(), "cks", stats, inspect=reduced_inspect())
+                self.assertEqual(row["memoryBytes"], 980)
+                self.assertEqual(row["memoryPercent"], 98)
+                self.assertEqual(row["memoryInactiveFileBytes"], 270)
+                self.assertEqual(row["memoryWorkingSetBytes"], 710)
+                self.assertNotIn("secret", json.dumps(stats))
+                self.assertEqual(collector.normalize_container_values([row])[0]["memoryWorkingSetBytes"], 710)
+
+    def test_unknown_or_invalid_cache_cannot_manufacture_low_usage(self):
+        for cache in (None, -1, 1001, True, "270"):
+            stats = collector.reduce_container_stats({"memory_stats": {
+                "usage": 980, "limit": 1000, "stats": {"inactive_file": cache},
+            }})
+            row = collector.container_from_api(raw_container(), "cks", stats, inspect=reduced_inspect())
+            self.assertEqual(row["memoryBytes"], 980)
+            self.assertIsNone(row["memoryWorkingSetBytes"])
+        row["memoryWorkingSetBytes"] = 0
+        with self.assertRaises(ValueError):
+            collector.normalize_container_values([row])
+
     def test_reviewed_mount_profile_requires_an_exact_complete_multiset(self) -> None:
         profile = (
             (
@@ -409,15 +436,12 @@ class DockerTelemetryV3Tests(unittest.TestCase):
         normalized = collector.normalize_container_values([row], NOW + dt.timedelta(seconds=60))
         self.assertEqual(normalized, [row])
         self.assertEqual(row["mountPolicyStatus"], "unknown")
-        v3_row = dict(row)
-        v3_row.pop("mountPolicyStatus")
+        v3_row = {key: row[key] for key in collector.CONTAINER_V3_FIELDS}
         v3_normalized = collector.normalize_container_values(
             [v3_row], NOW + dt.timedelta(seconds=60)
         )
         self.assertEqual(v3_normalized[0]["mountPolicyStatus"], "unknown")
-        legacy_row = dict(row)
-        legacy_row.pop("mountPolicyStatus")
-        legacy_row.pop("writableSensitiveBindMounted")
+        legacy_row = {key: row[key] for key in collector.CONTAINER_V3_LEGACY_FIELDS}
         legacy_normalized = collector.normalize_container_values(
             [legacy_row], NOW + dt.timedelta(seconds=60)
         )

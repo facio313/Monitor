@@ -9,6 +9,7 @@ import socket
 import ssl
 import stat
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -20,7 +21,9 @@ from ops.synthetic_probe import (
     parse_target,
     publish_output,
     probe_once,
+    probe_with_retry,
     resolve_public_addresses,
+    run_configured_probes,
 )
 
 
@@ -294,9 +297,121 @@ class SyntheticProbeTests(unittest.TestCase):
         self.assertIn("RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6", service)
         self.assertIn("MemoryMax=80M", service)
         self.assertIn("TimeoutStartSec=40s", service)
+        self.assertIn("TimeoutStopSec=5s", service)
+        self.assertIn("Type=oneshot", service)
+        self.assertIn("TasksMax=16", service)
         self.assertNotIn("User=root", service)
-        self.assertIn("OnUnitActiveSec=5min", timer)
+        self.assertIn("OnUnitActiveSec=1min", timer)
+        self.assertIn("AccuracySec=1s", timer)
+        self.assertIn("RandomizedDelaySec=0", timer)
         self.assertIn("Persistent=true", timer)
+
+    def test_transient_failures_retry_once_and_publish_only_final_sample_and_diagnostic(self):
+        for initial_status in ("dns", "timeout", "http"):
+            with self.subTest(initial_status=initial_status):
+                calls, sleeps, diagnostics = [], [], []
+                first = {"status": initial_status, "checkedAt": "first", "latencyMilliseconds": 5000}
+                final = {"status": "ok", "checkedAt": "second", "latencyMilliseconds": 42}
+
+                def attempt(probe, *, diagnostics, marker):
+                    calls.append((probe, marker))
+                    diagnostics.append({"id": probe.probe_id, "checkedAt": len(calls)})
+                    return first if len(calls) == 1 else final
+
+                result = probe_with_retry(self.probe(), probe_call=attempt, sleep=sleeps.append,
+                                          diagnostics=diagnostics, marker="forwarded")
+                self.assertIs(result, final)
+                self.assertEqual(len(calls), 2)
+                self.assertEqual(calls[0], calls[1])
+                self.assertEqual(sleeps, [2])
+                self.assertEqual(diagnostics, [{"id": "public", "checkedAt": 2}])
+
+    def test_retry_stops_after_second_failure_and_tls_or_policy_failures_are_immediate(self):
+        for initial_status in ("ok", "tls", "invalid", "permission", "unsupported", "timeout"):
+            with self.subTest(initial_status=initial_status):
+                calls, sleeps = [], []
+
+                def attempt(probe, *, diagnostics):
+                    self.assertIsNone(diagnostics)
+                    calls.append(probe)
+                    return {"status": initial_status}
+
+                result = probe_with_retry(self.probe(), probe_call=attempt, sleep=sleeps.append)
+                self.assertEqual(result["status"], initial_status)
+                self.assertEqual(len(calls), 2 if initial_status == "timeout" else 1)
+                self.assertEqual(sleeps, [2] if initial_status == "timeout" else [])
+
+    def test_retry_resolves_again_and_blocks_dns_rebinding_before_connect(self):
+        answers = iter(([answer()], [answer("169.254.169.254")]))
+        connections, sleeps, diagnostics = [], [], []
+
+        def socket_factory(*_args):
+            connection = FakeSocket(b"HTTP/1.1 503 Unavailable\r\n\r\n")
+            connections.append(connection)
+            return connection
+
+        result = probe_with_retry(
+            self.probe(), resolver=lambda *_args: next(answers), socket_factory=socket_factory,
+            ssl_context_factory=FakeTlsContext, environment={}, now=lambda: NOW,
+            sleep=sleeps.append, diagnostics=diagnostics,
+        )
+        self.assertEqual(result["status"], "invalid")
+        self.assertEqual(len(connections), 1)
+        self.assertTrue(connections[0].closed)
+        self.assertEqual(sleeps, [2])
+        self.assertEqual(len(diagnostics), 1)
+        self.assertEqual(diagnostics[0]["status"], "invalid")
+        self.assertEqual(diagnostics[0]["errorPhase"], "dns")
+        self.assertNotIn("169.254.169.254", json.dumps(diagnostics))
+        self.assertEqual(build_public_document([result])["results"][0], result)
+
+    def test_retry_recovery_keeps_final_certificate_and_exact_public_schema(self):
+        responses = iter((b"HTTP/1.1 503 Unavailable\r\n\r\n", b"HTTP/1.1 200 OK\r\n\r\n"))
+        diagnostics, resolver_calls, sleeps = [], [], []
+
+        def resolver(*args):
+            resolver_calls.append(args)
+            return [answer()]
+
+        result = probe_with_retry(
+            self.probe(), resolver=resolver, socket_factory=lambda *_args: FakeSocket(next(responses)),
+            ssl_context_factory=FakeTlsContext, environment={}, now=lambda: NOW,
+            sleep=sleeps.append, diagnostics=diagnostics,
+        )
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["certificateExpiresAt"], "2030-01-01T00:00:00Z")
+        self.assertEqual(len(resolver_calls), 2)
+        self.assertEqual(sleeps, [2])
+        self.assertEqual(len(diagnostics), 1)
+        self.assertEqual(diagnostics[0]["status"], "ok")
+        self.assertEqual(build_public_document([result])["results"][0], result)
+
+    def test_configured_runner_preserves_order_and_bounds_concurrency_during_retries(self):
+        probes = [Probe(f"check-{index}", "https://public.example/", 200, 5, 0) for index in range(8)]
+        lock = threading.Lock()
+        barrier = threading.Barrier(4)
+        attempts, active, peak = {}, 0, 0
+
+        def attempt(probe, *, diagnostics):
+            nonlocal active, peak
+            self.assertIsNone(diagnostics)
+            with lock:
+                active += 1
+                peak = max(peak, active)
+                attempts[probe.probe_id] = attempts.get(probe.probe_id, 0) + 1
+                number = attempts[probe.probe_id]
+            # Four configured jobs enter together, both on the first attempt
+            # and the retry. A fifth worker would exceed the asserted bound.
+            barrier.wait(timeout=5)
+            with lock:
+                active -= 1
+            return {"id": probe.probe_id, "status": "timeout" if number == 1 else "ok"}
+
+        results = run_configured_probes(probes, probe_call=attempt, sleep=lambda _seconds: None)
+        self.assertEqual([row["id"] for row in results], [probe.probe_id for probe in probes])
+        self.assertTrue(all(row["status"] == "ok" for row in results))
+        self.assertEqual(peak, 4)
+        self.assertEqual(set(attempts.values()), {2})
 
 
 if __name__ == "__main__":

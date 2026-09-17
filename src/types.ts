@@ -144,6 +144,15 @@ export interface LinuxDiagnostics {
       outgoingSegmentsPerSecond: number | null;
       retransmittedSegmentsPerSecond: number | null;
       retransmissionPercent: number | null;
+      assessment?: {
+        status: 'ok' | 'insufficient_samples' | 'stale';
+        observedAt: string | null;
+        retransmissionPercent: number | null;
+        sampleCount: number;
+        windowSeconds: number;
+        outboundSegmentsDelta: number;
+        retransmittedSegmentsDelta: number;
+      } | null;
       states: {
         established: number;
         synSent: number;
@@ -531,7 +540,18 @@ export interface SystemKernelStatus {
   pcieAerFatal: SystemEventCount;
 }
 
+export interface SystemRebootStatus {
+  status: 'ok' | 'unavailable' | 'permission-denied' | 'collection-error';
+  required: boolean | null;
+  observedAt: string | null;
+  packages: string[];
+  packagesStatus: 'ok' | 'unavailable' | 'permission-denied' | 'collection-error';
+  packagesTruncated: boolean;
+}
+
 export interface SystemStatus {
+  /** Optional only for compatibility with snapshots from older collectors. */
+  reboot?: SystemRebootStatus;
   versions: SystemVersions;
   pcie: SystemPcieStatus;
   kernel: SystemKernelStatus;
@@ -630,6 +650,8 @@ export interface ContainerStatus {
   memoryBytes: number | null;
   memoryPercent: number | null;
   memoryLimitBytes?: number | null;
+  memoryInactiveFileBytes?: number | null;
+  memoryWorkingSetBytes?: number | null;
   cpuLimitCores?: number | null;
   pidLimit?: number | null;
   restartCount?: number | null;

@@ -35,6 +35,9 @@ from typing import Any, Mapping, Sequence
 from generic_log_collector import collect_generic_logs
 from linux_telemetry import collect_linux_telemetry
 from monitoring_catalog import MAX_CATALOG_BYTES, build_monitoring_catalog
+from network_diagnostics import record_network_diagnostics
+from notification_reports import produce_notifications
+from security_signals import prepare_notification_current
 
 
 DEFAULT_RULE_PACK_PATH = Path(__file__).resolve().parent / "rules" / "default-rules.v1.json"
@@ -162,7 +165,7 @@ CONTAINER_V2_FIELDS = (
     "cpuPercent", "memoryBytes", "memoryPercent", "memoryLimitBytes", "cpuLimitCores",
     "pidLimit", "restartCount", "restartCountDelta", "oomKilled", "startedAt", "finishedAt",
 )
-CONTAINER_FIELDS = CONTAINER_V2_FIELDS + (
+CONTAINER_V4_FIELDS = CONTAINER_V2_FIELDS + (
     "instanceId", "pidCount", "cpuThrottledPercent", "cpuThrottledPeriods",
     "cpuThrottledSeconds", "blockReadBytes", "blockWriteBytes",
     "blockReadBytesPerSecond", "blockWriteBytesPerSecond", "networkRxBytes",
@@ -176,8 +179,9 @@ CONTAINER_FIELDS = CONTAINER_V2_FIELDS + (
     "imageDigest", "imageDigestSource", "usesLatestTag", "imageDigestDrift",
     "imageDigestChanged", "mountPolicyStatus",
 )
+CONTAINER_FIELDS = CONTAINER_V4_FIELDS + ("memoryInactiveFileBytes", "memoryWorkingSetBytes")
 CONTAINER_V3_FIELDS = tuple(
-    field_name for field_name in CONTAINER_FIELDS
+    field_name for field_name in CONTAINER_V4_FIELDS
     if field_name != "mountPolicyStatus"
 )
 CONTAINER_V3_LEGACY_FIELDS = tuple(
@@ -256,9 +260,9 @@ ALLOWED_COMPOSE_SERVICES = {
     ("dukkeobi", "dukkeobi"): "dukkeobi",
     ("react", "react"): "react",
     ("vue", "vue"): "vue",
-    ("pongdang-multtara", "backend"): "multtara-backend",
-    ("pongdang-multtara", "collector"): "multtara-collector",
-    ("pongdang-multtara", "frontend"): "multtara-frontend",
+    ("pongdang", "backend"): "pongdang-backend",
+    ("pongdang", "db"): "pongdang-db",
+    ("pongdang", "frontend"): "pongdang-frontend",
 }
 
 # These are the reviewed production host-storage contracts. Raw paths and
@@ -314,6 +318,15 @@ CURRENT_CONTAINER_PROJECTS = {
     public_name: project
     for (project, _service), public_name in ALLOWED_COMPOSE_SERVICES.items()
 }
+# Multtara was archived when the independent Pongdang stack replaced it. Keep
+# its exact historical provenance readable without querying its Docker project
+# or admitting new observations for its retired services.
+RETIRED_CONTAINER_PROJECTS = {
+    "multtara-backend": "pongdang-multtara",
+    "multtara-collector": "pongdang-multtara",
+    "multtara-frontend": "pongdang-multtara",
+}
+SAFE_CONTAINER_PROJECTS = CURRENT_CONTAINER_PROJECTS | RETIRED_CONTAINER_PROJECTS
 LEGACY_CONTAINER_SERVICE_NAMES = frozenset({
     "bonifacio-web",
     "bonifacio-sso",
@@ -324,7 +337,7 @@ LEGACY_CONTAINER_SERVICE_NAMES = frozenset({
     # The standalone PostgreSQL service is forbidden in the live cksDB
     # topology, but retained snapshots/incidents must remain readable.
     "multtara-database",
-})
+}) | frozenset(RETIRED_CONTAINER_PROJECTS)
 # Previous exporters emitted app-level traffic labels, ``cks-workload``, or the
 # superseded service labels above. Keep every prior value readable for retained
 # snapshots/incidents, but never assign one to a new Docker observation.
@@ -1746,9 +1759,69 @@ def pcie_power_settings(proc_root: Path, sys_root: Path) -> tuple[bool | None, b
     return aspm_disabled, nvme_power_disabled
 
 
+def collect_reboot_status(run_root: Path, now: dt.datetime) -> dict[str, Any]:
+    """Read the OS reboot marker without exporting free-form marker contents."""
+    result: dict[str, Any] = {
+        "status": "unavailable", "required": None,
+        "observedAt": iso_timestamp(now), "packages": [],
+        "packagesStatus": "unavailable", "packagesTruncated": False,
+    }
+    root_fd: int | None = None
+    try:
+        root_fd = os.open(run_root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            marker = os.stat("reboot-required", dir_fd=root_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            result.update(status="ok", required=False, packagesStatus="ok")
+            return result
+        if not stat.S_ISREG(marker.st_mode):
+            result["status"] = "collection-error"
+            return result
+        result.update(status="ok", required=True)
+        try:
+            descriptor = os.open(
+                "reboot-required.pkgs", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                dir_fd=root_fd,
+            )
+            with os.fdopen(descriptor, "rb") as handle:
+                if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                    result["packagesStatus"] = "collection-error"
+                    return result
+                raw = handle.read(8193)
+            lines = raw[:8192].decode("ascii").splitlines()
+            if len(raw) > 8192:
+                # The last bounded line may have been cut mid-package.
+                lines = lines[:-1]
+            packages = sorted(set(line.strip() for line in lines if line.strip()))
+            if any(re.fullmatch(r"[a-z0-9][a-z0-9+.-]{0,127}(?::[a-z0-9][a-z0-9-]{0,31})?", name) is None for name in packages):
+                result["packagesStatus"] = "collection-error"
+                return result
+            result.update(
+                packages=packages[:64], packagesStatus="ok",
+                packagesTruncated=len(raw) > 8192 or len(packages) > 64,
+            )
+        except FileNotFoundError:
+            pass
+        except PermissionError:
+            result["packagesStatus"] = "permission-denied"
+        except (OSError, UnicodeError):
+            result["packagesStatus"] = "collection-error"
+    except FileNotFoundError:
+        pass
+    except PermissionError:
+        result["status"] = "permission-denied"
+    except OSError:
+        result["status"] = "collection-error"
+    finally:
+        if root_fd is not None:
+            os.close(root_fd)
+    return result
+
+
 def collect_system(
     config: "Config",
     kernel_summary: Mapping[str, Mapping[str, Any]],
+    now: dt.datetime | None = None,
 ) -> dict[str, Any]:
     controller = first_nvme_controller(config.sys_root)
     device = controller / "device" if controller is not None else None
@@ -1775,6 +1848,7 @@ def collect_system(
     if normalized_kernel is None:
         normalized_kernel = empty_kernel_event_summary()
     return {
+        "reboot": collect_reboot_status(config.reboot_root, now or utc_now()),
         "versions": {
             "kernelRunning": kernel_running,
             "kernelLatestInstalled": kernel_latest,
@@ -2206,6 +2280,14 @@ def reduce_container_stats(value: Mapping[str, Any]) -> dict[str, Any]:
     limit = bounded_integer(raw_memory.get("limit"), 0, MAX_CONTAINER_MEMORY_LIMIT_BYTES)
     if usage is not None or limit is not None:
         reduced["memory_stats"] = {"usage": usage, "limit": limit}
+        counters = raw_memory.get("stats")
+        if isinstance(counters, Mapping):
+            # Docker CLI semantics: subtract only inactive file cache. Shared
+            # memory and active file pages remain in the working-set estimate.
+            cache_key = "total_inactive_file" if "total_inactive_file" in counters else "inactive_file"
+            cache = bounded_integer(counters.get(cache_key), 0, MAX_CONTAINER_MEMORY_LIMIT_BYTES)
+            if usage is not None and cache is not None and cache <= usage:
+                reduced["memory_stats"]["inactive_file"] = cache
     raw_pids = value.get("pids_stats") if isinstance(value.get("pids_stats"), Mapping) else {}
     reduced["pids_stats"] = {
         "current": bounded_integer(raw_pids.get("current"), 0, MAX_CONTAINER_PID_LIMIT),
@@ -2888,6 +2970,8 @@ def container_from_api(
 
     memory_bytes: int | None = None
     memory_percent: float | None = None
+    memory_inactive_file: int | None = None
+    memory_working_set: int | None = None
     cpu_percent: float | None = None
     if isinstance(stats, Mapping):
         memory = stats.get("memory_stats") if isinstance(stats.get("memory_stats"), dict) else {}
@@ -2898,6 +2982,10 @@ def container_from_api(
             if raw_memory_bytes is not None and 0 <= raw_memory_bytes <= MAX_CONTAINER_MEMORY_LIMIT_BYTES
             else None
         )
+        cache = bounded_integer(memory.get("inactive_file"), 0, MAX_CONTAINER_MEMORY_LIMIT_BYTES)
+        if memory_bytes is not None and cache is not None and cache <= memory_bytes:
+            memory_inactive_file = cache
+            memory_working_set = memory_bytes - cache
         effective_memory_limit = (
             int(raw_memory_limit)
             if raw_memory_limit is not None and 0 < raw_memory_limit <= MAX_CONTAINER_MEMORY_LIMIT_BYTES
@@ -3106,6 +3194,8 @@ def container_from_api(
         "imageDigestDrift": False if image_digest is not None else None,
         "imageDigestChanged": image_digest_changed,
         "mountPolicyStatus": mount_policy_status,
+        "memoryInactiveFileBytes": memory_inactive_file,
+        "memoryWorkingSetBytes": memory_working_set,
     }
 
 
@@ -3557,8 +3647,8 @@ def normalize_public_docker_event(value: Any, not_after: dt.datetime) -> dict[st
         not isinstance(event_id, str) or re.fullmatch(r"[a-f0-9]{32}", event_id) is None
         or occurred is None or occurred > not_after + dt.timedelta(seconds=60)
         or action not in DOCKER_EVENT_ACTIONS
-        or name not in CURRENT_CONTAINER_NAMES
-        or project != CURRENT_CONTAINER_PROJECTS.get(str(name))
+        or name not in SAFE_CONTAINER_PROJECTS
+        or project != SAFE_CONTAINER_PROJECTS.get(str(name))
         or not isinstance(instance_id, str) or re.fullmatch(r"[a-f0-9]{32}", instance_id) is None
         or (exit_code is not None and bounded_integer(exit_code, 0, 2_147_483_647) is None)
         or (health is not None and health not in DOCKER_EVENT_HEALTH_STATES)
@@ -3706,8 +3796,9 @@ def normalize_container_values(
         v2 = fields == set(CONTAINER_V2_FIELDS)
         v3_legacy = fields == set(CONTAINER_V3_LEGACY_FIELDS)
         v3 = fields == set(CONTAINER_V3_FIELDS)
-        v4 = fields == set(CONTAINER_FIELDS)
-        extended = v3_legacy or v3 or v4
+        v4 = fields == set(CONTAINER_V4_FIELDS)
+        v5 = fields == set(CONTAINER_FIELDS)
+        extended = v3_legacy or v3 or v4 or v5
         if not legacy and not v2 and not extended:
             raise ValueError("container telemetry workload has unexpected fields")
         name = value.get("name")
@@ -3729,11 +3820,8 @@ def normalize_container_values(
         # migrate it as unknown and preserve that null in subsequent last-known
         # v2 snapshots. Fresh observations always carry the fixed allowlist value.
         project = None if legacy else value.get("project")
-        expected_project = CURRENT_CONTAINER_PROJECTS.get(str(name))
-        if (
-            (project is not None and project != expected_project)
-            or (project is not None and project not in ALLOWED_COMPOSE_PROJECTS)
-        ):
+        expected_project = SAFE_CONTAINER_PROJECTS.get(str(name))
+        if project is not None and project != expected_project:
             raise ValueError("container telemetry workload has an invalid Compose project")
 
         cpu_percent = normalized_bounded_number(value.get("cpuPercent"), 0, MAX_CONTAINER_CPU_PERCENT)
@@ -3820,6 +3908,18 @@ def normalize_container_values(
             "startedAt": normalized_times["startedAt"],
             "finishedAt": normalized_times["finishedAt"],
         }
+        if extended:
+            normalized.update(memoryInactiveFileBytes=None, memoryWorkingSetBytes=None)
+        if v5:
+            cache = value.get("memoryInactiveFileBytes")
+            working_set = value.get("memoryWorkingSetBytes")
+            if (cache is None) != (working_set is None) or (cache is not None and (
+                bounded_integer(cache, 0, MAX_CONTAINER_MEMORY_LIMIT_BYTES) is None
+                or bounded_integer(working_set, 0, MAX_CONTAINER_MEMORY_LIMIT_BYTES) is None
+                or memory_bytes is None or cache + working_set != memory_bytes
+            )):
+                raise ValueError("container telemetry workload has inconsistent memory accounting")
+            normalized.update(memoryInactiveFileBytes=cache, memoryWorkingSetBytes=working_set)
         if extended:
             def optional_integer(field_name: str, maximum: int) -> int | None:
                 source = value.get(field_name)
@@ -3982,7 +4082,7 @@ def normalize_container_values(
                 "imageDigest": image_digest,
                 "imageDigestSource": image_digest_source,
             })
-            if v4:
+            if v4 or v5:
                 mount_policy_status = value.get("mountPolicyStatus")
                 if mount_policy_status not in MOUNT_POLICY_STATUSES:
                     raise ValueError(
@@ -7015,6 +7115,7 @@ class Config:
     sys_root: Path = Path("/sys")
     etc_root: Path = Path("/etc")
     package_root: Path = Path("/")
+    reboot_root: Path = Path("/run")
     mountinfo: Path | None = None
     mount_root: Path | None = None
     events_log: Path = Path("/var/log/server-watch/events.log")
@@ -7084,6 +7185,7 @@ def config_from_environment(arguments: Sequence[str] | None = None) -> Config:
     parser.add_argument("--sys-root", default=env.get("MONITOR_SYS_ROOT", "/sys"))
     parser.add_argument("--etc-root", default=env.get("MONITOR_ETC_ROOT", "/etc"))
     parser.add_argument("--package-root", default=env.get("MONITOR_PACKAGE_ROOT", "/"))
+    parser.add_argument("--reboot-root", default=env.get("MONITOR_REBOOT_ROOT", "/run"))
     parser.add_argument("--mountinfo", default=env.get("MONITOR_MOUNTINFO"))
     parser.add_argument("--mount-root", default=env.get("MONITOR_MOUNT_ROOT"))
     parser.add_argument("--events-log", default=env.get("MONITOR_EVENTS_LOG", "/var/log/server-watch/events.log"))
@@ -7236,6 +7338,7 @@ def config_from_environment(arguments: Sequence[str] | None = None) -> Config:
         output_dir=Path(values.output_dir), runtime_dir=Path(values.runtime_dir),
         proc_root=Path(values.proc_root), sys_root=Path(values.sys_root), etc_root=Path(values.etc_root),
         package_root=Path(values.package_root),
+        reboot_root=Path(values.reboot_root),
         mountinfo=Path(values.mountinfo) if values.mountinfo else None,
         mount_root=Path(values.mount_root) if values.mount_root else None,
         events_log=Path(values.events_log), kernel_log=Path(values.kernel_log),
@@ -7895,7 +7998,7 @@ def run(config: Config, now: dt.datetime | None = None) -> dict[str, Any]:
         reliability, kernel_summary = collect_reliability(
             config, now, uptime_seconds, include_kernel_summary=True
         )
-        system = collect_system(config, kernel_summary)
+        system = collect_system(config, kernel_summary, now)
         linux, linux_delta_state = collect_linux_telemetry(
             proc_root=config.proc_root,
             sys_root=config.sys_root,
@@ -7944,7 +8047,33 @@ def run(config: Config, now: dt.datetime | None = None) -> dict[str, Any]:
         # The strict public snapshot schema has no GPU object. GPU temperature,
         # supply voltage, and throttle flags contribute only to the safe latest
         # sample; power transitions go to the bounded semantic event exports.
+        qualified_current, tcp_window_state = prepare_notification_current(current, now, prior.get("tcpWindow"))
+        qualified_tcp = qualified_current["linux"]["tcp"]
+        # Publish the same bounded assessment used by mail, preserving the raw
+        # instantaneous rate/counters for diagnostics and charts.
+        linux["tcp"]["assessment"] = {
+            "status": "ok" if qualified_tcp.get("rateStatus") == "ok" else "insufficient_samples",
+            "observedAt": linux.get("collectedAt"),
+            "retransmissionPercent": qualified_tcp.get("retransmissionPercent"),
+            **qualified_tcp.get("notificationWindow", {}),
+        }
         atomic_write_json(config.output_dir / "current.json", current)
+        try:
+            record_network_diagnostics(
+                config.output_dir,
+                metrics=latest,
+                pressure=pressure,
+                proc_root=config.proc_root,
+                diagnostic_input=(
+                    config.synthetic_input.with_name("diagnostics.json")
+                    if config.synthetic_input is not None else None
+                ),
+                now=now,
+            )
+        except (OSError, ValueError):
+            # Retain the last bounded evidence and let its timestamp expire;
+            # failure of one diagnostic store must not stop host telemetry.
+            print("monitor-network-diagnostics: collection failed", file=sys.stderr)
         history_dir = config.output_dir / "history"
         history_path = history_dir / f"{now.date().isoformat()}.jsonl"
         history_records = [
@@ -8006,6 +8135,7 @@ def run(config: Config, now: dt.datetime | None = None) -> dict[str, Any]:
             "dockerEvents": docker_event_state,
             "processes": process_cpu_state,
             "linux": linux_delta_state,
+            "tcpWindow": tcp_window_state,
             "notificationFinalFailures": prior_notification_counter,
             "incident": incident_state,
         }
@@ -8019,6 +8149,14 @@ def run(config: Config, now: dt.datetime | None = None) -> dict[str, Any]:
             delta_state,
             notification_counter,
         )
+        try:
+            produce_notifications(config.output_dir, now, current=current, traffic_available=traffic_available)
+        except Exception:
+            # No message or credential from an optional channel is logged.
+            atomic_write_json(config.output_dir / "notification-reports.json", {
+                "schemaVersion": 1, "observedAt": now_text, "status": "error",
+            })
+            print("monitor-notification-reports: production failed", file=sys.stderr)
         publish_monitoring_catalog(config, now)
         return current
 

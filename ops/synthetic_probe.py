@@ -44,6 +44,7 @@ MAX_DNS_RESULTS = 16
 MAX_RESPONSE_HEADER_BYTES = 16 * 1024
 MAX_RESPONSE_BODY_BYTES = 0
 MAX_OUTPUT_BYTES = 256 * 1024
+TRANSIENT_RETRY_DELAY_SECONDS = 2
 _PROBE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
 _PROXY_ENVIRONMENT_KEYS = (
     "http_proxy", "https_proxy", "all_proxy", "no_proxy",
@@ -51,6 +52,7 @@ _PROXY_ENVIRONMENT_KEYS = (
 )
 _STATUS = frozenset({"ok", "dns", "permission", "timeout", "tls", "http", "invalid", "unsupported"})
 _REDIRECT_STATUS = frozenset({301, 302, 303, 307, 308})
+_TRANSIENT_RETRY_STATUS = frozenset({"dns", "timeout", "http"})
 
 
 class SyntheticProbeError(ValueError):
@@ -228,7 +230,7 @@ def resolve_public_addresses(target: Target, resolver: Resolver = socket.getaddr
     except socket.gaierror as exc:
         raise SyntheticProbeError("dns") from exc
     except OSError as exc:
-        raise _classify_os_error(exc) from exc
+        raise SyntheticProbeError(_classify_os_error(exc)) from exc
     if not answers or len(answers) > MAX_DNS_RESULTS:
         raise SyntheticProbeError("dns")
     accepted: list[tuple[Any, ...]] = []
@@ -266,7 +268,7 @@ def _classify_os_error(exc: OSError) -> str:
     return "http"
 
 
-def _read_headers(connection: SocketLike) -> tuple[int, dict[str, str]]:
+def _read_headers(connection: SocketLike, on_first_byte: Callable[[], None] | None = None) -> tuple[int, dict[str, str]]:
     received = bytearray()
     while b"\r\n\r\n" not in received:
         if len(received) >= MAX_RESPONSE_HEADER_BYTES:
@@ -276,6 +278,8 @@ def _read_headers(connection: SocketLike) -> tuple[int, dict[str, str]]:
         chunk = connection.recv(1)
         if not chunk:
             raise SyntheticProbeError("http")
+        if not received and on_first_byte is not None:
+            on_first_byte()
         received.extend(chunk)
     header_block = bytes(received.split(b"\r\n\r\n", 1)[0])
     try:
@@ -334,23 +338,43 @@ def _request_once(
     socket_factory: SocketFactory,
     ssl_context_factory: Callable[[], ssl.SSLContext],
     now: Callable[[], float],
+    diagnostic: dict[str, Any] | None = None,
+    diagnostic_clock: Callable[[], float] = time.monotonic,
 ) -> tuple[int, dict[str, str], str | None, int | None]:
     # There is exactly one TCP connect per request.  It is preceded by a fresh
     # complete DNS validation; a failed connect is not retried against a stale
     # answer, which keeps the rebinding invariant simple and auditable.
+    phase_started = diagnostic_clock() if diagnostic is not None else 0.0
+
+    def phase(name: str) -> None:
+        nonlocal phase_started
+        if diagnostic is not None:
+            diagnostic["errorPhase"] = name
+            phase_started = diagnostic_clock()
+
+    def completed(name: str) -> None:
+        if diagnostic is not None:
+            diagnostic["timings"][name] = round(max(0, (diagnostic_clock() - phase_started) * 1000), 3)
+
+    phase("dns")
     family, socktype, _protocol, _canonical_name, sockaddr = resolve_public_addresses(target, resolver)[0]
+    completed("dnsMs")
     connection: SocketLike | None = None
     try:
+        phase("tcp")
         connection = socket_factory(family, socktype)
         connection.settimeout(timeout_seconds)
         # Pin the validated DNS sockaddr; do not pass target.host to connect.
         connection.connect(sockaddr)
+        completed("tcpMs")
         if target.scheme == "https":
+            phase("tls")
             try:
                 connection = ssl_context_factory().wrap_socket(connection, server_hostname=target.host)
                 connection.settimeout(timeout_seconds)
             except ssl.SSLError as exc:
                 raise SyntheticProbeError("tls") from exc
+            completed("tlsMs")
         request = (
             f"GET {target.target} HTTP/1.1\r\n"
             f"Host: {target.host_header}\r\n"
@@ -358,10 +382,18 @@ def _request_once(
             "Accept: */*\r\n"
             "Connection: close\r\n\r\n"
         ).encode("ascii")
+        phase("request")
         connection.sendall(request)
-        http_status, headers = _read_headers(connection)
+        phase("ttfb")
+
+        def first_byte() -> None:
+            completed("ttfbMs")
+            phase("headers")
+
+        http_status, headers = _read_headers(connection, first_byte if diagnostic is not None else None)
         # Redirect responses still receive normal TLS hostname verification, but
         # only the final response has certificate-expiry evidence retained.
+        phase("certificate")
         expiry, expiry_days = (
             _certificate_evidence(connection, now)
             if target.scheme == "https" and http_status not in _REDIRECT_STATUS
@@ -393,6 +425,8 @@ def probe_once(
     environment: Mapping[str, str] = os.environ,
     now: Callable[[], float] = time.time,
     monotonic: Callable[[], float] = time.monotonic,
+    diagnostics: list[dict[str, Any]] | None = None,
+    diagnostic_clock: Callable[[], float] = time.monotonic,
 ) -> dict[str, Any]:
     """Run one probe and return only bounded operational evidence."""
 
@@ -400,36 +434,52 @@ def probe_once(
     checked_at = _utc_now(now)
     current_url = probe.url
     redirects = 0
+    diagnostic = {"id": probe.probe_id, "checkedAt": checked_at, "errorPhase": "validation",
+                  "timings": {"dnsMs": None, "tcpMs": None, "tlsMs": None, "ttfbMs": None, "totalMs": None}}
+
+    def finish(result: dict[str, Any]) -> dict[str, Any]:
+        if diagnostics is not None:
+            diagnostic.update(status=result["status"], httpStatus=result["httpStatus"], redirectCount=redirects)
+            diagnostic["timings"]["totalMs"] = result["latencyMilliseconds"]
+            diagnostics.append(diagnostic)
+        return result
+
     try:
         if _proxies_present(environment):
             raise SyntheticProbeError("unsupported")
         while True:
+            diagnostic["errorPhase"] = "validation"
+            diagnostic["timings"] = {"dnsMs": None, "tcpMs": None, "tlsMs": None, "ttfbMs": None, "totalMs": None}
             target = parse_target(current_url)
             http_status, headers, expiry, expiry_days = _request_once(
                 target, probe.timeout_seconds, resolver=resolver, socket_factory=socket_factory,
                 ssl_context_factory=ssl_context_factory, now=now,
+                diagnostic=diagnostic if diagnostics is not None else None,
+                diagnostic_clock=diagnostic_clock,
             )
             if http_status not in _REDIRECT_STATUS:
                 category = "ok" if http_status == probe.expected_status else "http"
-                return {
+                diagnostic["errorPhase"] = None if category == "ok" else "http"
+                return finish({
                     "schemaVersion": SCHEMA_VERSION, "id": probe.probe_id, "status": category,
                     "checkedAt": checked_at, "url": target.url, "httpStatus": http_status,
                     "redirectCount": redirects,
                     "latencyMilliseconds": max(0, int((monotonic() - started) * 1000)),
                     "certificateExpiresAt": expiry, "certificateDaysRemaining": expiry_days,
-                }
+                })
+            diagnostic["errorPhase"] = "redirect"
             if redirects >= probe.max_redirects or not headers.get("location"):
                 raise SyntheticProbeError("http")
             redirects += 1
             current_url = urljoin(target.url, headers["location"])
     except SyntheticProbeError as exc:
-        return {
+        return finish({
             "schemaVersion": SCHEMA_VERSION, "id": probe.probe_id, "status": exc.category,
             "checkedAt": checked_at, "url": None, "httpStatus": None,
             "redirectCount": redirects,
             "latencyMilliseconds": max(0, int((monotonic() - started) * 1000)),
             "certificateExpiresAt": None, "certificateDaysRemaining": None,
-        }
+        })
 
 
 def load_config(path: Path, *, expected_uid: int | None = None) -> tuple[Probe, ...]:
@@ -464,16 +514,48 @@ def load_config(path: Path, *, expected_uid: int | None = None) -> tuple[Probe, 
     return tuple(probes)
 
 
+def probe_with_retry(
+    probe: Probe,
+    *,
+    sleep: Callable[[float], None] = time.sleep,
+    probe_call: Callable[..., dict[str, Any]] | None = None,
+    diagnostics: list[dict[str, Any]] | None = None,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    """Confirm a transient availability failure once before publication.
+
+    Every attempt uses the same SSRF-safe ``probe_once`` implementation, hence
+    resolves and validates DNS again instead of reusing an address or socket.
+    Certificate validation failures and policy/configuration errors are final
+    immediately. Only the final attempt's timestamp, latency and diagnostic are
+    published: a retry is not a second independent periodic observation, and
+    the backoff must not be misreported as application response latency.
+
+    The service retains its independent 40-second process deadline, including
+    DNS calls and slow response headers that socket timeouts alone cannot bound.
+    """
+    attempt = probe_once if probe_call is None else probe_call
+    final_diagnostics: list[dict[str, Any]] | None = [] if diagnostics is not None else None
+    result = attempt(probe, diagnostics=final_diagnostics, **kwargs)
+    if result["status"] in _TRANSIENT_RETRY_STATUS:
+        sleep(TRANSIENT_RETRY_DELAY_SECONDS)
+        final_diagnostics = [] if diagnostics is not None else None
+        result = attempt(probe, diagnostics=final_diagnostics, **kwargs)
+    if diagnostics is not None:
+        diagnostics.extend(final_diagnostics or [])
+    return result
+
+
 def run_configured_probes(
     probes: Sequence[Probe],
     **kwargs: Any,
 ) -> list[dict[str, Any]]:
-    """Run at most four probes concurrently and preserve reviewed config order."""
+    """Run at most four confirmed probes concurrently in reviewed config order."""
 
     if not probes or len(probes) > MAX_PROBES:
         raise SyntheticProbeError("invalid")
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(MAX_CONCURRENCY, len(probes))) as executor:
-        return list(executor.map(lambda item: probe_once(item, **kwargs), probes))
+        return list(executor.map(lambda item: probe_with_retry(item, **kwargs), probes))
 
 
 _PUBLIC_RESULT_FIELDS = frozenset({
@@ -596,9 +678,13 @@ def publish_output(path: Path, document: Mapping[str, Any], *, expected_uid: int
 
     if not isinstance(document, Mapping) or set(document) != {"schemaVersion", "generatedAt", "results"} or document.get("schemaVersion") != SCHEMA_VERSION:
         raise SyntheticProbeError("invalid")
+    canonical = build_public_document(document.get("results"), generated_at=document.get("generatedAt"))
+    _publish_document(path, canonical, expected_uid=expected_uid, expected_gid=expected_gid)
+
+
+def _publish_document(path: Path, canonical: Mapping[str, Any], *, expected_uid: int | None = None, expected_gid: int | None = None) -> None:
     uid = os.geteuid() if expected_uid is None else expected_uid
     gid = os.getegid() if expected_gid is None else expected_gid
-    canonical = build_public_document(document.get("results"), generated_at=document.get("generatedAt"))
     encoded = (json.dumps(canonical, separators=(",", ":"), sort_keys=True) + "\n").encode("utf-8")
     if len(encoded) > MAX_OUTPUT_BYTES:
         raise SyntheticProbeError("invalid")
@@ -651,12 +737,23 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run SSRF-safe Monitor synthetic probes")
     parser.add_argument("--config", required=True, help="absolute owner-only v1 JSON config")
     parser.add_argument("--output", help="absolute atomic mode-0640 result document path")
+    parser.add_argument("--diagnostics-output", help="absolute atomic mode-0640 phase timings document path (no URLs)")
     arguments = parser.parse_args(argv)
     try:
-        results = run_configured_probes(load_config(Path(arguments.config)))
+        diagnostics: list[dict[str, Any]] = []
+        probes = tuple(probe for probe in load_config(Path(arguments.config))
+                       if "wgang" not in (probe.probe_id + " " + probe.url).lower())
+        results = run_configured_probes(probes, diagnostics=diagnostics if arguments.diagnostics_output else None)
         document = build_public_document(results)
         if arguments.output:
             publish_output(Path(arguments.output), document)
+        if arguments.diagnostics_output:
+            # Diagnostics are independently versioned so exact-schema legacy
+            # consumers continue receiving precisely the reviewed v1 results.
+            _publish_document(Path(arguments.diagnostics_output), {
+                "schemaVersion": 1, "generatedAt": document["generatedAt"],
+                "probes": sorted(diagnostics, key=lambda item: item["id"]),
+            })
     except SyntheticProbeError as exc:
         # Configuration failures are intentionally not expanded: paths and
         # malformed values may be sensitive operational information.

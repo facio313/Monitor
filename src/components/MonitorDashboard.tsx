@@ -3,7 +3,7 @@ import type { SessionInfo } from '../api';
 import { agentHeartbeatLabel, containerCollectionLabel } from '../collection-status';
 import { chooseInitialLocale, localized, MONITOR_STALE_AFTER_MS, monitorPathForPage, monitorRangeFromSearch, monitorSnapshotIsStale, operationalAssessmentPresentation } from '../dashboard-model';
 import { useDashboard } from '../hooks/useDashboard';
-import { operationalFindings, operationalServiceStates } from '../operational-health';
+import { operationalCollectionLimitations, operationalFindings, operationalServiceStates } from '../operational-health';
 import { deriveSystemEmotion } from '../system-emotion';
 import type { DashboardPayload, MonitorDetailPage, MonitorLocale, MonitorPage, TimeRange } from '../types';
 import { formatDateTime, safeText } from '../utils';
@@ -37,6 +37,8 @@ import { RuleHealthSummary } from './RuleHealthSummary';
 import { SystemMaintenance } from './SystemMaintenance';
 import { SystemEmotionEngine } from './SystemEmotionEngine';
 import { SystemUpdateControls } from './SystemUpdateControls';
+import { NotificationStatusPanel } from './NotificationStatusPanel';
+import { SshAccessHistory } from './SshAccessHistory';
 
 const LOCALE_STORAGE_KEY = 'monitor.locale.v2';
 const RANGES: Array<{ value: TimeRange; ko: string; en: string }> = [
@@ -291,6 +293,7 @@ export function MonitorDashboard({
     return { ...data, stale: effectiveStale };
   }, [data, effectiveStale]);
   const findings = useMemo(() => assessedData ? operationalFindings(assessedData) : [], [assessedData]);
+  const collectionLimitations = assessedData ? operationalCollectionLimitations(assessedData) : [];
   const counts = {
     danger: findings.filter((finding) => finding.level === 'danger').length,
     caution: findings.filter((finding) => finding.level === 'caution').length,
@@ -457,6 +460,16 @@ export function MonitorDashboard({
             <RuleHealthSummary evaluation={data.ruleEvaluation} alerts={data.ruleAlerts} locale={locale} stale={effectiveStale} compactWhenNominal />
           )}
 
+          {collectionLimitations.length > 0 && normalizedPage === 'overview' && (
+            <aside className="control-notice collection-limitations" aria-label={t(locale, '관측 범위 제한', 'Observation limits')}>
+              <Icon name="info" size={19} />
+              <div><strong>{t(locale, '관측 범위 제한', 'Observation limits')}</strong><span>
+                {collectionLimitations.map((entry) => entry[locale === 'ko' ? 0 : 1]).join(' ')}{' '}
+                {t(locale, '이 제한은 장애 건수와 별도로 표시합니다.', 'These limits are reported separately from incidents.')}
+              </span></div>
+            </aside>
+          )}
+
           {error && normalizedPage !== 'logs' && <div className="control-notice" role="alert"><Icon name="alert" size={19} /><div><strong>{t(locale, '원격 측정 갱신 실패', 'Telemetry refresh failed')}</strong><span>{safeText(error)} {data ? t(locale, '마지막 정상 화면을 유지합니다.', 'The last good snapshot remains visible.') : ''}</span></div><button type="button" onClick={() => void refresh()}>{t(locale, '재시도', 'Retry')}</button></div>}
 
           {normalizedPage === 'overview' && (
@@ -481,6 +494,8 @@ export function MonitorDashboard({
               </div>
             : normalizedPage === 'logs'
               ? <div className="detail-dashboard">
+                  <NotificationStatusPanel locale={locale} onUnauthorized={onUnauthorized} />
+                  <SshAccessHistory locale={locale} onUnauthorized={onUnauthorized} />
                   <GenericLogExplorer locale={locale} onUnauthorized={onUnauthorized} />
                   <RelatedEvidencePanel page="logs" data={data} range={range} locale={locale} onUnauthorized={onUnauthorized} />
                 </div>
@@ -500,18 +515,20 @@ export function MonitorDashboard({
                     <div id="system-maintenance" className="detail-system-target" tabIndex={-1}>
                       <SystemMaintenance
                         system={data.system}
+                        stale={data.stale}
                         generatedAt={data.latestObservedAt ?? data.generatedAt}
                         locale={locale}
-                        updateControls={<SystemUpdateControls locale={locale} />}
+                        updateControls={<SystemUpdateControls locale={locale} system={data.system} telemetryStale={data.stale} />}
                       />
                     </div>
+                    <NotificationStatusPanel locale={locale} onUnauthorized={onUnauthorized} />
                     <RelatedEvidencePanel page="maintenance" data={data} range={range} locale={locale} onUnauthorized={onUnauthorized} />
                   </div>
                 : <div className="detail-dashboard">
                     <DetailPage page={normalizedPage as Exclude<MonitorDetailPage, 'coverage' | 'maintenance' | 'infrastructure' | 'logs'>} data={data} findings={findings} range={range} locale={locale} onOpen={(next, anchor) => navigate(next, anchor)} />
                     <RelatedEvidencePanel page={normalizedPage} data={data} range={range} locale={locale} onUnauthorized={onUnauthorized} />
                   </div>
-          ) : <div className="control-empty"><Icon name="server" size={32} /><h2>{t(locale, '수집 데이터가 아직 없습니다', 'Telemetry is not available yet')}</h2><p>{t(locale, '수집기가 첫 스냅샷을 만들면 계기판이 자동으로 나타납니다.', 'The instruments will appear after the collector writes its first snapshot.')}</p><button type="button" onClick={() => void refresh()}>{t(locale, '다시 확인', 'Try again')}</button></div>}
+          ) : <div className="control-empty"><Icon name="server" size={32} /><h2>{error ? t(locale, '원격 측정 데이터를 불러오지 못했습니다', 'Telemetry could not be loaded') : t(locale, '수집 데이터가 아직 없습니다', 'Telemetry is not available yet')}</h2><p>{error ? t(locale, '데이터 요청에 실패했습니다. 잠시 후 다시 시도해 주세요.', 'The data request failed. Please try again shortly.') : t(locale, '수집기가 첫 스냅샷을 만들면 계기판이 자동으로 나타납니다.', 'The instruments will appear after the collector writes its first snapshot.')}</p><button type="button" onClick={() => void refresh()}>{t(locale, '다시 확인', 'Try again')}</button></div>}
         </main>
       </div>
 

@@ -27,6 +27,9 @@ import {
 } from './generic-logs.js';
 import { readInfrastructureLedger } from './infrastructure-ledger.js';
 import { readMonitoringCatalog } from './monitoring-catalog.js';
+import { readNetworkDiagnostics, NetworkDiagnosticsQueryError } from './network-diagnostics.js';
+import { readNotificationReports } from './notification-reports.js';
+import { readSshAccess, SshAccessQueryError } from './ssh-access.js';
 import { inventoryLegacyAuth } from './legacy-auth.js';
 import { PasswordStore, PasswordStoreBusyError } from './password-store.js';
 import {
@@ -203,6 +206,9 @@ const API_KEY_EXACT_ROUTES = new Map<string, ApplicationApiKeyScope>([
   ['GET /monitor/api/dashboard', 'dashboard:read'],
   ['GET /monitor/api/monitoring-catalog', 'dashboard:read'],
   ['GET /monitor/api/generic-logs', 'logs:read'],
+  ['GET /monitor/api/network-diagnostics', 'logs:read'],
+  ['GET /monitor/api/notification-reports', 'logs:read'],
+  ['GET /monitor/api/ssh-access', 'logs:read'],
   ['GET /monitor/api/agents', 'agents:read'],
   ['POST /monitor/api/agents/enrollment-tokens', 'agents:write'],
   ['GET /monitor/api/infrastructure-ledger', 'infrastructure-ledger:read'],
@@ -485,6 +491,12 @@ export function createApp(options: AppOptions = {}) {
     },
     crossOriginResourcePolicy: { policy: 'same-origin' },
   }));
+  app.use((_request, response, next) => {
+    // Stream Monitor responses without depending on Nginx proxy temp files;
+    // failed disk buffering can truncate large JSON and JavaScript after a 200.
+    response.set('X-Accel-Buffering', 'no');
+    next();
+  });
   app.use('/monitor/api', (_request, response, next) => {
     response.set('Cache-Control', 'no-store');
     next();
@@ -1139,6 +1151,34 @@ export function createApp(options: AppOptions = {}) {
       }
     },
   );
+
+  app.get('/monitor/api/network-diagnostics', requireGenericLogReadIdentity, genericLogReadLimiter, (request, response) => {
+    try {
+      response.status(200).json(readNetworkDiagnostics(config.dataDir, request.query, now()));
+    } catch (error) {
+      if (error instanceof NetworkDiagnosticsQueryError) {
+        apiError(response, 400, 'INVALID_DIAGNOSTICS_QUERY', 'Network diagnostics query is invalid');
+        return;
+      }
+      throw error;
+    }
+  });
+
+  app.get('/monitor/api/notification-reports', requireGenericLogReadIdentity, genericLogReadLimiter, (_request, response) => {
+    response.status(200).json(readNotificationReports(config.dataDir, now()));
+  });
+
+  app.get('/monitor/api/ssh-access', requireGenericLogReadIdentity, genericLogReadLimiter, (request, response) => {
+    try {
+      response.status(200).json(readSshAccess(config.dataDir, request.query, now()));
+    } catch (error) {
+      if (error instanceof SshAccessQueryError) {
+        apiError(response, 400, 'INVALID_SSH_ACCESS_QUERY', 'SSH access query is invalid');
+        return;
+      }
+      throw error;
+    }
+  });
 
   app.get('/monitor/api/system-updates', (request, response) => {
     const apiKey = apiKeyPrincipals.get(request);

@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily refresh of GitHub SSH source exceptions
+
+[Timer]
+OnCalendar=*-*-* 06:15:00
+RandomizedDelaySec=30m
+Persistent=true
+Unit=monitor-ssh-github-update.service
+
+[Install]
+WantedBy=timers.target

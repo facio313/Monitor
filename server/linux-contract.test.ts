@@ -327,6 +327,23 @@ afterEach(() => {
 });
 
 describe('Linux collector v1 API boundary', () => {
+  it('validates qualified TCP counts and their source freshness independently of raw rates', () => {
+    const linux = linuxFixture();
+    const assessment = { status: 'ok', observedAt: linux.collectedAt, retransmissionPercent: 6,
+      sampleCount: 4, windowSeconds: 240, outboundSegmentsDelta: 2000, retransmittedSegmentsDelta: 120 };
+    Object.assign(linux.tcp, { assessment });
+    expect(dashboard(linux).linux.network.tcp.assessment).toMatchObject({ status: 'ok', retransmissionPercent: 6 });
+    assessment.outboundSegmentsDelta = 90;
+    assessment.retransmittedSegmentsDelta = 9;
+    assessment.retransmissionPercent = 10;
+    expect(dashboard(linux).linux.network.tcp.assessment).toBeNull();
+    expect(dashboard(linux).linux.network.tcp.retransmissionPercent).toBe(1);
+    Object.assign(assessment, { outboundSegmentsDelta: 2000, retransmittedSegmentsDelta: 120, retransmissionPercent: 6,
+      observedAt: '2026-08-30T11:00:00Z' });
+    linux.collectedAt = assessment.observedAt;
+    expect(dashboard(linux).linux.network.tcp.assessment?.status).toBe('stale');
+  });
+
   it('exposes only bounded operational evidence and does not leak process labels', () => {
     const result = dashboard(linuxFixture()).linux;
 
@@ -363,6 +380,22 @@ describe('Linux collector v1 API boundary', () => {
       const fixture = linuxFixture();
       fixture.processes.status = status;
       expect(dashboard(fixture).linux.resources.status).toBe(status);
+    }
+  });
+
+  it('keeps observed process counts but never claims host PID headroom from a partial view', () => {
+    for (const [status, lowerBound] of [['partial', false], ['supported', true]] as const) {
+      const fixture = linuxFixture();
+      fixture.processes.status = status;
+      fixture.processes.pidCountLowerBound = lowerBound;
+      fixture.processes.pidUsedPercent = 0;
+      const resources = dashboard(fixture).linux.resources;
+      expect(resources.processCount).toBe(120);
+      expect(resources.observedProcessCount).toBe(120);
+      expect(resources.pid).toEqual({
+        status: 'partial', current: null, maximum: 4_194_304, usedPercent: null,
+      });
+      expect(resources.systemFileDescriptors.status).toBe('supported');
     }
   });
 

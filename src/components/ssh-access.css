@@ -1,0 +1,47 @@
+.ssh-access-history {
+  grid-column: 1 / -1;
+  width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+  padding: 24px;
+  border: 1px solid var(--control-border, #263734);
+  border-radius: 18px;
+  background: var(--control-panel, #0c1715);
+  color: var(--control-text, #eef4f2);
+}
+.ssh-access-history h2 { margin: 0 0 8px; }
+.ssh-access-note, .ssh-access-window, .ssh-access-health { font-size: 13px; line-height: 1.75; overflow-wrap: anywhere; }
+.ssh-access-note { color: var(--control-muted, #a0afac); }
+.ssh-access-note a { color: inherit; text-decoration: underline; text-underline-offset: 3px; }
+.ssh-access-filters, .ssh-access-ip-filter { display: flex; flex-wrap: wrap; align-items: end; gap: 10px; margin: 18px 0; }
+.ssh-access-filters label { display: grid; gap: 6px; font-size: 12px; }
+.ssh-access-filters select, .ssh-access-filters button, .ssh-access-ip-filter input, .ssh-access-ip-filter button {
+  box-sizing: border-box; min-height: 38px; max-width: 100%; padding: 8px 11px; border: 1px solid var(--control-border, #263734);
+  border-radius: 8px; background: var(--control-panel, #0c1715); color: inherit; font: inherit;
+}
+.ssh-access-filters button, .ssh-access-ip-filter button { cursor: pointer; }
+.ssh-access-filters button:disabled { opacity: .55; cursor: default; }
+.ssh-access-shortcuts { display: flex; gap: 5px; }
+.ssh-access-shortcuts [aria-pressed="true"] { background: var(--control-text, #eef4f2); color: var(--control-panel, #0c1715); }
+.ssh-access-ip-filter label { flex-basis: 100%; font-size: 12px; }
+.ssh-access-ip-filter input { width: 340px; min-width: 0; }
+.ssh-access-warning { padding: 12px 14px; border-left: 3px solid #b57712; background: rgba(181, 119, 18, .08); font-size: 13px; line-height: 1.7; }
+.ssh-access-sources { display: flex; flex-wrap: wrap; gap: 8px 16px; padding: 0; list-style: none; font-size: 12px; }
+.ssh-access-sources li { padding: 5px 9px; border: 1px solid var(--control-border, #263734); border-radius: 6px; }
+.ssh-access-table-wrap { width: 100%; max-width: 100%; overflow-x: auto; border: 1px solid var(--control-border, #263734); border-radius: 12px; }
+.ssh-access-table { width: 100%; min-width: 760px; border-collapse: collapse; text-align: left; font-size: 13px; }
+.ssh-access-table th, .ssh-access-table td { padding: 12px 14px; border-bottom: 1px solid var(--control-border, #263734); vertical-align: top; line-height: 1.6; }
+.ssh-access-table th { font-size: 11px; font-weight: 600; color: var(--control-muted, #a0afac); }
+.ssh-access-table tr:last-child td { border-bottom: 0; }
+.ssh-access-table small { display: block; padding-top: 4px; color: var(--control-muted, #a0afac); font-size: 11px; }
+.ssh-access-table time { white-space: nowrap; }
+.ssh-access-ip { display: inline-block; max-width: 260px; overflow-wrap: anywhere; }
+.ssh-access-event { font-weight: 600; }
+.ssh-access-event-accepted { color: var(--control-green, #80d8b0); }
+.ssh-access-event-auth_failed, .ssh-access-event-denied, .ssh-access-event-invalid_user { color: var(--control-yellow, #e5bd72); }
+.ssh-access-empty { padding: 18px 0; font-size: 13px; line-height: 1.7; }
+@media (max-width: 600px) {
+  .ssh-access-history { padding: 16px; }
+  .ssh-access-ip-filter input { flex: 1 1 100%; width: 100%; }
+  .ssh-access-filters label { max-width: 100%; }
+}

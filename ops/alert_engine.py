@@ -29,6 +29,11 @@ RULE_ID = re.compile(r"^[A-Z][A-Za-z0-9]{2,63}$")
 PACK_VERSION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 METRIC_NAME = re.compile(r"^[a-z][a-z0-9_.]{2,127}$")
 TARGET_ID = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.:/-]{0,191}$")
+RETIRED_CONTAINER_TARGET = re.compile(r"^container/[a-zA-Z0-9][a-zA-Z0-9_.-]{0,95}$")
+MAX_RETIRED_TARGETS = 128
+RETIREMENT_DESCRIPTION = (
+    "Monitoring target was retired; this does not assert service recovery."
+)
 LABEL_NAME = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 LABEL_VALUE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.:/-]{0,95}$")
 OPERATORS = frozenset({"gt", "gte", "lt", "lte", "eq", "neq"})
@@ -81,6 +86,11 @@ class Observation:
     value: float | None
     status: str = "ok"
     labels: tuple[tuple[str, str], ...] = ()
+    # Asynchronous sources keep their own sample clock. Collector ticks must
+    # not turn one cached measurement into multiple independent observations.
+    sampled_at: dt.datetime | None = None
+    sample_interval_seconds: int | None = None
+    max_sample_age_seconds: int | None = None
 
 
 @dataclass(frozen=True)
@@ -309,7 +319,7 @@ def _prior_state(value: Any) -> dict[str, Any]:
         result[key] = item if isinstance(item, int) and not isinstance(item, bool) and 0 <= item <= 10_000 else 0
     for key in (
         "openedAt", "changedAt", "conditionStartedAt",
-        "recoveryStartedAt", "missingStartedAt",
+        "recoveryStartedAt", "missingStartedAt", "lastSampledAt",
     ):
         item = value.get(key)
         result[key] = item if isinstance(item, str) and STATE_TIMESTAMP.fullmatch(item) else None
@@ -325,6 +335,8 @@ def _prior_state(value: Any) -> dict[str, Any]:
         if isinstance(interval, int) and not isinstance(interval, bool) and 1 <= interval <= 86_400
         else None
     )
+    result["lastValue"] = value.get("lastValue")
+    result["observationStatus"] = value.get("observationStatus", "no_data")
     return result
 
 
@@ -369,15 +381,70 @@ def evaluate_observation(
     previous_evaluated_at = _parsed_state_timestamp(previous_state.get("lastEvaluatedAt"))
     normalized_now = now if now.tzinfo is not None else now.replace(tzinfo=dt.timezone.utc)
     normalized_now = normalized_now.astimezone(dt.timezone.utc)
+    sample_clock = (
+        observation.sampled_at is not None
+        or observation.sample_interval_seconds is not None
+        or observation.max_sample_age_seconds is not None
+    )
+    for duration in (observation.sample_interval_seconds, observation.max_sample_age_seconds):
+        if duration is not None and (
+            isinstance(duration, bool) or not isinstance(duration, int)
+            or not 1 <= duration <= 86_400
+        ):
+            raise ValueError("observation sample duration is invalid")
+    sample_time = observation.sampled_at
+    if sample_time is not None:
+        if not isinstance(sample_time, dt.datetime) or sample_time.tzinfo is None:
+            raise ValueError("observation sample timestamp must have a timezone")
+        sample_time = sample_time.astimezone(dt.timezone.utc)
+    last_sampled_at = _parsed_state_timestamp(previous_state.get("lastSampledAt"))
+    migrating_sample_clock = sample_clock and last_sampled_at is None and previous_evaluated_at is not None
+    if migrating_sample_clock and previous_phase in {"firing", "recovering"}:
+        # Legacy/event-rehydrated incidents have no source watermark. A cached
+        # healthy row predating their last evaluation cannot prove recovery.
+        last_sampled_at = previous_evaluated_at
+    observation_status = observation.status
+    max_sample_age = observation.max_sample_age_seconds or max(
+        MAX_CONTINUOUS_EVALUATION_GAP_SECONDS,
+        int(math.ceil((observation.sample_interval_seconds or rule.evaluation_interval_seconds) * 1.5)),
+    )
+    valid_sample_time = sample_time is not None and 0 <= (
+        normalized_now - sample_time
+    ).total_seconds() <= max_sample_age
+    if sample_clock and observation_status == "ok":
+        if sample_time is None or sample_time > normalized_now:
+            observation_status = "no_data"
+        elif not valid_sample_time:
+            observation_status = "stale"
+    if sample_time is not None:
+        sample_time = sample_time.replace(microsecond=0)
+    valid_sample = observation_status == "ok" and observation.value is not None
+    repeated_sample = (
+        sample_clock and valid_sample and sample_time is not None
+        and last_sampled_at is not None and sample_time <= last_sampled_at
+    )
     prior_interval = previous_state.get("evaluationIntervalSeconds")
     interval_changed = prior_interval is not None and prior_interval != rule.evaluation_interval_seconds
     if previous_evaluated_at is not None:
         gap_seconds = (normalized_now - previous_evaluated_at).total_seconds()
         maximum_gap = max(
             MAX_CONTINUOUS_EVALUATION_GAP_SECONDS,
-            int(math.ceil(rule.evaluation_interval_seconds * 1.5)),
+            int(math.ceil((observation.sample_interval_seconds or rule.evaluation_interval_seconds) * 1.5)),
         )
-        if gap_seconds < 0 or gap_seconds > maximum_gap or interval_changed:
+        if sample_clock and valid_sample and sample_time is not None:
+            # An upgrade cannot trust streaks accumulated without sample
+            # identity. New sample spacing, rather than evaluator spacing,
+            # determines whether an asynchronous streak is continuous.
+            discontinuous = migrating_sample_clock or last_sampled_at is None or (
+                not repeated_sample
+                and (sample_time - last_sampled_at).total_seconds() > maximum_gap
+            )
+        else:
+            discontinuous = gap_seconds > maximum_gap
+        if gap_seconds < 0:
+            observation_status = "no_data"
+            valid_sample = repeated_sample = valid_sample_time = False
+        if gap_seconds < 0 or discontinuous or interval_changed:
             if previous_phase in {"firing", "recovering"}:
                 previous_state["phase"] = "firing"
                 previous_state["recoverySamples"] = 0
@@ -394,13 +461,20 @@ def evaluate_observation(
     missing_started_at = previous_state.get("missingStartedAt")
     phase = previous_phase
     now_text = _timestamp(normalized_now)
+    evidence_time = sample_time if sample_clock and valid_sample else normalized_now
+    evidence_text = _timestamp(evidence_time)
 
     if not rule.enabled:
         phase = "inactive"
         breach_samples = recovery_samples = missing_samples = 0
         opened_at = None
         condition_started_at = recovery_started_at = missing_started_at = None
-    elif observation.status in {"unsupported", "permission_denied", "collection_error"}:
+    elif repeated_sample:
+        # Holding a cached sample must neither advance nor reset a legitimate
+        # pending/recovery streak. Keep the last accepted value too, since an
+        # out-of-order row is not evidence of a changed condition.
+        pass
+    elif observation_status in {"unsupported", "permission_denied", "collection_error"}:
         missing_samples = min(10_000, missing_samples + 1)
         missing_started_at = missing_started_at or now_text
         condition_started_at = None
@@ -412,10 +486,10 @@ def evaluate_observation(
             phase = "firing"
             recovery_samples = 0
         else:
-            phase = observation.status
+            phase = observation_status
             breach_samples = recovery_samples = 0
             opened_at = None
-    elif observation.status in {"no_data", "stale"} or observation.value is None:
+    elif observation_status in {"no_data", "stale"} or observation.value is None:
         missing_samples = min(10_000, missing_samples + 1)
         missing_started_at = missing_started_at or now_text
         condition_started_at = None
@@ -444,13 +518,13 @@ def evaluate_observation(
         missing_started_at = None
         if previous_phase in {"firing", "recovering"}:
             if _recovered(rule, value):
-                recovery_started_at = recovery_started_at or now_text
+                recovery_started_at = recovery_started_at or evidence_text
                 recovery_samples = min(rule.recovery_samples, recovery_samples + 1)
                 phase = (
                     "inactive"
                     if recovery_samples >= rule.recovery_samples
                     and _elapsed_at_least(
-                        recovery_started_at, normalized_now, rule.recovery_seconds
+                        recovery_started_at, evidence_time, rule.recovery_seconds
                     )
                     else "recovering"
                 )
@@ -464,14 +538,14 @@ def evaluate_observation(
                 recovery_samples = 0
                 recovery_started_at = None
         elif _condition(rule.operator, value, rule.threshold):
-            condition_started_at = condition_started_at or now_text
+            condition_started_at = condition_started_at or evidence_text
             breach_samples = min(rule.for_samples, breach_samples + 1)
             recovery_samples = 0
             recovery_started_at = None
             if (
                 breach_samples >= rule.for_samples
                 and _elapsed_at_least(
-                    condition_started_at, normalized_now, rule.for_seconds
+                    condition_started_at, evidence_time, rule.for_seconds
                 )
             ):
                 phase = "firing"
@@ -505,8 +579,17 @@ def evaluate_observation(
         "evaluationIntervalSeconds": rule.evaluation_interval_seconds,
         "changedAt": now_text if phase != previous_phase else previous_state.get("changedAt") or now_text,
         "lastEvaluatedAt": now_text,
-        "lastValue": observation.value if observation.status == "ok" else None,
-        "observationStatus": observation.status,
+        "lastValue": (
+            previous_state.get("lastValue") if repeated_sample
+            else observation.value if observation_status == "ok" else None
+        ),
+        "observationStatus": previous_state.get("observationStatus", "ok") if repeated_sample else observation_status,
+        "lastSampledAt": (
+            _timestamp(sample_time) if valid_sample_time and (
+                last_sampled_at is None or sample_time > last_sampled_at
+            )
+            else _timestamp(last_sampled_at) if last_sampled_at is not None else None
+        ),
     }
     return state, transition
 
@@ -630,11 +713,37 @@ def evaluate_rule_pack(
     previous_states: Mapping[str, Any],
     now: dt.datetime,
     silences: Sequence[Silence] = (),
+    retired_targets: Sequence[str] = (),
+    *,
+    container_inventory_complete: bool = False,
+    container_inventory_sampled_at: dt.datetime | None = None,
 ) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
-    """Evaluate a pack and emit only idempotent state transitions."""
+    """Evaluate a pack and emit only idempotent state transitions.
+
+    Callers must establish fresh container-source evidence before supplying
+    explicit retirement targets. A target observed anywhere in this evaluation
+    remains monitored, even when its particular metric is unavailable.
+    """
+
+    if (
+        isinstance(retired_targets, (str, bytes))
+        or len(retired_targets) > MAX_RETIRED_TARGETS
+        or any(
+            not isinstance(target, str)
+            or RETIRED_CONTAINER_TARGET.fullmatch(target) is None
+            for target in retired_targets
+        )
+    ):
+        raise ValueError("alert retirement targets are invalid")
+    retirement_targets = frozenset(retired_targets)
+    observed_targets = {
+        observation.target
+        for rule_observations in observations.values()
+        for observation in rule_observations
+    }
 
     states: dict[str, dict[str, Any]] = {}
-    pending_events: list[tuple[AlertRule, Observation, str, dict[str, Any]]] = []
+    pending_events: list[tuple[AlertRule, Observation, str, dict[str, Any], str]] = []
     for rule in pack.rules:
         for observation in observations.get(rule.rule_id, ()):
             state_key = f"{rule.rule_id}:{observation.target}"
@@ -643,12 +752,12 @@ def evaluate_rule_pack(
             )
             states[state_key] = state
             if transition in {"firing", "resolved"}:
-                pending_events.append((rule, observation, transition, state))
+                pending_events.append((rule, observation, transition, state, rule.description))
 
     # A source failure or target disappearance must not silently erase an
     # unresolved incident. Carry only active prior targets that had no current
     # observation, mark their evidence as no-data, and require a later valid
-    # recovery sample (or an explicit future retirement model) to resolve them.
+    # recovery sample or explicit retirement with fresh source evidence.
     rules_by_id = {rule.rule_id: rule for rule in pack.rules}
     for state_key in sorted(previous_states):
         if state_key in states:
@@ -656,12 +765,43 @@ def evaluate_rule_pack(
         rule_id, separator, target = state_key.partition(":")
         prior = _prior_state(previous_states.get(state_key))
         rule = rules_by_id.get(rule_id)
+        if "wgang" in target.casefold():
+            continue  # Explicit workspace exclusion; never infer its absence.
         if (
             separator != ":"
             or rule is None
             or TARGET_ID.fullmatch(target) is None
-            or prior.get("phase") not in {"firing", "recovering"}
+            or (prior.get("phase") not in {"firing", "recovering"}
+                and not (rule_id == "ContainerDown" and target.startswith("container/")))
         ):
+            continue
+        if target in retirement_targets and target not in observed_targets:
+            if prior.get("phase") not in {"firing", "recovering"}:
+                continue
+            pending_events.append((
+                rule,
+                Observation(target, None, "unsupported", (("retirement", "service-retired"),)),
+                "resolved",
+                {
+                    "lastEvaluatedAt": _timestamp(now),
+                    "lastValue": None,
+                    "observationStatus": "unsupported",
+                },
+                RETIREMENT_DESCRIPTION,
+            ))
+            continue
+        # Previously observed containers remain expected until explicitly
+        # retired. Only a complete, fresh inventory can prove their absence;
+        # a Docker collection failure is not proof that every service is down.
+        if (rule_id == "ContainerDown" and target.startswith("container/")
+                and target not in observed_targets and container_inventory_complete):
+            synthetic = Observation(target, 0.0, "ok", sampled_at=container_inventory_sampled_at,
+                                    sample_interval_seconds=60 if container_inventory_sampled_at else None,
+                                    max_sample_age_seconds=180 if container_inventory_sampled_at else None)
+            state, transition = evaluate_observation(rule, synthetic, prior, now)
+            states[state_key] = state
+            if transition in {"firing", "resolved"}:
+                pending_events.append((rule, synthetic, transition, state, rule.description))
             continue
         current_statuses = {
             observation.status
@@ -683,7 +823,7 @@ def evaluate_rule_pack(
     events: list[dict[str, Any]] = []
     normalized_now = now if now.tzinfo is not None else now.replace(tzinfo=dt.timezone.utc)
     normalized_now = normalized_now.astimezone(dt.timezone.utc)
-    for rule, observation, transition, state in pending_events:
+    for rule, observation, transition, state, description in pending_events:
         observation_labels = dict(_runtime_labels(observation.labels, "observation"))
         labels = dict(rule.labels) | observation_labels
         notification_state = _notification_state(
@@ -711,7 +851,7 @@ def evaluate_rule_pack(
             "value": state["lastValue"],
             "status": state["observationStatus"],
             "labels": labels,
-            "description": rule.description,
+            "description": description,
             "runbook": rule.runbook,
         })
     return states, events
