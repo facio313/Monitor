@@ -1,5 +1,6 @@
 """SSH observation helpers stay in the existing collector transaction."""
 
+import configparser
 import unittest
 from pathlib import Path
 
@@ -8,6 +9,26 @@ OPS = Path(__file__).resolve().parents[1]
 
 
 class SshInstallContractTests(unittest.TestCase):
+    def test_geo_dropins_gate_the_correct_ssh_unit_types(self):
+        for filename, section in (("ssh-service-geo.conf", "Service"), ("ssh-socket-geo.conf", "Socket")):
+            with self.subTest(dropin=filename):
+                config = configparser.ConfigParser(interpolation=None, strict=True)
+                config.read_string((OPS / "systemd" / filename).read_text())
+                self.assertEqual(set(config.sections()), {"Unit", section})
+                self.assertEqual(dict(config["Unit"]), {
+                    "wants": "monitor-ssh-geo.service",
+                    "after": "monitor-ssh-geo.service",
+                })
+                self.assertEqual(dict(config[section]), {
+                    "execstartpre": "/usr/local/sbin/monitor-ssh-geo-apply",
+                })
+
+    def test_ci_checks_standalone_units_without_passing_dropins_as_unit_files(self):
+        workflow = (OPS.parent / ".github" / "workflows" / "deploy.yml").read_text()
+        self.assertIn("'ops/systemd/*.service' 'ops/systemd/*.timer'", workflow)
+        self.assertNotIn("git ls-files -z 'ops/systemd/*'", workflow)
+        self.assertIn("sudo install -m 0755 ops/ssh_geo_apply.py /usr/local/sbin/monitor-ssh-geo-apply", workflow)
+
     def test_helpers_are_preflighted_backed_up_installed_and_restored(self):
         install = (OPS / "install.sh").read_text()
         uninstall = (OPS / "uninstall.sh").read_text()

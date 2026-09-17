@@ -21,7 +21,7 @@ DB 설정·메모리 한도·커널·방화벽·프록시는 변경하지 않았
 - 호스트 모듈: `/usr/local/lib/monitor-collector/{collector.py,alert_runtime.py,security_signals.py}`. 주 작업 트리의 대응 파일과 SHA-256 일치를 확인했다.
 - 변경 전 호스트 모듈/compose 백업: `/var/backups/monitor-warning-20260917.4c9yie`.
 
-레지스트리 push나 원격 커밋은 하지 않았다. 일반 CI 배포 전 이 변경을 배포 브랜치에 통합해야 덮어써지지 않는다. 소스는 위의 별도 worktree에 보존했다.
+초기 수동 배포에서는 레지스트리 push나 원격 커밋을 하지 않았다. 이후 운영자의 전체 커밋·푸시 요청에 따라 주 작업 트리의 모든 소스 변경과 원격 `main`의 화면 개편을 병합했다. 경고 수정도 주 작업 트리에 포함되어 일반 CI 빌드에서 유지된다. 위 별도 worktree는 초기 수동 배포본의 기록으로 보존한다.
 
 ## 검증
 

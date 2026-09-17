@@ -53,7 +53,12 @@ jobs:
           git ls-files -z '*.sh' | xargs -0 --no-run-if-empty bash -n
           git ls-files -z '*.py' | xargs -0 --no-run-if-empty python3 -m py_compile
           git ls-files -z '*.json' | xargs -0 --no-run-if-empty -n 1 python3 -m json.tool >/dev/null
-          git ls-files -z 'ops/systemd/*' | xargs -0 --no-run-if-empty systemd-analyze verify
+          # verify checks executable existence but never starts a unit. This
+          # host-only helper is otherwise absent on the disposable CI runner.
+          sudo install -m 0755 ops/ssh_geo_apply.py /usr/local/sbin/monitor-ssh-geo-apply
+          # Drop-in .conf files are not standalone units; their SSH integration
+          # contract is checked by ops/tests/test_ssh_install_contract.py below.
+          git ls-files -z 'ops/systemd/*.service' 'ops/systemd/*.timer' | xargs -0 --no-run-if-empty systemd-analyze verify
           python3 ops/state_backup.py backup --help >/dev/null
           python3 ops/state_backup.py verify --help >/dev/null
           python3 ops/state_backup.py restore --help >/dev/null
