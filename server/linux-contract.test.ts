@@ -327,6 +327,35 @@ afterEach(() => {
 });
 
 describe('Linux collector v1 API boundary', () => {
+  it('preserves raw TCP and bounded duplicate-probe evidence while rejecting inconsistent adjustments', () => {
+    const linux = linuxFixture();
+    Object.assign(linux.tcp.counters, { TCPLossProbes: 200, TCPDSACKRecv: 200, TCPLossProbeRecovery: 0,
+      TCPTimeouts: 0, TCPSynRetrans: 0, TCPFastRetrans: 0, TCPSlowStartRetrans: 0, TCPRetransFail: 0 });
+    const assessment = { status: 'ok', observedAt: linux.collectedAt, retransmissionPercent: 0,
+      sampleCount: 4, windowSeconds: 240, outboundSegmentsDelta: 2000, retransmittedSegmentsDelta: 0,
+      rawRetransmittedSegmentsDelta: 120, rawRetransmissionPercent: 6, duplicateProbeSegmentsEstimate: 120,
+      duplicateProbeScope: 'verified_ssh_socket' };
+    Object.assign(linux.tcp, { assessment });
+    const normalized = dashboard(linux).linux.network.tcp;
+    expect(normalized.assessment).toMatchObject({ ...assessment, observedAt: new Date(assessment.observedAt).toISOString() });
+    expect(normalized.retransmissionPercent).toBe(1);
+    for (const changes of [{ duplicateProbeSegmentsEstimate: 121 }, { rawRetransmissionPercent: 5 },
+      { rawRetransmittedSegmentsDelta: -1 }, { duplicateProbeSegmentsEstimate: undefined },
+      { duplicateProbeScope: undefined }, { duplicateProbeScope: 'host_totals' }]) {
+      Object.assign(linux.tcp, { assessment: { ...assessment, ...changes } });
+      expect(dashboard(linux).linux.network.tcp.assessment).toBeNull();
+    }
+  });
+  it('accepts only bounded socket evidence without exposing socket identities to the dashboard', () => {
+    const linux = linuxFixture();
+    const verifiedSsh = { status: 'supported', socketId: 'a'.repeat(64),
+      before: { totalRetrans: 120, dsackDuplicates: 120 }, after: { totalRetrans: 121, dsackDuplicates: 121 } };
+    Object.assign(linux.tcp, { verifiedSsh });
+    expect(dashboard(linux).linux.network.tcp.status).toBe('supported');
+    expect(JSON.stringify(dashboard(linux))).not.toContain('a'.repeat(64));
+    verifiedSsh.after.totalRetrans = 119;
+    expect(dashboard(linux).linux.network.tcp.status).toBe('collection_error');
+  });
   it('validates qualified TCP counts and their source freshness independently of raw rates', () => {
     const linux = linuxFixture();
     const assessment = { status: 'ok', observedAt: linux.collectedAt, retransmissionPercent: 6,

@@ -19,7 +19,8 @@ class AlertDeliveryUnitTests(unittest.TestCase):
         self.assertIn("--max-items=10 --max-runtime-seconds=45", worker)
         self.assertIn(" drain --worker-id=monitor-alert-delivery ", worker)
 
-        self.assertIn("RestrictAddressFamilies=AF_UNIX", collector)
+        self.assertIn("RestrictAddressFamilies=AF_UNIX AF_NETLINK\n", collector)
+        self.assertIn("CapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH\n", collector)
         self.assertNotIn("AF_INET", collector)
         self.assertNotIn("alert_delivery.py", collector)
 

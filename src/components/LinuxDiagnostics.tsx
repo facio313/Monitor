@@ -194,11 +194,18 @@ function networkCards(linux: LinuxDiagnostics, locale: MonitorLocale) {
         { label: t(locale, '경고 판정용 합산', 'Weighted assessment'), value: tcp.assessment?.status === 'ok'
           ? `${percent(tcp.assessment.retransmissionPercent, locale)} · ${tcp.assessment.sampleCount}${t(locale, '구간', ' intervals')}`
           : t(locale, '유효 표본 부족 또는 오래된 관측', 'Insufficient or stale observations') },
+        ...(tcp.assessment?.status === 'ok' && (tcp.assessment.duplicateProbeSegmentsEstimate ?? 0) > 0 ? [
+          { label: t(locale, '원시 합산 재전송률', 'Raw weighted retransmission'), value: percent(tcp.assessment.rawRetransmissionPercent ?? null, locale) },
+          { label: t(locale, '확인된 관리 SSH 중복 재전송 추정', 'Verified management SSH duplicate estimate'),
+            value: `${number(tcp.assessment.duplicateProbeSegmentsEstimate ?? null, locale)} · SSH/DSACK` },
+        ] : []),
         { label: t(locale, '재전송 / 송신', 'Retransmitted / outgoing'), value: `${number(tcp.retransmittedSegmentsPerSecond, locale)}/s · ${number(tcp.outgoingSegmentsPerSecond, locale)}/s` },
         { label: t(locale, '계산 근거', 'Rate basis'), value: rateStatusLabel(tcp.rateStatus, locale) },
       ]}
       action={tcp.assessment?.status === 'ok' && (tcp.assessment.retransmissionPercent ?? 0) >= 1
         ? t(locale, '링크 손실, 혼잡, 애플리케이션 재시도를 함께 확인합니다.', 'Check link loss, congestion, and application retries together.')
+        : tcp.assessment?.status === 'ok' && (tcp.assessment.duplicateProbeSegmentsEstimate ?? 0) > 0
+          ? t(locale, '미리 확인한 관리 SSH 소켓의 재전송·중복 수신 통계만 보정했습니다. 다른 연결은 제외하지 않으며, 재접속·근거 누락 시 보정하지 않습니다. 연결별 추정이지 실제 패킷 손실률은 아닙니다.', 'Only retransmission and duplicate-receipt evidence from the explicitly verified management SSH socket is discounted. Other connections are not exempt; reconnects or missing evidence disable adjustment. This is a per-socket estimate, not a packet-loss rate.')
         : collectionAction(tcp.status, locale)}
     />,
     <DiagnosticCard

@@ -38,6 +38,11 @@ TCP_MIN_SPAN_SECONDS = 120
 TCP_MAX_INTERVAL_SECONDS = 180
 TCP_MIN_OUTBOUND_SEGMENTS = 1000
 TCP_MIN_RETRANSMITTED_SEGMENTS = 20
+TCP_PROBE_COUNTERS = ("TCPLossProbes", "TCPDSACKRecv", "TCPLossProbeRecovery", "TCPTimeouts",
+                      "TCPSynRetrans", "TCPFastRetrans", "TCPSlowStartRetrans", "TCPRetransFail")
+TCP_LOSS_COUNTERS = TCP_PROBE_COUNTERS[2:]
+
+
 
 
 def excluded(value: Any) -> bool:
@@ -117,6 +122,39 @@ def _tcp_boot_identity(current: Mapping[str, Any], linux: Mapping[str, Any]) -> 
     return boot_time.isoformat() if boot_time is not None else None
 
 
+def _tcp_probe_counters(value: Any) -> dict[str, int] | None:
+    if not isinstance(value, Mapping):
+        return None
+    result = {key: _tcp_counter(value.get(key)) for key in TCP_PROBE_COUNTERS}
+    return result if all(item is not None for item in result.values()) else None
+
+
+def _tcp_verified_ssh(value: Any) -> dict[str, Any] | None:
+    if (not isinstance(value, Mapping) or value.get("status") != "supported"
+            or not isinstance(value.get("socketId"), str)
+            or not re.fullmatch(r"[0-9a-f]{64}", value["socketId"])):
+        return None
+    result = {"status": "supported", "socketId": value["socketId"]}
+    for bound in ("before", "after"):
+        counters = value.get(bound)
+        if not isinstance(counters, Mapping):
+            return None
+        result[bound] = {key: _tcp_counter(counters.get(key)) for key in ("totalRetrans", "dsackDuplicates")}
+        if any(item is None for item in result[bound].values()):
+            return None
+    if any(result["after"][key] < result["before"][key] for key in result["before"]):
+        return None
+    return result
+
+
+def _tcp_ssh_delta(value: Any) -> dict[str, Any] | None:
+    if (not isinstance(value, Mapping) or not isinstance(value.get("socketId"), str)
+            or not re.fullmatch(r"[0-9a-f]{64}", value["socketId"])):
+        return None
+    result = {key: _tcp_counter(value.get(key)) for key in ("totalRetrans", "dsackDuplicates")}
+    return {"socketId": value["socketId"], **result} if all(item is not None for item in result.values()) else None
+
+
 def _project_tcp_window(tcp: dict[str, Any], samples: list[dict[str, Any]]) -> None:
     if len(samples) < TCP_MIN_SAMPLES:
         return
@@ -127,6 +165,23 @@ def _project_tcp_window(tcp: dict[str, Any], samples: list[dict[str, Any]]) -> N
     total_retransmitted = sum(sample["retransmittedSegmentsDelta"] for sample in samples)
     if not total_out:
         return
+    raw_retransmitted = total_retransmitted
+    duplicate_estimate = 0
+    evidence = [_tcp_probe_counters(sample.get("probeDeltas")) for sample in samples]
+    scoped = [_tcp_ssh_delta(sample.get("verifiedSshDelta")) for sample in samples]
+    if (all(item is not None for item in evidence) and all(item is not None for item in scoped)
+            and len({item["socketId"] for item in scoped}) == 1
+            and all(item["totalRetrans"] <= sample["retransmittedSegmentsDelta"]
+                    for item, sample in zip(scoped, samples))):
+        totals = {key: sum(item[key] for item in evidence) for key in TCP_PROBE_COUNTERS}
+        # Host counters are guards/caps only, never the source of a discount.
+        # Each contribution belongs to the same explicitly pinned SSH socket.
+        # Do not pair DSACKs from another socket or from a different interval.
+        if not any(totals[key] for key in TCP_LOSS_COUNTERS):
+            scoped_duplicates = sum(min(item["totalRetrans"], item["dsackDuplicates"]) for item in scoped)
+            duplicate_estimate = min(raw_retransmitted, scoped_duplicates,
+                                     totals["TCPLossProbes"], totals["TCPDSACKRecv"])
+            total_retransmitted -= duplicate_estimate
     percent = total_retransmitted / total_out * 100
     # Sparse high ratios are unknown rather than evidence of recovery. A real
     # healthy ratio can clear after the same sustained observation requirement.
@@ -135,6 +190,10 @@ def _project_tcp_window(tcp: dict[str, Any], samples: list[dict[str, Any]]) -> N
     tcp.update({"rateStatus": "ok", "retransmissionPercent": percent,
                 "notificationWindow": {"outboundSegmentsDelta": total_out,
                                        "retransmittedSegmentsDelta": total_retransmitted,
+                                       "rawRetransmittedSegmentsDelta": raw_retransmitted,
+                                       "rawRetransmissionPercent": raw_retransmitted / total_out * 100,
+                                       "duplicateProbeSegmentsEstimate": duplicate_estimate,
+                                       "duplicateProbeScope": "verified_ssh_socket",
                                        "windowSeconds": sum(sample["intervalSeconds"] for sample in samples),
                                        "sampleCount": len(samples)}})
 
@@ -167,7 +226,7 @@ def prepare_notification_current(
     if previous_time is not None and not 0 <= (now - previous_time).total_seconds() <= WINDOW_SECONDS:
         prior, previous_time = {}, None
     state: dict[str, Any] = {"lastCollectedAt": prior.get("lastCollectedAt") if previous_time else None,
-                             "lastCounters": None, "bootIdentity": None, "samples": []}
+                             "lastCounters": None, "lastVerifiedSsh": None, "bootIdentity": None, "samples": []}
     observed = timestamp(linux.get("collectedAt"))
     if observed is None or not 0 <= (now - observed).total_seconds() <= TCP_MAX_INTERVAL_SECONDS:
         return projected, state
@@ -192,20 +251,27 @@ def prepare_notification_current(
             samples = []
             continue
         samples.append({"collectedAt": at.isoformat().replace("+00:00", "Z"), "intervalSeconds": interval,
-                        "outboundSegmentsDelta": outbound, "retransmittedSegmentsDelta": retransmitted})
+                        "outboundSegmentsDelta": outbound, "retransmittedSegmentsDelta": retransmitted,
+                        "probeDeltas": _tcp_probe_counters(sample.get("probeDeltas")),
+                        "verifiedSshDelta": _tcp_ssh_delta(sample.get("verifiedSshDelta"))})
     previous_counters = prior.get("lastCounters")
     previous_counters = previous_counters if isinstance(previous_counters, Mapping) else {}
     previous_out = _tcp_counter(previous_counters.get("OutSegs"))
     previous_retransmitted = _tcp_counter(previous_counters.get("RetransSegs"))
+    previous_probes = _tcp_probe_counters(previous_counters)
+    previous_ssh = _tcp_verified_ssh(prior.get("lastVerifiedSsh"))
+    ssh = _tcp_verified_ssh(tcp.get("verifiedSsh"))
     if previous_time is not None and observed <= previous_time:
-        state.update({"lastCounters": {"OutSegs": previous_out, "RetransSegs": previous_retransmitted}
+        state.update({"lastCounters": {"OutSegs": previous_out, "RetransSegs": previous_retransmitted, **(previous_probes or {})}
                       if previous_out is not None and previous_retransmitted is not None else None,
-                      "bootIdentity": prior.get("bootIdentity"), "samples": samples})
+                      "lastVerifiedSsh": previous_ssh, "bootIdentity": prior.get("bootIdentity"), "samples": samples})
         counters = tcp.get("counters")
         if (observed == previous_time and tcp.get("status") == "supported" and raw_rate_status == "ok"
                 and isinstance(counters, Mapping) and previous_out is not None and previous_retransmitted is not None
                 and _tcp_counter(counters.get("OutSegs")) == previous_out
                 and _tcp_counter(counters.get("RetransSegs")) == previous_retransmitted
+                and _tcp_probe_counters(counters) == previous_probes
+                and ssh == previous_ssh
                 and _tcp_boot_identity(current, linux) == prior.get("bootIdentity")):
             _project_tcp_window(tcp, samples)
         return projected, state
@@ -219,8 +285,9 @@ def prepare_notification_current(
     if (tcp.get("status") != "supported" or raw_rate_status != "ok"
             or outbound is None or retransmitted is None or boot_identity is None):
         return projected, state
-    state.update({"lastCounters": {"OutSegs": outbound, "RetransSegs": retransmitted},
-                  "bootIdentity": boot_identity})
+    probes = _tcp_probe_counters(counters)
+    state.update({"lastCounters": {"OutSegs": outbound, "RetransSegs": retransmitted, **(probes or {})},
+                  "lastVerifiedSsh": ssh, "bootIdentity": boot_identity})
     interval = (observed - previous_time).total_seconds() if previous_time else None
     clock = linux.get("clock")
     reboot = clock.get("rebootDetectedSincePreviousSample") if isinstance(clock, Mapping) else None
@@ -230,9 +297,20 @@ def prepare_notification_current(
             or outbound < previous_out or retransmitted < previous_retransmitted):
         return projected, state
 
+    probe_deltas = ({key: probes[key] - previous_probes[key] for key in TCP_PROBE_COUNTERS}
+                    if probes is not None and previous_probes is not None
+                    and all(probes[key] >= previous_probes[key] for key in TCP_PROBE_COUNTERS) else None)
+    # Bracket the host SNMP read with two socket reads. Only the inner delta
+    # (previous AFTER -> current BEFORE) certainly belongs to this host interval.
+    ssh_delta = ({"socketId": ssh["socketId"],
+                  **{key: ssh["before"][key] - previous_ssh["after"][key] for key in ssh["before"]}}
+                 if ssh is not None and previous_ssh is not None
+                 and ssh["socketId"] == previous_ssh["socketId"]
+                 and all(ssh["before"][key] >= previous_ssh["after"][key] for key in ssh["before"]) else None)
     samples.append({"collectedAt": state["lastCollectedAt"], "intervalSeconds": interval,
                     "outboundSegmentsDelta": outbound - previous_out,
-                    "retransmittedSegmentsDelta": retransmitted - previous_retransmitted})
+                    "retransmittedSegmentsDelta": retransmitted - previous_retransmitted,
+                    "probeDeltas": probe_deltas, "verifiedSshDelta": ssh_delta})
     state["samples"] = samples[-TCP_MAX_SAMPLES:]
     _project_tcp_window(tcp, state["samples"])
     return projected, state
@@ -461,6 +539,9 @@ def operational_signals(current: Mapping[str, Any], now: dt.datetime | None = No
                                 f"서로 다른 관측 {window['sampleCount']}개에서 송신 "
                                 f"{window['outboundSegmentsDelta']}개 중 재전송 "
                                 f"{window['retransmittedSegmentsDelta']}개를 합산했습니다.")
+                    if window.get("duplicateProbeSegmentsEstimate", 0):
+                        evidence += (f" 원시 합산 {window['rawRetransmissionPercent']:.2f}%, "
+                                     f"TLP/DSACK 중복 탐색 추정 {window['duplicateProbeSegmentsEstimate']}개를 보정한 판정입니다.")
                 result.append(_signal(row["key"], "operational-caution", "critical" if danger else "warning",
                                       "snapshot", max(1, int(row["value"])),
                                       evidence))

@@ -152,6 +152,21 @@ function render(page: 'resources' | 'network' | 'storage' | 'reliability' | 'pow
 }
 
 describe('Linux diagnostics detail panels', () => {
+  it('explains probe adjustment while retaining the raw retransmission evidence', () => {
+    const linux = fixture();
+    linux.network.tcp.assessment = { status: 'ok', observedAt: linux.collectedAt, retransmissionPercent: 0,
+      sampleCount: 4, windowSeconds: 240, outboundSegmentsDelta: 2000, retransmittedSegmentsDelta: 0,
+      rawRetransmittedSegmentsDelta: 120, rawRetransmissionPercent: 6, duplicateProbeSegmentsEstimate: 120,
+      duplicateProbeScope: 'verified_ssh_socket' };
+    const markup = render('network', linux);
+    expect(markup).toContain('Raw weighted retransmission');
+    expect(markup).toContain('6%');
+    expect(markup).toContain('Verified management SSH duplicate estimate');
+    expect(markup).toContain('120 · SSH/DSACK');
+    expect(markup).toContain('Other connections are not exempt');
+    expect(markup).toContain('reconnects or missing evidence disable adjustment');
+    expect(markup).toContain('not a packet-loss rate');
+  });
   it.each([
     ['supported', 'Supported'],
     ['partial', 'Partial'],

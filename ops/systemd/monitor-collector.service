@@ -50,7 +50,9 @@ ProtectClock=true
 ProtectHostname=true
 ProtectProc=invisible
 ProcSubset=all
-RestrictAddressFamilies=AF_UNIX
+# AF_NETLINK permits read-only SOCK_DIAG statistics for the pinned management
+# SSH socket. No IP sockets or CAP_NET_ADMIN are granted.
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
 RestrictNamespaces=true
 RestrictRealtime=true
 LockPersonality=true

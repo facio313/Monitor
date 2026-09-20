@@ -152,6 +152,10 @@ export interface LinuxDiagnostics {
         windowSeconds: number;
         outboundSegmentsDelta: number;
         retransmittedSegmentsDelta: number;
+        rawRetransmittedSegmentsDelta?: number;
+        rawRetransmissionPercent?: number;
+        duplicateProbeSegmentsEstimate?: number;
+        duplicateProbeScope?: 'verified_ssh_socket';
       } | null;
       states: {
         established: number;

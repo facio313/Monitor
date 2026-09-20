@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import datetime as dt
 import hashlib
+import ipaddress
+import json
 import math
 import os
 import re
@@ -894,9 +896,88 @@ def _ephemeral_range(proc_root: Path) -> tuple[str, int | None, int | None]:
     return "supported", start, end
 
 
+def verified_ssh_policy(proc_root: Path) -> tuple[str, str, int] | None:
+    """Opt in one manually verified socket, never a peer subnet or all SSH."""
+    if proc_root != Path("/proc"):
+        return None
+    status, text = read_limited(Path("/etc/monitor-collector/tcp-verified-ssh.json"), 1024)
+    boot_status, boot = read_limited(proc_root / "sys/kernel/random/boot_id", 64)
+    if status != "supported" or boot_status != "supported":
+        return None
+    try:
+        policy = json.loads(text)
+    except (ValueError, TypeError):
+        return None
+    if (not isinstance(policy, dict) or set(policy) != {"schemaVersion", "socketId", "localPort"}
+            or type(policy["schemaVersion"]) is not int or policy["schemaVersion"] != 1
+            or not isinstance(policy["socketId"], str) or not re.fullmatch(r"[0-9a-f]{64}", policy["socketId"])
+            or type(policy["localPort"]) is not int or policy["localPort"] not in {22, 22022}
+            or not re.fullmatch(r"[0-9a-f-]{36}", boot.strip())):
+        return None
+    return boot.strip(), policy["socketId"], policy["localPort"]
+
+
+def parse_verified_ssh_socket(text: str, policy: tuple[str, str, int]) -> dict[str, Any] | None:
+    """Do not export peer addresses, ports, cookies, or unapproved sockets."""
+    boot, approved_id, port = policy
+    matches = []
+    if len(text) > 65536:
+        return None
+    for line in text.splitlines():
+        fields = line.split()
+        # `ss -HtinOe state established` omits the state column.
+        if len(fields) < 4 or not all(field.isdigit() for field in fields[:2]):
+            continue
+        local, peer = fields[2:4]
+        try:
+            address = ipaddress.ip_address(peer.rsplit(":", 1)[0].strip("[]"))
+            local_port = int(local.rsplit(":", 1)[1])
+        except (ValueError, IndexError):
+            continue
+        if local_port != port or not address.is_private or address.is_loopback:
+            continue
+        cookie = re.search(r"\bsk:([0-9a-f]+)\b", line)
+        retrans = re.search(r"\bretrans:\d+/(\d+)\b", line)
+        dsack = re.search(r"\bdsack_dups:(\d+)\b", line)
+        if not cookie or not retrans or not dsack:
+            continue  # Missing TCP_INFO fields are not fabricated as zero.
+        identity = hashlib.sha256(f"{boot}|{cookie[1]}|{local}|{peer}".encode()).hexdigest()
+        if identity != approved_id:
+            continue
+        counters = {"totalRetrans": _safe_integer(retrans[1], (1 << 32) - 1),
+                    "dsackDuplicates": _safe_integer(dsack[1], (1 << 32) - 1)}
+        if all(value is not None for value in counters.values()):
+            matches.append({"socketId": identity, **counters})
+    return matches[0] if len(matches) == 1 else None
+
+
+def collect_verified_ssh_socket(policy: tuple[str, str, int] | None) -> dict[str, Any] | None:
+    if policy is None:
+        return None
+    try:
+        result = subprocess.run(
+            ["/usr/bin/ss", "-tinHeO", "state", "established", f"( sport = :{policy[2]} )"],
+            capture_output=True, text=True, timeout=1.0, check=False,
+            env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return parse_verified_ssh_socket(result.stdout, policy) if result.returncode == 0 else None
+
+
 def collect_tcp(proc_root: Path, previous: Any, elapsed: float) -> tuple[dict[str, Any], dict[str, Any]]:
+    policy = verified_ssh_policy(proc_root)
+    ssh_before = collect_verified_ssh_socket(policy)
     snmp_status, snmp_text = read_limited(proc_root / "net" / "snmp", MAX_FILE_BYTES)
     netstat_status, netstat_text = read_limited(proc_root / "net" / "netstat", MAX_FILE_BYTES)
+    ssh_after = collect_verified_ssh_socket(policy) if ssh_before is not None else None
+    verified_ssh: dict[str, Any] = {"status": "unavailable"}
+    if (ssh_before is not None and ssh_after is not None
+            and ssh_before["socketId"] == ssh_after["socketId"]
+            and all(ssh_after[key] >= ssh_before[key] for key in ("totalRetrans", "dsackDuplicates"))):
+        verified_ssh = {"status": "supported", "socketId": ssh_before["socketId"],
+                        "before": {key: ssh_before[key] for key in ("totalRetrans", "dsackDuplicates")},
+                        "after": {key: ssh_after[key] for key in ("totalRetrans", "dsackDuplicates")}}
     tcp = parse_protocol_counters(snmp_text, "Tcp") if snmp_status == "supported" else {}
     tcp_ext = parse_protocol_counters(netstat_text, "TcpExt") if netstat_status == "supported" else {}
     counter_names = (
@@ -904,10 +985,10 @@ def collect_tcp(proc_root: Path, previous: Any, elapsed: float) -> tuple[dict[st
         "InSegs", "OutSegs", "RetransSegs", "InErrs", "OutRsts",
     )
     counters = {name: tcp[name] for name in counter_names if name in tcp}
-    if "TCPSynRetrans" in tcp_ext:
-        counters["TCPSynRetrans"] = tcp_ext["TCPSynRetrans"]
-    if "TCPTimeouts" in tcp_ext:
-        counters["TCPTimeouts"] = tcp_ext["TCPTimeouts"]
+    for name in ("TCPSynRetrans", "TCPTimeouts", "TCPLossProbes", "TCPDSACKRecv",
+                 "TCPLossProbeRecovery", "TCPFastRetrans", "TCPSlowStartRetrans", "TCPRetransFail"):
+        if name in tcp_ext:
+            counters[name] = tcp_ext[name]
     prior = previous if isinstance(previous, Mapping) else {}
     required = ("OutSegs", "RetransSegs")
     rate_status = (
@@ -973,6 +1054,7 @@ def collect_tcp(proc_root: Path, previous: Any, elapsed: float) -> tuple[dict[st
     return ({
         "status": status,
         "counters": counters,
+        "verifiedSsh": verified_ssh,
         "rateStatus": rate_status,
         "outgoingSegmentsPerSecond": out_rate,
         "retransmittedSegmentsPerSecond": retrans_rate,

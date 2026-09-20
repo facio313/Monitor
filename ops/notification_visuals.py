@@ -274,8 +274,17 @@ def assess_hourly(current: Mapping[str, Any], evaluation: Mapping[str, Any],
     if (tcp_ratio is not None and tcp_ratio >= 1 and outbound < signals.TCP_MIN_OUTBOUND_SEGMENTS
             and retransmitted < signals.TCP_MIN_RETRANSMITTED_SEGMENTS):
         tcp_ratio = None
-    cards.append(observation(_card("TCP 합산 재전송", tcp_ratio, "%", 1, 5, tcp_fresh, decimals=3),
+    duplicate_estimate = signals.number(window.get("duplicateProbeSegmentsEstimate"))
+    raw_tcp_ratio = signals.number(window.get("rawRetransmissionPercent"))
+    tcp_note = None
+    cards.append(observation(_card("TCP 경고 판정" if duplicate_estimate else "TCP 합산 재전송", tcp_ratio, "%", 1, 5, tcp_fresh, decimals=3),
                              matched_severity(lambda key: key == "tcp:retransmission", {"TcpRetransmissionHigh"})))
+    if tcp_fresh and tcp_ratio is not None and raw_tcp_ratio is not None and duplicate_estimate:
+        tcp_note = (
+            f"TCP 원시 합산 {raw_tcp_ratio:.3f}%, "
+            f"경고 판정 {tcp_ratio:.3f}%. 확인된 관리 SSH 소켓의 "
+            f"중복 재전송 추정 {duplicate_estimate:g}개만 보정했습니다. "
+            "다른 연결은 제외하지 않으며 실제 패킷 손실률은 아닙니다.")
     collection = current.get("syntheticProbeCollection", {})
     collection = collection if isinstance(collection, Mapping) else {}
     # Match the collector's 10-minute synthetic input freshness contract.
@@ -341,6 +350,8 @@ def assess_hourly(current: Mapping[str, Any], evaluation: Mapping[str, Any],
         highlights.append(f"확정 전 관측 {unconfirmed_count}건은 참고 정보이며 현재 위험 건수에 포함하지 않습니다.")
     if coverage_notes and len(highlights) < 4:
         highlights.append("일부 로컬 관측 범위가 제한됩니다. 주의 표시는 서버 장애 확정이 아닙니다.")
+    if tcp_note and len(highlights) < 4:
+        highlights.append(tcp_note[:160])
     return {"status": status, "active_rows": current_active, "rule_rows": active_rules,
             "sources": sources, "cards": cards, "highlights": highlights[:4],
             "snapshot_fresh": snapshot_fresh, "rules_fresh": rules_fresh,

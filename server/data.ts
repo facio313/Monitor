@@ -3167,7 +3167,7 @@ function validateLinuxTcp(value: unknown): boolean {
     'status', 'counters', 'rateStatus', 'outgoingSegmentsPerSecond',
     'retransmittedSegmentsPerSecond', 'retransmissionPercent', 'states',
     'socketScanStatus', 'socketScanTruncated', 'ephemeralPorts', 'conntrack',
-  ], ['assessment']);
+  ], ['assessment', 'verifiedSsh']);
   if (!record || !linuxRawStatus(own(record, 'status')) || !linuxRateStatusIsValid(own(record, 'rateStatus'))) return false;
   if (!linuxNullableNumber(own(record, 'outgoingSegmentsPerSecond'))
     || !linuxNullableNumber(own(record, 'retransmittedSegmentsPerSecond'))
@@ -3175,8 +3175,23 @@ function validateLinuxTcp(value: unknown): boolean {
   const counters = linuxRecord(own(record, 'counters'), [], [
     'ActiveOpens', 'PassiveOpens', 'AttemptFails', 'EstabResets', 'InSegs',
     'OutSegs', 'RetransSegs', 'InErrs', 'OutRsts', 'TCPSynRetrans', 'TCPTimeouts',
+    'TCPLossProbes', 'TCPDSACKRecv', 'TCPLossProbeRecovery', 'TCPFastRetrans', 'TCPSlowStartRetrans', 'TCPRetransFail',
   ]);
   if (!counters || !Object.keys(counters).every((field) => integer(own(counters, field), 0, MAX_LINUX_COUNTER) !== null)) return false;
+  if (Object.hasOwn(record, 'verifiedSsh')) {
+    const ssh = linuxRecord(record.verifiedSsh, ['status'], ['socketId', 'before', 'after']);
+    if (!ssh || !['supported', 'unavailable'].includes(String(ssh.status))) return false;
+    if (ssh.status === 'supported') {
+      if (typeof ssh.socketId !== 'string' || !/^[0-9a-f]{64}$/.test(ssh.socketId)) return false;
+      const before = linuxRecord(ssh.before, ['totalRetrans', 'dsackDuplicates']);
+      const after = linuxRecord(ssh.after, ['totalRetrans', 'dsackDuplicates']);
+      if (!before || !after || !['totalRetrans', 'dsackDuplicates'].every(key => {
+        const start = integer(before[key], 0, 0xffffffff);
+        const end = integer(after[key], 0, 0xffffffff);
+        return start !== null && end !== null && end >= start;
+      })) return false;
+    } else if (Object.keys(ssh).length !== 1) return false;
+  }
   const states = linuxRecord(own(record, 'states'), LINUX_TCP_STATE_FIELDS);
   if (!states || !LINUX_TCP_STATE_FIELDS.every((field) => integer(own(states, field), 0, 65_536) !== null)) return false;
   if (!linuxRawStatus(own(record, 'socketScanStatus')) || typeof own(record, 'socketScanTruncated') !== 'boolean') return false;
@@ -3595,7 +3610,8 @@ function emptyLinuxDiagnostics(
 
 function normalizeTcpAssessment(value: unknown, sourceAt: unknown, nowMs: number): NonNullable<DashboardResponse['linux']['network']['tcp']['assessment']> | null {
   const row = linuxRecord(value, ['status', 'observedAt', 'retransmissionPercent'],
-    ['outboundSegmentsDelta', 'retransmittedSegmentsDelta', 'windowSeconds', 'sampleCount']);
+    ['outboundSegmentsDelta', 'retransmittedSegmentsDelta', 'windowSeconds', 'sampleCount',
+      'rawRetransmittedSegmentsDelta', 'rawRetransmissionPercent', 'duplicateProbeSegmentsEstimate', 'duplicateProbeScope']);
   if (!row || !['ok', 'insufficient_samples'].includes(String(row.status))) return null;
   const observedAt = linuxTimestamp(row.observedAt, nowMs);
   if (!observedAt || observedAt !== linuxTimestamp(sourceAt, nowMs)) return null;
@@ -3608,11 +3624,27 @@ function normalizeTcpAssessment(value: unknown, sourceAt: unknown, nowMs: number
     || !outboundSegmentsDelta || Math.abs(ratio - 100 * retransmittedSegmentsDelta / outboundSegmentsDelta) > 0.000001
     || (ratio >= 1 && outboundSegmentsDelta < 1000 && retransmittedSegmentsDelta < 20))) return null;
   if (row.status === 'insufficient_samples' && row.retransmissionPercent !== null) return null;
+  const hasProbeEvidence = ['rawRetransmittedSegmentsDelta', 'rawRetransmissionPercent', 'duplicateProbeSegmentsEstimate']
+    .some(key => Object.hasOwn(row, key));
+  const rawRetransmittedSegmentsDelta = hasProbeEvidence ? integer(row.rawRetransmittedSegmentsDelta) : retransmittedSegmentsDelta;
+  const rawRetransmissionPercent = hasProbeEvidence ? finite(row.rawRetransmissionPercent, 0, MAX_LINUX_RATE) : ratio;
+  const duplicateProbeSegmentsEstimate = hasProbeEvidence ? integer(row.duplicateProbeSegmentsEstimate) : 0;
+  let probeEvidence = {};
+  if (hasProbeEvidence) {
+    if (row.status !== 'ok' || rawRetransmittedSegmentsDelta === null
+      || rawRetransmissionPercent === null || duplicateProbeSegmentsEstimate === null
+      || (duplicateProbeSegmentsEstimate > 0 && row.duplicateProbeScope !== 'verified_ssh_socket')
+      || rawRetransmittedSegmentsDelta !== retransmittedSegmentsDelta + duplicateProbeSegmentsEstimate
+      || Math.abs(rawRetransmissionPercent - 100 * rawRetransmittedSegmentsDelta / outboundSegmentsDelta) > 0.000001) return null;
+    probeEvidence = { rawRetransmittedSegmentsDelta, rawRetransmissionPercent, duplicateProbeSegmentsEstimate,
+      ...(row.duplicateProbeScope === 'verified_ssh_socket' ? { duplicateProbeScope: 'verified_ssh_socket' as const } : {}) };
+  }
   const age = nowMs - Date.parse(observedAt);
   return {
     status: age < 0 || age > 180_000 ? 'stale' : row.status as 'ok' | 'insufficient_samples',
     observedAt, retransmissionPercent: ratio, sampleCount, windowSeconds,
     outboundSegmentsDelta, retransmittedSegmentsDelta,
+    ...probeEvidence,
   };
 }
 
