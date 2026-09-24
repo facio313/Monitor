@@ -13,6 +13,14 @@ def ssh_row(message, seconds=0, **overrides):
             "message": message, **overrides}
 
 
+def ssh_access_row(identifier="a", *, account="cks", fingerprint=None,
+                   event="accepted", method="publickey", country="US"):
+    return {"id": identifier * 64, "observedAt": NOW.isoformat().replace("+00:00", "Z"),
+            "sourceId": "journal:ssh", "countryStatus": "estimated", "countryCode": country,
+            "eventType": event, "authMethod": method, "targetAccount": account,
+            "publicKeyFingerprint": fingerprint}
+
+
 class SecuritySignalsTests(unittest.TestCase):
     def test_memory_mail_uses_cache_adjustment_but_oom_still_escalates(self):
         row = {"name": "database", "state": "running", "health": "healthy", "memoryBytes": 980,
@@ -27,14 +35,21 @@ class SecuritySignalsTests(unittest.TestCase):
         self.assertTrue(any(item["key"].endswith(":memory") and item["severity"] == "critical"
                             for item in signals.operational_signals(current, NOW)))
 
-    def test_successful_slow_probe_warns_without_claiming_unavailability(self):
+    def test_latency_is_left_to_rule_while_availability_and_tls_signals_remain(self):
         current = {"latest": {}, "generatedAt": NOW.isoformat(),
                    "syntheticProbeCollection": {"status": "fresh", "observedAt": NOW.isoformat()},
-                   "syntheticProbes": [{"id": "ready", "checkedAt": NOW.isoformat(), "status": "ok",
-                                        "latencyMilliseconds": 3209}]}
+                   "syntheticProbes": [
+                       {"id": "ready", "checkedAt": NOW.isoformat(), "status": "ok",
+                        "latencyMilliseconds": 3209, "certificateDaysRemaining": 5},
+                       {"id": "down", "checkedAt": NOW.isoformat(), "status": "timeout",
+                        "latencyMilliseconds": 3209},
+                   ]}
         result = signals.operational_signals(current, NOW)
-        self.assertTrue(any(item["key"].endswith(":latency") and item["severity"] == "warning" for item in result))
-        self.assertFalse(any(item["severity"] == "critical" for item in result))
+        self.assertFalse(any(item["key"].endswith(":latency") for item in result))
+        self.assertTrue(any(item["key"].endswith(":status") and item["severity"] == "critical"
+                            for item in result))
+        self.assertTrue(any(item["key"].endswith(":certificate") and item["severity"] == "critical"
+                            for item in result))
 
     def test_denial_and_close_pair_is_one_conservative_attempt(self):
         denied = ssh_row("User root from [REDACTED_IP] not allowed because not listed in AllowUsers")
@@ -52,7 +67,7 @@ class SecuritySignalsTests(unittest.TestCase):
         result = signals.ssh_signals(rows, NOW)[0]
         self.assertEqual(result["severity"], "warning")
         self.assertEqual(result["count"], 20)
-        self.assertIn("침입 성공의 증거는 아닙니다", result["evidence"])
+        self.assertIn("무단 접근 성공의 증거는 아닙니다", result["evidence"])
         self.assertEqual(signals.ssh_signals([
             ssh_row("Failed password for invalid user someone", redactionVersion=None),
             ssh_row("Failed password for invalid user someone", sourceId="journal:nginx"),
@@ -69,6 +84,46 @@ class SecuritySignalsTests(unittest.TestCase):
         self.assertEqual(result["kind"], "ssh-auth-burst")
         self.assertEqual(result["severity"], "warning")
         self.assertEqual(result["count"], 20)
+
+    def test_only_exact_trusted_publickey_success_is_suppressed(self):
+        trusted_fingerprint = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        trusted = frozenset({("cks", trusted_fingerprint)})
+        approved = ssh_access_row(fingerprint=trusted_fingerprint)
+        self.assertEqual(signals.ssh_signals([], NOW, [approved], trusted), [])
+
+        unknown_key = ssh_access_row(
+            "b", fingerprint="SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+        )
+        result = signals.ssh_signals([], NOW, [approved, unknown_key], trusted)
+        self.assertEqual(len(result), 1)
+        self.assertEqual((result[0]["key"], result[0]["count"]),
+                         ("ssh-untrusted-accepted", 1))
+
+        for row in (
+            ssh_access_row("c", fingerprint=None),
+            ssh_access_row("d", account="other", fingerprint=trusted_fingerprint),
+            ssh_access_row("e", fingerprint=trusted_fingerprint, method="password"),
+        ):
+            with self.subTest(row=row):
+                self.assertEqual(signals.ssh_signals([], NOW, [row], trusted)[0]["key"],
+                                 "ssh-untrusted-accepted")
+
+        failed = ssh_access_row("f", fingerprint=trusted_fingerprint, event="auth_failed")
+        failure = signals.ssh_signals([], NOW, [failed], trusted)
+        self.assertEqual(failure[0]["key"], "ssh-auth")
+        serialized = str(result)
+        self.assertNotIn("cks", serialized)
+        self.assertNotIn(trusted_fingerprint, serialized)
+
+    def test_generic_and_structured_failures_share_one_conservative_count(self):
+        generic = [ssh_row(
+            "Failed password for invalid user account from [REDACTED_IP]", seconds=-index,
+        ) for index in range(5)]
+        structured = [ssh_access_row(chr(97 + index), event="auth_failed", method="password")
+                      for index in range(2)]
+        result = signals.ssh_signals(generic, NOW, structured)
+        self.assertEqual(len(result), 1)
+        self.assertEqual((result[0]["key"], result[0]["count"]), ("ssh-auth", 5))
 
     def test_http_counts_are_not_claimed_to_be_attacks(self):
         rows = {"currentTraffic": [

@@ -1,8 +1,10 @@
 """Bounded OpenSSH access metadata, extracted before generic-log redaction.
 
-Only reviewed SSH journal batches are accepted. No username, journal cursor,
-fingerprint, or raw message reaches this separate export. Rows are observations,
-not sessions: a denied login and its preauth close remain distinct event types.
+Only reviewed SSH journal batches are accepted. Version 2 rows retain the
+target account and an accepted public-key fingerprint, but never a journal
+cursor, private key, authentication content, or raw message. Rows are
+observations, not sessions: a denied login and its preauth close remain
+distinct event types.
 """
 
 from __future__ import annotations
@@ -30,31 +32,38 @@ MAX_DAY_ROWS = 10_000
 MAX_DAY_BYTES = 4 * 1024 * 1024
 MAX_STATUS_BYTES = 8192
 MAX_INPUT_BYTES = 128 * 1024
+TRUSTED_SSH_IDENTITIES_FILENAME = "trusted-ssh-identities.json"
+MAX_TRUSTED_SSH_IDENTITIES_BYTES = 16 * 1024
+MAX_TRUSTED_SSH_IDENTITIES = 32
 SOURCE_UNITS = {"journal:ssh": "ssh.service", "journal:sshd": "sshd.service"}
 EVENT_TYPES = {"denied", "invalid_user", "auth_failed", "accepted", "preauth_closed"}
 AUTH_METHODS = {None, "publickey", "password", "keyboard-interactive"}
 COUNTRY_STATUSES = {"estimated", "private", "unavailable", "not_found", "stale"}
 SOURCE_STATUSES = {"fresh", "partial", "unavailable", "stale"}
 ERROR_CLASSES = {None, "not_configured", "acquisition_failed", "acquisition_partial", "persistence_failed", "invalid_input"}
-RECORD_FIELDS = {"schemaVersion", "id", "observedAt", "sourceId", "sourceIp", "sourcePort",
-                 "eventType", "authMethod", "countryCode", "countryStatus", "databaseDate"}
 STATUS_FIELDS = {"schemaVersion", "observedAt", "status", "lastSuccessAt", "errorClass", "sources",
                  "acceptedRecords", "deduplicatedRecords", "droppedRecords", "retentionDays"}
 SOURCE_FIELDS = {"sourceId", "status", "observedAt", "lastSuccessAt", "errorClass"}
 _ISO = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})")
 _DAY = re.compile(r"\d{4}-\d{2}-\d{2}")
 _USER = r"[^\s\x00-\x1f\x7f]{1,256}"
+_ACCOUNT = r"(?P<account>" + _USER + r")"
 _IP = r"(?P<ip>[0-9A-Fa-f:.]{2,45})"
 _PORT = r"(?P<port>[0-9]{1,5})"
 _METHOD = r"(?P<method>publickey|password|keyboard-interactive(?:/pam)?)"
-_FINGERPRINT = r"(?:: (?:RSA|DSA|ECDSA|ED25519|ECDSA-SK|ED25519-SK)(?:-CERT)? SHA256:[A-Za-z0-9+/=]{1,128})?"
+_FINGERPRINT = (r"(?:: (?:RSA|DSA|ECDSA|ED25519|ECDSA-SK|ED25519-SK)(?:-CERT)? "
+                r"(?P<fingerprint>SHA256:[A-Za-z0-9+/=]{1,128}))?")
 _PATTERNS = (
-    ("denied", re.compile(r"User " + _USER + r" from " + _IP + r" not allowed because (?:not listed in AllowUsers|listed in DenyUsers|none of user's groups are listed in AllowGroups|a group is listed in DenyGroups)")),
-    ("invalid_user", re.compile(r"Invalid user " + _USER + r" from " + _IP + r" port " + _PORT)),
-    ("auth_failed", re.compile(r"Failed " + _METHOD + r" for (?:invalid user )?" + _USER + r" from " + _IP + r" port " + _PORT + r" ssh2" + _FINGERPRINT)),
-    ("accepted", re.compile(r"Accepted " + _METHOD + r" for " + _USER + r" from " + _IP + r" port " + _PORT + r" ssh2" + _FINGERPRINT)),
-    ("preauth_closed", re.compile(r"(?:Connection closed by|Disconnected from) (?:(?:invalid user|authenticating user) " + _USER + r" )?" + _IP + r" port " + _PORT + r" \[preauth\]")),
+    ("denied", re.compile(r"User " + _ACCOUNT + r" from " + _IP + r" not allowed because (?:not listed in AllowUsers|listed in DenyUsers|none of user's groups are listed in AllowGroups|a group is listed in DenyGroups)")),
+    ("invalid_user", re.compile(r"Invalid user " + _ACCOUNT + r" from " + _IP + r" port " + _PORT)),
+    ("auth_failed", re.compile(r"Failed " + _METHOD + r" for (?:invalid user )?" + _ACCOUNT + r" from " + _IP + r" port " + _PORT + r" ssh2" + _FINGERPRINT)),
+    ("accepted", re.compile(r"Accepted " + _METHOD + r" for " + _ACCOUNT + r" from " + _IP + r" port " + _PORT + r" ssh2" + _FINGERPRINT)),
+    ("preauth_closed", re.compile(r"(?:Connection closed by|Disconnected from) (?:(?:invalid user|authenticating user) " + _ACCOUNT + r" )?" + _IP + r" port " + _PORT + r" \[preauth\]")),
 )
+
+V1_RECORD_FIELDS = {"schemaVersion", "id", "observedAt", "sourceId", "sourceIp", "sourcePort",
+                    "eventType", "authMethod", "countryCode", "countryStatus", "databaseDate"}
+RECORD_FIELDS = V1_RECORD_FIELDS | {"targetAccount", "publicKeyFingerprint"}
 
 
 def _iso(value: dt.datetime) -> str:
@@ -99,8 +108,17 @@ def is_ssh_source(definition: Any) -> bool:
 
 
 def _identity(row: Mapping[str, Any]) -> str:
+    # Keep the v1 identity stable so mixed v1/v2 history and replay share one
+    # durable observation identity.
     return hashlib.sha256("\0".join(str(row[key]) for key in (
         "observedAt", "sourceId", "eventType", "sourceIp", "sourcePort")).encode()).hexdigest()
+
+
+def _target_account(value: Any) -> str | None:
+    if (not isinstance(value, str) or re.fullmatch(_USER, value) is None
+            or len(value.encode("utf-8")) > 256):
+        return None
+    return value
 
 
 def _country(ip: str, lookup: Any) -> dict[str, Any]:
@@ -154,9 +172,12 @@ def parse_ssh_event(source_id: str, unit: str, line: str, *, lookup: Any = None)
         if port is not None and not 1 <= port <= 65535:
             return None
         method = fields.get("method")
-        row = {"schemaVersion": 1, "observedAt": _iso(_timestamp(raw["timestamp"])),
+        fingerprint = fields.get("fingerprint")
+        row = {"schemaVersion": 2, "observedAt": _iso(_timestamp(raw["timestamp"])),
                "sourceId": source_id, "sourceIp": address.compressed, "sourcePort": port,
                "eventType": event_type, "authMethod": "keyboard-interactive" if method and method.startswith("keyboard-interactive") else method,
+               "targetAccount": _target_account(fields.get("account")),
+               "publicKeyFingerprint": fingerprint if event_type == "accepted" and method == "publickey" else None,
                **_country(address.compressed, lookup)}
         row["id"] = _identity(row)
         return row
@@ -164,13 +185,28 @@ def parse_ssh_event(source_id: str, unit: str, line: str, *, lookup: Any = None)
 
 
 def normalize_record(value: Any) -> dict[str, Any]:
-    if not isinstance(value, Mapping) or set(value) != RECORD_FIELDS or _excluded(value):
+    if not isinstance(value, Mapping) or _excluded(value):
         raise ValueError("invalid SSH access record fields")
-    if type(value["schemaVersion"]) is not int or value["schemaVersion"] != 1:
+    version = value.get("schemaVersion")
+    expected_fields = (V1_RECORD_FIELDS if type(version) is int and version == 1
+                       else RECORD_FIELDS if type(version) is int and version == 2 else None)
+    if expected_fields is None or set(value) != expected_fields:
         raise ValueError("invalid SSH access schema")
     if (_iso(_timestamp(value["observedAt"])) != value["observedAt"] or value["sourceId"] not in SOURCE_UNITS
             or value["eventType"] not in EVENT_TYPES or value["authMethod"] not in AUTH_METHODS):
         raise ValueError("invalid SSH access record")
+    if version == 2:
+        account = value["targetAccount"]
+        fingerprint = value["publicKeyFingerprint"]
+        if account is not None and _target_account(account) != account:
+            raise ValueError("invalid SSH target account")
+        if fingerprint is not None and (
+            not isinstance(fingerprint, str)
+            or re.fullmatch(r"SHA256:[A-Za-z0-9+/=]{1,128}", fingerprint) is None
+            or value["eventType"] != "accepted"
+            or value["authMethod"] != "publickey"
+        ):
+            raise ValueError("invalid SSH public key fingerprint")
     if not isinstance(value["sourceIp"], str) or ipaddress.ip_address(value["sourceIp"]).compressed != value["sourceIp"] or "%" in value["sourceIp"]:
         raise ValueError("invalid SSH source IP")
     address = ipaddress.ip_address(value["sourceIp"])
@@ -188,6 +224,73 @@ def normalize_record(value: Any) -> dict[str, Any]:
     if _country(value["sourceIp"], ExistingCountry()) != country:
         raise ValueError("invalid SSH country data")
     return dict(value)
+
+
+def _v1_record(value: Mapping[str, Any]) -> dict[str, Any]:
+    legacy = {key: value[key] for key in V1_RECORD_FIELDS}
+    legacy["schemaVersion"] = 1
+    return legacy
+
+
+def load_trusted_ssh_identities(
+    path: Path, expected_uid: int | None = None,
+) -> dict[tuple[str, str], str]:
+    """Load exact root-private account/key identities used only for mail policy.
+
+    Missing configuration means no trusted identities. Unsafe or malformed
+    configuration raises so callers can fail closed to the same empty policy.
+    """
+    path = Path(path)
+    owner = os.geteuid() if expected_uid is None else expected_uid
+    if (not path.is_absolute() or ".." in path.parts or path.name != TRUSTED_SSH_IDENTITIES_FILENAME
+            or type(owner) is not int or owner < 0):
+        raise ValueError("invalid trusted SSH identity path")
+    try:
+        parent = path.parent.lstat()
+    except FileNotFoundError:
+        return {}
+    if (not stat.S_ISDIR(parent.st_mode) or parent.st_uid != owner
+            or parent.st_mode & 0o022):
+        raise ValueError("unsafe trusted SSH identity directory")
+    try:
+        raw = _read_bounded(
+            path, expected_uid=owner,
+            maximum_bytes=MAX_TRUSTED_SSH_IDENTITIES_BYTES, private=True,
+        )
+    except LogStoreError as exc:
+        raise ValueError("unsafe trusted SSH identity file") from exc
+    if raw is None:
+        return {}
+    try:
+        value = _json(raw)
+    except (UnicodeError, RecursionError) as exc:
+        raise ValueError("invalid trusted SSH identity encoding") from exc
+    if (not isinstance(value, Mapping) or set(value) != {"schemaVersion", "identities"}
+            or type(value["schemaVersion"]) is not int or value["schemaVersion"] != 1
+            or not isinstance(value["identities"], list)
+            or len(value["identities"]) > MAX_TRUSTED_SSH_IDENTITIES):
+        raise ValueError("invalid trusted SSH identity configuration")
+    result: dict[tuple[str, str], str] = {}
+    for item in value["identities"]:
+        if not isinstance(item, Mapping) or set(item) != {
+            "targetAccount", "publicKeyFingerprint", "label",
+        }:
+            raise ValueError("invalid trusted SSH identity entry")
+        account = item["targetAccount"]
+        fingerprint = item["publicKeyFingerprint"]
+        label = item["label"]
+        if (_target_account(account) != account
+                or not isinstance(fingerprint, str)
+                or re.fullmatch(r"SHA256:[A-Za-z0-9+/=]{1,128}", fingerprint) is None
+                or not isinstance(label, str) or not 1 <= len(label) <= 64
+                or len(label.encode("utf-8")) > 128
+                or any(ord(char) < 32 or ord(char) == 127 for char in label)):
+            raise ValueError("invalid trusted SSH identity value")
+        identity = (account, fingerprint)
+        if identity in result:
+            raise ValueError("duplicate trusted SSH identity")
+        result[identity] = label
+    return result
 
 
 def _directory(path: Path, owner: int, *, create: bool = False) -> None:
@@ -282,7 +385,8 @@ def _merge_days(root: Path, records: Sequence[Mapping[str, Any]], now: dt.dateti
     cutoff = now.astimezone(dt.timezone.utc).date() - dt.timedelta(days=RETENTION_DAYS - 1)
     dates: dict[str, list[Mapping[str, Any]]] = {}
     dropped = 0
-    for row in records:
+    for candidate in records:
+        row = normalize_record(candidate)
         day = row["observedAt"][:10]
         if dt.date.fromisoformat(day) < cutoff or _timestamp(row["observedAt"]) > now + dt.timedelta(seconds=60):
             dropped += 1
@@ -308,11 +412,23 @@ def _merge_days(root: Path, records: Sequence[Mapping[str, Any]], now: dt.dateti
                 retained[row["id"]] = row
         new_ids = set()
         for row in incoming:
-            if row["id"] in retained:
-                duplicates += 1
-            else:
+            existing = retained.get(row["id"])
+            if existing is None:
                 retained[row["id"]] = row
                 new_ids.add(row["id"])
+                continue
+            if existing == row:
+                duplicates += 1
+                continue
+            if _v1_record(existing) != _v1_record(row):
+                raise ValueError("conflicting SSH observation identity")
+            if existing["schemaVersion"] == 1 and row["schemaVersion"] == 2:
+                retained[row["id"]] = row
+                duplicates += 1
+            elif existing["schemaVersion"] == 2 and row["schemaVersion"] == 1:
+                duplicates += 1  # A legacy replay must never remove enrichment.
+            else:
+                raise ValueError("conflicting SSH v2 observation")
         ordered = sorted(retained.values(), key=lambda row: (row["observedAt"], row["id"]))
         lines = [_encoded(row) for row in ordered]
         size = sum(map(len, lines))

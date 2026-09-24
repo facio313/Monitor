@@ -13,8 +13,13 @@ function fixture(ssoEnabled = false) {
   const directory = mkdtempSync(join(tmpdir(), 'monitor-ssh-access-api-'));
   roots.push(directory);
   mkdirSync(join(directory, 'ssh-access'), { mode: 0o750 });
-  const records = ['accepted', 'auth_failed'].map((eventType, index) => ({ schemaVersion: 1, id: String(index + 1).repeat(64), observedAt: `2026-09-13T11:59:5${index}.123456Z`,
-    sourceId: 'journal:ssh', sourceIp: '203.0.113.10', sourcePort: 51234, eventType, authMethod: 'publickey', countryCode: 'KR', countryStatus: 'estimated', databaseDate: '2026-09-01' }));
+  const records = [
+    { schemaVersion: 2, id: '1'.repeat(64), observedAt: '2026-09-13T11:59:50.123456Z', sourceId: 'journal:ssh', sourceIp: '203.0.113.10',
+      sourcePort: 51234, eventType: 'accepted', authMethod: 'publickey', countryCode: 'KR', countryStatus: 'estimated', databaseDate: '2026-09-01',
+      targetAccount: 'operator', publicKeyFingerprint: `SHA256:${'A'.repeat(43)}` },
+    { schemaVersion: 1, id: '2'.repeat(64), observedAt: '2026-09-13T11:59:51.123456Z', sourceId: 'journal:ssh', sourceIp: '203.0.113.10',
+      sourcePort: 51234, eventType: 'auth_failed', authMethod: 'publickey', countryCode: 'KR', countryStatus: 'estimated', databaseDate: '2026-09-01' },
+  ];
   writeFileSync(join(directory, 'ssh-access', '2026-09-13.jsonl'), records.map(record => JSON.stringify(record)).join('\n') + '\n', { mode: 0o640 });
   const security = new ApplicationSecurityState(directory, { now: () => NOW });
   const app = createApp({ password: 'correct horse battery staple', authStateFile: join(directory, 'auth-state.json'), sessionSecret: 'ssh-access-test-secret-at-least-32-bytes',
@@ -36,7 +41,9 @@ describe('SSH access authenticated API', () => {
     const response = await request(app).get('/monitor/api/ssh-access?range=6h&limit=1&page=1').set('Cookie', cookie).expect('Cache-Control', 'no-store').expect(200);
     expect(response.body).toMatchObject({ total: 2, status: 'unavailable', page: 1 });
     expect(response.body.records[0]).toMatchObject({ sourceIp: '203.0.113.10', eventType: 'auth_failed' });
-    expect((await request(app).get('/monitor/api/ssh-access?event=accepted').set('Cookie', cookie).expect(200)).body.total).toBe(1);
+    const accepted = await request(app).get('/monitor/api/ssh-access?event=accepted').set('Cookie', cookie).expect(200);
+    expect(accepted.body).toMatchObject({ total: 1, records: [{ schemaVersion: 1, eventType: 'accepted' }] });
+    expect(JSON.stringify(accepted.body)).not.toMatch(/targetAccount|publicKeyFingerprint|operator|SHA256:/);
     for (const query of ['limit=101', 'page=0', 'ip=hostname.invalid', 'range=1h&range=24h', 'path=/etc/passwd']) {
       const invalid = await request(app).get(`/monitor/api/ssh-access?${query}`).set('Cookie', cookie).expect(400);
       expect(invalid.body.code).toBe('INVALID_SSH_ACCESS_QUERY');

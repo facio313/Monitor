@@ -1,11 +1,15 @@
-# Hourly mail and immediate observations
+# Notification reports and immediate observations
 
-Current resource/HTTP/SSH policy and deployment notes are in
+The current schedule, single-owner routing, SSH policy and unsupported-observation
+contracts are defined in
+[the 2026-09-24 remediation record](alert-policy-remediation-2026-09-24.md).
+It supersedes older policy text in this document. Public `hourly` fields,
+`HourlyReport` rule IDs and hourly-named preview functions remain compatibility
+names; they do not change the once-daily KST schedule. Earlier resource-policy
+background remains in
 [the 2026-09-14 remediation record](monitoring-policy-remediation-2026-09-14.md).
-Its thresholds and one-minute synthetic cadence supersede the earlier noise
-policy examples below. `notification_policy.py` is installed with the producer;
-entry/recovery rules and resource cards use that shared policy. External host
-monitoring is not configured, and hourly text states this limitation explicitly.
+`notification_policy.py` is installed with the producer; entry/recovery rules
+and resource cards use that shared policy.
 
 `ops/notification_reports.py` exposes:
 
@@ -38,14 +42,14 @@ delivery boundary rejects excluded targets too.
 
 ## Schedule and durability
 
-A healthy report is queued once per UTC hour, at the first collector run in
-that hour. The mail is written in Korean with KST timestamps and covers current
-CPU, memory, temperature, load, pressure, TCP retransmissions, disk capacity,
-reboot requirement, active rules, immediate signals, recent HTTP/network rule
-transitions and source coverage. Historical short RCU delays are identified as
-history. Stale metrics are not described as current healthy readings. Downtime
-does not cause a backlog of hourly reports to be recreated; the next current
-hour is reported when collection returns.
+A healthy report is queued once per KST day, at the first collector run on or
+after the 09:00 KST boundary. The mail is written in Korean with KST timestamps
+and covers current CPU, memory, temperature, load, pressure, TCP retransmissions,
+disk capacity, reboot requirement, active rules, immediate signals, recent
+HTTP/network rule transitions and source coverage. Historical short RCU delays
+are identified as history. Stale metrics are not described as current healthy
+readings. Downtime does not cause a backlog of daily reports to be recreated;
+the current day is reported when collection returns.
 
 The producer checkpoint, current incident states, and queue inserts commit in
 one transaction in the existing delivery SQLite database. An unchanged warning
@@ -61,18 +65,21 @@ mail. Repeated warning episodes have a durable 15-minute cooldown; a new critica
 escalation can still notify. Discrete critical availability failures are not
 subject to this cooldown. Reboot and certificate maintenance notices retain their
 single-episode notification behavior. Single refused SSH logins remain visible
-in local detections (and hourly reports while active); immediate SSH mail starts at five observations
-in five minutes, with the existing critical threshold of twenty.
+in local detections (and the daily report while active); immediate SSH mail starts
+at five distinct observations in five minutes, with the existing critical threshold
+of twenty. An accepted public-key login is suppressed only when its exact account
+and key-fingerprint pair is trusted; other accepted logins notify immediately.
+SSH security conditions do not send recovery mail.
 Missing/null metrics, unavailable sources and repeated snapshots cannot prove
 recovery. SSH conditions clear after their five-minute observation window plus
 the two fresh recovery samples. These recoveries describe the observation
 condition, not proof that an attempted attack succeeded or was remediated.
 
-Queue-full drops do not consume the hourly slot or signal notification
+Queue-full drops do not consume the daily slot or signal notification
 checkpoint. Never-sent rows dropped or evicted for capacity can be admitted
 again with the same event/channel identity when space returns, including if
 only their attempt-zero audit remains. Successful, leased and attempted rows
-retain ordinary deduplication/retry semantics. Current hourly and active signal
+retain ordinary deduplication/retry semantics. Current daily and active signal
 rows are checked for later capacity eviction. Pending recovery notifications
 are retained across queue pressure, including recoveries admitted and subsequently
 evicted before any delivery attempt. A fresh active rule can notify on SMTP
@@ -87,9 +94,9 @@ The public `lastQueuedAt` means queued, not delivered.
 ## Card-based email and trend graphs
 
 SMTP mail includes a responsive, light card layout and a complete plain-text
-alternative. Hourly cards show the latest CPU, memory, temperature, maximum
+alternative. Daily cards show the latest CPU, memory, temperature, maximum
 disk use, TCP retransmission ratio and maximum HTTP probe response time.
-The subject, plain-text summary and HTML heading share one hourly assessment.
+The subject, plain-text summary and HTML heading share one daily assessment.
 Only qualified unresolved incidents raise warning/critical incident severity;
 single raw peaks do not. Cards are explicitly labeled observations and cannot
 raise the overall verdict by themselves. A card's color never exceeds either
@@ -97,11 +104,11 @@ its current measurement range or the corresponding confirmed incident level.
 Missing or stale values are not presented as zero or healthy. Immediate mail
 puts the condition, first observation and suggested checks in a shorter layout.
 
-Hourly TCP cards and text use the same bounded segment-count window as immediate
-TCP detection, never the instantaneous raw ratio. Insufficient samples remain
-unavailable. Routed-out alternate TCP/HTTP latency rule paths do not reintroduce
-their old verdict through the hourly report. Rule episodes require ready
-notification authority; public `firing` rows alone do not establish it.
+Daily TCP cards and text use the same bounded segment-count window as the
+canonical TCP rule, never the instantaneous raw ratio. Insufficient samples
+remain unavailable. Diagnostic direct TCP/HTTP paths do not own mail or
+reintroduce a duplicate verdict through the daily report. Rule episodes require
+ready notification authority; public `firing` rows alone do not establish it.
 
 Qualification is independent of SMTP success or resend cooldown. Confirmed
 incidents survive missing observations until recovery is verified. After a
@@ -113,7 +120,7 @@ genuine renewed critical observations must qualify again. Full recovery still
 requires the existing two fresh clear samples. The existing once-per-episode
 immediate notification/deduplication policy is unchanged.
 
-Read-only hourly previews reuse the private producer qualification and TCP
+Read-only report previews reuse the private producer qualification and TCP
 checkpoint through a query-only SQLite connection. They do not infer qualification
 from the truncated public detections list, create an outbox, update checkpoints,
 load credentials or send mail. When that authority is unavailable, the preview
@@ -138,10 +145,10 @@ The only link is the fixed Monitor dashboard. Each model is limited to 4 KiB,
 HTML to 60 KiB and each of at most two PNGs to 200 KiB. If a visual cannot be
 built or rendered, the existing text report remains available. Visual data is
 omitted when needed to preserve the existing 16 KiB outbox payload limit.
-Delivery identity, credentials, retry policy and schedule are unchanged.
+The renderer itself does not change delivery identity, credentials or retry policy.
 
 An explicitly marked design sample can be queued through the same configured
-SMTP channel without consuming a production hourly slot:
+SMTP channel without consuming a production daily slot:
 
 ```sh
 sudo python3 /usr/local/lib/monitor-collector/alert_delivery.py \
@@ -172,10 +179,10 @@ Additional immediate conditions use current reviewed exports:
 
 | Source | Observation thresholds |
 | --- | --- |
-| SSH | AllowUsers denial, invalid-user pre-auth close, failed authentication; first episode warning, at least 20 observations in five minutes critical repeated-pattern signal |
+| SSH | Failures/denials stay local from the first row; mail starts at five distinct rows in five minutes and becomes critical at twenty. An accepted login not matched by an exact trusted account/key pair sends an immediate warning |
 | HTTP requests | At least 20 4xx and 20% share warning (attack unconfirmed); any 5xx warning, critical at 20 errors or at least 5 errors/20 requests and 5% share; slow share 10%/40% requires at least 20 requests and 3 slow responses, while max response 5/15 seconds still qualifies |
 | Host | CPU/memory 75%/90%, temperature 75/85°C, dashboard PSI/error/drop thresholds, load, disk/inode 75%/90%, current power/link/SSH-listener failures, reboot-required marker |
-| TCP | Weighted retransmission 1%/5% warning/critical over up to five minutes, at least three distinct counter intervals spanning two minutes, and at least 1,000 outbound segments or 20 retransmissions; sparse high ratios remain insufficient evidence |
+| TCP | Canonical rule firing at 5% over five distinct samples spanning 240 seconds; recovery at 1% or lower over three samples spanning 120 seconds; sparse evidence remains insufficient |
 | Synthetic | DNS/timeout/TLS/HTTP failure critical; latency 1/3 seconds; certificate expiry within 30/7 days |
 | Containers | Fresh state/health failures, OOM, restart delta 1/3, memory/PID limit use 80%/90%, CPU throttling 20%/50%, interface errors |
 | Kernel/clock | Supported kernel observations whose latest event occurred within five minutes; clock explicitly unsynchronized or absolute drift 15/60 seconds |
@@ -196,13 +203,12 @@ the outbox. Reset, stale, missing and backward observations cannot synthesize a
 healthy zero. Repeated observations never add another interval. When traffic is
 low, sustained retransmissions can still qualify through the absolute count floor.
 
-The production Gmail route uses optional `excludeRuleIds` for
-`TcpRetransmissionHigh` and `HttpLatencyHigh`, whose mail is owned by the qualified
-additional signal path above. Their local rule evaluations/history remain intact;
-other rules and separately configured routes retain delivery. Install the upgraded
-producer and delivery reader before enabling these exclusions. The ordinary rule
-evaluator also preserves original synthetic sample timestamps in private state,
-so it cannot mistake cached probe results for repeated checks.
+Canonical TCP, NIC, container, HTTP, TLS and synthetic rules are the sole mail
+owners for their conditions. Diagnostic direct-signal state remains available
+locally but does not enqueue duplicate mail. Route exclusions must not suppress
+those canonical owners. The ordinary rule evaluator preserves original synthetic
+sample timestamps in private state, so it cannot mistake cached probe results for
+repeated checks.
 
 Reads are bounded to 16 MiB documents and the final 2 MiB/20,000 records of log
 exports. Up to 128 immediate signal groups and 32 public recent entries are
@@ -212,8 +218,8 @@ no new SSH records can still be healthy; source failure cannot be interpreted
 as absence of attempts.
 
 The public `notification-reports.json` includes overall producer status,
-hourly/immediate enqueue counters, last queued hour, source health, bounded
-detection evidence and delivery counts. `delivery.sent` is SMTP acceptance as
+legacy-named `hourly`/immediate enqueue counters, the last queued daily slot,
+source health, bounded detection evidence and delivery counts. `delivery.sent` is SMTP acceptance as
 recorded by the worker, not inbox receipt; `delivery.failed` includes final
 failures and dropped rows. `lastAttemptAt` and `lastOutcome` are audit readback.
 No enabled SMTP channel gives `status=disabled` while local detections continue.

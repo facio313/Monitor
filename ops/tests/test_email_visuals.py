@@ -215,6 +215,7 @@ class RenderEmailTests(unittest.TestCase):
         self.assertNotIn("display:block!important", mobile_css)
         self.assertIn("font-size:24px!important", mobile_css)
         self.assertIn("2026-09-13 17:00 – 2026-09-13 18:00 KST", document)
+        self.assertIn("DAILY BRIEF", document)
         self.assertIn("최근 1시간 · 2분 구간 최대값", document)
         self.assertIn("전송량 가중 비율", document)
         self.assertIn("CPU 실선", document)

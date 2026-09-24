@@ -15,7 +15,7 @@ import json
 import math
 import re
 from collections import Counter
-from typing import Any, Mapping, Sequence
+from typing import AbstractSet, Any, Mapping, Sequence
 
 try:
     from . import notification_policy as resource_policy
@@ -27,7 +27,7 @@ WINDOW_SECONDS = 300
 BURST_THRESHOLD = 20
 SOURCE_NAMES = frozenset({"snapshot", "rules", "ssh", "http"})
 DETECTION_KINDS = frozenset({
-    "ssh-auth-attempt", "ssh-auth-burst", "http-client-errors",
+    "ssh-auth-attempt", "ssh-auth-burst", "ssh-auth-success", "http-client-errors",
     "http-server-errors", "operational-caution", "source-unavailable", "rule-alert",
 })
 SSH_SOURCES = frozenset({"journal:ssh", "journal:sshd"})
@@ -84,9 +84,17 @@ def sample_timestamp(key: str, current: Mapping[str, Any]) -> str | None:
     if key.startswith("host:") and resource_policy.policy_for_signal(key) is not None:
         latest = current.get("latest")
         raw = latest.get("timestamp", raw) if isinstance(latest, Mapping) else None
-    elif key.startswith(("tcp:", "clock:", "kernel:")):
+    elif key.startswith("kernel:"):
+        field = key.partition(":")[2]
+        kernel = current.get("system", {}).get("kernel", {})
+        event = kernel.get(field, {}) if isinstance(kernel, Mapping) else {}
+        raw = event.get("lastEventAt") if isinstance(event, Mapping) else None
+    elif key.startswith(("tcp:", "clock:")):
         linux = current.get("linux")
         raw = linux.get("collectedAt") if isinstance(linux, Mapping) else None
+    elif key.startswith("docker:"):
+        collection = current.get("dockerEventCollection")
+        raw = collection.get("observedAt") if isinstance(collection, Mapping) else None
     elif key.startswith("synthetic:"):
         raw = None
         rows = current.get("syntheticProbes")
@@ -322,7 +330,39 @@ def _signal(key: str, kind: str, severity: str, source: str, count: int, evidenc
             "evidence": evidence}
 
 
-def ssh_signals(records: Sequence[Mapping[str, Any]], now: dt.datetime) -> list[dict[str, Any]]:
+def ssh_signals(records: Sequence[Mapping[str, Any]], now: dt.datetime,
+                access_records: Sequence[Mapping[str, Any]] = (),
+                trusted_identities: AbstractSet[tuple[str, str]] = frozenset()) -> list[dict[str, Any]]:
+    # Country-enriched records have already passed ssh_access.normalize_record.
+    # Authentication success is security-relevant regardless of geography.
+    recent_access = [row for row in access_records if not excluded(row)
+                     and row.get("sourceId") in SSH_SOURCES
+                     and fresh(row.get("observedAt"), now, WINDOW_SECONDS)]
+    accepted = [row for row in recent_access if row.get("eventType") == "accepted"]
+    accepted = list({row["id"]: row for row in accepted}.values())
+    untrusted_accepted = [row for row in accepted if not (
+        row.get("authMethod") == "publickey"
+        and isinstance(row.get("targetAccount"), str)
+        and isinstance(row.get("publicKeyFingerprint"), str)
+        and (row["targetAccount"], row["publicKeyFingerprint"]) in trusted_identities
+    )]
+    foreign = [row for row in recent_access if row.get("eventType") != "accepted"
+               and row.get("countryStatus") in {"estimated", "stale"}
+               and isinstance(row.get("countryCode"), str) and row["countryCode"] not in {"KR", "ZZ"}]
+    foreign = list({row["id"]: row for row in foreign}.values())
+    result = []
+    if untrusted_accepted:
+        codes = sorted({row["countryCode"] for row in untrusted_accepted
+                        if isinstance(row.get("countryCode"), str) and row["countryCode"] != "ZZ"})
+        country_detail = (f" 추정 국가 {', '.join(codes[:8])}"
+                          f"{' 외 추가 국가' if len(codes) > 8 else ''}." if codes else "")
+        result.append(_signal(
+            "ssh-untrusted-accepted", "ssh-auth-success", "warning", "ssh",
+            len(untrusted_accepted),
+            f"신뢰 목록에 없는 SSH 인증 성공: 최근 5분 {len(untrusted_accepted)}개 로그 행."
+            + country_detail
+            + " 인증 성공은 확인되었지만 승인된 운영 접속인지 여부는 미확인입니다. "
+              "계정·키 지문·주소는 알림에 포함하지 않습니다."))
     categories: Counter[str] = Counter()
     seen: set[str] = set()
     for row in records[-20000:]:
@@ -350,18 +390,33 @@ def ssh_signals(records: Sequence[Mapping[str, Any]], now: dt.datetime) -> list[
             categories["invalid"] += 1
         elif "authentication failure" in lowered:
             categories["authentication"] += 1
-    count = max(categories.values(), default=0)
+    # Structured country rows are derived from the generic SSH stream but do
+    # not share a safe public record identifier with its redacted rows. Taking
+    # the larger conservative count avoids both double counting and dropping
+    # every generic row that happens to share a timestamp with one foreign row.
+    count = max(max(categories.values(), default=0), len(foreign))
     if not count:
-        return []
+        return result
     burst = count >= BURST_THRESHOLD
-    return [_signal(
+    country_detail = ""
+    if foreign:
+        codes = sorted({row["countryCode"] for row in foreign})
+        countries = ", ".join(codes[:8]) + (" 외 추가 국가" if len(codes) > 8 else "")
+        country_detail = (
+            f" 이 중 해외 추정 관측은 {len(foreign)}개 로그 행, 추정 국가 {countries}입니다."
+            + (" 오래된 국가 DB 추정이 포함됩니다."
+               if any(row["countryStatus"] == "stale" for row in foreign) else "")
+        )
+    return result + [_signal(
         "ssh-auth", "ssh-auth-burst" if burst else "ssh-auth-attempt",
         # These records prove rejected/failed authentication, not compromise or
         # service unavailability. Volume alone must not turn them into danger.
         "warning", "ssh", count,
-        f"최근 5분 SSH 비허용 로그인/인증 실패 최소 {count}건. "
+        f"최근 5분 SSH 인증 실패·거부 최소 {count}개 로그 행."
+        + country_detail + " "
         + ("반복 공격 의심 패턴입니다. " if burst else "접근 시도 주의가 필요합니다. ")
-        + "거부·종료 로그 중복을 보수적으로 묶었으며 침입 성공의 증거는 아닙니다.",
+        + "실패·거부·인증 전 종료 기록을 보수적으로 묶었으며 무단 접근 성공의 증거는 아닙니다. "
+          "로그 행 수는 고유 접근 횟수가 아닙니다.",
     )]
 
 
@@ -457,6 +512,13 @@ def _extended_observations(current: Mapping[str, Any], now: dt.datetime) -> list
                 value = count if fresh(entry.get("lastEventAt"), now, WINDOW_SECONDS) else 0
                 add(f"kernel:{field}", value, 1, 1 if critical else float("inf"),
                     f"최근 5분 {label} 기록(부팅 후 누적)", "건")
+    docker_events = current.get("dockerEventCollection", {})
+    if (isinstance(docker_events, Mapping)
+            and docker_events.get("status") in {"fresh", "gap"}
+            and fresh(docker_events.get("observedAt"), now)
+            and type(docker_events.get("gapDetected")) is bool):
+        add("docker:eventGap", 1 if docker_events["gapDetected"] else 0, 1, float("inf"),
+            "Docker 이벤트 수집 연속성 공백")
     for collection_key, rows_key, prefix, identity_key in (
         ("syntheticProbeCollection", "syntheticProbes", "synthetic", "id"),
         ("containerCollection", "containers", "container", "name"),
@@ -490,8 +552,9 @@ def _extended_observations(current: Mapping[str, Any], now: dt.datetime) -> list
                     add(f"{base}:status", 1, 1, 1, f"{name} 합성 검사 실패")
                 elif state in {"permission", "invalid"}:
                     add(f"{base}:status", 1, 1, 2, f"{name} 합성 검사 수집 주의")
-                if state == "ok":
-                    add(f"{base}:latency", row.get("latencyMilliseconds"), 1000, float("inf"), f"{name} 합성 검사 지연", "ms")
+                # Successful-probe latency mail is owned by the canonical
+                # HttpLatencyHigh rule, including its sustained entry/recovery
+                # thresholds. Keep availability and certificate signals here.
                 days = row.get("certificateDaysRemaining")
                 if isinstance(days, (int, float)) and not isinstance(days, bool) and math.isfinite(days):
                     add(f"{base}:certificate", max(0, days), 30, 7, f"{name} TLS 인증서 잔여", "일", low=True)
@@ -604,9 +667,11 @@ def observable(key: str, current: Mapping[str, Any]) -> bool:
         return resource_policy.resource_value(key, current) is not None
     if key == "host:cpuPressureFullAvg10":
         return False  # Undefined at host scope, never an observed healthy zero.
+    if key.startswith("ssh-foreign-") or key == "ssh-untrusted-accepted":
+        return current.get("_sshCountryObservable") is True
     if key.startswith("source:") or key == "ssh-auth":
         return True  # Caller separately requires the corresponding source healthy.
-    if key.startswith(("tcp:", "clock:", "kernel:", "synthetic:", "container:", "collection:")):
+    if key.startswith(("tcp:", "clock:", "kernel:", "docker:", "synthetic:", "container:", "collection:")):
         now = timestamp(current.get("generatedAt"))
         return now is not None and any(row["key"] == key for row in _extended_observations(current, now))
     latest = current.get("latest", {})

@@ -8,7 +8,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from ops import linux_telemetry, security_signals as signals, notification_visuals as visuals
+from ops import linux_telemetry, notification_reports as reports
+from ops import security_signals as signals, notification_visuals as visuals
 from ops.tests import test_notification_visuals as visual_fixtures
 from ops.tests import test_notification_reports as report_fixtures
 
@@ -205,7 +206,7 @@ class TcpProbePolicyTests(unittest.TestCase):
         self.assertTrue(any('확인된 관리 SSH 소켓' in text for text in visual['highlights']))
         self.assertEqual(next(card['value'] for card in visual['cards'] if card['label'].startswith('TCP 경고 판정')), '0')
 
-    def test_real_timeout_alongside_duplicate_probes_still_enqueues_once(self):
+    def test_real_timeout_alongside_duplicate_probes_remains_rule_owned(self):
         fixture = report_fixtures.NotificationReportsTests('test_ssh_episode_and_source_loss_do_not_false_recover')
         fixture.setUp()
         self.addCleanup(fixture.tearDown)
@@ -215,8 +216,9 @@ class TcpProbePolicyTests(unittest.TestCase):
             snapshot = current(index, TCPTimeouts=100 + index)
             fixture.current.update(identity=snapshot['identity'], linux=snapshot['linux'])
             produced = fixture.run_producer(now)
-        self.assertEqual(produced['immediate']['enqueued'], 1)
-        self.assertTrue(any('TCP 재전송률' in row['evidence'] for row in produced['detections']))
+        self.assertEqual(produced['immediate']['enqueued'], 0)
+        self.assertFalse(any('TCP 재전송률' in row['evidence'] for row in produced['detections']))
+        self.assertIn('TcpRetransmissionHigh', reports._retired_signal_reason('tcp:retransmission'))
         self.assertEqual(fixture.run_producer(now)['immediate']['enqueued'], 0)
 
 

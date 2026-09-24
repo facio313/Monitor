@@ -57,10 +57,37 @@ class SshParsingTests(unittest.TestCase):
                 self.assertEqual(row["eventType"], event)
                 self.assertEqual(row["sourcePort"], port)
                 self.assertEqual(row["authMethod"], method)
+                self.assertEqual(row["targetAccount"], "sensitive-user" if "by 8.8.8.8" not in message else None)
+                self.assertEqual(
+                    row["publicKeyFingerprint"],
+                    "SHA256:SECRETFAKEFINGERPRINT" if event == "accepted" and method == "publickey" else None,
+                )
                 self.assertEqual(row["countryCode"], "US")
                 self.assertEqual(ssh.normalize_record(row), row)
-                self.assertNotIn("sensitive-user", json.dumps(row))
-                self.assertNotIn("SECRETFAKEFINGERPRINT", json.dumps(row))
+
+    def test_v1_rows_remain_valid_while_v2_fields_are_exact_and_bounded(self):
+        row = ssh.parse_ssh_event(
+            "journal:ssh", "ssh.service",
+            reduced("Accepted publickey for operator from 8.8.8.8 port 42123 ssh2: "
+                    "ED25519 SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+        )
+        legacy = {key: value for key, value in row.items() if key in ssh.V1_RECORD_FIELDS}
+        legacy["schemaVersion"] = 1
+        self.assertEqual(ssh.normalize_record(legacy), legacy)
+        self.assertEqual(row["schemaVersion"], 2)
+        self.assertEqual(row["targetAccount"], "operator")
+        self.assertEqual(row["publicKeyFingerprint"],
+                         "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+        for changes in (
+            {"schemaVersion": 1},
+            {"targetAccount": "two words"},
+            {"targetAccount": "x" * 257},
+            {"publicKeyFingerprint": "MD5:unsafe"},
+            {"eventType": "auth_failed"},
+            {"authMethod": "password"},
+        ):
+            with self.subTest(changes=changes), self.assertRaises((ValueError, TypeError)):
+                ssh.normalize_record({**row, **changes})
 
     def test_username_spoofing_embedded_shapes_and_excluded_input_are_rejected(self):
         messages = [
@@ -118,6 +145,73 @@ class SshParsingTests(unittest.TestCase):
         self.assertEqual(private["countryStatus"], "private")
 
 
+class TrustedSshIdentityTests(unittest.TestCase):
+    FINGERPRINT = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.state = self.root / ".state"
+        self.state.mkdir(mode=0o700)
+        self.path = self.state / ssh.TRUSTED_SSH_IDENTITIES_FILENAME
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def write(self, value):
+        self.path.write_text(json.dumps(value))
+        self.path.chmod(0o600)
+
+    def value(self):
+        return {"schemaVersion": 1, "identities": [{
+            "targetAccount": "cks", "publicKeyFingerprint": self.FINGERPRINT,
+            "label": "github-deploy-1",
+        }]}
+
+    def test_missing_is_empty_and_exact_private_config_loads_labels(self):
+        self.assertEqual(ssh.load_trusted_ssh_identities(
+            self.path, os.geteuid(),
+        ), {})
+        self.write(self.value())
+        self.assertEqual(ssh.load_trusted_ssh_identities(
+            self.path, os.geteuid(),
+        ), {("cks", self.FINGERPRINT): "github-deploy-1"})
+
+    def test_unsafe_or_malformed_config_fails_closed(self):
+        self.write(self.value())
+        self.path.chmod(0o640)
+        with self.assertRaises(ValueError):
+            ssh.load_trusted_ssh_identities(self.path, os.geteuid())
+        self.path.chmod(0o600)
+        for value in (
+            {**self.value(), "extra": True},
+            {"schemaVersion": 1, "identities": [
+                self.value()["identities"][0], self.value()["identities"][0],
+            ]},
+            {"schemaVersion": 1, "identities": [{
+                **self.value()["identities"][0], "publicKeyFingerprint": "MD5:unsafe",
+            }]},
+            {"schemaVersion": 1, "identities": [{
+                **self.value()["identities"][0], "targetAccount": "two words",
+            }]},
+        ):
+            self.write(value)
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                ssh.load_trusted_ssh_identities(self.path, os.geteuid())
+
+    def test_symlink_and_writable_parent_are_rejected(self):
+        target = self.root / "target.json"
+        target.write_text(json.dumps(self.value()))
+        target.chmod(0o600)
+        self.path.symlink_to(target)
+        with self.assertRaises(ValueError):
+            ssh.load_trusted_ssh_identities(self.path, os.geteuid())
+        self.path.unlink()
+        self.state.chmod(0o770)
+        with self.assertRaises(ValueError):
+            ssh.load_trusted_ssh_identities(self.path, os.geteuid())
+
+
 class SshPersistenceTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -151,7 +245,37 @@ class SshPersistenceTests(unittest.TestCase):
         self.assertEqual(status["acceptedRecords"], 0)
         self.assertEqual(len(self.rows()), 1)
         self.assertEqual((self.output / ssh.STATUS_FILENAME).stat().st_mode & 0o777, 0o640)
-        self.assertNotIn("sensitive-user", str(self.rows()))
+        self.assertEqual(self.rows()[0]["targetAccount"], "sensitive-user")
+
+    def test_v2_replay_upgrades_v1_without_new_count_and_never_downgrades(self):
+        current = ssh.parse_ssh_event(
+            "journal:ssh", "ssh.service", self.line, lookup=Countries(),
+        )
+        legacy = {key: value for key, value in current.items() if key in ssh.V1_RECORD_FIELDS}
+        legacy["schemaVersion"] = 1
+        directory = self.output / "ssh-access"
+        directory.mkdir(mode=0o750)
+        path = directory / "2026-09-13.jsonl"
+        path.write_text(json.dumps(legacy) + "\n")
+        path.chmod(0o640)
+
+        accepted, duplicates, dropped = ssh._merge_days(
+            self.output, [current], NOW, os.geteuid(),
+        )
+        self.assertEqual((accepted, duplicates, dropped), (0, 1, 0))
+        self.assertEqual(self.rows()[0], current)
+
+        accepted, duplicates, dropped = ssh._merge_days(
+            self.output, [legacy], NOW, os.geteuid(),
+        )
+        self.assertEqual((accepted, duplicates, dropped), (0, 1, 0))
+        self.assertEqual(self.rows()[0], current)
+
+        conflicting = {**current, "targetAccount": "different-account"}
+        before = path.read_bytes()
+        with self.assertRaises(ValueError):
+            ssh._merge_days(self.output, [conflicting], NOW, os.geteuid())
+        self.assertEqual(path.read_bytes(), before)
 
     def test_failed_partial_and_missing_sources_never_claim_no_activity(self):
         self.collect()

@@ -16,6 +16,8 @@ const EVENTS = ['denied', 'invalid_user', 'auth_failed', 'accepted', 'preauth_cl
 const FILTERS = ['all', 'failed', 'accepted', 'preauth_closed'];
 const SOURCES = ['journal:ssh', 'journal:sshd'];
 const ERRORS = [null, 'not_configured', 'acquisition_failed', 'acquisition_partial', 'persistence_failed', 'invalid_input'];
+const V1_RECORD_FIELDS = ['schemaVersion', 'id', 'observedAt', 'sourceId', 'sourceIp', 'sourcePort', 'eventType', 'authMethod', 'countryCode', 'countryStatus', 'databaseDate'];
+const V2_RECORD_FIELDS = [...V1_RECORD_FIELDS, 'targetAccount', 'publicKeyFingerprint'];
 const COUNTRIES = new Set(('AD AE AF AG AI AL AM AO AQ AR AS AT AU AW AX AZ BA BB BD BE BF BG BH BI BJ BL BM BN BO BQ BR BS BT BV BW BY BZ '
   + 'CA CC CD CF CG CH CI CK CL CM CN CO CR CU CV CW CX CY CZ DE DJ DK DM DO DZ EC EE EG EH ER ES ET FI FJ FK FM FO FR '
   + 'GA GB GD GE GF GG GH GI GL GM GN GP GQ GR GS GT GU GW GY HK HM HN HR HT HU ID IE IL IM IN IO IQ IR IS IT JE JM JO JP '
@@ -64,20 +66,30 @@ export function canonicalSshIp(value: unknown): string | null {
 }
 
 export function parseSshAccessRecord(raw: unknown): SshAccessRecord | null {
-  if (!exact(raw, ['schemaVersion', 'id', 'observedAt', 'sourceId', 'sourceIp', 'sourcePort', 'eventType', 'authMethod', 'countryCode', 'countryStatus', 'databaseDate'])
-    || raw.schemaVersion !== 1 || typeof raw.id !== 'string' || !/^[a-f0-9]{64}$/.test(raw.id)
+  const version = raw !== null && typeof raw === 'object' && !Array.isArray(raw) ? (raw as Obj).schemaVersion : null;
+  const fields = version === 1 ? V1_RECORD_FIELDS : version === 2 ? V2_RECORD_FIELDS : null;
+  if (fields === null || !exact(raw, fields)
+    || typeof raw.id !== 'string' || !/^[a-f0-9]{64}$/.test(raw.id)
     || !timestamp(raw.observedAt) || !SOURCES.includes(raw.sourceId as string) || typeof raw.sourceIp !== 'string' || canonicalSshIp(raw.sourceIp) !== raw.sourceIp
     || !(raw.sourcePort === null || Number.isInteger(raw.sourcePort) && Number(raw.sourcePort) >= 1 && Number(raw.sourcePort) <= 65535)
     || !EVENTS.includes(raw.eventType as string) || ![null, 'publickey', 'password', 'keyboard-interactive'].includes(raw.authMethod as string | null)
     || !(raw.countryCode === null || typeof raw.countryCode === 'string' && /^[A-Z]{2}$/.test(raw.countryCode))
     || !['estimated', 'private', 'unavailable', 'not_found', 'stale'].includes(raw.countryStatus as string)
     || !(raw.databaseDate === null || date(raw.databaseDate))) return null;
+  if (version === 2) {
+    if (!(raw.targetAccount === null || typeof raw.targetAccount === 'string'
+      && /^[^\s\x00-\x1f\x7f]{1,256}$/u.test(raw.targetAccount) && Buffer.byteLength(raw.targetAccount) <= 256)
+      || !(raw.publicKeyFingerprint === null || typeof raw.publicKeyFingerprint === 'string'
+        && /^SHA256:[A-Za-z0-9+/=]{1,128}$/u.test(raw.publicKeyFingerprint))
+      || raw.publicKeyFingerprint !== null && (raw.eventType !== 'accepted' || raw.authMethod !== 'publickey')) return null;
+  }
   if (raw.countryStatus === 'estimated' && raw.countryCode === null
     || ['private', 'unavailable', 'not_found'].includes(raw.countryStatus as string) && raw.countryCode !== null) return null;
   // Provider-specific/non-ISO codes must not hide otherwise valid access logs.
   const countryCode = typeof raw.countryCode === 'string' && COUNTRIES.has(raw.countryCode) ? raw.countryCode : null;
   const countryStatus = raw.countryCode !== null && countryCode === null && raw.countryStatus !== 'stale' ? 'not_found' : raw.countryStatus;
-  // Reconstruct only reviewed fields. No usernames, raw log messages or arbitrary labels.
+  // Reconstruct only the existing public v1 fields. The v2 account and key
+  // identity stay private to the collector's local notification policy.
   return { schemaVersion: 1, id: raw.id, observedAt: raw.observedAt, sourceId: raw.sourceId as SshAccessRecord['sourceId'],
     sourceIp: raw.sourceIp as string, sourcePort: raw.sourcePort as number | null, eventType: raw.eventType as SshAccessRecord['eventType'],
     authMethod: raw.authMethod as SshAccessRecord['authMethod'], countryCode,

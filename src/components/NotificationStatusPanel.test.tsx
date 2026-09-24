@@ -11,6 +11,9 @@ describe('notification status presentation', () => {
   it('shows delivery limits and missing detection coverage rather than claiming successful mail or safety', () => {
     const markup = renderToStaticMarkup(createElement(NotificationReportView, { data: fixture(), locale: 'en' }));
     expect(markup).toContain('Accepted by SMTP');
+    expect(markup).toContain('Daily reports and incident alerts');
+    expect(markup).toContain('Reports run daily');
+    expect(markup).toContain('Last daily report queued');
     expect(markup).toContain('Queued items have not yet been sent');
     expect(markup).toContain('Unavailable');
     expect(markup).toContain('does not establish a successful intrusion');
@@ -18,5 +21,10 @@ describe('notification status presentation', () => {
   it('prominently distinguishes disabled delivery and stale snapshots', () => {
     expect(renderToStaticMarkup(createElement(NotificationReportView, { data: { ...fixture(), status: 'disabled' }, locale: 'ko' }))).toContain('메일 전송 미설정');
     expect(renderToStaticMarkup(createElement(NotificationReportView, { data: { ...fixture(), stale: true }, locale: 'en' }))).toContain('Notification status is stale');
+  });
+  it('labels the compatible hourly field as a daily report in Korean', () => {
+    const markup = renderToStaticMarkup(createElement(NotificationReportView, { data: fixture(), locale: 'ko' }));
+    expect(markup).toContain('일일 보고 · 이상 징후 알림');
+    expect(markup).toContain('마지막 일일 보고 예약');
   });
 });

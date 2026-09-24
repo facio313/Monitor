@@ -16,9 +16,9 @@ class NotificationNoiseRegressions(unittest.TestCase):
         self.fixture.setUp()
         self.addCleanup(self.fixture.tearDown)
 
-    def run_at(self, minute, rate=0, **extra_latest):
+    def run_at(self, minute, temperature=65, **extra_latest):
         now = fixtures.NOW + dt.timedelta(minutes=minute)
-        self.fixture.refresh_network(now, rate=rate)
+        self.fixture.refresh_temperature(now, value=temperature)
         self.fixture.current["latest"].update(extra_latest)
         result = self.fixture.run_producer(now)
         self.assertEqual(result["status"], "ok")
@@ -35,20 +35,20 @@ class NotificationNoiseRegressions(unittest.TestCase):
                 if row["event"]["ruleId"] == "OperationalCaution"]
 
     def test_continuous_breach_across_severity_changes_warns_then_escalates_once(self):
-        for minute, rate in enumerate((2, 0.5, 2, 0.5, 2, 0.5)):
-            self.run_at(minute, rate)
+        for minute, temperature in enumerate((85, 80, 85, 80, 85, 80)):
+            self.run_at(minute, temperature)
         firing = [row for row in self.signal_events() if row["transition"] == "firing"]
         self.assertEqual([row["severity"] for row in firing], ["warning"])
         self.assertEqual(firing[0]["observedAt"], reports._iso(fixtures.NOW + dt.timedelta(minutes=2)))
 
-        # Two sustained critical samples escalate the same incident. Returning
+        # Three sustained critical samples escalate the same incident. Returning
         # through warning and critical afterward must not emit it a third time.
-        for minute, rate in enumerate((2, 2, 0.5, 2, 2), start=6):
-            self.run_at(minute, rate)
+        for minute, temperature in enumerate((85, 85, 85, 80, 85, 85, 85), start=6):
+            self.run_at(minute, temperature)
         firing = [row for row in self.signal_events() if row["transition"] == "firing"]
         self.assertEqual([row["severity"] for row in firing], ["warning", "critical"])
         self.assertEqual(firing[0]["openedAt"], firing[1]["openedAt"])
-        self.assertEqual(self.state()["active"]["host:networkRxErrorsPerSecond"]["notifiedSeverity"], "critical")
+        self.assertEqual(self.state()["active"]["host:temperatureC"]["notifiedSeverity"], "critical")
 
     def test_admitted_recovery_evicted_by_critical_is_readmitted_with_same_identity(self):
         fixture = self.fixture
@@ -99,45 +99,46 @@ class NotificationNoiseRegressions(unittest.TestCase):
 
     def test_processing_cap_cannot_resolve_a_still_observed_breach(self):
         for minute in range(3):
-            self.run_at(minute, rate=0.5)
-        self.assertEqual(self.state()["active"]["host:networkRxErrorsPerSecond"]["notifiedSeverity"], "warning")
+            self.run_at(minute, temperature=80)
+        self.assertEqual(self.state()["active"]["host:temperatureC"]["notifiedSeverity"], "warning")
 
         with mock.patch.object(reports, "MAX_SIGNALS", 1):
             for minute in (3, 4):
                 # The critical memory signal receives the only processing slot.
-                self.run_at(minute, rate=0.5, memoryPercent=95)
-        self.assertEqual(self.state()["active"]["host:networkRxErrorsPerSecond"]["status"], "active")
+                self.run_at(minute, temperature=80, memoryPercent=95)
+        self.assertEqual(self.state()["active"]["host:temperatureC"]["status"], "active")
         self.assertFalse(any(row["transition"] == "resolved" for row in self.signal_events()))
 
     def test_cached_and_backdated_absent_metric_cannot_reset_breach_or_recovery_streaks(self):
-        self.run_at(0, rate=0.5)
-        self.run_at(1, rate=0.5)
-        before = self.state()["active"]["host:networkRxErrorsPerSecond"]
+        self.run_at(0, temperature=80)
+        self.run_at(1, temperature=80)
+        before = self.state()["active"]["host:temperatureC"]
         self.assertEqual(before["breachSamples"], 2)
-        del self.fixture.current["latest"]["networkRxErrorsPerSecond"]
+        del self.fixture.current["latest"]["temperatureC"]
         for sample_minute in (1, 0):
             self.fixture.current["generatedAt"] = reports._iso(
                 fixtures.NOW + dt.timedelta(minutes=sample_minute)
             )
             result = self.fixture.run_producer(fixtures.NOW + dt.timedelta(seconds=90))
             self.assertEqual(result["status"], "ok")
-            after = self.state()["active"]["host:networkRxErrorsPerSecond"]
+            after = self.state()["active"]["host:temperatureC"]
             self.assertEqual(after["breachSamples"], 2)
             self.assertEqual(after["lastBreachSampleAt"], before["lastBreachSampleAt"])
-        self.run_at(2, rate=0.5)
+        self.run_at(2, temperature=80)
         self.assertEqual([row["severity"] for row in self.signal_events()], ["warning"])
 
-        self.run_at(3, rate=0)
-        self.assertEqual(self.state()["active"]["host:networkRxErrorsPerSecond"]["clearSamples"], 1)
-        del self.fixture.current["latest"]["networkRxErrorsPerSecond"]
+        self.run_at(3, temperature=75)
+        self.assertEqual(self.state()["active"]["host:temperatureC"]["clearSamples"], 1)
+        del self.fixture.current["latest"]["temperatureC"]
         for sample_minute in (3, 2):
             self.fixture.current["generatedAt"] = reports._iso(
                 fixtures.NOW + dt.timedelta(minutes=sample_minute)
             )
             result = self.fixture.run_producer(fixtures.NOW + dt.timedelta(seconds=210))
             self.assertEqual(result["status"], "ok")
-            self.assertEqual(self.state()["active"]["host:networkRxErrorsPerSecond"]["clearSamples"], 1)
-        self.run_at(4, rate=0)
+            self.assertEqual(self.state()["active"]["host:temperatureC"]["clearSamples"], 1)
+        self.run_at(4, temperature=75)
+        self.run_at(5, temperature=75)
         self.assertEqual([row["transition"] for row in self.signal_events()], ["firing", "resolved"])
 
 

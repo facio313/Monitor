@@ -87,20 +87,17 @@ class NotificationCoverageTests(unittest.TestCase):
         self.assertEqual(signals.operational_signals(current, NOW), [])
         self.assertFalse(signals.observable(key, current))
 
-    def test_synthetic_failures_and_latency_match_current_dashboard(self):
+    def test_synthetic_failures_remain_while_latency_is_rule_owned(self):
         for status in ("dns", "timeout", "tls", "http"):
             with self.subTest(status=status):
                 current = snapshot()
                 current["syntheticProbes"][0]["status"] = status
                 self.only_signal(current, "critical")
-        for milliseconds, severity in ((999, None), (1000, "warning"), (2999, "warning"), (3000, "warning")):
+        for milliseconds in (999, 1000, 2999, 3000):
             with self.subTest(milliseconds=milliseconds):
                 current = snapshot()
                 current["syntheticProbes"][0]["latencyMilliseconds"] = milliseconds
-                if severity:
-                    self.only_signal(current, severity)
-                else:
-                    self.assertEqual(signals.operational_signals(current, NOW), [])
+                self.assertEqual(signals.operational_signals(current, NOW), [])
 
     def test_certificate_warning_starts_at_30_days_and_includes_expired_certificates(self):
         # The maintenance dashboard warns at 30 days, including the 14-day period.
@@ -116,8 +113,8 @@ class NotificationCoverageTests(unittest.TestCase):
 
     def test_synthetic_stale_collection_or_probe_cannot_fire_or_clear(self):
         current = snapshot()
-        current["syntheticProbes"][0]["latencyMilliseconds"] = 3000
-        key = self.only_signal(current, "warning")["key"]
+        current["syntheticProbes"][0]["status"] = "timeout"
+        key = self.only_signal(current, "critical")["key"]
         variants = []
         stale_status = copy.deepcopy(current)
         stale_status["syntheticProbeCollection"]["status"] = "stale"
@@ -131,9 +128,6 @@ class NotificationCoverageTests(unittest.TestCase):
         missing_probe = copy.deepcopy(current)
         missing_probe["syntheticProbes"] = []
         variants.append(missing_probe)
-        missing_latency = copy.deepcopy(current)
-        missing_latency["syntheticProbes"][0]["latencyMilliseconds"] = None
-        variants.append(missing_latency)
         for index, unknown in enumerate(variants):
             with self.subTest(index=index):
                 # A collection-health warning is valid; retained probe failures
@@ -381,10 +375,10 @@ class NotificationCoverageTests(unittest.TestCase):
         current["syntheticProbes"][0]["checkedAt"] = None
         self.assertIsNone(signals.sample_timestamp(f"synthetic:{probe_hash}:latency", current))
 
-    def test_five_minute_synthetic_sample_remains_available_without_changing_identity(self):
+    def test_five_minute_certificate_sample_remains_available_without_changing_identity(self):
         current = snapshot()
-        current["syntheticProbes"][0]["latencyMilliseconds"] = 4000
-        key = self.only_signal(current, "warning")["key"]
+        current["syntheticProbes"][0]["certificateDaysRemaining"] = 5
+        key = self.only_signal(current, "critical")["key"]
         for elapsed in (240, 300, 600):
             now = NOW + dt.timedelta(seconds=elapsed)
             current["generatedAt"] = now.isoformat().replace("+00:00", "Z")
@@ -395,11 +389,11 @@ class NotificationCoverageTests(unittest.TestCase):
         current["generatedAt"] = (NOW + dt.timedelta(seconds=601)).isoformat().replace("+00:00", "Z")
         self.assertFalse(signals.observable(key, current))
 
-    def test_failed_fast_synthetic_probe_is_not_a_latency_recovery_sample(self):
+    def test_failed_probe_is_not_a_certificate_recovery_sample(self):
         current = snapshot()
-        current["syntheticProbes"][0]["latencyMilliseconds"] = 4000
-        key = self.only_signal(current, "warning")["key"]
-        current["syntheticProbes"][0].update({"status": "tls", "latencyMilliseconds": 5})
+        current["syntheticProbes"][0]["certificateDaysRemaining"] = 5
+        key = self.only_signal(current, "critical")["key"]
+        current["syntheticProbes"][0].update({"status": "tls", "certificateDaysRemaining": None})
         self.assertFalse(signals.observable(key, current))
         rows = signals.operational_signals(current, NOW)
         self.assertEqual(len(rows), 1)

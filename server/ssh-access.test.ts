@@ -14,6 +14,12 @@ function record(index = 0, overrides: Partial<SshAccessRecord> = {}): SshAccessR
     sourceIp: '203.0.113.10', sourcePort: 52123, eventType: 'auth_failed', authMethod: 'password',
     countryCode: 'US', countryStatus: 'estimated', databaseDate: '2026-09-01', ...overrides };
 }
+function recordV2(index = 0, overrides: Record<string, unknown> = {}) {
+  return { schemaVersion: 2, id: id(String(index)), observedAt: '2026-09-13T11:59:59.123456Z', sourceId: 'journal:ssh',
+    sourceIp: '203.0.113.10', sourcePort: 52123, eventType: 'accepted', authMethod: 'publickey',
+    countryCode: 'US', countryStatus: 'estimated', databaseDate: '2026-09-01', targetAccount: 'operator',
+    publicKeyFingerprint: `SHA256:${'A'.repeat(43)}`, ...overrides };
+}
 function status(overrides: Record<string, unknown> = {}) {
   return { schemaVersion: 1, observedAt: '2026-09-13T12:00:00.000000Z', status: 'fresh', lastSuccessAt: '2026-09-13T12:00:00Z', errorClass: null,
     sources: [{ sourceId: 'journal:ssh', status: 'fresh', observedAt: '2026-09-13T12:00:00Z', lastSuccessAt: '2026-09-13T12:00:00Z', errorClass: null }],
@@ -50,6 +56,30 @@ describe('SSH access strict read model', () => {
     expect(readSshAccess(root, { event: 'failed' }, NOW).records.map(row => row.eventType).sort()).toEqual(['auth_failed', 'denied', 'invalid_user']);
     expect(readSshAccess(root, { event: 'accepted' }, NOW).records.map(row => row.eventType)).toEqual(['accepted']);
     expect(readSshAccess(root, { event: 'preauth_closed' }, NOW).records.map(row => row.eventType)).toEqual(['preauth_closed']);
+  });
+
+  it('accepts exact v2 rows but strips private identity from public records', () => {
+    const legacy = record(0);
+    const current = recordV2(1);
+    const { root } = fixture([legacy, current]);
+    const records = readSshAccess(root, {}, NOW).records;
+    expect(records).toHaveLength(2);
+    const projected = parseSshAccessRecord(current);
+    expect(projected).toMatchObject({ schemaVersion: 1, id: current.id, eventType: 'accepted' });
+    expect(projected).not.toHaveProperty('targetAccount');
+    expect(projected).not.toHaveProperty('publicKeyFingerprint');
+    expect(JSON.stringify(records)).not.toMatch(/operator|SHA256:/);
+
+    const invalid = [
+      recordV2(2, { targetAccount: 'two words' }),
+      recordV2(3, { targetAccount: 'x'.repeat(257) }),
+      recordV2(4, { publicKeyFingerprint: 'MD5:unsafe' }),
+      recordV2(5, { eventType: 'auth_failed' }),
+      recordV2(6, { authMethod: 'password' }),
+      { ...legacy, targetAccount: 'operator' },
+      { ...current, schemaVersion: 1 },
+    ];
+    invalid.forEach(row => expect(parseSshAccessRecord(row)).toBeNull());
   });
 
   it('keeps a fresh successful empty acquisition distinct from unavailable/stale/partial', () => {

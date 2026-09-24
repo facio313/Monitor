@@ -495,6 +495,37 @@ class AlertRuntimeTests(unittest.TestCase):
         self.assertEqual(observations["DiskIoErrors"][0].status, "unsupported")
         self.assertEqual(observations["DatabaseEndpointDown"][0].status, "unsupported")
 
+    def test_supported_raid_degraded_count_feeds_existing_rule(self):
+        snapshot = self.snapshot()
+        snapshot["linux"]["blockDevices"] = {"status": "supported", "items": [
+            {"name": "md0", "health": {"raidStatus": "supported", "raidDegradedDevices": 1,
+             "raidArrayState": "active"}},
+            {"name": "md1", "health": {"raidStatus": "supported", "raidDegradedDevices": 0,
+             "raidArrayState": "clean"}},
+        ]}
+        observations = observations_for_snapshot(self.pack, snapshot)["RaidDegraded"]
+        self.assertEqual([(row.target, row.status, row.value) for row in observations], [
+            ("storage/md0", "ok", 1.0), ("storage/md1", "ok", 0.0),
+        ])
+
+    def test_absent_or_unreadable_raid_capability_never_looks_healthy(self):
+        snapshot = self.snapshot()
+        snapshot["linux"]["blockDevices"] = {"status": "supported", "items": [{
+            "name": "md0", "health": {"raidStatus": "permission_error",
+            "raidDegradedDevices": None, "raidArrayState": None},
+        }]}
+        denied = observations_for_snapshot(self.pack, snapshot)["RaidDegraded"]
+        self.assertEqual((denied[0].status, denied[0].value), ("permission_denied", None))
+        snapshot["linux"]["blockDevices"]["items"] = [{
+            "name": "nvme0n1", "health": {"raidStatus": "unsupported",
+            "raidDegradedDevices": None, "raidArrayState": None},
+        }]
+        absent = observations_for_snapshot(self.pack, snapshot)["RaidDegraded"]
+        self.assertEqual((absent[0].status, absent[0].value), ("unsupported", None))
+        snapshot["linux"]["blockDevices"]["items"] = [{"name": "legacy-disk"}]
+        legacy = observations_for_snapshot(self.pack, snapshot)["RaidDegraded"]
+        self.assertEqual((legacy[0].status, legacy[0].value), ("unsupported", None))
+
     def test_detailed_linux_signals_feed_default_host_rules(self):
         observations = observations_for_snapshot(self.pack, self.snapshot())
         expected = {

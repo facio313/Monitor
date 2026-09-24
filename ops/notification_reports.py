@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Hourly Korean reports and immediate signals using the existing SMTP outbox.
+"""Daily Korean reports and immediate signals using the existing SMTP outbox.
 
 The collector calls produce_notifications after committing its public exports.
 Only the independent alert delivery worker opens network connections. Producer
-checkpoints and queue inserts share one SQLite transaction, including the UTC
-hour slot, so restarts cannot repeat an unchanged warning or hourly report.
+checkpoints and queue inserts share one SQLite transaction, including the KST
+reporting-day slot, so restarts cannot repeat an unchanged warning or daily report.
 """
 
 from __future__ import annotations
@@ -25,12 +25,14 @@ try:
     from . import security_signals as signals
     from . import notification_visuals as visuals
     from . import notification_policy as policy
+    from .ssh_access import load_trusted_ssh_identities, normalize_record as normalize_ssh_record
     from .alert_store import _atomic_write, _delivery_config_path, _json_payload, normalize_event
 except ImportError:  # Installed scripts share one directory.
     import alert_delivery as delivery
     import security_signals as signals
     import notification_visuals as visuals
     import notification_policy as policy
+    from ssh_access import load_trusted_ssh_identities, normalize_record as normalize_ssh_record
     from alert_store import _atomic_write, _delivery_config_path, _json_payload, normalize_event
 
 
@@ -43,7 +45,51 @@ MAX_DETECTIONS = 32
 WARNING_COOLDOWN_SECONDS = 900
 KST = dt.timezone(dt.timedelta(hours=9))
 RETIRED_SIGNALS = {"host:cpuPressureFullAvg10":
-    "판정 정책 정정: 호스트 범위 CPU PSI full은 유효한 지표가 아니므로 현재 경고에서 제외했습니다. 실제 장애 복구를 의미하지 않습니다."}
+    "판정 정책 정정: 호스트 범위 CPU PSI full은 유효한 지표가 아니므로 현재 경고에서 제외했습니다. 실제 장애 복구를 의미하지 않습니다.",
+    "tcp:retransmission":
+    "알림 경로 통합: TCP 재전송은 TcpRetransmissionHigh 지속 규칙만 판정합니다. 실제 장애 복구를 의미하지 않습니다.",
+    "host:networkRxErrorsPerSecond":
+    "알림 경로 통합: 네트워크 오류는 NetworkErrorsHigh 지속 규칙만 판정합니다. 실제 장애 복구를 의미하지 않습니다.",
+    "host:networkTxErrorsPerSecond":
+    "알림 경로 통합: 네트워크 오류는 NetworkErrorsHigh 지속 규칙만 판정합니다. 실제 장애 복구를 의미하지 않습니다.",
+    "host:networkRxDroppedPerSecond":
+    "알림 경로 통합: 네트워크 드롭은 NetworkDropsHigh 지속 규칙만 판정합니다. 실제 장애 복구를 의미하지 않습니다.",
+    "host:networkTxDroppedPerSecond":
+    "알림 경로 통합: 네트워크 드롭은 NetworkDropsHigh 지속 규칙만 판정합니다. 실제 장애 복구를 의미하지 않습니다.",
+    "collection:container":
+    "알림 경로 통합: 컨테이너 수집 가용성은 DockerDaemonUnavailable 지속 규칙만 판정합니다. 실제 장애 복구를 의미하지 않습니다.",
+    "collection:synthetic":
+    "알림 경로 통합: 합성 점검 수집 공백은 HttpEndpointDown의 no-data 지속 규칙만 판정합니다. 실제 장애 복구를 의미하지 않습니다.",
+    "ssh-foreign-accepted":
+    "보안 정책 정정: 인증 성공은 국가와 무관한 ssh-untrusted-accepted 사건으로 판정합니다. 실제 보안 복구를 의미하지 않습니다.",
+    "ssh-foreign-attempt":
+    "알림 경로 통합: SSH 인증 실패·거부는 국가와 무관한 ssh-auth 사건 하나로 판정합니다. 실제 보안 복구를 의미하지 않습니다."}
+
+CONTAINER_SIGNAL_OWNERS = {
+    "state": "ContainerDown", "health": "ContainerUnhealthy",
+    "oom": "ContainerOOMKilled", "restarts": "ContainerRestartLoop",
+    "cpu-throttle": "ContainerCpuThrottlingHigh",
+    "network-errors": "ContainerNetworkErrors",
+    "memory": "ContainerMemoryNearLimit", "pids": "ContainerPidNearLimit",
+}
+
+
+def _retired_signal_reason(key: str) -> str | None:
+    reason = RETIRED_SIGNALS.get(key)
+    if reason is not None:
+        return reason
+    if key.startswith("synthetic:"):
+        owner = {"status": "HttpEndpointDown", "latency": "HttpLatencyHigh",
+                 "certificate": "TlsCertificateExpiring"}.get(key.rsplit(":", 1)[-1])
+        if owner:
+            return (f"알림 경로 통합: 합성 HTTP 신호는 {owner} 지속 규칙만 판정합니다. "
+                    "실제 장애 복구를 의미하지 않습니다.")
+    if key.startswith("container:"):
+        owner = CONTAINER_SIGNAL_OWNERS.get(key.rsplit(":", 1)[-1])
+        if owner:
+            return (f"알림 경로 통합: 컨테이너 신호는 {owner} 지속 규칙만 판정합니다. "
+                    "실제 장애 복구를 의미하지 않습니다.")
+    return None
 
 
 def _iso(now: dt.datetime) -> str:
@@ -112,6 +158,36 @@ def _health(source: str, status: str, observed_at: Any, detail: str) -> dict[str
             "detail": detail}
 
 
+def _ssh_country_records(output_dir: Path, now: dt.datetime) -> tuple[list[dict[str, Any]], bool]:
+    status = _object(output_dir / "ssh-access-status.json")
+    if not status:
+        return [], False
+    if (status.get("status") != "fresh" or status.get("droppedRecords") != 0
+            or not signals.fresh(status.get("observedAt"), now)):
+        raise ValueError("SSH country observations are incomplete")
+    dates = {now.date(), (now - dt.timedelta(seconds=signals.WINDOW_SECONDS)).date()}
+    rows = []
+    for day in sorted(dates):
+        path = output_dir / "ssh-access" / f"{day.isoformat()}.jsonl"
+        if path.exists() and path.stat().st_size > MAX_LOG_TAIL_BYTES:
+            raise ValueError("SSH country observations exceed the notification read bound")
+        rows.extend(normalize_ssh_record(row) for row in _rows(path))
+    return rows, True
+
+
+def _log_source_has_no_reported_drops(row: Mapping[str, Any]) -> bool:
+    dropped_lines = row.get("droppedLines")
+    if dropped_lines is not None and (
+            type(dropped_lines) is not int or dropped_lines < 0 or dropped_lines > 0):
+        return False
+    dropped = row.get("dropped")
+    if dropped is None:
+        return True  # Backward-compatible input; current exporters publish counters.
+    return (isinstance(dropped, Mapping) and all(
+        type(value) is int and value == 0 for value in dropped.values()
+    ))
+
+
 def _source_health(current: Mapping[str, Any], evaluation: Mapping[str, Any],
                    log_sources: Mapping[str, Any], now: dt.datetime,
                    traffic_available: bool | None = None) -> list[dict[str, Any]]:
@@ -125,8 +201,11 @@ def _source_health(current: Mapping[str, Any], evaluation: Mapping[str, Any],
                    if isinstance(row, Mapping) and not signals.excluded(row)
                    and row.get("sourceId") in signals.SSH_SOURCES]
     ssh_ok = bool(ssh_sources) and all(row.get("status") in {"fresh", "no_data"}
-               and signals.fresh(row.get("observedAt"), now) for row in ssh_sources)
-    ssh_partial = bool(ssh_sources) and any(row.get("status") == "truncated" for row in ssh_sources)
+               and signals.fresh(row.get("observedAt"), now)
+               and _log_source_has_no_reported_drops(row) for row in ssh_sources)
+    ssh_partial = bool(ssh_sources) and any(
+        row.get("status") == "truncated" or not _log_source_has_no_reported_drops(row)
+        for row in ssh_sources)
     result.append(_health("ssh", "fresh" if ssh_ok else "partial" if ssh_partial else "unavailable",
                           log_sources.get("generatedAt"),
                           "검토된 SSH 로그 수집 정상; 새 로그 없음도 정상" if ssh_ok else
@@ -226,9 +305,9 @@ def _immediate_presentation(event: Mapping[str, Any], evidence: str) -> dict[str
     return presentation
 
 
-def _recovery_evidence(previous: str) -> str:
+def _recovery_evidence(previous: str, observations: int = 2) -> str:
     historical = re.sub(r"최신 관측 기준입니다\.\s*|현재\s+", "", previous).strip()
-    prefix = "서로 다른 새 관측 2회에서 알림 조건 해제를 확인했습니다. 해소 전 마지막 이상 관측: "
+    prefix = f"서로 다른 새 관측 {observations}회에서 알림 조건 해제를 확인했습니다. 해소 전 마지막 이상 관측: "
     return prefix + historical[:500 - len(prefix)]
 
 
@@ -243,7 +322,7 @@ def _project_legacy_recovery(evidence: str) -> str:
 def _mail_requirements(signal: Mapping[str, Any]) -> tuple[int, int]:
     """Debounce measurements, while retaining immediate discrete failures."""
     key = signal["key"]
-    if key in RETIRED_SIGNALS:
+    if _retired_signal_reason(key) is not None:
         return 1000001, 0
     resource = policy.policy_for_signal(key)
     if resource is not None:
@@ -252,15 +331,15 @@ def _mail_requirements(signal: Mapping[str, Any]) -> tuple[int, int]:
         return policy.qualification(resource, signal["severity"])
     if key == "tcp:retransmission":
         return 1, 0  # The weighted TCP window already requires three intervals.
-    if key.startswith("synthetic:") and key.endswith(":latency"):
-        return 3, 120
     if key == "ssh-auth":
         return (1, 0) if signal["count"] >= 5 else (1000000, 0)
+    if key == "ssh-untrusted-accepted":
+        return 1, 0
     if key == "host:reboot" or key.endswith(":certificate"):
         return 1, 0
     if signal["severity"] == "critical":
         discrete = (key.startswith("kernel:") or key in {
-            "host:power", "host:sshListenersAvailable", "host:networkLinkAvailable",
+            "host:power",
         } or (key.startswith(("synthetic:", "container:"))
               and key.rsplit(":", 1)[-1] in {"status", "state", "health", "oom", "restarts"}))
         return (1, 0) if discrete else (2, 60)
@@ -269,12 +348,16 @@ def _mail_requirements(signal: Mapping[str, Any]) -> tuple[int, int]:
 
 def _source_sample(key: str, source: str, current: Mapping[str, Any],
                    evaluation: Mapping[str, Any], log_sources: Mapping[str, Any],
-                   now: dt.datetime) -> dt.datetime | None:
+                   now: dt.datetime, *, recovery: bool = False) -> dt.datetime | None:
     if key.startswith("source:"):
         return now  # A fresh producer invocation observes source unavailability.
-    value = (log_sources.get("generatedAt") if source == "ssh" else
-             evaluation.get("evaluatedAt") if source == "rules" else
-             signals.sample_timestamp(key, current))
+    if recovery and key.startswith("kernel:"):
+        linux = current.get("linux")
+        value = linux.get("collectedAt") if isinstance(linux, Mapping) else None
+    else:
+        value = (log_sources.get("generatedAt") if source == "ssh" else
+                 evaluation.get("evaluatedAt") if source == "rules" else
+                 signals.sample_timestamp(key, current))
     sample = signals.timestamp(value)
     maximum_age = 600 if key.startswith("synthetic:") else 180
     return sample if sample is not None and 0 <= (now - sample).total_seconds() <= maximum_age else None
@@ -328,7 +411,7 @@ def _qualified(signal: Mapping[str, Any], item: Mapping[str, Any]) -> bool:
 
 
 def _qualified_severity(key: str, item: Mapping[str, Any]) -> str | None:
-    if key in RETIRED_SIGNALS:
+    if _retired_signal_reason(key) is not None:
         return None
     # A confirmed incident remains open through recovery qualification or loss
     # of observation. A first raw critical sample cannot upgrade a warning.
@@ -368,7 +451,8 @@ def _resource_hysteresis(observed: list[dict[str, Any]], active: Mapping[str, An
     result = {row["key"]: row for row in observed}
     for key, prior in active.items():
         resource = policy.policy_for_signal(key)
-        if resource is None or not isinstance(prior, Mapping) or signals.excluded(key):
+        if (resource is None or not isinstance(prior, Mapping)
+                or _retired_signal_reason(key) is not None or signals.excluded(key)):
             continue
         value = policy.resource_value(key, current)
         confirmed = _qualified_severity(key, prior)
@@ -401,6 +485,13 @@ def _mail_ready(signal: Mapping[str, Any], item: Mapping[str, Any],
     cooldown_applies = signal["severity"] == "warning" or signal["key"] == "tcp:retransmission"
     return not (cooldown_applies and not escalation and previous is not None
                 and (now - previous).total_seconds() < WARNING_COOLDOWN_SECONDS)
+
+
+def _daily_report_slot(now: dt.datetime) -> str:
+    local = now.astimezone(KST)
+    report_date = local.date() if local.hour >= 9 else local.date() - dt.timedelta(days=1)
+    boundary = dt.datetime.combine(report_date, dt.time(hour=9), tzinfo=KST)
+    return _iso(boundary)
 
 
 def _report_rules(evaluation: Mapping[str, Any], outstanding: list[dict[str, Any]],
@@ -476,7 +567,7 @@ def _digest(current: Mapping[str, Any], evaluation: Mapping[str, Any],
     assessment = visuals.assess_hourly(current, evaluation, health, report_active, now)
     rule_rows, active_rows = assessment["rule_rows"], assessment["active_rows"]
     summary = {"ok": "정상", "warning": "주의", "critical": "위험", "unknown": "관측 불가"}[assessment["status"]]
-    lines = [f"Monitor 매시간 서버 보고 · {summary}", f"보고 시각: {_kst(now_text)}",
+    lines = [f"Monitor 일일 서버 보고 · {summary}", f"보고 시각: {_kst(now_text)}",
              f"최신 수집: {_kst(current.get('generatedAt'))}", "",
              "전체 등급은 확인된 미해소 사건과 관측 가능 여부를 기준으로 합니다.",
              "아래 수치는 관측값이며, 순간값만으로 서버 전체를 위험으로 판정하지 않습니다."]
@@ -538,7 +629,7 @@ def _digest(current: Mapping[str, Any], evaluation: Mapping[str, Any],
     while len(body.encode()) > 9500:
         lines.pop(-6)
         body = "\n".join(lines)
-    presentation: dict[str, Any] = {"subject": f"[Monitor 매시간 보고] {summary} · {now.astimezone(KST):%m/%d %H시}", "body": body}
+    presentation: dict[str, Any] = {"subject": f"[Monitor 일일 보고] {summary} · {now.astimezone(KST):%m/%d}", "body": body}
     try:
         presentation["visual"] = delivery.email_visuals.normalize_visual(
             visuals.build_hourly_visual(output_dir, current, evaluation, health, report_active, now,
@@ -617,7 +708,7 @@ def produce_notifications(
     """Publish bounded status and enqueue reports; never send mail or read secrets."""
     now = (now if now.tzinfo else now.replace(tzinfo=dt.timezone.utc)).astimezone(dt.timezone.utc)
     now_text = _iso(now)
-    slot = now.strftime("%Y-%m-%dT%H:00:00Z")
+    slot = _daily_report_slot(now)
     status: dict[str, Any] = {
         "schemaVersion": 1, "observedAt": now_text, "status": "error",
         "hourly": {"slot": slot, "lastQueuedAt": None, **_empty_counts()},
@@ -637,6 +728,24 @@ def produce_notifications(
         event_ids = {event.get("idempotencyKey") for event in events}
         events.extend(event for event in outstanding_events if event["idempotencyKey"] not in event_ids)
         health = _source_health(current, evaluation, log_sources, now, traffic_available)
+        try:
+            ssh_records, ssh_observable = _ssh_country_records(output_dir, now)
+        except (OSError, ValueError, TypeError):
+            ssh_records, ssh_observable = [], False
+            health[2] = _health("ssh", "partial", log_sources.get("generatedAt"),
+                                "SSH 국가 관측이 누락·지연·손상되었습니다. 일반 인증 로그만으로 해외 여부를 판단하지 않습니다.")
+        if not ssh_observable and health[2]["status"] == "fresh":
+            health[2] = _health("ssh", "partial", log_sources.get("generatedAt"),
+                                "SSH 인증 성공·국가 관측 상태가 없어 보안 사건의 해제를 판정하지 않습니다.")
+        current = {**current, "_sshCountryObservable": ssh_observable}
+        try:
+            trusted_ssh_identities = frozenset(load_trusted_ssh_identities(
+                output_dir.absolute() / ".state" / "trusted-ssh-identities.json"
+            ))
+        except (OSError, ValueError, TypeError):
+            # Unsafe, malformed or unreadable policy trusts nobody. Successful
+            # unknown identities retain the existing warning behavior.
+            trusted_ssh_identities = frozenset()
         log_path = output_dir / "generic-logs.jsonl"
         if log_path.exists() and log_path.stat().st_size > MAX_LOG_TAIL_BYTES:
             times = [parsed for row in log_rows if (parsed := signals.timestamp(row.get("timestamp"))) is not None]
@@ -645,7 +754,9 @@ def produce_notifications(
                                     "로그 읽기 상한으로 최근 5분 SSH 관측 범위가 일부 누락될 수 있음")
         status["sourceHealth"] = health
         health_by_source = {row["source"]: row["status"] for row in health}
-        observed = signals.ssh_signals(log_rows, now) if health_by_source["ssh"] in {"fresh", "partial"} else []
+        observed = signals.ssh_signals(
+            log_rows, now, ssh_records, trusted_ssh_identities,
+        ) if health_by_source["ssh"] in {"fresh", "partial"} else []
         if health_by_source["http"] == "fresh":
             observed.extend(signals.http_signals(current))
         for row in health:
@@ -669,7 +780,8 @@ def produce_notifications(
             notification_current, state["tcpWindow"] = signals.prepare_notification_current(
                 current, now, state.get("tcpWindow"))
             if health_by_source["snapshot"] == "fresh":
-                observed.extend(signals.operational_signals(notification_current, now))
+                observed.extend(signal for signal in signals.operational_signals(notification_current, now)
+                                if _retired_signal_reason(signal["key"]) is None)
             active = state.get("active", {})
             if health_by_source["snapshot"] == "fresh":
                 observed = _resource_hysteresis(observed, active, notification_current)
@@ -686,8 +798,11 @@ def produce_notifications(
                     pending_recoveries.append(event)
             recent = [row for row in state.get("recent", []) if not signals.excluded(row)
                       and (row.get("status") == "active" or signals.fresh(row.get("observedAt"), now, 86400))]
-            for key, explanation in RETIRED_SIGNALS.items():
-                retired = active.pop(key, None)
+            for key in list(active):
+                explanation = _retired_signal_reason(key)
+                if explanation is None:
+                    continue
+                retired = active.pop(key)
                 if isinstance(retired, Mapping):
                     recent = [row for row in recent if row["id"] != retired["id"]] + [{
                         **retired, "status": "resolved", "severity": "warning", "observedAt": now_text,
@@ -732,7 +847,10 @@ def produce_notifications(
             for key, item in list(active.items()):
                 if key in present:
                     continue
-                sample = _source_sample(key, item["source"], notification_current, evaluation, log_sources, now)
+                sample = _source_sample(
+                    key, item["source"], notification_current, evaluation, log_sources, now,
+                    recovery=True,
+                )
                 previous_sample = signals.timestamp(item.get("lastSourceSampleAt") or item.get("observedAt"))
                 if sample is not None and previous_sample is not None and sample <= previous_sample:
                     continue  # Cached/backdated input cannot alter a streak, even if absent from signals.
@@ -765,11 +883,11 @@ def produce_notifications(
                 if (item["clearSamples"] < recovery_samples or first_clear is None
                         or (sample - first_clear).total_seconds() < recovery_seconds):
                     continue
-                evidence = _recovery_evidence(item["evidence"])
+                evidence = _recovery_evidence(item["evidence"], recovery_samples)
                 event = _event("SecurityPattern" if item["kind"].startswith("ssh-") else "OperationalCaution",
                                f"signal\0{item['id']}\0resolved", item["notifiedSeverity"] or item["severity"],
                                now_text, item["openedAt"], evidence, "resolved", 0)
-                if item["notifiedSeverity"]:
+                if item["notifiedSeverity"] and not key.startswith("ssh-"):
                     _emit(outbox, connection, config, event, now, status["immediate"], _immediate_presentation(event, evidence))
                     if _recovery_unfinished(connection, config, event):
                         pending_recoveries.append(event)
@@ -804,7 +922,9 @@ def produce_notifications(
             state["reportRules"] = {
                 key: {field: value for field, value in row.items() if field in report_rule_fields}
                 for key, row in report_evaluation.get("states", {}).items() if row.get("reportReady") is True}
-            event = _event("HourlyReport", f"hourly\0{slot}", "info", now_text, slot, "서버 매시간 상태 보고")
+            # Keep the historical rule/status identifiers for API compatibility;
+            # the durable slot and user-facing presentation are now daily.
+            event = _event("HourlyReport", f"daily\0{slot}", "info", now_text, slot, "서버 일일 상태 보고")
             if enabled and (not state.get("lastHour") or slot > state["lastHour"] or (
                     slot == state["lastHour"] and _needs_readmission(connection, config, event))):
                 if _emit(outbox, connection, config, event, now, status["hourly"],

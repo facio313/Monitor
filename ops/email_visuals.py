@@ -325,7 +325,7 @@ def render_email(payload: Mapping[str, Any], delivery_key: str) -> tuple[str, li
     sections.append(
         f'<tr><td class="pad" style="padding:36px 24px 26px;">'
         f'<div style="font-size:12px;font-weight:700;letter-spacing:2px;color:{muted};">MONITOR / '
-        + ("HOURLY BRIEF" if model["kind"] == "hourly" else "INCIDENT UPDATE")
+        + ("DAILY BRIEF" if model["kind"] == "hourly" else "INCIDENT UPDATE")
         + f'</div><div style="padding-top:22px;"><span style="display:inline-block;padding:7px 12px;'
         f'border:1px solid {palette[status]};border-radius:24px;color:{palette[status]};font-size:12px;'
         f'font-weight:700;">{escaped(_STATUS_LABELS[status])}</span></div>'

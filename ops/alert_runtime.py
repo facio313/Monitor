@@ -549,6 +549,30 @@ def observations_for_snapshot(pack: RulePack, snapshot: Mapping[str, Any]) -> di
             result["DiskLatencyHigh"] = [Observation(
                 host_target, None, _linux_observation_status(linux_block),
             )]
+    if "RaidDegraded" in result:
+        result["RaidDegraded"] = []
+        for item in block_items:
+            if not isinstance(item, Mapping):
+                continue
+            health = _mapping(item.get("health"))
+            if health.get("raidStatus") in {None, "unsupported"}:
+                continue
+            target = _target("storage", item.get("name"), "unknown")
+            raid_status = health.get("raidStatus")
+            degraded = _number(health.get("raidDegradedDevices"))
+            observation_status = {
+                "supported": "ok", "permission_error": "permission_denied",
+                "unsupported": "unsupported", "missing": "unsupported",
+            }.get(raid_status, "collection_error")
+            result["RaidDegraded"].append(Observation(
+                target,
+                1.0 if observation_status == "ok" and degraded is not None and degraded > 0
+                else 0.0 if observation_status == "ok" and degraded is not None else None,
+                observation_status if observation_status != "ok" or degraded is not None else "no_data",
+                (("parent_target", host_target),),
+            ))
+        if not result["RaidDegraded"]:
+            result["RaidDegraded"] = [Observation(host_target, None, "unsupported")]
 
     linux_tcp = _mapping(linux.get("tcp"))
     if "TcpRetransmissionHigh" in result:

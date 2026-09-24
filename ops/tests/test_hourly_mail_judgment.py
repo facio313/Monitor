@@ -1,4 +1,4 @@
-"""Independent end-to-end regressions for the hourly email verdict."""
+"""Independent end-to-end regressions for the compatible daily email verdict."""
 
 import datetime as dt
 import unittest
@@ -45,9 +45,9 @@ class HourlyMailJudgmentTests(unittest.TestCase):
         self.fixture.write("rule-evaluation.json", self.fixture.evaluation)
         return result
 
-    def tick(self, minute, rate=0):
+    def tick(self, minute, temperature=65):
         self.refresh(minute)
-        self.fixture.current["latest"]["networkRxErrorsPerSecond"] = rate
+        self.fixture.current["latest"]["temperatureC"] = temperature
         return self.produce()
 
     def preview(self):
@@ -57,7 +57,7 @@ class HourlyMailJudgmentTests(unittest.TestCase):
         label = {"ok": "정상", "warning": "주의", "critical": "위험", "unknown": "관측 불가"}[level]
         self.assertIn("] " + label + " ·", mail["subject"])
         self.assertEqual(mail["visual"]["status"], level)
-        self.assertEqual(mail["body"].splitlines()[0], "Monitor 매시간 서버 보고 · " + label)
+        self.assertEqual(mail["body"].splitlines()[0], "Monitor 일일 서버 보고 · " + label)
 
     def state(self):
         return reports._readonly_producer_state(self.fixture.root)
@@ -68,80 +68,91 @@ class HourlyMailJudgmentTests(unittest.TestCase):
         result = self.produce()
         self.assertEqual(result["immediate"]["enqueued"], 0)
         hourly = [row for row in self.fixture.queued() if row["event"]["ruleId"] == "HourlyReport"][-1]
-        self.assert_verdict(hourly["presentation"], "ok")
+        self.assert_verdict(hourly["presentation"], "warning")
         self.assert_verdict(self.preview(), "ok")
         self.assertEqual(hourly["presentation"]["visual"]["cards"][0]["tone"], "neutral")
-        self.assertEqual(hourly["presentation"]["visual"]["cards"][4]["value"], "0")
+        self.assertEqual(hourly["presentation"]["visual"]["cards"][4]["value"], "관측 없음")
+        self.assertEqual(self.preview()["visual"]["cards"][4]["value"], "0")
 
-    def test_warning_critical_qualification_missing_input_and_two_sample_recovery(self):
+    def test_warning_critical_qualification_missing_input_and_recovery(self):
         for minute in (0, 1, 2):
-            self.tick(minute, 0.5)
+            self.tick(minute, 80)
         self.assert_verdict(self.preview(), "warning")
-        self.tick(3, 2)
+        self.tick(3, 85)
         self.assert_verdict(self.preview(), "warning")
-        self.assertEqual(self.state()["active"]["host:networkRxErrorsPerSecond"]["qualifiedSeverity"], "warning")
-        self.tick(4, 2)
+        self.assertEqual(self.state()["active"]["host:temperatureC"]["qualifiedSeverity"], "warning")
+        self.tick(4, 85)
+        self.assert_verdict(self.preview(), "warning")
+        self.tick(5, 85)
         self.assert_verdict(self.preview(), "critical")
-        self.tick(5, None)
+        self.tick(6, None)
         self.assert_verdict(self.preview(), "critical")
-        self.assertEqual(self.state()["active"]["host:networkRxErrorsPerSecond"]["qualifiedSeverity"], "critical")
-        self.tick(6)
+        self.assertEqual(self.state()["active"]["host:temperatureC"]["qualifiedSeverity"], "critical")
+        self.tick(7, 75)
         self.assert_verdict(self.preview(), "critical")
         self.assertIn("복구 확인 중", self.preview()["body"])
-        self.tick(7)
+        self.tick(8, 75)
+        self.assert_verdict(self.preview(), "critical")
+        self.tick(9, 75)
         self.assert_verdict(self.preview(), "ok")
 
     def test_cooldown_does_not_erase_qualified_unnotified_warning(self):
         for minute in (0, 1, 2):
-            self.tick(minute, 0.5)
-        self.tick(3)
-        self.tick(4)
+            self.tick(minute, 80)
+        for minute in (3, 4, 5):
+            self.tick(minute, 75)
         for minute in (5, 6, 7):
-            result = self.tick(minute, 0.5)
+            result = self.tick(minute + 1, 80)
         self.assertEqual(result["immediate"]["enqueued"], 0)
-        active = self.state()["active"]["host:networkRxErrorsPerSecond"]
+        active = self.state()["active"]["host:temperatureC"]
         self.assertIsNone(active["notifiedSeverity"])
         self.assertEqual(active["qualifiedSeverity"], "warning")
         self.assert_verdict(self.preview(), "warning")
-        self.tick(8, None)
+        self.tick(9, None)
         self.assert_verdict(self.preview(), "warning")
 
     def test_confirmed_improvement_downgrades_current_danger_without_new_incident(self):
-        self.tick(0, 2)
-        self.tick(1, 2)
+        for minute in (0, 1, 2):
+            self.tick(minute, 85)
         self.assert_verdict(self.preview(), "critical")
-        self.tick(2, 0.5)
+        self.tick(3, 80)
         self.assert_verdict(self.preview(), "critical")
-        self.assertEqual(self.state()["active"]["host:networkRxErrorsPerSecond"]["severity"], "warning")
+        self.assertEqual(self.state()["active"]["host:temperatureC"]["severity"], "warning")
         # A second producer call over the same source sample is not a second
         # observation of improvement, even though wall clock time has advanced.
         self.now += dt.timedelta(seconds=60)
         self.produce()
         self.assert_verdict(self.preview(), "critical")
-        self.tick(3, 0.5)
+        self.tick(4, 80)
+        self.assert_verdict(self.preview(), "critical")
+        self.tick(5, 80)
         self.assert_verdict(self.preview(), "warning")
-        active = self.state()["active"]["host:networkRxErrorsPerSecond"]
+        active = self.state()["active"]["host:temperatureC"]
         self.assertEqual(active["qualifiedSeverity"], "warning")
         self.assertEqual(active["notifiedSeverity"], "critical")
-        self.tick(4, 0.5)
+        self.tick(6, 80)
         self.assert_verdict(self.preview(), "warning")
         firing = [row for row in self.fixture.queued()
                   if row["event"]["ruleId"] == "OperationalCaution"
                   and row["event"]["transition"] == "firing"]
         self.assertEqual(len(firing), 1)
         self.assertEqual(firing[0]["event"]["severity"], "critical")
-        self.tick(5, 2)
+        self.tick(7, 85)
         self.assert_verdict(self.preview(), "warning")
-        self.tick(6, 2)
+        self.tick(8, 85)
+        self.assert_verdict(self.preview(), "warning")
+        self.tick(9, 85)
         self.assert_verdict(self.preview(), "critical")
 
     def test_observation_gap_breaks_downgrade_streak(self):
-        self.tick(0, 2)
-        self.tick(1, 2)
-        self.tick(2, 0.5)
-        self.tick(6, 0.5)
+        for minute in (0, 1, 2):
+            self.tick(minute, 85)
+        self.tick(3, 80)
+        self.tick(7, 80)
         self.assert_verdict(self.preview(), "critical")
-        self.tick(7, 0.5)
+        self.tick(8, 80)
+        self.assert_verdict(self.preview(), "critical")
+        self.tick(9, 80)
         self.assert_verdict(self.preview(), "warning")
 
     def test_preview_does_not_write_any_checkpoint_or_access_secret_or_queue(self):
