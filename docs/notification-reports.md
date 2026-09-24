@@ -42,22 +42,30 @@ delivery boundary rejects excluded targets too.
 
 ## Schedule and durability
 
-A healthy report is queued once per KST day, at the first collector run on or
+A daily report is queued once per KST day, at the first notification-producing collector run on or
 after the 09:00 KST boundary. The mail is written in Korean with KST timestamps
 and covers current CPU, memory, temperature, load, pressure, TCP retransmissions,
 disk capacity, reboot requirement, active rules, immediate signals, recent
 HTTP/network rule transitions and source coverage. Historical short RCU delays
 are identified as history. Stale metrics are not described as current healthy
 readings. Downtime does not cause a backlog of daily reports to be recreated;
-the current day is reported when collection returns.
+the current day is reported when processing returns after its 09:00 boundary.
 
 The producer checkpoint, current incident states, and queue inserts commit in
-one transaction in the existing delivery SQLite database. An unchanged warning
-does not enqueue every minute. Discrete critical failures (availability, OOM,
-current power failures and kernel faults) enqueue immediately. Resource warnings
-require three distinct observations spanning at least 120 seconds; resource
-critical escalation requires two spanning 60 seconds. Continuous warning-level
-breaches remain continuous when severity fluctuates. Synthetic latency requires
+one transaction in the existing delivery SQLite database. Daily checkpoints are
+stored as `lastDailySlot` and `lastDailyQueuedAt`. A legacy `lastHour` is migrated
+only when it exactly matches the current daily slot; its queue timestamp is copied
+only when valid. Unrelated hourly values are not accepted as proof. Before 09:00 KST
+there is no current-day slot and no previous-day catch-up mail. An unchanged
+warning does not enqueue every minute. Discrete critical failures (availability,
+OOM, current power failures and kernel faults) enqueue immediately. Ordinary
+host-resource warnings require five distinct observations spanning at least 240
+seconds, and critical escalation requires three spanning at least 120 seconds.
+Temperature warning is the deliberate shorter exception at three observations
+over at least 120 seconds. Continuous warning-level breaches remain continuous
+when severity fluctuates. I/O PSI `some` and `full` share one incident: either
+entry threshold can open it, while both recovery thresholds and a complete
+metric pair are required to clear it. Synthetic latency requires
 two actual successful probe observations spanning at least 240 seconds. Both
 detection and recovery use the original `checkedAt`. Two distinct healthy source observations
 establish recovery, and an episode that never qualified for mail has no recovery
@@ -66,8 +74,9 @@ escalation can still notify. Discrete critical availability failures are not
 subject to this cooldown. Reboot and certificate maintenance notices retain their
 single-episode notification behavior. Single refused SSH logins remain visible
 in local detections (and the daily report while active); immediate SSH mail starts
-at five distinct observations in five minutes, with the existing critical threshold
-of twenty. An accepted public-key login is suppressed only when its exact account
+at five distinct log rows in five minutes. Twenty rows change the classification
+to a repeated pattern but remain warning severity. An accepted public-key login
+is suppressed only when its exact account
 and key-fingerprint pair is trusted; other accepted logins notify immediately.
 SSH security conditions do not send recovery mail.
 Missing/null metrics, unavailable sources and repeated snapshots cannot prove
@@ -94,7 +103,9 @@ The public `lastQueuedAt` means queued, not delivered.
 ## Card-based email and trend graphs
 
 SMTP mail includes a responsive, light card layout and a complete plain-text
-alternative. Daily cards show the latest CPU, memory, temperature, maximum
+alternative. The validated, bounded detailed report is also included as escaped
+HTML, so active rules and source-coverage limits are not lost in rich-mail clients.
+Daily cards show the latest CPU, memory, temperature, maximum
 disk use, TCP retransmission ratio and maximum HTTP probe response time.
 The subject, plain-text summary and HTML heading share one daily assessment.
 Only qualified unresolved incidents raise warning/critical incident severity;
@@ -126,6 +137,10 @@ from the truncated public detections list, create an outbox, update checkpoints,
 load credentials or send mail. When that authority is unavailable, the preview
 reports a coverage limitation instead of guessing a critical or healthy state.
 The public report schema and existing stored delivery payloads are unchanged.
+The dashboard separates current detections from collapsed resolved history,
+labels pending (including leased/sending) and retry as current queue state and sent/undelivered terminal outcomes
+(final failure or queue exclusion) as cumulative,
+and displays the latest worker outcome explicitly.
 
 Two inline PNG charts show CPU/memory and TCP over the preceding hour. Thirty
 two-minute buckets use CPU/memory maxima and the TCP ratio
@@ -179,9 +194,9 @@ Additional immediate conditions use current reviewed exports:
 
 | Source | Observation thresholds |
 | --- | --- |
-| SSH | Failures/denials stay local from the first row; mail starts at five distinct rows in five minutes and becomes critical at twenty. An accepted login not matched by an exact trusted account/key pair sends an immediate warning |
-| HTTP requests | At least 20 4xx and 20% share warning (attack unconfirmed); any 5xx warning, critical at 20 errors or at least 5 errors/20 requests and 5% share; slow share 10%/40% requires at least 20 requests and 3 slow responses, while max response 5/15 seconds still qualifies |
-| Host | CPU/memory 75%/90%, temperature 75/85°C, dashboard PSI/error/drop thresholds, load, disk/inode 75%/90%, current power/link/SSH-listener failures, reboot-required marker |
+| SSH | Failures/denials stay local from the first row; mail starts at five distinct rows in five minutes. Twenty changes the kind to a repeated pattern but not to critical. An accepted login not matched by an exact trusted account/key pair sends an immediate warning |
+| HTTP requests | At least 20 4xx and 20% share warning (attack unconfirmed); any 5xx is a warning, and critical requires either 3 errors at 50% share or 5 errors at 5% share. Slow responses require at least 20 requests and 3 slow rows: 10%/40% share gives warning/critical, while a 5s/15s maximum also qualifies |
+| Host | Shared policy: CPU 90% warning only; memory 80%/90%; temperature 80/85°C; I/O PSI `some` 20% or `full` 8% as one warning-only incident; load 1.5/core; disk 85%/95%; inode 85%/90%; plus current power/link/SSH-listener failures and reboot-required marker |
 | TCP | Canonical rule firing at 5% over five distinct samples spanning 240 seconds; recovery at 1% or lower over three samples spanning 120 seconds; sparse evidence remains insufficient |
 | Synthetic | DNS/timeout/TLS/HTTP failure critical; latency 1/3 seconds; certificate expiry within 30/7 days |
 | Containers | Fresh state/health failures, OOM, restart delta 1/3, memory/PID limit use 80%/90%, CPU throttling 20%/50%, interface errors |
@@ -189,9 +204,9 @@ Additional immediate conditions use current reviewed exports:
 
 SSH detection consumes only redacted `journal:ssh`/`journal:sshd` records from
 the reviewed generic-log export. It never reads arbitrary auth log paths.
-Duplicate identical sanitized records are ignored, and failure categories are
-combined using their maximum count to avoid counting a denial plus pre-auth
-close twice. Counts are conservative observations, not unique attackers or
+Duplicate identical sanitized records are ignored. Each remaining generic row
+enters at most one failure category, and those categories are summed. Counts are
+log-row observations, not unique attackers or
 verified sessions. Firewall multicast records are not classified as attacks.
 HTTP detection uses service response counts, not request bodies or URL scans;
 it cannot determine exploit success.
@@ -219,13 +234,19 @@ as absence of attempts.
 
 The public `notification-reports.json` includes overall producer status,
 legacy-named `hourly`/immediate enqueue counters, the last queued daily slot,
-source health, bounded detection evidence and delivery counts. `delivery.sent` is SMTP acceptance as
+source health, bounded detection evidence and delivery counts. Active detections
+are retained ahead of resolved history in the 32-item public list; the dashboard
+marks the limit when reached because additional history may exist.
+`delivery.sent` is SMTP acceptance as
 recorded by the worker, not inbox receipt; `delivery.failed` includes final
 failures and dropped rows. `lastAttemptAt` and `lastOutcome` are audit readback.
 No enabled SMTP channel gives `status=disabled` while local detections continue.
 Unsafe input/configuration/persistence gives fixed `status=error` without
 exception contents. This local producer cannot send when its host or collector
-is fully down; that requires an independent external monitor.
+is fully down. The independent GitHub Actions probe checks the public readiness,
+TLS and SSO boundary on a nominal five-minute schedule, persists one issue per
+outage and closes it after recovery. Scheduled runs are not an SLA, the probe
+does not send SMTP, and GitHub Actions or Issues downtime remains a coverage gap.
 
 ## Verification
 
@@ -234,7 +255,10 @@ python3 -m unittest ops.tests.test_notification_reports \
   ops.tests.test_security_signals ops.tests.test_notification_coverage \
   ops.tests.test_alert_delivery ops.tests.test_delivery_contract \
   ops.tests.test_notification_visuals ops.tests.test_email_visuals \
-  ops.tests.test_email_delivery_visuals
+  ops.tests.test_email_delivery_visuals ops.tests.test_daily_report_schedule \
+  ops.tests.test_email_visuals_detail ops.tests.test_notification_visuals_security \
+  ops.tests.test_io_pressure_policy ops.tests.test_ssh_mail_threshold \
+  ops.tests.test_detection_history_priority
 ```
 
 Tests use temporary data, a fake SMTP client and crash/queue-pressure injection;

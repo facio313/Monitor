@@ -223,8 +223,8 @@ describe('current-boot reliability presentation', () => {
 
     expect(markup).toContain('id="synthetic-probes"');
     expect(markup).toContain('External HTTP and TLS probes');
-    expect(markup).toContain('every five minutes');
-    expect(markup).toContain('latest replace-only result');
+    expect(markup).toContain('Latest scheduled external-path results');
+    expect(markup).toContain('Diagnostic history in Network details retains failure records');
     expect(markup).toContain('Fresh');
     expect(markup).toContain('public-monitor-readiness');
     expect(markup).toContain('status-ok">OK</span>');

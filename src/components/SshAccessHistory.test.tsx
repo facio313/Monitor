@@ -38,10 +38,18 @@ describe('SSH access history UI', () => {
     expect(html).toContain('role="alert"');
   });
   it('provides readable filters, privacy caveats and mandatory DB-IP attribution', () => {
-    const html = renderToStaticMarkup(createElement(SshAccessHistory, { locale: 'ko', onUnauthorized: () => undefined }));
+    const ko = renderToStaticMarkup(createElement(SshAccessHistory, { locale: 'ko', onUnauthorized: () => undefined }));
+    const en = renderToStaticMarkup(createElement(SshAccessHistory, { locale: 'en', onUnauthorized: () => undefined }));
     for (const value of ['SSH 출처·국가 접속 기록', '6h', '24h', '인증 성공', '인증 전 종료', '출처 IP 정확히 일치',
-      '실제 위치를 뜻하지 않습니다', '고유 접속 시도 수가 아닙니다', '40,000행·16 MiB', 'DB-IP.com', 'href="https://db-ip.com"']) expect(html).toContain(value);
-    expect(html).not.toContain('https://db-ip.com/203.');
+      '실제 위치를 뜻하지 않습니다', '고유 접속 시도 수가 아닙니다', '계정명과 공개키 지문', '대시보드나 메일에는 표시하지 않습니다',
+      '5분 안에 서로 다른 실패·거부 로그 행이 5개 이상', '접속 승인 여부를 결정하지 않습니다', '40,000행·16 MiB', 'DB-IP.com', 'href="https://db-ip.com"']) expect(ko).toContain(value);
+    for (const value of ['Account names and public-key fingerprints', 'never displayed in the dashboard or email',
+      'five distinct failure or denial log rows within five minutes', 'never determine whether access is authorized']) expect(en).toContain(value);
+    expect(ko).not.toContain('https://db-ip.com/203.');
+    expect(ko).not.toContain('<th>대상 계정</th>');
+    expect(ko).not.toContain('<th>공개키 지문</th>');
+    expect(en).not.toContain('<th>Target account</th>');
+    expect(en).not.toContain('<th>Public-key fingerprint</th>');
   });
   it('canonicalizes user IPv6 input and mapped addresses without accepting URLs or hostnames', () => {
     expect(normalizeSshIpInput(' 8.8.8.8 ')).toBe('8.8.8.8');

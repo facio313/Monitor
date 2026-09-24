@@ -2,9 +2,9 @@
 """Finite, evidence-based signals over reviewed and sanitized Monitor exports.
 
 No log acquisition, network access, source addresses, usernames, or raw message
-publication. Authentication messages are counted in categories using their
-maximum, since a denied login can produce both denial and pre-auth close lines.
-Counts therefore represent a conservative lower bound, not unique attackers.
+publication. Each generic authentication row enters one mutually exclusive
+category; those rows are summed, then compared with the overlapping structured
+stream using its maximum. Counts remain log-row lower bounds, not unique attackers.
 """
 
 from __future__ import annotations
@@ -330,6 +330,36 @@ def _signal(key: str, kind: str, severity: str, source: str, count: int, evidenc
             "evidence": evidence}
 
 
+def _io_pressure_evidence(some: float | None, full: float | None) -> str:
+    some_policy = resource_policy.RESOURCE_POLICIES["ioPressureSomeAvg10"]
+    full_policy = resource_policy.RESOURCE_POLICIES["ioPressureFullAvg10"]
+    some_text = f"{some:g}%" if some is not None else "관측 없음"
+    full_text = f"{full:g}%" if full is not None else "관측 없음"
+    return (
+        f"호스트 I/O 대기: PSI some {some_text}, full {full_text}. "
+        f"진입 기준은 some {some_policy.warning:g}% 또는 full {full_policy.warning:g}% 이상, "
+        f"해제 기준은 둘 다 각각 {some_policy.warning_recovery:g}% / "
+        f"{full_policy.warning_recovery:g}% 이하입니다. "
+        "이는 저장장치 경합 신호이며 디스크 고장 자체의 증거는 아닙니다."
+    )
+
+
+def io_pressure_signal(current: Mapping[str, Any],
+                       previous_severity: str | None = None) -> dict[str, Any] | None:
+    values = resource_policy.io_pressure_values(current)
+    score = resource_policy.resource_value(resource_policy.IO_PRESSURE_SIGNAL_KEY, current)
+    if values is None or score is None:
+        return None
+    severity = resource_policy.severity_for_value(
+        resource_policy.IO_PRESSURE_POLICY, score, previous_severity,
+    )
+    if severity is None:
+        return None
+    some, full = values
+    return _signal(resource_policy.IO_PRESSURE_SIGNAL_KEY, "operational-caution", severity,
+                   "snapshot", 1, _io_pressure_evidence(some, full))
+
+
 def ssh_signals(records: Sequence[Mapping[str, Any]], now: dt.datetime,
                 access_records: Sequence[Mapping[str, Any]] = (),
                 trusted_identities: AbstractSet[tuple[str, str]] = frozenset()) -> list[dict[str, Any]]:
@@ -390,11 +420,11 @@ def ssh_signals(records: Sequence[Mapping[str, Any]], now: dt.datetime,
             categories["invalid"] += 1
         elif "authentication failure" in lowered:
             categories["authentication"] += 1
-    # Structured country rows are derived from the generic SSH stream but do
-    # not share a safe public record identifier with its redacted rows. Taking
-    # the larger conservative count avoids both double counting and dropping
-    # every generic row that happens to share a timestamp with one foreign row.
-    count = max(max(categories.values(), default=0), len(foreign))
+    # Each generic row enters at most one mutually exclusive category, so their
+    # sum is the distinct-row lower bound promised by the mail threshold.
+    # Structured country rows are derived from the same stream but do not share
+    # a safe public record identifier; max avoids double-counting that overlap.
+    count = max(sum(categories.values()), len(foreign))
     if not count:
         return result
     burst = count >= BURST_THRESHOLD
@@ -614,13 +644,17 @@ def operational_signals(current: Mapping[str, Any], now: dt.datetime | None = No
         result.append(_signal("host:reboot", "operational-caution", "warning", "snapshot", 1,
                               "운영체제가 재부팅 필요 상태입니다. 유지보수 시간을 정해 적용해야 합니다."))
     for field, policy in resource_policy.RESOURCE_POLICIES.items():
-        if field not in resource_policy.HOST_RESOURCE_FIELDS:
+        if (field not in resource_policy.HOST_RESOURCE_FIELDS
+                or field in resource_policy.IO_PRESSURE_FIELDS):
             continue
         value = resource_policy.resource_value(f"host:{field}", current)
         severity = resource_policy.severity_for_value(policy, value)
         if severity is not None:
             result.append(_signal(f"host:{field}", "operational-caution", severity, "snapshot", 1,
                                   resource_policy.evidence_for_value(policy, value, severity)))
+    io_pressure = io_pressure_signal(current)
+    if io_pressure is not None:
+        result.append(io_pressure)
     for field, caution, danger, label, unit in (
         ("networkRxErrorsPerSecond", 0.1, 1, "수신 오류", "/초"),
         ("networkTxErrorsPerSecond", 0.1, 1, "송신 오류", "/초"),
@@ -663,6 +697,9 @@ def operational_signals(current: Mapping[str, Any], now: dt.datetime | None = No
 
 def observable(key: str, current: Mapping[str, Any]) -> bool:
     """Absence of a breach is a recovery sample only when its input exists."""
+    if key == resource_policy.IO_PRESSURE_SIGNAL_KEY:
+        values = resource_policy.io_pressure_values(current)
+        return values is not None and all(value is not None for value in values)
     if resource_policy.policy_for_signal(key) is not None:
         return resource_policy.resource_value(key, current) is not None
     if key == "host:cpuPressureFullAvg10":

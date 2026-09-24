@@ -18,6 +18,9 @@
 }
 .notification-status-panel th { color: var(--control-muted, #a9b5bc); font-weight: 500; }
 .notification-status-panel td:first-child { white-space: nowrap; }
+.notification-history { margin-top: 18px; }
+.notification-history summary { cursor: pointer; color: var(--control-muted, #a9b5bc); font-size: 13px; }
+.notification-history[open] summary { margin-bottom: 10px; }
 @media (max-width: 640px) {
   .notification-status-panel { padding: 14px; }
   .notification-status-panel th, .notification-status-panel td { padding: 8px; }

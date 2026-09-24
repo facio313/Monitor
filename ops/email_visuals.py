@@ -306,7 +306,8 @@ def render_email(payload: Mapping[str, Any], delivery_key: str) -> tuple[str, li
     presentation = payload.get("presentation")
     has_visual = isinstance(presentation, Mapping) and "visual" in presentation
     if has_visual:
-        model, body = normalize_visual(presentation["visual"]), ""
+        model = normalize_visual(presentation["visual"])
+        body = _legacy_text(presentation.get("body"), 6000, multiline=True)
     else:
         model, body = _legacy_model(payload)
     palette = _PALETTES[model["theme"]]
@@ -372,8 +373,9 @@ def render_email(payload: Mapping[str, Any], delivery_key: str) -> tuple[str, li
     if body:
         escaped_body = escaped(body).replace("\n", "<br>")
         sections.append(
-            f'<tr><td class="pad" style="padding:0 24px 28px;font-size:14px;line-height:1.8;'
-            f'overflow-wrap:anywhere;">{escaped_body}</td></tr>'
+            f'<tr><td class="pad" style="padding:0 24px 28px;">'
+            f'<h2 style="margin:0 0 10px;font-size:17px;color:{ink};">상세 보고</h2>'
+            f'<div style="font-size:14px;line-height:1.8;overflow-wrap:anywhere;">{escaped_body}</div></td></tr>'
         )
     trend = model["trend"]
     if trend is not None:

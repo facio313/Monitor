@@ -47,6 +47,13 @@ RESOURCE_POLICIES: Mapping[str, ResourcePolicy] = {
     "inodeUsedPercent": ResourcePolicy("아이노드 사용률", "%", 85, 80, 90, 85),
 }
 
+# PSI ``some`` and ``full`` describe one host I/O-contention episode.  Keep
+# one notification state: either entry boundary opens it, while both recovery
+# boundaries must be satisfied before it can close.
+IO_PRESSURE_SIGNAL_KEY = "host:ioPressure"
+IO_PRESSURE_FIELDS = frozenset({"ioPressureSomeAvg10", "ioPressureFullAvg10"})
+IO_PRESSURE_POLICY = ResourcePolicy("I/O 압력", "", 1, 0)
+
 HOST_RESOURCE_FIELDS = frozenset(RESOURCE_POLICIES) - {"usedPercent", "inodeUsedPercent"}
 DISK_RESOURCE_FIELDS = frozenset({"usedPercent", "inodeUsedPercent"})
 
@@ -67,6 +74,8 @@ RESOURCE_RULE_POLICIES: Mapping[str, tuple[str, str, bool]] = {
 
 
 def policy_for_signal(key: str) -> ResourcePolicy | None:
+    if key == IO_PRESSURE_SIGNAL_KEY:
+        return IO_PRESSURE_POLICY
     parts = key.split(":")
     if len(parts) == 2 and parts[0] == "host" and parts[1] in HOST_RESOURCE_FIELDS:
         return RESOURCE_POLICIES[parts[1]]
@@ -83,6 +92,21 @@ def _number(value: Any) -> float | None:
 
 def resource_value(key: str, current: Mapping[str, Any]) -> float | None:
     """Read only the bounded public metric represented by a resource key."""
+    if key == IO_PRESSURE_SIGNAL_KEY:
+        values = io_pressure_values(current)
+        if values is None:
+            return None
+        some, full = values
+        some_policy = RESOURCE_POLICIES["ioPressureSomeAvg10"]
+        full_policy = RESOURCE_POLICIES["ioPressureFullAvg10"]
+        normalized = [0.0]
+        if some is not None:
+            normalized.append((some - some_policy.warning_recovery)
+                              / (some_policy.warning - some_policy.warning_recovery))
+        if full is not None:
+            normalized.append((full - full_policy.warning_recovery)
+                              / (full_policy.warning - full_policy.warning_recovery))
+        return max(normalized)
     if policy_for_signal(key) is None:
         return None
     parts = key.split(":")
@@ -105,6 +129,16 @@ def resource_value(key: str, current: Mapping[str, Any]) -> float | None:
         if disk_id == parts[1]:
             return _number(row.get(parts[2]))
     return None
+
+
+def io_pressure_values(current: Mapping[str, Any]) -> tuple[float | None, float | None] | None:
+    """Return observed PSI values; a partial pair can enter but cannot recover."""
+    latest = current.get("latest")
+    if not isinstance(latest, Mapping):
+        return None
+    some = _number(latest.get("ioPressureSomeAvg10"))
+    full = _number(latest.get("ioPressureFullAvg10"))
+    return (some, full) if some is not None or full is not None else None
 
 
 def severity_for_value(policy: ResourcePolicy, value: float | None,

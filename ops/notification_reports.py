@@ -46,6 +46,10 @@ WARNING_COOLDOWN_SECONDS = 900
 KST = dt.timezone(dt.timedelta(hours=9))
 RETIRED_SIGNALS = {"host:cpuPressureFullAvg10":
     "판정 정책 정정: 호스트 범위 CPU PSI full은 유효한 지표가 아니므로 현재 경고에서 제외했습니다. 실제 장애 복구를 의미하지 않습니다.",
+    "host:ioPressureSomeAvg10":
+    "알림 경로 통합: I/O PSI some/full은 하나의 host:ioPressure 사건으로 판정합니다. 실제 장애 복구를 의미하지 않습니다.",
+    "host:ioPressureFullAvg10":
+    "알림 경로 통합: I/O PSI some/full은 하나의 host:ioPressure 사건으로 판정합니다. 실제 장애 복구를 의미하지 않습니다.",
     "tcp:retransmission":
     "알림 경로 통합: TCP 재전송은 TcpRetransmissionHigh 지속 규칙만 판정합니다. 실제 장애 복구를 의미하지 않습니다.",
     "host:networkRxErrorsPerSecond":
@@ -222,14 +226,18 @@ def _source_health(current: Mapping[str, Any], evaluation: Mapping[str, Any],
 
 
 def _event(rule: str, key: str, severity: str, now_text: str, opened: str,
-           evidence: str, transition: str = "firing", count: int | None = None) -> dict[str, Any]:
+           evidence: str, transition: str = "firing", count: int | None = None,
+           signal_kind: str | None = None) -> dict[str, Any]:
+    labels = {"scope": "notification", "purpose": "report" if rule == "HourlyReport" else "signal"}
+    if signal_kind in signals.DETECTION_KINDS:
+        labels["signal_kind"] = signal_kind
     return normalize_event({
         "schemaVersion": 1, "rulePackVersion": "notifications-v1",
         "idempotencyKey": hashlib.sha256(key.encode()).hexdigest(),
         "ruleId": rule, "target": "host/monitor", "transition": transition,
         "severity": severity, "notificationState": "ready", "observedAt": now_text,
         "openedAt": opened, "value": count, "status": "ok",
-        "labels": {"scope": "notification", "purpose": "report" if rule == "HourlyReport" else "signal"},
+        "labels": labels,
         "description": evidence[:500],
         "runbook": "Monitor의 최신 표본과 해당 사건의 관측 시각을 확인하세요. 공격 의심은 침입 성공을 뜻하지 않습니다.",
     })
@@ -459,6 +467,11 @@ def _resource_hysteresis(observed: list[dict[str, Any]], active: Mapping[str, An
         severity = policy.severity_for_value(resource, value, confirmed)
         if value is None or severity is None:
             continue
+        if key == policy.IO_PRESSURE_SIGNAL_KEY:
+            signal = signals.io_pressure_signal(current, confirmed)
+            if signal is not None:
+                result[key] = signal
+            continue
         result[key] = {"key": key, "kind": "operational-caution", "severity": severity,
                        "source": "snapshot", "count": max(1, int(value)), "windowSeconds": 300,
                        "evidence": policy.evidence_for_value(resource, value, severity)}
@@ -476,6 +489,22 @@ def _report_active(active: Mapping[str, Any]) -> dict[str, Any]:
             and not signals.excluded(key) and not signals.excluded(item)}
 
 
+def _bounded_recent(active: Mapping[str, Any], recent: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Retain active incidents ahead of resolved history within the public bound."""
+    by_id = {
+        row["id"]: dict(row) for row in recent
+        if isinstance(row, Mapping) and isinstance(row.get("id"), str)
+    }
+    for row in active.values():
+        if isinstance(row, Mapping) and isinstance(row.get("id"), str):
+            by_id[row["id"]] = dict(row)
+    active_rows = [row for row in by_id.values() if row.get("status") == "active"]
+    resolved_rows = [row for row in by_id.values() if row.get("status") == "resolved"]
+    active_rows.sort(key=lambda row: row.get("observedAt", ""), reverse=True)
+    resolved_rows.sort(key=lambda row: row.get("observedAt", ""), reverse=True)
+    return (active_rows + resolved_rows)[:MAX_DETECTIONS]
+
+
 def _mail_ready(signal: Mapping[str, Any], item: Mapping[str, Any],
                 last_notice: Mapping[str, Any], now: dt.datetime) -> bool:
     if not _qualified(signal, item):
@@ -487,10 +516,11 @@ def _mail_ready(signal: Mapping[str, Any], item: Mapping[str, Any],
                 and (now - previous).total_seconds() < WARNING_COOLDOWN_SECONDS)
 
 
-def _daily_report_slot(now: dt.datetime) -> str:
+def _daily_report_slot(now: dt.datetime) -> str | None:
     local = now.astimezone(KST)
-    report_date = local.date() if local.hour >= 9 else local.date() - dt.timedelta(days=1)
-    boundary = dt.datetime.combine(report_date, dt.time(hour=9), tzinfo=KST)
+    if local.hour < 9:
+        return None
+    boundary = dt.datetime.combine(local.date(), dt.time(hour=9), tzinfo=KST)
     return _iso(boundary)
 
 
@@ -561,7 +591,7 @@ def _active_rule_events(evaluation: Mapping[str, Any], private: Mapping[str, Any
 def _digest(current: Mapping[str, Any], evaluation: Mapping[str, Any],
             health: list[dict[str, Any]], active: Mapping[str, Any],
             events: list[dict[str, Any]], now: dt.datetime,
-            output_dir: Path | None = None) -> dict[str, Any]:
+            output_dir: Path | None = None, report_slot: str | None = None) -> dict[str, Any]:
     now_text = _iso(now)
     report_active = _report_active(active)
     assessment = visuals.assess_hourly(current, evaluation, health, report_active, now)
@@ -620,8 +650,8 @@ def _digest(current: Mapping[str, Any], evaluation: Mapping[str, Any],
     for row in health:
         lines.append(f"- {row['source']}: {row['status']} · {row['detail']}")
     lines.extend(assessment.get("coverage_notes", []))
-    lines.extend(["", "외부 감시: 미구축. 별도 서버·서비스가 없어 서버 전체 정지·전원 단절 시 이 서버는 이메일을 보낼 수 없습니다.",
-                  "이는 현재 장애가 아니라 감시 범위의 한계이며, 외부 감시 미구축만으로 위험 알림을 만들지 않습니다."])
+    lines.extend(["", "외부 감시: GitHub Actions가 공개 readiness·TLS·SSO를 명목상 5분 간격으로 확인합니다. 예약 실행 간격은 SLA가 아닙니다.",
+                  "장애당 GitHub Issue 하나를 기록하고 복구 시 닫습니다. 호스트와 독립되어 전체 호스트 중단도 감지하지만 SMTP는 보내지 않으며, GitHub Actions·Issues 장애 시 관측되지 않을 수 있습니다."])
     lines.extend(["", "SSH는 비허용 로그인·인증 실패 패턴, HTTP는 응답 코드 이상을 관찰합니다.",
                   "요청 주소·IP·사용자명·원문 로그는 메일에 포함하지 않습니다."])
     body = "\n".join(lines)
@@ -629,7 +659,12 @@ def _digest(current: Mapping[str, Any], evaluation: Mapping[str, Any],
     while len(body.encode()) > 9500:
         lines.pop(-6)
         body = "\n".join(lines)
-    presentation: dict[str, Any] = {"subject": f"[Monitor 일일 보고] {summary} · {now.astimezone(KST):%m/%d}", "body": body}
+    report_time = signals.timestamp(report_slot) if report_slot is not None else None
+    report_time = report_time or now
+    presentation: dict[str, Any] = {
+        "subject": f"[Monitor 일일 보고] {summary} · {report_time.astimezone(KST):%m/%d}",
+        "body": body,
+    }
     try:
         presentation["visual"] = delivery.email_visuals.normalize_visual(
             visuals.build_hourly_visual(output_dir, current, evaluation, health, report_active, now,
@@ -834,7 +869,8 @@ def produce_notifications(
                 escalation = mail_severity == "critical" and item["notifiedSeverity"] == "warning"
                 event = _event("SecurityPattern" if item["kind"].startswith("ssh-") else "OperationalCaution",
                                f"signal\0{identifier}\0{mail_severity}", mail_severity,
-                               now_text, item["openedAt"], item["evidence"], count=item["count"])
+                               now_text, item["openedAt"], item["evidence"], count=item["count"],
+                               signal_kind=item["kind"])
                 readmission = _needs_readmission(connection, config, event)
                 if readmission or ((item["notifiedSeverity"] is None or escalation)
                                    and ready):
@@ -886,7 +922,8 @@ def produce_notifications(
                 evidence = _recovery_evidence(item["evidence"], recovery_samples)
                 event = _event("SecurityPattern" if item["kind"].startswith("ssh-") else "OperationalCaution",
                                f"signal\0{item['id']}\0resolved", item["notifiedSeverity"] or item["severity"],
-                               now_text, item["openedAt"], evidence, "resolved", 0)
+                               now_text, item["openedAt"], evidence, "resolved", 0,
+                               signal_kind=item["kind"])
                 if item["notifiedSeverity"] and not key.startswith("ssh-"):
                     _emit(outbox, connection, config, event, now, status["immediate"], _immediate_presentation(event, evidence))
                     if _recovery_unfinished(connection, config, event):
@@ -924,14 +961,22 @@ def produce_notifications(
                 for key, row in report_evaluation.get("states", {}).items() if row.get("reportReady") is True}
             # Keep the historical rule/status identifiers for API compatibility;
             # the durable slot and user-facing presentation are now daily.
-            event = _event("HourlyReport", f"daily\0{slot}", "info", now_text, slot, "서버 일일 상태 보고")
-            if enabled and (not state.get("lastHour") or slot > state["lastHour"] or (
-                    slot == state["lastHour"] and _needs_readmission(connection, config, event))):
-                if _emit(outbox, connection, config, event, now, status["hourly"],
-                         _digest(notification_current, report_evaluation, health, active, events, now, output_dir)):
-                    state["lastHour"], state["lastQueuedAt"] = slot, now_text
-            recent.sort(key=lambda row: row["observedAt"], reverse=True)
-            state.update({"active": active, "recent": recent[:MAX_DETECTIONS],
+            if enabled and slot is not None:
+                event = _event("HourlyReport", f"daily\0{slot}", "info", now_text, slot, "서버 일일 상태 보고")
+                if not state.get("lastDailySlot") and state.get("lastHour") == slot:
+                    # The preceding daily implementation used the legacy field
+                    # names with the same durable event identity. Preserve its
+                    # real queue timestamp instead of relabeling deploy time.
+                    state["lastDailySlot"] = slot
+                    if signals.timestamp(state.get("lastQueuedAt")) is not None:
+                        state["lastDailyQueuedAt"] = state["lastQueuedAt"]
+                if (not state.get("lastDailySlot") or slot > state["lastDailySlot"] or (
+                        slot == state["lastDailySlot"] and _needs_readmission(connection, config, event))):
+                    if _emit(outbox, connection, config, event, now, status["hourly"],
+                             _digest(notification_current, report_evaluation, health, active, events, now,
+                                     output_dir, report_slot=slot)):
+                        state["lastDailySlot"], state["lastDailyQueuedAt"] = slot, now_text
+            state.update({"active": active, "recent": _bounded_recent(active, recent),
                           "pendingRecoveries": pending_recoveries,
                           "lastNotices": dict(sorted(last_notices.items(), key=lambda pair: pair[1]["at"],
                                                      reverse=True)[:MAX_SIGNALS])})
@@ -941,7 +986,7 @@ def produce_notifications(
             connection.execute("INSERT INTO notification_producer_state(id,value) VALUES(1,?) ON CONFLICT(id) DO UPDATE SET value=excluded.value", (serialized,))
             outbox._prune(connection)
             connection.execute("COMMIT")
-        status["hourly"]["lastQueuedAt"] = state.get("lastQueuedAt")
+        status["hourly"]["lastQueuedAt"] = state.get("lastDailyQueuedAt")
         public_fields = {"id", "kind", "severity", "status", "openedAt", "observedAt", "count", "windowSeconds", "evidence"}
         status["detections"] = [{key: value for key, value in row.items() if key in public_fields} for row in state["recent"]]
         for row in status["detections"]:

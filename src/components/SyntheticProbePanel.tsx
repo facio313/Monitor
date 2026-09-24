@@ -66,7 +66,7 @@ export function SyntheticProbePanel({ data, locale }: { data: DashboardPayload; 
         <span className="cockpit-panel-icon"><Icon name="network" size={19} /></span>
         <div>
           <h2>{t(locale, '외부 HTTP·TLS 합성 검사', 'External HTTP and TLS probes')}</h2>
-          <p>{t(locale, '5분마다 외부 경로를 확인한 최신 결과 1개입니다. URL과 인증정보는 저장하지 않습니다.', 'The latest replace-only result checks the external path every five minutes; URLs and credentials are not retained.')}</p>
+          <p>{t(locale, '설정된 주기로 외부 경로를 확인한 최신 결과입니다. 네트워크 상세의 진단 이력에서 장애 기록을 확인할 수 있습니다.', 'Latest scheduled external-path results. Diagnostic history in Network details retains failure records.')}</p>
         </div>
         <span className={`cockpit-panel-badge ${failed ? 'probe-badge-danger' : ''}`}>{failed ? `${failed} ${t(locale, '실패', 'failed')}` : `${probes.length} OK`}</span>
       </header>

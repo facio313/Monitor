@@ -393,11 +393,55 @@ describe('operational health assessment', () => {
     const findings = operationalFindings(data);
     expect(findings.find((entry) => entry.id === 'resource-pressure')).toMatchObject({ level: 'danger', scope: 'current', page: 'resources' });
     expect(findings.find((entry) => entry.id === 'network-quality')).toMatchObject({ level: 'danger', scope: 'current', page: 'network' });
+    expect(findings.find((entry) => entry.id === 'storage-performance')).toMatchObject({ level: 'caution', scope: 'current', page: 'storage' });
     expect(findings.find((entry) => entry.id === 'storage-integrity')).toMatchObject({ level: 'danger', scope: 'current', page: 'storage' });
     expect(findings.find((entry) => entry.id === 'linux-reliability')).toMatchObject({ level: 'danger', scope: 'current', page: 'reliability', count: 2 });
     expect(findings.find((entry) => entry.id === 'power-quality')).toMatchObject({ level: 'danger', scope: 'current', page: 'power' });
     expect(operationalFindingHref(findings.find((entry) => entry.id === 'linux-reliability')!, '7d'))
       .toBe('/monitor/details/reliability?range=7d#issue-linux-reliability');
+  });
+
+  it('keeps block-device performance pressure separate from storage integrity faults', () => {
+    const data = payload();
+    data.linux = linuxDiagnostics();
+    data.linux.storage.devices = [{
+      name: 'nvme0n1', type: 'nvme', rotational: false, rateStatus: 'ok',
+      queueDepth: 1, readLatencyMilliseconds: 24, writeLatencyMilliseconds: 26,
+      averageLatencyMilliseconds: 25, utilizationPercent: 82, averageQueueDepth: 1,
+      smartStatus: 'supported', raidStatus: 'supported', raidDegradedDevices: 0,
+      raidArrayState: 'clean',
+    }];
+
+    const performanceOnly = operationalFindings(data);
+    expect(performanceOnly.find((entry) => entry.id === 'storage-performance')).toMatchObject({
+      level: 'caution', scope: 'current', page: 'storage', count: 2,
+      evidence: [expect.stringContaining('지연 25.0ms'), expect.stringContaining('latency 25.0ms')],
+    });
+    expect(performanceOnly.find((entry) => entry.id === 'storage-integrity')).toBeUndefined();
+
+    data.linux.storage.devices[0]!.raidDegradedDevices = 1;
+    data.linux.storage.devices[0]!.raidArrayState = 'degraded';
+    const withIntegrityFault = operationalFindings(data);
+    expect(withIntegrityFault.find((entry) => entry.id === 'storage-performance')).toBeDefined();
+    expect(withIntegrityFault.find((entry) => entry.id === 'storage-integrity')).toMatchObject({
+      level: 'danger', scope: 'current', page: 'storage', count: 1,
+      evidence: [expect.stringContaining('RAID degraded 1'), expect.stringContaining('RAID degraded 1')],
+    });
+  });
+
+  it('routes storage collection gaps to storage coverage instead of Linux reliability', () => {
+    const data = payload();
+    data.linux = linuxDiagnostics();
+    data.linux.storage.status = 'collection_error';
+    data.linux.storage.truncated = true;
+
+    const findings = operationalFindings(data);
+
+    expect(findings.find((entry) => entry.id === 'storage-observation')).toMatchObject({
+      level: 'danger', scope: 'current', page: 'storage', count: 2,
+      evidence: [expect.stringContaining('저장장치 수집 collection_error'), expect.stringContaining('storage collection collection_error')],
+    });
+    expect(findings.find((entry) => entry.id === 'linux-reliability')).toBeUndefined();
   });
 
   it('keeps unsupported Linux and an explicitly unconfigured healthcheck neutral', () => {

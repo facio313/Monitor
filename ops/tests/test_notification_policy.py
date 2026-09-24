@@ -89,6 +89,23 @@ class NotificationPolicyTests(unittest.TestCase):
         self.assertEqual(policy.resource_value("host:load", current), 1.5)
         self.assertEqual([row["severity"] for row in signals.operational_signals(current)], ["warning", "warning"])
 
+    def test_io_pressure_is_one_episode_and_requires_both_values_for_recovery(self):
+        for some, full in ((20, 0), (0, 8), (25, 10)):
+            current = {"latest": {"ioPressureSomeAvg10": some,
+                                  "ioPressureFullAvg10": full}}
+            rows = signals.operational_signals(current)
+            self.assertEqual([row["key"] for row in rows], [policy.IO_PRESSURE_SIGNAL_KEY])
+            self.assertEqual(rows[0]["severity"], "warning")
+        score = policy.resource_value(
+            policy.IO_PRESSURE_SIGNAL_KEY,
+            {"latest": {"ioPressureSomeAvg10": 5, "ioPressureFullAvg10": 1}},
+        )
+        self.assertIsNone(policy.severity_for_value(policy.IO_PRESSURE_POLICY, score, "warning"))
+        incomplete = {"latest": {"ioPressureSomeAvg10": 25}}
+        self.assertEqual(policy.resource_value(policy.IO_PRESSURE_SIGNAL_KEY, incomplete), 4 / 3)
+        self.assertEqual(signals.operational_signals(incomplete)[0]["key"], policy.IO_PRESSURE_SIGNAL_KEY)
+        self.assertFalse(signals.observable(policy.IO_PRESSURE_SIGNAL_KEY, incomplete))
+
     def test_disk_identity_and_exclusion_are_preserved(self):
         root_id = hashlib.sha256(b"/").hexdigest()[:12]
         excluded_id = hashlib.sha256(b"/srv/wgang").hexdigest()[:12]

@@ -38,6 +38,8 @@ export type OperationalFindingId =
   | 'rcu-expedited'
   | 'kernel-warning'
   | 'memory-oom'
+  | 'storage-observation'
+  | 'storage-performance'
   | 'storage-integrity'
   | 'pcie-integrity'
   | 'nvme-mitigation'
@@ -357,15 +359,49 @@ const DEFINITIONS: Record<OperationalFindingId, OperationalFindingDefinition> = 
       ['정상 부하에도 반복되면 메모리 또는 swap 용량 계획을 검토합니다.', 'If it recurs under normal load, review memory or swap capacity.'],
     ],
   },
+  'storage-observation': {
+    id: 'storage-observation',
+    page: 'storage',
+    priority: 4,
+    title: ['저장장치 관측 범위 확인', 'Storage observation coverage needs review'],
+    summary: ['저장장치 목록 또는 상태 수집이 불완전해 현재 상태를 전부 확인할 수 없습니다.', 'Storage inventory or health collection is incomplete, so the current state is not fully verified.'],
+    problem: ['수집 오류·권한 제한·목록 축약은 장치가 정상이라는 뜻이 아니며, 성능 경고나 무결성 오류가 누락될 수 있습니다.', 'Collection errors, permission limits, or truncation do not establish healthy storage and can hide performance or integrity evidence.'],
+    symptoms: [
+      ['저장장치 수집 상태가 partial·unavailable·collection_error로 표시되거나 장치 목록이 축약됩니다.', 'Storage collection reports partial, unavailable, or collection_error, or the device list is truncated.'],
+      ['SMART·RAID 상태가 수집되지 않아 해당 장치의 상태를 판단할 수 없습니다.', 'SMART or RAID status is unavailable, preventing a health judgment for that device.'],
+    ],
+    resolutions: [
+      ['저장장치 상세에서 수집 상태와 누락된 SMART·RAID 입력을 확인합니다.', 'Review collection status and missing SMART or RAID inputs in Storage details.'],
+      ['수집 권한·명령 지원 여부·시간 제한을 확인하고 다음 표본에서 fresh/supported로 회복되는지 봅니다.', 'Check collection permissions, command support, and time limits, then verify a later sample returns to fresh/supported.'],
+      ['관측이 복구될 때까지 빈 장치 목록이나 누락 상태를 정상으로 해석하지 않습니다.', 'Do not interpret an empty inventory or missing health status as normal until observation recovers.'],
+    ],
+  },
+  'storage-performance': {
+    id: 'storage-performance',
+    page: 'storage',
+    priority: 6,
+    title: ['저장장치 I/O 성능 경고', 'Storage I/O performance warning'],
+    summary: ['블록 장치 지연 또는 사용률이 성능 관찰 임계치를 넘었습니다.', 'Block-device latency or utilization crossed a performance observation threshold.'],
+    problem: ['장치 고장이나 데이터 손상 증거는 아니지만, I/O 요청이 오래 기다리거나 장치 처리 용량에 가까워졌을 수 있습니다.', 'This is not evidence of device failure or data corruption, but I/O requests may be waiting longer or the device may be near its processing capacity.'],
+    symptoms: [
+      ['응답 지연, 높은 I/O PSI 또는 작업 대기열 증가가 함께 나타날 수 있습니다.', 'Higher response latency, I/O PSI, or work queues may appear at the same time.'],
+      ['지연·사용률이 짧게 상승한 뒤 바로 정상화되면 일시적인 대량 작업일 수 있습니다.', 'A short latency or utilization spike that quickly clears can be a transient bulk operation.'],
+    ],
+    resolutions: [
+      ['장치 지연·사용률·큐 깊이와 I/O PSI가 같은 시간대에 지속되는지 확인합니다.', 'Check whether device latency, utilization, queue depth, and I/O PSI persist in the same period.'],
+      ['지속된다면 당시 I/O를 만든 워크로드와 읽기·쓰기 처리량을 확인합니다.', 'If it persists, identify the workload and read/write throughput responsible for the I/O.'],
+      ['무결성 경고가 함께 없으면 장치 교체보다 작업 조정과 용량 계획을 먼저 검토합니다.', 'When no integrity warning is present, review workload tuning and capacity planning before device replacement.'],
+    ],
+  },
   'storage-integrity': {
     id: 'storage-integrity',
     page: 'storage',
     priority: 1,
     title: ['저장장치 무결성 오류', 'Storage integrity fault'],
-    summary: ['파일시스템 또는 NVMe 입출력·재설정 오류가 기록되었습니다.', 'A filesystem or NVMe I/O or reset error was recorded.'],
+    summary: ['파일시스템·NVMe 오류, 읽기 전용 전환 또는 RAID 저하가 기록되었습니다.', 'A filesystem or NVMe error, read-only transition, or degraded RAID was recorded.'],
     problem: ['저장 계층이 요청을 정상 처리하지 못했습니다. 반복되면 데이터 손상이나 서비스 중단으로 이어질 수 있습니다.', 'The storage stack failed to process an operation normally. Recurrence can lead to data corruption or service outages.'],
     symptoms: [
-      ['읽기·쓰기 실패, 파일시스템 read-only 전환, I/O 멈춤 또는 NVMe 재설정이 나타날 수 있습니다.', 'Reads or writes may fail, filesystems may become read-only, I/O may stall, or NVMe may reset.'],
+      ['읽기·쓰기 실패, 파일시스템 read-only 전환, RAID 저하, I/O 멈춤 또는 NVMe 재설정이 나타날 수 있습니다.', 'Reads or writes may fail, filesystems may become read-only, RAID may degrade, I/O may stall, or NVMe may reset.'],
       ['서비스 오류와 높은 I/O 대기가 같은 시각에 나타날 수 있습니다.', 'Service errors and high I/O wait may coincide.'],
     ],
     resolutions: [
@@ -558,7 +594,9 @@ interface FindingSignal {
 interface LinuxFindingSignals {
   resource: FindingSignal[];
   network: FindingSignal[];
-  storage: FindingSignal[];
+  storageObservation: FindingSignal[];
+  storagePerformance: FindingSignal[];
+  storageIntegrity: FindingSignal[];
   reliability: FindingSignal[];
   power: FindingSignal[];
   observedAt: string | null;
@@ -661,7 +699,7 @@ export function operationalCollectionLimitations(data: DashboardPayload): Locali
 
 function projectedLinuxSignals(data: DashboardPayload): LinuxFindingSignals {
   const result: LinuxFindingSignals = {
-    resource: [], network: [], storage: [], reliability: [], power: [], observedAt: null,
+    resource: [], network: [], storageObservation: [], storagePerformance: [], storageIntegrity: [], reliability: [], power: [], observedAt: null,
   };
   const linux = data.linux;
   // Old unsupported payloads intentionally contained only `status`.
@@ -713,23 +751,23 @@ function projectedLinuxSignals(data: DashboardPayload): LinuxFindingSignals {
   });
 
   const storageStatus = collectionSignal('storage:status', '저장장치 수집', 'storage collection', linux.storage.status);
-  if (storageStatus) result.storage.push(storageStatus);
-  if (linux.storage.truncated) result.storage.push({ key: 'storage:truncated', level: 'caution', ko: '장치 목록 축약', en: 'device list truncated' });
+  if (storageStatus) result.storageObservation.push(storageStatus);
+  if (linux.storage.truncated) result.storageObservation.push({ key: 'storage:truncated', level: 'caution', ko: '장치 목록 축약', en: 'device list truncated' });
   for (const device of linux.storage.devices) {
     const deviceName = device.name.slice(0, 64) || 'device';
     const degraded = device.raidDegradedDevices ?? 0;
-    if (degraded > 0) result.storage.push({
+    if (degraded > 0) result.storageIntegrity.push({
       key: `storage:${deviceName}:raid`, level: 'danger',
       ko: `${deviceName} RAID degraded ${degraded.toLocaleString()}`,
       en: `${deviceName} RAID degraded ${degraded.toLocaleString()}`,
     });
     const latency = device.averageLatencyMilliseconds;
-    if (typeof latency === 'number' && Number.isFinite(latency) && latency >= 20) result.storage.push({
+    if (typeof latency === 'number' && Number.isFinite(latency) && latency >= 20) result.storagePerformance.push({
       key: `storage:${deviceName}:latency`, level: latency >= 100 ? 'danger' : 'caution',
       ko: `${deviceName} 지연 ${latency.toFixed(1)}ms`, en: `${deviceName} latency ${latency.toFixed(1)}ms`,
     });
     const utilization = device.utilizationPercent;
-    if (typeof utilization === 'number' && Number.isFinite(utilization) && utilization >= 80) result.storage.push({
+    if (typeof utilization === 'number' && Number.isFinite(utilization) && utilization >= 80) result.storagePerformance.push({
       key: `storage:${deviceName}:utilization`, level: utilization >= 95 ? 'danger' : 'caution',
       ko: `${deviceName} 사용률 ${percent(utilization)}`, en: `${deviceName} utilization ${percent(utilization)}`,
     });
@@ -738,7 +776,7 @@ function projectedLinuxSignals(data: DashboardPayload): LinuxFindingSignals {
       ['raid-status', 'RAID 수집', 'RAID collection', device.raidStatus],
     ] as const) {
       const signal = collectionSignal(`storage:${deviceName}:${suffix}`, `${deviceName} ${labelKo}`, `${deviceName} ${labelEn}`, status);
-      if (signal) result.storage.push(signal);
+      if (signal) result.storageObservation.push(signal);
     }
   }
 
@@ -832,7 +870,9 @@ function projectedLinuxSignals(data: DashboardPayload): LinuxFindingSignals {
 
   result.resource = uniqueSignals(result.resource);
   result.network = uniqueSignals(result.network);
-  result.storage = uniqueSignals(result.storage);
+  result.storageObservation = uniqueSignals(result.storageObservation);
+  result.storagePerformance = uniqueSignals(result.storagePerformance);
+  result.storageIntegrity = uniqueSignals(result.storageIntegrity);
   result.reliability = uniqueSignals(result.reliability);
   result.power = uniqueSignals(result.power);
   return result;
@@ -1515,9 +1555,31 @@ export function operationalFindings(data: DashboardPayload): OperationalFinding[
     findings.push(finding('memory-oom', 'danger', bootScope, [`OOM 종료 ${oomCount.toLocaleString()}건`, `${oomCount.toLocaleString()} OOM kills`], oomCount, kernel.oomKill.lastEventAt));
   }
 
+  if (linuxSignals.storagePerformance.length) {
+    findings.push(finding(
+      'storage-performance',
+      signalLevel(linuxSignals.storagePerformance) ?? 'caution',
+      snapshotScope,
+      boundedSignalEvidence(linuxSignals.storagePerformance),
+      linuxSignals.storagePerformance.length,
+      linuxSignals.observedAt ?? snapshotObservedAt,
+    ));
+  }
+
+  if (linuxSignals.storageObservation.length) {
+    findings.push(finding(
+      'storage-observation',
+      signalLevel(linuxSignals.storageObservation) ?? 'caution',
+      snapshotScope,
+      boundedSignalEvidence(linuxSignals.storageObservation),
+      linuxSignals.storageObservation.length,
+      linuxSignals.observedAt ?? snapshotObservedAt,
+    ));
+  }
+
   const readOnlyMounts = data.disks.filter((disk) => disk.readOnly === true);
   const storageErrorCount = numericCount(kernel.filesystemError.count) + numericCount(kernel.nvmeReset.count) + numericCount(kernel.nvmeIo.count);
-  if (storageErrorCount || readOnlyMounts.length || linuxSignals.storage.length) {
+  if (storageErrorCount || readOnlyMounts.length || linuxSignals.storageIntegrity.length) {
     const readOnlyKo = readOnlyMounts.length ? ` · 읽기 전용 ${readOnlyMounts.map((disk) => disk.mount).join(', ')}` : '';
     const readOnlyEn = readOnlyMounts.length ? ` · read-only ${readOnlyMounts.map((disk) => disk.mount).join(', ')}` : '';
     const legacyKo = storageErrorCount || readOnlyMounts.length
@@ -1526,16 +1588,16 @@ export function operationalFindings(data: DashboardPayload): OperationalFinding[
     const legacyEn = storageErrorCount || readOnlyMounts.length
       ? `filesystem ${numericCount(kernel.filesystemError.count)} · NVMe reset ${numericCount(kernel.nvmeReset.count)} · I/O ${numericCount(kernel.nvmeIo.count)}${readOnlyEn}`
       : null;
-    const currentStorageEvidence = linuxSignals.storage.length > 0 || readOnlyMounts.length > 0;
+    const currentStorageEvidence = linuxSignals.storageIntegrity.length > 0 || readOnlyMounts.length > 0;
     findings.push(finding(
       'storage-integrity',
-      storageErrorCount || readOnlyMounts.length || signalLevel(linuxSignals.storage) === 'danger' ? 'danger' : 'caution',
+      storageErrorCount || readOnlyMounts.length || signalLevel(linuxSignals.storageIntegrity) === 'danger' ? 'danger' : 'caution',
       currentStorageEvidence ? snapshotScope : bootScope,
       [
-        [legacyKo, ...linuxSignals.storage.map((signal) => signal.ko)].filter(Boolean).join(' · '),
-        [legacyEn, ...linuxSignals.storage.map((signal) => signal.en)].filter(Boolean).join(' · '),
+        [legacyKo, ...linuxSignals.storageIntegrity.map((signal) => signal.ko)].filter(Boolean).join(' · '),
+        [legacyEn, ...linuxSignals.storageIntegrity.map((signal) => signal.en)].filter(Boolean).join(' · '),
       ],
-      storageErrorCount + readOnlyMounts.length + linuxSignals.storage.length,
+      storageErrorCount + readOnlyMounts.length + linuxSignals.storageIntegrity.length,
       currentStorageEvidence
         ? latestTimestamp([snapshotObservedAt, linuxSignals.observedAt])
         : latestTimestamp([kernel.filesystemError.lastEventAt, kernel.nvmeReset.lastEventAt, kernel.nvmeIo.lastEventAt]),

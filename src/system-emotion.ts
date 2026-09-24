@@ -140,6 +140,7 @@ const FINDING_AXIS: Partial<Record<OperationalFindingId, SystemEmotionAxisKey>> 
   'rcu-expedited': 'reliability',
   'kernel-warning': 'reliability',
   'memory-oom': 'memory',
+  'storage-performance': 'storage',
   'storage-integrity': 'storage',
   'pcie-integrity': 'reliability',
   'nvme-mitigation': 'reliability',

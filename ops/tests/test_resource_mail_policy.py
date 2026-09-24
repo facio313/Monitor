@@ -71,10 +71,12 @@ class ResourceMailPolicyTests(unittest.TestCase):
         self.assertEqual(reports._qualified_severity("host:cpuPercent", legacy), "warning")
         self.assertFalse(reports._qualified({**legacy, "key": "host:cpuPercent"}, legacy))
 
-    def test_external_monitoring_limit_is_explicit_without_inventing_failure(self):
+    def test_external_monitoring_scope_is_explicit_without_inventing_failure(self):
         mail = reports._digest(self.fixture.current, self.fixture.evaluation, [], {}, [], fixtures.NOW)
-        self.assertIn("외부 감시: 미구축", mail["body"])
-        self.assertIn("서버 전체 정지", mail["body"])
+        self.assertIn("GitHub Actions가 공개 readiness·TLS·SSO", mail["body"])
+        self.assertIn("예약 실행 간격은 SLA가 아닙니다", mail["body"])
+        self.assertIn("전체 호스트 중단도 감지", mail["body"])
+        self.assertIn("SMTP는 보내지 않으며", mail["body"])
         self.assertNotIn("] 위험", mail["subject"])
 
     def test_undefined_host_cpu_full_psi_never_retains_legacy_danger(self):

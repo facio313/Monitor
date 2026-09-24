@@ -16,11 +16,11 @@ function payload(): DashboardPayload {
 }
 
 describe('SyntheticProbePanel', () => {
-  it('shows every retained HTTP and TLS result field and its replace-only cadence', () => {
+  it('shows current HTTP/TLS evidence and points to retained diagnostics', () => {
     const markup = renderToStaticMarkup(createElement(SyntheticProbePanel, { data: payload(), locale: 'en' }));
     expect(markup).toContain('External HTTP and TLS probes');
-    expect(markup).toContain('every five minutes');
-    expect(markup).toContain('latest replace-only result');
+    expect(markup).toContain('Latest scheduled external-path results');
+    expect(markup).toContain('Diagnostic history in Network details retains failure records');
     expect(markup).toContain('public-monitor-readiness');
     expect(markup).toContain('<td>200</td>');
     expect(markup).toContain('364 ms');

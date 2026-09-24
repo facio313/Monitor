@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import type { NotificationReportStatus } from '../src/notification-report-types.js';
 
 const MAX_BYTES = 256 * 1024;
-const KINDS = new Set(['ssh-auth-attempt', 'ssh-auth-burst', 'http-client-errors', 'http-server-errors', 'operational-caution', 'source-unavailable', 'rule-alert']);
+const KINDS = new Set(['ssh-auth-attempt', 'ssh-auth-burst', 'ssh-auth-success', 'http-client-errors', 'http-server-errors', 'operational-caution', 'source-unavailable', 'rule-alert']);
 const SOURCES = new Set(['snapshot', 'rules', 'ssh', 'http']);
 type Obj = Record<string, unknown>;
 function obj(value: unknown): Obj {

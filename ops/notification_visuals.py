@@ -383,10 +383,15 @@ def build_incident_visual(event: Mapping[str, Any], evidence: str) -> dict[str, 
     resolved = event.get("transition") == "resolved"
     status = "resolved" if resolved else "critical" if event.get("severity") == "critical" else "warning"
     reboot = "재부팅" in evidence
-    ssh = event.get("ruleId") == "SecurityPattern" or "SSH" in evidence
+    labels = event.get("labels")
+    signal_kind = labels.get("signal_kind") if isinstance(labels, Mapping) else None
+    ssh_success = event.get("ruleId") == "SecurityPattern" and signal_kind == "ssh-auth-success"
+    ssh_failure = (event.get("ruleId") == "SecurityPattern"
+                   and signal_kind in {"ssh-auth-attempt", "ssh-auth-burst"})
     tcp = "TCP" in evidence or event.get("ruleId") == "TcpRetransmissionHigh"
     title = ("재부팅 필요 조건이 해제됐습니다" if resolved else "서버 재부팅이 필요합니다") if reboot else (
-        "SSH 관측 조건이 해제됐습니다" if resolved else "SSH 접근 시도가 감지됐습니다") if ssh else (
+        "SSH 인증 성공 관측 조건이 해제됐습니다" if resolved else "신뢰 목록 밖 SSH 인증 성공이 감지됐습니다") if ssh_success else (
+        "SSH 관측 조건이 해제됐습니다" if resolved else "SSH 접근 시도가 감지됐습니다") if ssh_failure else (
         "TCP 재전송 경고가 해제됐습니다" if resolved else "네트워크 품질을 확인해주세요") if tcp else (
         "알림 조건이 해제됐습니다" if resolved else "서버에 확인할 사항이 있습니다")
     observed = signals.timestamp(event.get("observedAt"))
@@ -399,7 +404,9 @@ def build_incident_visual(event: Mapping[str, Any], evidence: str) -> dict[str, 
     elif reboot:
         highlights.extend(["운영체제가 재부팅 필요 표식을 보고했습니다. 즉시 장애가 발생했다는 뜻은 아닙니다.",
                            "진행 중인 작업을 저장하고 서비스 점검 시간을 정하세요. 재부팅 후 서비스 상태를 확인하세요."])
-    elif ssh:
+    elif ssh_success:
+        highlights.append("인증은 성공했지만 승인된 운영 접속인지와 침해 여부는 확인되지 않았습니다.")
+    elif ssh_failure:
         highlights.append("거부 또는 인증 실패의 관측입니다. 침입 성공 여부는 확인되지 않았습니다.")
     elif tcp:
         highlights.append("전체 송신량과 재전송 건수를 함께 보고, 외부 경로·장비·상대 서버 상태를 확인하세요.")

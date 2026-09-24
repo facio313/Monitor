@@ -51,12 +51,13 @@ class SecuritySignalsTests(unittest.TestCase):
         self.assertTrue(any(item["key"].endswith(":certificate") and item["severity"] == "critical"
                             for item in result))
 
-    def test_denial_and_close_pair_is_one_conservative_attempt(self):
+    def test_distinct_failure_rows_are_counted_without_claiming_unique_attempts(self):
         denied = ssh_row("User root from [REDACTED_IP] not allowed because not listed in AllowUsers")
         closed = ssh_row("Connection closed by invalid user root [REDACTED_IP] port 5555 [preauth]")
         result = signals.ssh_signals([denied, closed, denied], NOW)
-        self.assertEqual(result[0]["count"], 1)
+        self.assertEqual(result[0]["count"], 2)
         self.assertEqual(result[0]["severity"], "warning")
+        self.assertIn("로그 행 수는 고유 접근 횟수가 아닙니다", result[0]["evidence"])
         self.assertNotIn("root", result[0]["evidence"])
         self.assertNotIn("REDACTED_IP", result[0]["evidence"])
 
