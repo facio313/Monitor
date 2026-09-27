@@ -161,11 +161,11 @@ class SecuritySignalsTests(unittest.TestCase):
         result = signals.operational_signals(current)
         self.assertEqual([row["severity"] for row in result], ["critical"])
 
-    def test_http_slow_share_requires_a_real_sample_but_absolute_delays_remain(self):
+    def test_http_slow_share_requires_a_real_sample_and_material_share(self):
         for total, slow, maximum, severity in (
             (1, 1, 1200, None), (4, 3, 1200, None), (20, 2, 1200, None),
             (20, 3, 1200, "warning"), (20, 8, 1200, "critical"),
-            (1, 1, 5000, "warning"), (1, 1, 15000, "critical"),
+            (1, 1, 5000, None), (1, 1, 15000, None),
         ):
             with self.subTest(total=total, slow=slow, maximum=maximum):
                 rows = signals.http_signals({"currentTraffic": [{

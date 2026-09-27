@@ -490,7 +490,10 @@ def http_signals(current: Mapping[str, Any]) -> list[dict[str, Any]]:
             result[-1]["windowSeconds"] = 60
         slow, maximum = number(row.get("slowCount")), number(row.get("maxResponseMs"))
         enough_slow = slow is not None and total >= 20 and slow >= 3
-        if (enough_slow and slow / total >= 0.1) or (maximum is not None and maximum >= 5000):
+        # A single maximum is unstable on a low-traffic personal service. Mail
+        # authority requires both a useful request count and a material share;
+        # the maximum remains diagnostic context only.
+        if enough_slow and slow / total >= 0.1:
             severe = (enough_slow and slow / total >= 0.4) or (maximum is not None and maximum >= 15000)
             result.append(_signal(f"http-slow:{app}", "operational-caution", "critical" if severe else "warning",
                                   "http", int(slow or 1), f"{app}: 느린 HTTP 요청 증가. "

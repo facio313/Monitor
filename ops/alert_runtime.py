@@ -38,6 +38,7 @@ MAX_CONTAINER_INVENTORY_AGE_SECONDS = 180
 SWAP_PRESSURE_MEMORY_USED_PERCENT = 75.0
 SWAP_PRESSURE_MEMORY_PSI_SOME_AVG10 = 1.0
 SWAP_PRESSURE_MEMORY_PSI_FULL_AVG10 = 0.2
+TCP_MAIL_MIN_RETRANSMITTED_SEGMENTS = 100
 
 
 def _mapping(value: Any) -> Mapping[str, Any]:
@@ -577,9 +578,22 @@ def observations_for_snapshot(pack: RulePack, snapshot: Mapping[str, Any]) -> di
     linux_tcp = _mapping(linux.get("tcp"))
     if "TcpRetransmissionHigh" in result:
         assessment = _mapping(linux_tcp.get("assessment"))
+        retransmitted = _number(assessment.get("retransmittedSegmentsDelta"))
+        retransmission_percent = _number(assessment.get("retransmissionPercent"))
+        if assessment.get("status") == "ok" and retransmitted is not None:
+            # Percentages swing sharply on quiet links. A valid but immaterial
+            # count is healthy for mail purposes; a missing count is unknown.
+            mail_value = (
+                retransmission_percent
+                if retransmission_percent is not None
+                and retransmitted >= TCP_MAIL_MIN_RETRANSMITTED_SEGMENTS
+                else 0.0
+            )
+        else:
+            mail_value = None
         result["TcpRetransmissionHigh"] = [
             _source_observation(
-                host_target, assessment.get("retransmissionPercent") if assessment.get("status") == "ok" else None, linux_tcp,
+                host_target, mail_value, linux_tcp,
             )
         ]
     if "ConntrackUsageHigh" in result:

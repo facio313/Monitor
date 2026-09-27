@@ -88,7 +88,8 @@ class AlertRuntimeTests(unittest.TestCase):
                 "tcp": {
                     "status": "supported",
                     "retransmissionPercent": 6,
-                    "assessment": {"status": "ok", "retransmissionPercent": 6},
+                    "assessment": {"status": "ok", "retransmissionPercent": 6,
+                                   "retransmittedSegmentsDelta": 100},
                     "conntrack": {"status": "supported", "usedPercent": 81},
                 },
                 "processes": {
@@ -762,7 +763,9 @@ class AlertRuntimeTests(unittest.TestCase):
         snapshot["containers"] = self.snapshot()["containers"]
         for minute, source_minute, expected in (
             (6, 6, "recovering"), (7, 6, "recovering"),
-            (8, 8, "recovering"), (9, 9, "inactive"),
+            (8, 8, "recovering"), (9, 9, "recovering"),
+            (10, 10, "recovering"), (11, 11, "recovering"),
+            (12, 12, "recovering"), (13, 13, "inactive"),
         ):
             snapshot["containerCollection"]["observedAt"] = (NOW + dt.timedelta(minutes=source_minute)).isoformat()
             evaluation, _ = evaluate_snapshot(
@@ -847,7 +850,8 @@ class AlertRuntimeTests(unittest.TestCase):
                 )
 
         resolved_events = []
-        for offset, expected_phase in enumerate(("recovering", "inactive")):
+        recovery_phases = ("recovering",) * 5 + ("inactive",)
+        for offset, expected_phase in enumerate(recovery_phases):
             restored = self.snapshot()
             now = NOW + dt.timedelta(minutes=rules["ContainerDown"].for_samples + offset)
             restored["containerCollection"]["observedAt"] = now.isoformat()

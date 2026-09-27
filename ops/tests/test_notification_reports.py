@@ -90,9 +90,10 @@ class NotificationReportsTests(unittest.TestCase):
 
     def test_warning_escalation_and_recovery_are_once(self):
         for minute, temperature, expected in (
-                (0, 80, 0), (1, 80, 0), (2, 80, 1),
-                (3, 85, 0), (4, 85, 0), (5, 85, 1),
-                (6, 75, 0), (7, 75, 0), (8, 75, 1)):
+                (0, 80, 0), (1, 80, 0), (2, 80, 0), (3, 80, 0), (4, 80, 1),
+                (5, 85, 0), (6, 85, 1),
+                (7, 75, 0), (8, 75, 0), (9, 75, 0), (10, 75, 0), (11, 75, 0),
+                (12, 75, 1)):
             now = NOW + dt.timedelta(minutes=minute)
             self.refresh_temperature(now, temperature)
             recovered = self.run_producer(now)

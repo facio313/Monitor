@@ -29,9 +29,9 @@ class ResourceMailPolicyTests(unittest.TestCase):
             self.assertIsNone(self.level(self.tick(minute, cpu=99), "host:cpuPercent"))
         self.assertEqual(self.level(self.tick(4, cpu=99), "host:cpuPercent"), "warning")
         self.assertEqual(self.level(self.tick(5, cpu=85), "host:cpuPercent"), "warning")
-        for minute in (6, 7):
+        for minute in range(6, 11):
             self.assertEqual(self.level(self.tick(minute, cpu=80), "host:cpuPercent"), "warning")
-        self.assertIsNone(self.level(self.tick(8, cpu=80), "host:cpuPercent"))
+        self.assertIsNone(self.level(self.tick(11, cpu=80), "host:cpuPercent"))
 
     def test_memory_critical_hysteresis_downgrade_and_full_recovery(self):
         for minute in range(3):
@@ -39,14 +39,14 @@ class ResourceMailPolicyTests(unittest.TestCase):
         self.assertEqual(self.level(state), "critical")
         for minute in (3, 4, 5):
             self.assertEqual(self.level(self.tick(minute, memory=85)), "critical")
-        for minute in (6, 7):
+        for minute in range(6, 11):
             self.assertEqual(self.level(self.tick(minute, memory=80)), "critical")
-        self.assertEqual(self.level(self.tick(8, memory=80)), "warning")
-        for minute in (9, 10, 11):
+        self.assertEqual(self.level(self.tick(11, memory=80)), "warning")
+        for minute in range(12, 15):
             self.assertEqual(self.level(self.tick(minute, memory=78)), "warning")
-        for minute in (12, 13):
+        for minute in range(15, 20):
             self.assertEqual(self.level(self.tick(minute, memory=75)), "warning")
-        self.assertIsNone(self.level(self.tick(14, memory=75)))
+        self.assertIsNone(self.level(self.tick(20, memory=75)))
 
     def test_missing_or_cached_values_cannot_clear_confirmed_resource(self):
         for minute in range(3):

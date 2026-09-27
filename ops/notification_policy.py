@@ -27,15 +27,18 @@ class ResourcePolicy:
     warning_seconds: int = 240
     critical_samples: int = 3
     critical_seconds: int = 120
-    recovery_samples: int = 3
-    recovery_seconds: int = 120
+    recovery_samples: int = 6
+    recovery_seconds: int = 300
 
 
 RESOURCE_POLICIES: Mapping[str, ResourcePolicy] = {
     "cpuPercent": ResourcePolicy("CPU 사용률", "%", 90, 80),
     "memoryPercent": ResourcePolicy("메모리 사용률", "%", 80, 75, 90, 80),
-    "temperatureC": ResourcePolicy("온도", "°C", 80, 75, 85, 80,
-                                   warning_samples=3, warning_seconds=120),
+    "temperatureC": ResourcePolicy(
+        "온도", "°C", 80, 75, 85, 80,
+        warning_samples=5, warning_seconds=240,
+        critical_samples=2, critical_seconds=60,
+    ),
     "cpuPressureSomeAvg10": ResourcePolicy("CPU PSI some", "%", 20, 5),
     # System-wide CPU PSI full is undefined, unlike cgroup CPU PSI full.
     "memoryPressureSomeAvg10": ResourcePolicy("메모리 PSI some", "%", 2, 1, 10, 2),
@@ -47,8 +50,8 @@ RESOURCE_POLICIES: Mapping[str, ResourcePolicy] = {
     "inodeUsedPercent": ResourcePolicy("아이노드 사용률", "%", 85, 80, 90, 85),
 }
 
-# PSI ``some`` and ``full`` describe one host I/O-contention episode.  Keep
-# one notification state: either entry boundary opens it, while both recovery
+# PSI ``some`` and ``full`` describe one host I/O-contention episode. Keep one
+# notification state: either entry boundary opens it, while both recovery
 # boundaries must be satisfied before it can close.
 IO_PRESSURE_SIGNAL_KEY = "host:ioPressure"
 IO_PRESSURE_FIELDS = frozenset({"ioPressureSomeAvg10", "ioPressureFullAvg10"})

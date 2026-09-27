@@ -293,7 +293,7 @@ def assess_hourly(current: Mapping[str, Any], evaluation: Mapping[str, Any],
               and not signals.excluded(row) and signals.fresh(row.get("checkedAt"), now, 600)] if probes_fresh else []
     latencies = [_value(row.get("latencyMilliseconds"), 600000) for row in probes]
     latencies = [value for value in latencies if value is not None]
-    http = _card("HTTP 응답 최대", max(latencies) if latencies else None, "ms", 1000, 3000, bool(probes), decimals=1)
+    http = _card("HTTP 응답 최대", max(latencies) if latencies else None, "ms", 800, 2000, bool(probes), decimals=1)
     if any(row.get("status") in {"dns", "timeout", "tls", "http"} for row in probes):
         http.update(value="검사 실패", unit="", tone="critical")
     cards.append(observation(http, matched_severity(

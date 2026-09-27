@@ -44,6 +44,16 @@ MAX_SIGNALS = 128
 MAX_DETECTIONS = 32
 WARNING_COOLDOWN_SECONDS = 900
 KST = dt.timezone(dt.timedelta(hours=9))
+IMMEDIATE_WARNING_SIGNAL_KEYS = frozenset({
+    "host:cpuPercent",
+    "host:memoryPercent",
+    "host:temperatureC",
+    "host:cpuPressureSomeAvg10",
+    "host:memoryPressureSomeAvg10",
+    "host:memoryPressureFullAvg10",
+    "host:load",
+    "host:power",
+})
 RETIRED_SIGNALS = {"host:cpuPressureFullAvg10":
     "판정 정책 정정: 호스트 범위 CPU PSI full은 유효한 지표가 아니므로 현재 경고에서 제외했습니다. 실제 장애 복구를 의미하지 않습니다.",
     "host:ioPressureSomeAvg10":
@@ -227,10 +237,14 @@ def _source_health(current: Mapping[str, Any], evaluation: Mapping[str, Any],
 
 def _event(rule: str, key: str, severity: str, now_text: str, opened: str,
            evidence: str, transition: str = "firing", count: int | None = None,
-           signal_kind: str | None = None) -> dict[str, Any]:
+           signal_kind: str | None = None, delivery_class: str | None = None) -> dict[str, Any]:
     labels = {"scope": "notification", "purpose": "report" if rule == "HourlyReport" else "signal"}
     if signal_kind in signals.DETECTION_KINDS:
         labels["signal_kind"] = signal_kind
+    if rule == "HourlyReport":
+        labels["delivery_class"] = "daily-report"
+    elif delivery_class in {"immediate-warning", "immediate-critical", "digest-only"}:
+        labels["delivery_class"] = delivery_class
     return normalize_event({
         "schemaVersion": 1, "rulePackVersion": "notifications-v1",
         "idempotencyKey": hashlib.sha256(key.encode()).hexdigest(),
@@ -241,6 +255,17 @@ def _event(rule: str, key: str, severity: str, now_text: str, opened: str,
         "description": evidence[:500],
         "runbook": "Monitor의 최신 표본과 해당 사건의 관측 시각을 확인하세요. 공격 의심은 침입 성공을 뜻하지 않습니다.",
     })
+
+
+def _signal_delivery_class(signal: Mapping[str, Any]) -> str:
+    """Classify direct signals without exposing variable host data to routes."""
+    if signal.get("severity") == "critical":
+        return "immediate-critical"
+    key = signal.get("key")
+    kind = signal.get("kind")
+    if (isinstance(kind, str) and kind.startswith("ssh-")) or key in IMMEDIATE_WARNING_SIGNAL_KEYS:
+        return "immediate-warning"
+    return "digest-only"
 
 
 def _empty_counts() -> dict[str, int]:
@@ -345,6 +370,8 @@ def _mail_requirements(signal: Mapping[str, Any]) -> tuple[int, int]:
         return 1, 0
     if key == "host:reboot" or key.endswith(":certificate"):
         return 1, 0
+    if key == "host:power":
+        return (2, 60) if signal["severity"] == "critical" else (3, 120)
     if signal["severity"] == "critical":
         discrete = (key.startswith("kernel:") or key in {
             "host:power",
@@ -352,6 +379,14 @@ def _mail_requirements(signal: Mapping[str, Any]) -> tuple[int, int]:
               and key.rsplit(":", 1)[-1] in {"status", "state", "health", "oom", "restarts"}))
         return (1, 0) if discrete else (2, 60)
     return 3, 120
+
+
+def _recovery_requirements(key: str, resource: policy.ResourcePolicy | None) -> tuple[int, int]:
+    if resource is not None:
+        return resource.recovery_samples, resource.recovery_seconds
+    if key == "host:power":
+        return 6, 300
+    return 2, 60
 
 
 def _source_sample(key: str, source: str, current: Mapping[str, Any],
@@ -439,8 +474,7 @@ def _qualified_severity(key: str, item: Mapping[str, Any]) -> str | None:
         confirmed.add("warning")
     below_started = signals.timestamp(item.get("firstBelowCriticalAt"))
     last = signals.timestamp(item.get("lastBreachSampleAt"))
-    recovery_samples = resource.recovery_samples if resource else 2
-    recovery_seconds = resource.recovery_seconds if resource else 60
+    recovery_samples, recovery_seconds = _recovery_requirements(key, resource)
     if (item.get("severity") == "warning" and "critical" in confirmed
             and item.get("belowCriticalSamples", 0) >= recovery_samples and below_started is not None and last is not None
             and (last - below_started).total_seconds() >= recovery_seconds):
@@ -596,6 +630,23 @@ def _digest(current: Mapping[str, Any], evaluation: Mapping[str, Any],
     report_active = _report_active(active)
     assessment = visuals.assess_hourly(current, evaluation, health, report_active, now)
     rule_rows, active_rows = assessment["rule_rows"], assessment["active_rows"]
+    digest_rule_rows = []
+    if evaluation.get("status") == "ok" and signals.fresh(evaluation.get("evaluatedAt"), now):
+        for row in evaluation.get("states", {}).values():
+            if (not isinstance(row, Mapping) or signals.excluded(row)
+                    or row.get("phase") not in {"firing", "recovering"}
+                    or row.get("severity") not in {"info", "warning"}
+                    or row.get("ruleId") in {"HttpLatencyHigh", "TcpRetransmissionHigh"}
+                    or row.get("ruleId") in policy.RESOURCE_RULE_POLICIES):
+                continue
+            digest_rule_rows.append(row)
+    digest_rule_rows.sort(key=lambda row: (row.get("severity") != "warning", row.get("ruleId", "")))
+    if digest_rule_rows and len(assessment["highlights"]) < 4:
+        names = [signals.safe_name(row.get("ruleId")) for row in digest_rule_rows[:3]]
+        names = [name for name in names if name]
+        assessment["highlights"].append(
+            f"일일 요약 항목 {len(digest_rule_rows)}건" + (" · " + ", ".join(names) if names else "")
+        )
     summary = {"ok": "정상", "warning": "주의", "critical": "위험", "unknown": "관측 불가"}[assessment["status"]]
     lines = [f"Monitor 일일 서버 보고 · {summary}", f"보고 시각: {_kst(now_text)}",
              f"최신 수집: {_kst(current.get('generatedAt'))}", "",
@@ -639,6 +690,11 @@ def _digest(current: Mapping[str, Any], evaluation: Mapping[str, Any],
         label = "위험" if row["reportSeverity"] == "critical" else "주의"
         state_label = "복구 확인 중" if row.get("reportRecoveryPending") else "미해소"
         lines.append(f"- [{label} · {state_label}] 마지막 이상 관측: {row['evidence']}")
+    lines.extend(["", f"일일 요약 전용 규칙 {len(digest_rule_rows)}건"])
+    for row in digest_rule_rows[:12]:
+        rule, target = signals.safe_name(row.get("ruleId")), signals.safe_name(row.get("target"))
+        if rule and target:
+            lines.append(f"- {rule} ({target}), {row.get('phase')}")
     lines.extend(["", *assessment["highlights"]])
     recent = [row for row in events if signals.fresh(row.get("observedAt"), now, 3600)
               and row.get("ruleId") in {"TcpRetransmissionHigh", "HttpLatencyHigh", "HttpProbeFailed"}]
@@ -650,8 +706,8 @@ def _digest(current: Mapping[str, Any], evaluation: Mapping[str, Any],
     for row in health:
         lines.append(f"- {row['source']}: {row['status']} · {row['detail']}")
     lines.extend(assessment.get("coverage_notes", []))
-    lines.extend(["", "외부 감시: GitHub Actions가 공개 readiness·TLS·SSO를 명목상 5분 간격으로 확인합니다. 예약 실행 간격은 SLA가 아닙니다.",
-                  "장애당 GitHub Issue 하나를 기록하고 복구 시 닫습니다. 호스트와 독립되어 전체 호스트 중단도 감지하지만 SMTP는 보내지 않으며, GitHub Actions·Issues 장애 시 관측되지 않을 수 있습니다."])
+    lines.extend(["", "외부 감시: GitHub Actions가 공개 readiness·TLS·SSO를 명목상 5분 간격으로 확인합니다. 예약 실행 간격은 SLA가 아닙니다. 따라서 5분 이내 탐지를 보장하지 않습니다.",
+                  "장애당 GitHub Issue 하나를 기록하고 복구 시 닫습니다. 호스트와 독립되어 서버 전체 정지처럼 전체 호스트 중단도 감지하지만 SMTP는 보내지 않으며, GitHub Actions·Issues 장애 시 관측되지 않을 수 있습니다."])
     lines.extend(["", "SSH는 비허용 로그인·인증 실패 패턴, HTTP는 응답 코드 이상을 관찰합니다.",
                   "요청 주소·IP·사용자명·원문 로그는 메일에 포함하지 않습니다."])
     body = "\n".join(lines)
@@ -870,7 +926,8 @@ def produce_notifications(
                 event = _event("SecurityPattern" if item["kind"].startswith("ssh-") else "OperationalCaution",
                                f"signal\0{identifier}\0{mail_severity}", mail_severity,
                                now_text, item["openedAt"], item["evidence"], count=item["count"],
-                               signal_kind=item["kind"])
+                               signal_kind=item["kind"],
+                               delivery_class=_signal_delivery_class(effective_signal))
                 readmission = _needs_readmission(connection, config, event)
                 if readmission or ((item["notifiedSeverity"] is None or escalation)
                                    and ready):
@@ -913,8 +970,7 @@ def produce_notifications(
                 item.pop("lastBreachSampleAt", None)
                 item["clearSamples"] = item.get("clearSamples", 0) + 1
                 resource = policy.policy_for_signal(key)
-                recovery_samples = resource.recovery_samples if resource else 2
-                recovery_seconds = resource.recovery_seconds if resource else 0
+                recovery_samples, recovery_seconds = _recovery_requirements(key, resource)
                 first_clear = signals.timestamp(item.get("firstClearAt"))
                 if (item["clearSamples"] < recovery_samples or first_clear is None
                         or (sample - first_clear).total_seconds() < recovery_seconds):
@@ -923,7 +979,12 @@ def produce_notifications(
                 event = _event("SecurityPattern" if item["kind"].startswith("ssh-") else "OperationalCaution",
                                f"signal\0{item['id']}\0resolved", item["notifiedSeverity"] or item["severity"],
                                now_text, item["openedAt"], evidence, "resolved", 0,
-                               signal_kind=item["kind"])
+                               signal_kind=item["kind"],
+                               delivery_class=_signal_delivery_class({
+                                   **item,
+                                   "key": key,
+                                   "severity": item["notifiedSeverity"] or item["severity"],
+                               }))
                 if item["notifiedSeverity"] and not key.startswith("ssh-"):
                     _emit(outbox, connection, config, event, now, status["immediate"], _immediate_presentation(event, evidence))
                     if _recovery_unfinished(connection, config, event):
