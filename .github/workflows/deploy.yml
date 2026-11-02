@@ -34,6 +34,15 @@ jobs:
         with:
           fetch-depth: 2
 
+      - name: Resolve runtime deployment scope
+        id: deploy_scope
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          deploy=$(python3 ops/deployment_scope.py --event "$EVENT_NAME" --before "$BEFORE_SHA")
+          printf 'runtime=%s\n' "$deploy" >> "$GITHUB_OUTPUT"
+
       - name: Set up Node.js
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
@@ -170,7 +179,9 @@ jobs:
           vuln-type: os,library
 
       - name: Request restricted server deployment
-        if: github.ref_name == 'main'
+        # Host collector modules are installed separately. Publishing a tested
+        # host-only change must not roll the currently customized web image back.
+        if: github.ref_name == 'main' && steps.deploy_scope.outputs.runtime == 'true'
         env:
           DEPLOY_KEY: ${{ secrets.DEPLOY_KEY }}
           GHCR_TOKEN: ${{ github.token }}

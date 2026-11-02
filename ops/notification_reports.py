@@ -143,14 +143,16 @@ def _source_health(current: Mapping[str, Any], evaluation: Mapping[str, Any],
 
 
 def _event(rule: str, key: str, severity: str, now_text: str, opened: str,
-           evidence: str, transition: str = "firing", count: int | None = None) -> dict[str, Any]:
+           evidence: str, transition: str = "firing", count: int | None = None,
+           signal_kind: str | None = None) -> dict[str, Any]:
     return normalize_event({
         "schemaVersion": 1, "rulePackVersion": "notifications-v1",
         "idempotencyKey": hashlib.sha256(key.encode()).hexdigest(),
         "ruleId": rule, "target": "host/monitor", "transition": transition,
         "severity": severity, "notificationState": "ready", "observedAt": now_text,
         "openedAt": opened, "value": count, "status": "ok",
-        "labels": {"scope": "notification", "purpose": "report" if rule == "HourlyReport" else "signal"},
+        "labels": {"scope": "notification", "purpose": "report" if rule == "HourlyReport" else "signal",
+                   **({"signal_kind": signal_kind} if signal_kind else {})},
         "description": evidence[:500],
         "runbook": "Monitor의 최신 표본과 해당 사건의 관측 시각을 확인하세요. 공격 의심은 침입 성공을 뜻하지 않습니다.",
     })
@@ -163,6 +165,9 @@ def _empty_counts() -> dict[str, int]:
 def _emit(outbox: delivery.DeliveryOutbox, connection: sqlite3.Connection,
           config: delivery.DeliveryConfig, event: Mapping[str, Any], now: dt.datetime,
           counts: dict[str, int], presentation: Mapping[str, Any] | None = None) -> bool:
+    # Successful logins remain in access history and detections, without mail.
+    if event.get("labels", {}).get("signal_kind") == "ssh-auth-success":
+        return False
     selected = delivery.route_channels(config, event)
     if not selected:
         return False
@@ -389,6 +394,7 @@ def _report_active(active: Mapping[str, Any]) -> dict[str, Any]:
                       and item.get("severity") == "warning"}
             for key, item in active.items()
             if isinstance(item, Mapping) and item.get("status") == "active"
+            and item.get("kind") != "ssh-auth-success"
             and not signals.excluded(key) and not signals.excluded(item)}
 
 
@@ -719,7 +725,8 @@ def produce_notifications(
                 escalation = mail_severity == "critical" and item["notifiedSeverity"] == "warning"
                 event = _event("SecurityPattern" if item["kind"].startswith("ssh-") else "OperationalCaution",
                                f"signal\0{identifier}\0{mail_severity}", mail_severity,
-                               now_text, item["openedAt"], item["evidence"], count=item["count"])
+                               now_text, item["openedAt"], item["evidence"], count=item["count"],
+                               signal_kind=item["kind"])
                 readmission = _needs_readmission(connection, config, event)
                 if readmission or ((item["notifiedSeverity"] is None or escalation)
                                    and ready):
@@ -768,7 +775,8 @@ def produce_notifications(
                 evidence = _recovery_evidence(item["evidence"])
                 event = _event("SecurityPattern" if item["kind"].startswith("ssh-") else "OperationalCaution",
                                f"signal\0{item['id']}\0resolved", item["notifiedSeverity"] or item["severity"],
-                               now_text, item["openedAt"], evidence, "resolved", 0)
+                               now_text, item["openedAt"], evidence, "resolved", 0,
+                               signal_kind=item["kind"])
                 if item["notifiedSeverity"]:
                     _emit(outbox, connection, config, event, now, status["immediate"], _immediate_presentation(event, evidence))
                     if _recovery_unfinished(connection, config, event):
