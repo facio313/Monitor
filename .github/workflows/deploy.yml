@@ -181,7 +181,9 @@ jobs:
       - name: Request restricted server deployment
         # Host collector modules are installed separately. Publishing a tested
         # host-only change must not roll the currently customized web image back.
-        if: github.ref_name == 'main' && steps.deploy_scope.outputs.runtime == 'true'
+        # A repository variable may hold one exact reviewed SHA while the live
+        # customized checkout is reconciled. Validation and publication still run.
+        if: github.ref_name == 'main' && steps.deploy_scope.outputs.runtime == 'true' && github.sha != vars.MONITOR_RUNTIME_HOLD_SHA
         env:
           DEPLOY_KEY: ${{ secrets.DEPLOY_KEY }}
           GHCR_TOKEN: ${{ github.token }}
