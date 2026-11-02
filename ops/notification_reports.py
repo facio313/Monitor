@@ -275,6 +275,9 @@ def _empty_counts() -> dict[str, int]:
 def _emit(outbox: delivery.DeliveryOutbox, connection: sqlite3.Connection,
           config: delivery.DeliveryConfig, event: Mapping[str, Any], now: dt.datetime,
           counts: dict[str, int], presentation: Mapping[str, Any] | None = None) -> bool:
+    # Login successes remain in SSH history and detections, without email.
+    if event.get("labels", {}).get("signal_kind") == "ssh-auth-success":
+        return False
     selected = delivery.route_channels(config, event)
     if not selected:
         return False
@@ -520,6 +523,7 @@ def _report_active(active: Mapping[str, Any]) -> dict[str, Any]:
                       and item.get("severity") == "warning"}
             for key, item in active.items()
             if isinstance(item, Mapping) and item.get("status") == "active"
+            and item.get("kind") != "ssh-auth-success"
             and not signals.excluded(key) and not signals.excluded(item)}
 
 

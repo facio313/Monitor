@@ -131,14 +131,18 @@ class SshCountryPolicyTests(unittest.TestCase):
         row = access(event="accepted")
         self.persist([row])
         result = self.fixture.run_producer()
-        self.assertEqual(result["immediate"]["enqueued"], 1)
+        self.assertEqual(result["immediate"]["enqueued"], 0)
+        self.assertTrue(any(item["kind"] == "ssh-auth-success" for item in result["detections"]))
         payload = json.dumps(self.fixture.queued(), ensure_ascii=False)
         self.assertNotIn("operator", payload)
         self.assertNotIn("SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", payload)
+        self.assertNotIn("신뢰 목록에 없는 SSH 인증 성공", payload)
+        stored = self.fixture.root / "ssh-access" / f"{NOW.date().isoformat()}.jsonl"
+        self.assertEqual(json.loads(stored.read_text()), row)
 
-    def test_untrusted_success_is_event_only_without_recovery_mail(self):
+    def test_untrusted_success_remains_recorded_without_firing_or_recovery_mail(self):
         self.persist([access(code="KR", event="accepted")])
-        self.assertEqual(self.fixture.run_producer()["immediate"]["enqueued"], 1)
+        self.assertEqual(self.fixture.run_producer()["immediate"]["enqueued"], 0)
         for offset in (600, 660):
             later = NOW + dt.timedelta(seconds=offset)
             self.fixture.refresh(later)
@@ -147,7 +151,7 @@ class SshCountryPolicyTests(unittest.TestCase):
         self.assertTrue(any(row["status"] == "resolved" for row in result["detections"]))
         security = [row for row in self.fixture.queued()
                     if row["event"]["ruleId"] == "SecurityPattern"]
-        self.assertEqual([row["event"]["transition"] for row in security], ["firing"])
+        self.assertEqual(security, [])
 
     def test_exact_root_private_identity_suppresses_only_its_accepted_warning(self):
         approved = access(event="accepted")
@@ -163,7 +167,7 @@ class SshCountryPolicyTests(unittest.TestCase):
         self.trust(approved)
         (self.fixture.root / ".state/trusted-ssh-identities.json").chmod(0o640)
         result = self.fixture.run_producer()
-        self.assertEqual(result["immediate"]["enqueued"], 1)
+        self.assertEqual(result["immediate"]["enqueued"], 0)
         self.assertTrue(any(row["kind"] == "ssh-auth-success" for row in result["detections"]))
 
     def test_country_source_loss_does_not_resolve_foreign_episode(self):
