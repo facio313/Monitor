@@ -12,3 +12,5 @@ Validation completed:
 - client and server TypeScript checks passed
 - shell branch and actual checkout guard passed in dev and main CI environment
 - workflow YAML parsed
+
+CI follow-up: the image build executes the actual-checkout regression in a disposable Git fixture. Its build stage now installs Git alongside Python; runtime stages remain unchanged. The first dev CI passed native checks but failed this new fixture because Git was absent from the build stage.

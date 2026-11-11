@@ -8,7 +8,7 @@ ENV PORTFOLIO_BRANCH=${PORTFOLIO_BRANCH} \
 
 WORKDIR /app
 
-RUN apk add --no-cache python3
+RUN apk add --no-cache python3 git
 
 COPY package.json package-lock.json ./
 RUN npm ci
