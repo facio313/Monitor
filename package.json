@@ -7,11 +7,11 @@
     "node": ">=22.12.0"
   },
   "scripts": {
-    "dev": "PORTFOLIO_AUTH_MODE=local ./scripts/portfolio-auth-mode.sh exec -- node scripts/monitor-dev.mjs",
+    "dev": "./scripts/dev-only.sh node scripts/monitor-dev.mjs",
     "dev:raw": "concurrently -k -n api,web -c cyan,magenta \"npm:dev:server:raw\" \"npm:dev:client:raw\"",
-    "dev:server": "PORTFOLIO_AUTH_MODE=local ./scripts/portfolio-auth-mode.sh exec -- npm run dev:server:raw",
+    "dev:server": "./scripts/dev-only.sh npm run dev:server:raw",
     "dev:server:raw": "tsx watch server/index.ts",
-    "dev:client": "PORTFOLIO_AUTH_MODE=local ./scripts/portfolio-auth-mode.sh exec -- npm run dev:client:raw",
+    "dev:client": "./scripts/dev-only.sh npm run dev:client:raw",
     "dev:client:raw": "vite",
     "build": "./scripts/portfolio-auth-mode.sh exec -- npm run build:raw",
     "build:raw": "npm run build:client:raw && npm run build:server:raw",

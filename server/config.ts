@@ -117,7 +117,10 @@ function ssoEnabledFromPortfolioContract(): boolean {
     throw new Error('PORTFOLIO_AUTH_MODE must be sso or local');
   }
 
-  const expectedMode = branch === 'main' || branch === 'dev' ? 'sso' : 'local';
+  if (branch !== 'main' && branch !== 'dev') {
+    throw new Error('Unsupported portfolio branch; use main or dev');
+  }
+  const expectedMode = branch === 'main' ? 'sso' : 'local';
   if (authMode !== expectedMode) {
     throw new Error(`Portfolio branch ${branch} requires ${expectedMode} authentication`);
   }

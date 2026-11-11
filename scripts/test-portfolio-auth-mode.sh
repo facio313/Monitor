@@ -1,37 +1,39 @@
 #!/bin/sh
 set -eu
-
 script_directory=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 resolver=$script_directory/portfolio-auth-mode.sh
-
-assert_mode() {
-  branch=$1
-  expected=$2
+for branch in main refs/heads/main dev refs/heads/dev; do
+  case "$branch" in *main) expected=sso ;; *) expected=local ;; esac
   actual=$(unset PORTFOLIO_AUTH_MODE GITHUB_REF_NAME; PORTFOLIO_BRANCH=$branch "$resolver" print)
-  [ "$actual" = "$expected" ] || {
-    printf 'expected %s for %s, got %s\n' "$expected" "$branch" "$actual" >&2
-    exit 1
-  }
-}
-
-assert_mode main sso
-assert_mode dev sso
-assert_mode codex local
-assert_mode feature/auth-contract local
-
+  [ "$actual" = "$expected" ]
+done
+for branch in codex cursor anthropic feature/auth-contract topic ''; do
+  if (unset PORTFOLIO_AUTH_MODE; PORTFOLIO_BRANCH=$branch "$resolver" check) 2>/dev/null; then
+    printf 'Unsupported branch accepted: %s\n' "$branch" >&2; exit 1
+  fi
+done
+for pair in main:local dev:sso; do
+  if PORTFOLIO_BRANCH=${pair%:*} PORTFOLIO_AUTH_MODE=${pair#*:} "$resolver" check 2>/dev/null; then
+    printf 'Mismatched mode accepted: %s\n' "$pair" >&2; exit 1
+  fi
+done
 github_mode=$(unset PORTFOLIO_BRANCH PORTFOLIO_AUTH_MODE; GITHUB_REF_NAME=dev "$resolver" print)
-[ "$github_mode" = sso ]
+[ "$github_mode" = local ]
+contract=$(PORTFOLIO_BRANCH=dev PORTFOLIO_AUTH_MODE=local "$resolver" contract)
+[ "$contract" = "$(printf 'dev\nlocal')" ]
+environment=$(PORTFOLIO_BRANCH=dev PORTFOLIO_AUTH_MODE=local "$resolver" exec -- env)
+printf '%s\n' "$environment" | grep -Fqx 'PORTFOLIO_BRANCH=dev'
+printf '%s\n' "$environment" | grep -Fqx 'PORTFOLIO_AUTH_MODE=local'
+printf '%s\n' 'portfolio main/dev auth contract: ok'
 
-if PORTFOLIO_BRANCH=main PORTFOLIO_AUTH_MODE=local "$resolver" check 2>/dev/null; then
-  printf '%s\n' 'mismatched explicit mode was accepted' >&2
-  exit 1
+fixture=$(mktemp -d)
+trap 'rm -rf "$fixture"' EXIT HUP INT TERM
+mkdir "$fixture/scripts"
+cp "$resolver" "$script_directory/dev-only.sh" "$fixture/scripts/"
+git -C "$fixture" init -q -b dev
+PORTFOLIO_BRANCH=dev PORTFOLIO_AUTH_MODE=local "$fixture/scripts/dev-only.sh" sh -c '[ "$PORTFOLIO_BRANCH:$PORTFOLIO_AUTH_MODE" = dev:local ]'
+git -C "$fixture" symbolic-ref HEAD refs/heads/main
+if PORTFOLIO_BRANCH=dev PORTFOLIO_AUTH_MODE=local "$fixture/scripts/dev-only.sh" true 2>/dev/null; then
+  printf '%s\n' 'A main checkout bypassed the local dev guard.' >&2; exit 1
 fi
-
-topic_contract=$(PORTFOLIO_BRANCH=topic PORTFOLIO_AUTH_MODE=local "$resolver" contract)
-[ "$topic_contract" = "$(printf 'topic\nlocal')" ]
-
-topic_environment=$(PORTFOLIO_BRANCH=topic PORTFOLIO_AUTH_MODE=local "$resolver" exec -- env)
-printf '%s\n' "$topic_environment" | grep -Fqx 'PORTFOLIO_BRANCH=topic'
-printf '%s\n' "$topic_environment" | grep -Fqx 'PORTFOLIO_AUTH_MODE=local'
-
-printf '%s\n' 'portfolio auth mode contract: ok'
+printf '%s\n' 'actual dev checkout guard: ok'

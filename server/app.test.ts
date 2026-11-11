@@ -74,7 +74,7 @@ describe('authentication', () => {
     vi.stubEnv('MONITOR_PASSWORD', 'password-from-environment');
     vi.stubEnv('MONITOR_SESSION_SECRET_FILE', sessionFile);
     vi.stubEnv('MONITOR_SESSION_SECRET', 'environment-session-secret-is-long-enough');
-    vi.stubEnv('PORTFOLIO_BRANCH', 'feature/local-monitor');
+    vi.stubEnv('PORTFOLIO_BRANCH', 'dev');
     vi.stubEnv('PORTFOLIO_AUTH_MODE', 'local');
     try {
       const config = loadConfig();
@@ -123,20 +123,23 @@ describe('authentication', () => {
   });
 
   it('derives authentication only from a matching branch contract', () => {
-    vi.stubEnv('PORTFOLIO_BRANCH', 'feature/local-dashboard');
+    vi.stubEnv('PORTFOLIO_BRANCH', 'dev');
     vi.stubEnv('PORTFOLIO_AUTH_MODE', 'local');
     try {
       expect(loadConfig({ sessionSecret: SECRET }).ssoEnabled).toBe(false);
 
-      vi.stubEnv('PORTFOLIO_BRANCH', 'dev');
+      vi.stubEnv('PORTFOLIO_BRANCH', 'main');
       vi.stubEnv('PORTFOLIO_AUTH_MODE', 'sso');
       expect(loadConfig({ sessionSecret: SECRET, edgeSecret: EDGE_SECRET }).ssoEnabled).toBe(true);
 
       vi.stubEnv('PORTFOLIO_AUTH_MODE', 'local');
       expect(() => loadConfig({ sessionSecret: SECRET })).toThrow(
-        'Portfolio branch dev requires sso authentication',
+        'Portfolio branch main requires sso authentication',
       );
 
+      vi.stubEnv('PORTFOLIO_BRANCH', 'feature/retired');
+      expect(() => loadConfig({ sessionSecret: SECRET })).toThrow('Unsupported portfolio branch');
+      vi.stubEnv('PORTFOLIO_BRANCH', 'main');
       vi.stubEnv('PORTFOLIO_AUTH_MODE', 'sso');
       vi.stubEnv('MONITOR_SSO_ENABLED', 'false');
       expect(() => loadConfig({ sessionSecret: SECRET, edgeSecret: EDGE_SECRET })).toThrow(

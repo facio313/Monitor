@@ -26,8 +26,9 @@ resolve_branch() {
 
 resolve_branch
 case "$resolved_branch" in
-  main|dev) resolved_mode=sso ;;
-  *) resolved_mode=local ;;
+  main) resolved_mode=sso ;;
+  dev) resolved_mode=local ;;
+  *) fail "unsupported branch '$resolved_branch'; use dev for development or main for production" ;;
 esac
 
 if [ "${PORTFOLIO_AUTH_MODE+x}" = x ] && [ "$PORTFOLIO_AUTH_MODE" != "$resolved_mode" ]; then

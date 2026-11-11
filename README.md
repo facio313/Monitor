@@ -75,7 +75,7 @@ and [the transport package guide](docs/agent-transport.md).
 
 `scripts/portfolio-auth-mode.sh` is the only branch-to-authentication resolver.
 It uses `PORTFOLIO_BRANCH`, then `GITHUB_REF_NAME`, then the current Git branch.
-`main` and `dev` resolve to `sso`; every other branch resolves to `local`. If an
+`main` resolves to `sso`; `dev` resolves to `local`; other branches are rejected. If an
 explicit `PORTFOLIO_AUTH_MODE` disagrees, startup, build, or Compose validation
 fails closed. Container images additionally carry a read-only build contract;
 runtime branch/mode overrides must match the branch and mode used to build the
@@ -246,7 +246,7 @@ private mTLS proxy. It must not contain the same value as
 missing, shorter than 32 bytes, or equal to the SSO secret.
 
 Do not mount `MONITOR_PASSWORD_FILE`, `MONITOR_SESSION_SECRET_FILE`, or
-`MONITOR_AUTH_STATE_FILE` in a `main`/ `dev` deployment. SSO mode does not
+`MONITOR_AUTH_STATE_FILE` in a `main` deployment. SSO mode does not
 read credential contents and does not instantiate the local password store.
 `GET /monitor/api/operations/auth-inventory` is admin-gated and reports
 only aggregate file/cookie counts. If an old local state file remains, stop the
@@ -303,7 +303,7 @@ curl --fail --silent --show-error http://127.0.0.1:5181/readyz
 
 The image contains a read-only build-authentication contract. Server startup
 compares it with the runtime branch and mode, so changing environment variables
-cannot turn a `main`/ `dev` SSO image into a local-password image.
+cannot turn a `main` SSO image into a local-password image.
 
 ### 4. Publish `/monitor/` through Nginx
 
@@ -538,7 +538,7 @@ separate operational control.
 
 ## Local development
 
-Use a branch other than `main` or `dev`. The shortest direct path creates a
+Use the actual `dev` checkout. The shortest direct path creates a
 private disposable password, session secret, and auth-state directory beneath
 `.runtime/monitor-dev`; the password value is never printed and remains only in
 the mode-`0600` file named by the startup message:
@@ -594,7 +594,7 @@ npm test
 npm run test:collector
 npm run build
 docker build \
-  --build-arg PORTFOLIO_BRANCH=feature/local-monitor \
+  --build-arg PORTFOLIO_BRANCH=dev \
   --build-arg PORTFOLIO_AUTH_MODE=local \
   --tag monitor:local .
 ```
@@ -618,7 +618,7 @@ Application variables:
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `PORTFOLIO_BRANCH` | current Git branch outside packaged builds | Canonical branch identity; CI and Docker builds must set it explicitly |
-| `PORTFOLIO_AUTH_MODE` | derived from the canonical branch | Must be `sso` for `main`/`dev` and `local` for every other branch |
+| `PORTFOLIO_AUTH_MODE` | derived from the canonical branch | Must be `sso` for `main` and `local` for `dev`; other branches are rejected |
 | `HOST` | `0.0.0.0` | Express listen address |
 | `PORT` | `8080` | Express listen port |
 | `MONITOR_DATA_DIR` | `/data` | Sanitized collector export root |
@@ -1070,7 +1070,7 @@ server dispatcher.
 ## Local-only password state
 
 Password state, session signing, password changes, backups, and recovery exist
-only for branches outside `main` and `dev`. The default helper keeps this
+only from the actual `dev` checkout. The default helper keeps this
 disposable state beneath `.runtime/monitor-dev`, which is ignored by Git.
 The repository's `docker-compose.local.yml` likewise adds the password and
 session secrets plus the writable auth-state mount only when the canonical mode
